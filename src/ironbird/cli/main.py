@@ -21,7 +21,7 @@ from typing import Annotated, Any
 import typer
 
 from ironbird import render
-from ironbird.ccdd.model import MessageKind
+from ironbird.ccdd.model import EventSeverity, MessageKind
 from ironbird.config import SystemConfig, find_config, load_config
 from ironbird.errors import Code, IronbirdError
 from ironbird.ledger import Ledger, default_state_dir
@@ -40,6 +40,18 @@ app = typer.Typer(
 class Format(StrEnum):
     LINE = "line"
     JSON = "json"
+
+
+class MinType(StrEnum):
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+    @property
+    def severity(self) -> EventSeverity:
+        return EventSeverity[self.name]
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,9 +244,10 @@ def find(
             msg = match.message
             fc = f" fc={msg.function_code}" if msg.function_code is not None else ""
             desc = f"  {clean(msg.description, 80)}" if msg.description else ""
+            cat = f" cat={msg.category.value}" if msg.kind is MessageKind.TELEMETRY else ""
             _out(
                 f"{match.tier:<11} {match.node}  {msg.kind.value:<9} {clean(msg.name)}"
-                f"  mid=0x{msg.mid:04X}{fc}{desc}"
+                f"  mid=0x{msg.mid:04X}{fc}{cat}{desc}"
             )
         if len(matches) > limit:
             _err(f"{len(matches) - limit} more matches not shown (raise --limit)")
@@ -364,6 +377,57 @@ def listen(
         return 0
 
     _run(ctx, as_node, verbose, body, "listen")
+
+
+@app.command()
+def events(
+    ctx: typer.Context,
+    node: Annotated[
+        list[str] | None,
+        typer.Option("--node", help="Only this node's events; repeat for several (default: all)."),
+    ] = None,
+    min_type: Annotated[
+        MinType | None,
+        typer.Option("--min-type", case_sensitive=False, help="Hide events below this type."),
+    ] = None,
+    fmt: Annotated[Format, typer.Option("--format", help="Output format.")] = Format.LINE,
+    count: Annotated[
+        int | None, typer.Option("--count", min=1, help="Stop after N events.")
+    ] = None,
+    timeout: TimeoutOption = None,
+    as_node: AsOption = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """Listen on every telemetry link of all (or selected) nodes and print only events."""
+
+    async def body(session: Session, config: SystemConfig) -> int:
+        stream = await session.events(
+            node, min_severity=min_type.severity if min_type is not None else None
+        )
+        where = ", ".join(
+            f"{name} (udp {addr[0]}:{addr[1]})" if addr else name for name, addr in stream.endpoints
+        )
+        _err(f"listening for events from {where}")
+        shown = 0
+
+        async def consume() -> None:
+            nonlocal shown
+            async for event in stream:
+                if fmt is Format.JSON:
+                    _out(json.dumps(render.event_record(event)))
+                else:
+                    _out(render.event_line(event))
+                shown += 1
+                if count is not None and shown >= count:
+                    return
+
+        try:
+            await _run_until(consume(), timeout, "events", session)
+        finally:
+            await stream.close()
+        return 0
+
+    _run(ctx, as_node, verbose, body, "events")
 
 
 @app.command()

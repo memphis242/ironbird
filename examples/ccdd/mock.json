@@ -41,6 +41,7 @@
       "kind": "telemetry",
       "mid": "0x0890",
       "description": "Housekeeping: command counters and mode",
+      "category": "housekeeping",
       "fields": [
         {"name": "cmd_counter", "type": "uint8", "description": "Accepted commands"},
         {"name": "err_counter", "type": "uint8", "description": "Rejected commands"},
@@ -59,10 +60,48 @@
       "kind": "telemetry",
       "mid": "0x0891",
       "description": "Environment status: temperature and bus voltage",
+      "category": "status",
       "fields": [
         {"name": "temperature_c", "type": "float32", "units": "degC"},
         {"name": "bus_voltage_v", "type": "float32", "units": "V"},
         {"name": "uptime_s", "type": "uint32", "endian": "big", "units": "s"}
+      ]
+    },
+    {
+      "name": "MOCK_RAISE_EVENT",
+      "kind": "command",
+      "mid": "0x1890",
+      "function_code": 3,
+      "description": "Make the mock node report an event with the given contents",
+      "fields": [
+        {"name": "app", "type": "char[8]", "description": "Reporting app name"},
+        {"name": "event_id", "type": "uint16", "description": "App-defined event id"},
+        {
+          "name": "event_type",
+          "type": "uint16",
+          "enum": {"DEBUG": 1, "INFORMATION": 2, "ERROR": 3, "CRITICAL": 4},
+          "description": "Event type"
+        },
+        {"name": "message", "type": "char[32]", "description": "Event text"}
+      ]
+    },
+    {
+      "name": "MOCK_EVENT",
+      "kind": "telemetry",
+      "mid": "0x0892",
+      "description": "Event report: app, id, type and text",
+      "category": "event",
+      "event": {"app": "app", "id": "event_id", "type": "event_type", "message": "message"},
+      "fields": [
+        {"name": "app", "type": "char[8]", "description": "Reporting app name"},
+        {"name": "event_id", "type": "uint16", "description": "App-defined event id"},
+        {
+          "name": "event_type",
+          "type": "uint16",
+          "enum": {"DEBUG": 1, "INFORMATION": 2, "ERROR": 3, "CRITICAL": 4},
+          "description": "Event type"
+        },
+        {"name": "message", "type": "char[32]", "description": "Event text"}
       ]
     }
   ]

@@ -99,7 +99,12 @@ def _ccdd() -> dict[str, Any]:
 
 def test_example_ccdd_loads_and_indexes() -> None:
     model = load_ccdd(EXAMPLES / "ccdd" / "mock.json")
-    assert [m.name for m in model.commands()] == ["MOCK_NOOP", "MOCK_SET_MODE", "MOCK_SET_LABEL"]
+    assert [m.name for m in model.commands()] == [
+        "MOCK_NOOP",
+        "MOCK_SET_MODE",
+        "MOCK_SET_LABEL",
+        "MOCK_RAISE_EVENT",
+    ]
     assert model.commands_by_key[(0x1890, 1)].name == "MOCK_SET_MODE"
     assert model.telemetry_by_mid[0x0890].kind is MessageKind.TELEMETRY
     status = model.by_name["MOCK_STATUS"]

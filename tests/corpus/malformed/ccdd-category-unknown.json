@@ -1,0 +1,18 @@
+{
+  "schema": "ironbird-ccdd/0",
+  "target": "corpus",
+  "messages": [
+    {
+      "name": "HK",
+      "kind": "telemetry",
+      "mid": "0x0801",
+      "category": "urgent",
+      "fields": [
+        {
+          "name": "a",
+          "type": "uint8"
+        }
+      ]
+    }
+  ]
+}

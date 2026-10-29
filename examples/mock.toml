@@ -5,6 +5,9 @@
 #   shell 2:  ib -c examples/mock.toml listen fc
 #   shell 3:  ib -c examples/mock.toml send fc MOCK_NOOP
 #             ib -c examples/mock.toml send fc MOCK_SET_MODE mode=SAFE pad=0
+#   events:   ib -c examples/mock.toml events           (shell 2, instead of listen)
+#             ib -c examples/mock.toml send fc MOCK_RAISE_EVENT app=DEMO event_id=7 \
+#                 event_type=ERROR "message=bus voltage low"
 
 [ironbird]
 acts_as = "ground"
@@ -34,6 +37,12 @@ reply = "MOCK_HK"
 accepted_counter = "cmd_counter"
 rejected_counter = "err_counter"
 echo = { label = "label" }
+
+# The mock reports whatever event it is asked to raise.
+[[nodes.fc.responses]]
+on = "MOCK_RAISE_EVENT"
+reply = "MOCK_EVENT"
+echo = { app = "app", event_id = "event_id", event_type = "event_type", message = "message" }
 
 [[nodes.fc.responses]]
 on = "*"

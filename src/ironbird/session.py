@@ -11,17 +11,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Final
 
 from ironbird.ccdd.loader import load_ccdd
-from ironbird.ccdd.model import CcddModel, Message, MessageKind, TypeClass
+from ironbird.ccdd.model import CcddModel, EventSeverity, Message, MessageKind, TypeClass
 from ironbird.coalesce import Coalescer
 from ironbird.codec import Codec, DecodedPacket, EncodedPacket
 from ironbird.config import Link, Node, ResponseRule, SystemConfig
 from ironbird.errors import Code, DecodeError, IronbirdError
+from ironbird.events import Event, extract_event
 from ironbird.header import load_profile
 from ironbird.ledger import Ledger
 from ironbird.transport import Datagram
@@ -29,6 +30,7 @@ from ironbird.transport.udp import UdpTransport
 
 MAX_TRACKED_MIDS: Final = 1024
 TICK_S: Final = 1.0
+EVENT_QUEUE_SIZE: Final = 1024
 
 
 class Side(StrEnum):
@@ -62,6 +64,7 @@ class Received:
     node: str  # node whose CCDD decoded the packet
     packet: DecodedPacket
     source: str
+    raw: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,6 +407,9 @@ class Session:
         self, peer: str, *, mids: frozenset[int] | None = None, link: str | None = None
     ) -> Listener:
         route = self.route(peer, link_name=link)
+        return await self._open_listener(route, mids)
+
+    async def _open_listener(self, route: Route, mids: frozenset[int] | None) -> Listener:
         codec = self.codec_for(route.server.name)
         if route.side is Side.COMMANDER:
             kind, endpoint = MessageKind.TELEMETRY, route.link.telemetry_endpoint
@@ -416,10 +422,95 @@ class Session:
             "listen.start",
             peer=route.peer.name,
             side=route.side.value,
+            link=route.link.name,
             endpoint=str(endpoint),
             mids=sorted(mids) if mids else None,
         )
         return Listener(self, route, codec, kind, transport, mids)
+
+    # -- events (all telemetry links of the selected nodes) ---------------------------
+
+    def _event_routes(self, nodes: Sequence[str] | None) -> list[Route]:
+        """Commander-side routes whose telemetry carries events, for ``nodes`` (default all)."""
+        me = self.node.name
+        outgoing = [lk for lk in self.config.links if lk.source == me]
+        wanted: set[str] | None = None
+        if nodes:
+            wanted = {self.config.resolve(name).name for name in nodes}
+            for name in sorted(wanted - {lk.destination for lk in outgoing}):
+                raise IronbirdError(
+                    Code.CFG_LINK,
+                    f"{me!r} has no telemetry link from {name!r}",
+                    details="links: " + ", ".join(link.name for link in self.config.links),
+                )
+        routes = [
+            Route(
+                lk,
+                Side.COMMANDER,
+                self.config.nodes[lk.destination],
+                self.config.nodes[lk.destination],
+            )
+            for lk in outgoing
+            if wanted is None or lk.destination in wanted
+        ]
+        if not routes:
+            raise IronbirdError(
+                Code.CFG_LINK,
+                f"{me!r} has no telemetry links to listen on; try --as with the ground node",
+                details="links: " + ", ".join(link.name for link in self.config.links),
+            )
+        seen: dict[str, Route] = {}
+        for route in routes:
+            clash = seen.setdefault(str(route.link.telemetry_endpoint), route)
+            if clash is not route:
+                raise IronbirdError(
+                    Code.CFG_LINK,
+                    f"links {clash.link.name!r} and {route.link.name!r} both receive telemetry "
+                    f"on {route.link.telemetry_endpoint}; select one node with --node",
+                )
+        return routes
+
+    async def events(
+        self, nodes: Sequence[str] | None = None, *, min_severity: EventSeverity | None = None
+    ) -> EventStream:
+        """Listen on every telemetry link of ``nodes`` (default: all) for event packets.
+
+        Every received event is ledgered in full; ``min_severity`` only limits what the
+        stream yields. Nodes whose CCDD defines no event messages are skipped with a notice;
+        if none is left, that is an error.
+        """
+        listeners: list[Listener] = []
+        try:
+            for route in self._event_routes(nodes):
+                codec = self.codec_for(route.server.name)
+                mids = frozenset(m.mid for m in codec.model.event_messages())
+                if not mids:
+                    self.report(
+                        IronbirdError(
+                            Code.EVT_NONE,
+                            f"node {route.server.name!r} defines no event telemetry in "
+                            f"{codec.model.source}; skipped",
+                        )
+                    )
+                    continue
+                listeners.append(await self._open_listener(route, mids))
+            if not listeners:
+                raise IronbirdError(
+                    Code.EVT_NONE,
+                    "no selected node defines event telemetry; mark event messages with "
+                    '"category": "event" and an "event" mapping in the CCDD',
+                )
+        except BaseException:
+            for opened in listeners:
+                await opened.close()
+            raise
+        self.ledger.record(
+            "action",
+            "events.start",
+            nodes=[lst.node for lst in listeners],
+            min_severity=min_severity.name if min_severity else None,
+        )
+        return EventStream(self, listeners, min_severity)
 
     # -- responder ------------------------------------------------------------------
 
@@ -481,6 +572,11 @@ class Listener:
         self._mids = mids
 
     @property
+    def node(self) -> str:
+        """Node whose CCDD decodes what arrives here."""
+        return self._route.server.name
+
+    @property
     def local_address(self) -> tuple[str, int] | None:
         return self._transport.local_address
 
@@ -494,11 +590,98 @@ class Listener:
             result = self._session._ingest(self._codec, self._kind, datagram, self._mids, label)
             seen_drops = self._session._check_drops(self._transport, seen_drops, "listen")
             if isinstance(result, DecodedPacket):
-                yield Received(datagram.time_ns, self._route.server.name, result, datagram.source)
+                yield Received(
+                    datagram.time_ns,
+                    self._route.server.name,
+                    result,
+                    datagram.source,
+                    datagram.data,
+                )
 
     async def close(self) -> None:
         await self._transport.close()
         self._session.ledger.record("action", "listen.stop", peer=self._route.peer.name)
+
+
+class EventStream:
+    """Events from several listeners merged into one stream. Close when done.
+
+    One pump task per listener decodes, ledgers (every event, in full) and queues; the
+    bounded queue applies back-pressure to a pump, and from there to its socket queue, whose
+    overflow the session already reports as one coalesced error.
+    """
+
+    def __init__(
+        self,
+        session: Session,
+        listeners: Sequence[Listener],
+        min_severity: EventSeverity | None,
+    ) -> None:
+        assert listeners
+        self._session = session
+        self._listeners = tuple(listeners)
+        self._min_severity = min_severity
+        self._queue: asyncio.Queue[Event | BaseException] = asyncio.Queue(EVENT_QUEUE_SIZE)
+        loop = asyncio.get_running_loop()
+        self._pumps = [
+            loop.create_task(self._pump(listener), name=f"events-{listener.node}")
+            for listener in self._listeners
+        ]
+
+    @property
+    def endpoints(self) -> list[tuple[str, tuple[str, int] | None]]:
+        """``(node, bound address)`` per listener."""
+        return [(lst.node, lst.local_address) for lst in self._listeners]
+
+    def __aiter__(self) -> AsyncIterator[Event]:
+        return self._iterate()
+
+    async def _iterate(self) -> AsyncIterator[Event]:
+        while True:
+            item = await self._queue.get()
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    async def _pump(self, listener: Listener) -> None:
+        ledger = self._session.ledger
+        try:
+            async for rx in listener:
+                event = extract_event(rx.node, rx.time_ns, rx.packet)
+                if event is None:  # the listener filters on event MIDs; stay defensive
+                    continue
+                ledger.record(
+                    "event",
+                    "rx.event",
+                    node=event.node,
+                    app=event.app,
+                    event_id=event.event_id,
+                    type=event.type_label,
+                    type_value=event.type_value,
+                    severity=event.severity.name if event.severity else None,
+                    text=event.text,
+                    message=event.name,
+                    mid=event.mid,
+                    sequence=event.sequence,
+                    source=rx.source,
+                    raw=rx.raw,
+                )
+                floor = self._min_severity
+                if floor is not None and event.severity is not None and event.severity < floor:
+                    continue
+                await self._queue.put(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # surfaced to the consumer, never lost with the task
+            await self._queue.put(exc)
+
+    async def close(self) -> None:
+        for pump in self._pumps:
+            pump.cancel()
+        await asyncio.gather(*self._pumps, return_exceptions=True)
+        for listener in self._listeners:
+            await listener.close()
+        self._session.ledger.record("action", "events.stop")
 
 
 def _validate_rules(node: Node, codec: Codec, config: SystemConfig) -> Mapping[str, ResponseRule]:

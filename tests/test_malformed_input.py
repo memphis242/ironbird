@@ -25,6 +25,7 @@ from ironbird.ccdd.model import MessageKind
 from ironbird.codec import Codec, DecodedPacket
 from ironbird.config import load_config, parse_config
 from ironbird.errors import Code, DecodeError, IronbirdError
+from ironbird.events import extract_event
 
 CMD, TLM = MessageKind.COMMAND, MessageKind.TELEMETRY
 CODEC = Codec(
@@ -254,6 +255,33 @@ def test_ccdd_parser_on_mutated_valid_files(doc: Any) -> None:
         Codec(model, CMD_PROFILE, TLM_PROFILE)
     except IronbirdError as err:
         assert err.code is Code.ENC_FIT
+
+
+EVENT_SCHEMA_PATHS = [
+    path
+    for path in _scalar_paths(MOCK_JSON)
+    if "category" in path or "event" in path or path[:2] == ("messages", 6)
+]
+
+
+@FUZZ
+@given(st.sampled_from(EVENT_SCHEMA_PATHS), JSON_VALUES)
+def test_ccdd_category_and_event_mapping_mutations(path: tuple[Any, ...], value: Any) -> None:
+    try:
+        model = parse_model(_replace(MOCK_JSON, path, value), "fuzz.json")
+    except IronbirdError as err:
+        assert err.code.value.startswith("IB-CCD-")
+        return
+    # Whatever survives validation must extract events from any packet the codec decodes.
+    try:
+        codec = Codec(model, CMD_PROFILE, TLM_PROFILE, clock=lambda: 1_000_000.25)
+    except IronbirdError as err:
+        assert err.code is Code.ENC_FIT
+        return
+    for msg in model.event_messages():
+        decoded = codec.decode(TLM, codec.encode_telemetry(msg.name).data)
+        assert isinstance(decoded, DecodedPacket)
+        assert extract_event("fc", 1, decoded) is not None
 
 
 @FUZZ

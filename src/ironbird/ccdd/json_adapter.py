@@ -16,8 +16,12 @@ from typing import Any, Final
 
 from ironbird.ccdd.model import (
     MAX_PAYLOAD_BYTES,
+    SEVERITY_LABELS,
+    Category,
     CcddModel,
     Endian,
+    EventSeverity,
+    EventSpec,
     FieldDef,
     FieldType,
     Message,
@@ -146,6 +150,90 @@ def _parse_field(ctx: _Ctx, raw: object, path: str, next_offset: int, names: set
     )
 
 
+def _parse_category(ctx: _Ctx, raw: Mapping[str, Any], path: str, kind: MessageKind) -> Category:
+    """The message's category: ``other`` unless given; ``event`` when an event mapping is."""
+    has_event = "event" in raw
+    if kind is MessageKind.COMMAND:
+        for key in ("category", "event"):
+            if key in raw:
+                raise ctx.fail(f"{path}.{key}", "only valid on telemetry")
+        return Category.OTHER
+    if "category" not in raw:
+        return Category.EVENT if has_event else Category.OTHER
+    text = raw["category"]
+    try:
+        category = Category(text) if isinstance(text, str) else None
+    except ValueError:
+        category = None
+    if category is None:
+        names = ", ".join(c.value for c in Category)
+        raise ctx.fail(f"{path}.category", f"must be one of: {names} (got {str(text)[:40]!r})")
+    if has_event and category is not Category.EVENT:
+        raise ctx.fail(f"{path}.event", f"only valid with category 'event', not {category.value!r}")
+    if category is Category.EVENT and not has_event:
+        raise ctx.fail(
+            f"{path}.event", "required for category 'event' (names the app/id/type/message fields)"
+        )
+    return category
+
+
+def _event_field(
+    ctx: _Ctx,
+    table: Mapping[str, Any],
+    key: str,
+    path: str,
+    fields: tuple[FieldDef, ...],
+    wanted: TypeClass,
+    required: bool,
+) -> FieldDef | None:
+    if key not in table:
+        if required:
+            raise ctx.fail(f"{path}.{key}", "required key is missing")
+        return None
+    name = table[key]
+    if not isinstance(name, str):
+        raise ctx.fail(f"{path}.{key}", "must be a field name")
+    fdef = next((f for f in fields if f.name == name), None)
+    if fdef is None:
+        raise ctx.fail(f"{path}.{key}", f"no field named {name[:40]!r} in this message")
+    if fdef.type.type_class is not wanted:
+        raise ctx.fail(
+            f"{path}.{key}", f"field {name} must be of {wanted.value} type, not {fdef.type.text}"
+        )
+    return fdef
+
+
+def _parse_event(ctx: _Ctx, raw: object, path: str, fields: tuple[FieldDef, ...]) -> EventSpec:
+    if not isinstance(raw, dict):
+        raise ctx.fail(path, 'must be an object like {"app": ..., "id": ..., "type": ...}')
+    _check_keys(ctx, raw, path, {"app", "id", "type", "message"}, {"id", "type"})
+    id_field = _event_field(ctx, raw, "id", path, fields, TypeClass.INT, True)
+    type_field = _event_field(ctx, raw, "type", path, fields, TypeClass.INT, True)
+    app_field = _event_field(ctx, raw, "app", path, fields, TypeClass.CHAR, False)
+    message_field = _event_field(ctx, raw, "message", path, fields, TypeClass.CHAR, False)
+    assert id_field is not None and type_field is not None
+    if type_field.enum is None:
+        raise ctx.fail(
+            f"{path}.type", f"field {type_field.name} needs an enum naming the event types"
+        )
+    severities: dict[int, EventSeverity] = {}
+    for label, number in type_field.enum.items():
+        severity = SEVERITY_LABELS.get(label.upper())
+        if severity is None:
+            known = ", ".join(sorted(SEVERITY_LABELS))
+            raise ctx.fail(
+                f"{path}.type", f"enum label {label!r} is not an event type; use one of: {known}"
+            )
+        severities[number] = severity
+    return EventSpec(
+        id=id_field.name,
+        type=type_field.name,
+        app=app_field.name if app_field else None,
+        message=message_field.name if message_field else None,
+        severities=MappingProxyType(severities),
+    )
+
+
 def _parse_message(ctx: _Ctx, raw: object, index: int) -> Message:
     path = f"messages[{index}]"
     if not isinstance(raw, dict):
@@ -157,7 +245,17 @@ def _parse_message(ctx: _Ctx, raw: object, index: int) -> Message:
         ctx,
         raw,
         path,
-        {"name", "kind", "mid", "function_code", "description", "fields", "payload_size"},
+        {
+            "name",
+            "kind",
+            "mid",
+            "function_code",
+            "description",
+            "fields",
+            "payload_size",
+            "category",
+            "event",
+        },
         {"name", "kind", "mid"},
     )
     name = raw["name"]
@@ -211,6 +309,12 @@ def _parse_message(ctx: _Ctx, raw: object, index: int) -> Message:
             )
     if payload_size > MAX_PAYLOAD_BYTES:
         raise ctx.fail(path, f"payload larger than {MAX_PAYLOAD_BYTES} bytes", Code.CCD_LAYOUT)
+    category = _parse_category(ctx, raw, path, kind)
+    event = (
+        _parse_event(ctx, raw["event"], f"{path}.event", tuple(fields))
+        if category is Category.EVENT
+        else None
+    )
     return Message(
         name=name,
         kind=kind,
@@ -219,6 +323,8 @@ def _parse_message(ctx: _Ctx, raw: object, index: int) -> Message:
         description=_text(ctx, raw, "description", path),
         fields=tuple(fields),
         payload_size=payload_size,
+        category=category,
+        event=event,
     )
 
 

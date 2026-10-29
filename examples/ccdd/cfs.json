@@ -55,6 +55,7 @@
       "kind": "telemetry",
       "mid": "0x0800",
       "description": "cFE Executive Services housekeeping.",
+      "category": "housekeeping",
       "fields": [
         {
           "name": "CommandCounter",
@@ -401,6 +402,288 @@
       ]
     },
     {
+      "name": "EVS_NOOP",
+      "kind": "command",
+      "mid": "0x1801",
+      "function_code": 0,
+      "description": "EVS no-op; increments the EVS command counter and emits an info event.",
+      "fields": []
+    },
+    {
+      "name": "EVS_RESET_COUNTERS",
+      "kind": "command",
+      "mid": "0x1801",
+      "function_code": 1,
+      "description": "Reset EVS command and error counters.",
+      "fields": []
+    },
+    {
+      "name": "EVS_SEND_HK",
+      "kind": "command",
+      "mid": "0x1809",
+      "function_code": 0,
+      "description": "Request one EVS housekeeping packet (normally sent by SCH_LAB every 4.2 s).",
+      "fields": []
+    },
+    {
+      "name": "EVS_HK",
+      "kind": "telemetry",
+      "mid": "0x0801",
+      "description": "cFE Event Services housekeeping (per-app event counters are left as the raw 16 x 8 byte AppData table).",
+      "category": "housekeeping",
+      "fields": [
+        {
+          "name": "CommandCounter",
+          "type": "uint8",
+          "offset": 0,
+          "endian": "little",
+          "description": "EVS valid command counter",
+          "units": ""
+        },
+        {
+          "name": "CommandErrorCounter",
+          "type": "uint8",
+          "offset": 1,
+          "endian": "little",
+          "description": "EVS command error counter",
+          "units": ""
+        },
+        {
+          "name": "MessageFormatMode",
+          "type": "uint8",
+          "offset": 2,
+          "endian": "little",
+          "description": "Event message format",
+          "units": "",
+          "enum": {
+            "SHORT": 0,
+            "LONG": 1
+          }
+        },
+        {
+          "name": "MessageTruncCounter",
+          "type": "uint8",
+          "offset": 3,
+          "endian": "little",
+          "description": "Event message truncation counter",
+          "units": ""
+        },
+        {
+          "name": "UnregisteredAppCounter",
+          "type": "uint8",
+          "offset": 4,
+          "endian": "little",
+          "description": "Events sent by unregistered apps",
+          "units": ""
+        },
+        {
+          "name": "OutputPort",
+          "type": "uint8",
+          "offset": 5,
+          "endian": "little",
+          "description": "Output port bit mask",
+          "units": ""
+        },
+        {
+          "name": "LogFullFlag",
+          "type": "uint8",
+          "offset": 6,
+          "endian": "little",
+          "description": "Local event log full flag",
+          "units": ""
+        },
+        {
+          "name": "LogMode",
+          "type": "uint8",
+          "offset": 7,
+          "endian": "little",
+          "description": "Local event log mode",
+          "units": "",
+          "enum": {
+            "OVERWRITE": 0,
+            "DISCARD": 1
+          }
+        },
+        {
+          "name": "MessageSendCounter",
+          "type": "uint16",
+          "offset": 8,
+          "endian": "little",
+          "description": "Event messages sent",
+          "units": ""
+        },
+        {
+          "name": "LogOverflowCounter",
+          "type": "uint16",
+          "offset": 10,
+          "endian": "little",
+          "description": "Local event log overflow counter",
+          "units": ""
+        },
+        {
+          "name": "LogEnabled",
+          "type": "uint8",
+          "offset": 12,
+          "endian": "little",
+          "description": "Local event log enabled",
+          "units": ""
+        },
+        {
+          "name": "Padding",
+          "type": "bytes[3]",
+          "offset": 13,
+          "endian": "little",
+          "description": "Padding to a 32-bit boundary",
+          "units": ""
+        },
+        {
+          "name": "AppData",
+          "type": "bytes[128]",
+          "offset": 16,
+          "endian": "little",
+          "description": "CFE_MISSION_ES_MAX_APPLICATIONS (16) x 8-byte records: u32 AppID, u16 MessageSentCounter, u8 EnableStatus, u8 MessageSquelchedCounter",
+          "units": ""
+        }
+      ]
+    },
+    {
+      "name": "EVS_LONG_EVENT",
+      "kind": "telemetry",
+      "mid": "0x0808",
+      "description": "cFE long-format event: who, what, how severe, and the message text.",
+      "category": "event",
+      "event": {
+        "app": "AppName",
+        "id": "EventID",
+        "type": "EventType",
+        "message": "Message"
+      },
+      "fields": [
+        {
+          "name": "AppName",
+          "type": "char[20]",
+          "offset": 0,
+          "endian": "little",
+          "description": "Name of the app that sent the event; NUL-padded (CFE_MISSION_MAX_API_LEN = 20)",
+          "units": ""
+        },
+        {
+          "name": "EventID",
+          "type": "uint16",
+          "offset": 20,
+          "endian": "little",
+          "description": "App-defined event identifier",
+          "units": ""
+        },
+        {
+          "name": "EventType",
+          "type": "uint16",
+          "offset": 22,
+          "endian": "little",
+          "description": "Event type",
+          "units": "",
+          "enum": {
+            "DEBUG": 1,
+            "INFORMATION": 2,
+            "ERROR": 3,
+            "CRITICAL": 4
+          }
+        },
+        {
+          "name": "SpacecraftID",
+          "type": "uint32",
+          "offset": 24,
+          "endian": "little",
+          "description": "Spacecraft identifier",
+          "units": ""
+        },
+        {
+          "name": "ProcessorID",
+          "type": "uint32",
+          "offset": 28,
+          "endian": "little",
+          "description": "Processor identifier",
+          "units": ""
+        },
+        {
+          "name": "Message",
+          "type": "char[122]",
+          "offset": 32,
+          "endian": "little",
+          "description": "Event text; NUL-padded (CFE_MISSION_EVS_MAX_MESSAGE_LENGTH = 122)",
+          "units": ""
+        },
+        {
+          "name": "Padding",
+          "type": "bytes[2]",
+          "offset": 154,
+          "endian": "little",
+          "description": "Structure padding",
+          "units": ""
+        }
+      ]
+    },
+    {
+      "name": "EVS_SHORT_EVENT",
+      "kind": "telemetry",
+      "mid": "0x0809",
+      "description": "cFE short-format event: identification only, no text.",
+      "category": "event",
+      "event": {
+        "app": "AppName",
+        "id": "EventID",
+        "type": "EventType"
+      },
+      "fields": [
+        {
+          "name": "AppName",
+          "type": "char[20]",
+          "offset": 0,
+          "endian": "little",
+          "description": "Name of the app that sent the event; NUL-padded (CFE_MISSION_MAX_API_LEN = 20)",
+          "units": ""
+        },
+        {
+          "name": "EventID",
+          "type": "uint16",
+          "offset": 20,
+          "endian": "little",
+          "description": "App-defined event identifier",
+          "units": ""
+        },
+        {
+          "name": "EventType",
+          "type": "uint16",
+          "offset": 22,
+          "endian": "little",
+          "description": "Event type",
+          "units": "",
+          "enum": {
+            "DEBUG": 1,
+            "INFORMATION": 2,
+            "ERROR": 3,
+            "CRITICAL": 4
+          }
+        },
+        {
+          "name": "SpacecraftID",
+          "type": "uint32",
+          "offset": 24,
+          "endian": "little",
+          "description": "Spacecraft identifier",
+          "units": ""
+        },
+        {
+          "name": "ProcessorID",
+          "type": "uint32",
+          "offset": 28,
+          "endian": "little",
+          "description": "Processor identifier",
+          "units": ""
+        }
+      ]
+    },
+    {
       "name": "TIME_NOOP",
       "kind": "command",
       "mid": "0x1805",
@@ -601,6 +884,7 @@
       "kind": "telemetry",
       "mid": "0x0805",
       "description": "cFE Time Services housekeeping.",
+      "category": "housekeeping",
       "fields": [
         {
           "name": "CommandCounter",
@@ -702,6 +986,7 @@
       "kind": "telemetry",
       "mid": "0x0806",
       "description": "cFE Time Services diagnostics.",
+      "category": "commanded",
       "fields": [
         {
           "name": "AtToneMET_Seconds",
@@ -1159,6 +1444,329 @@
       ]
     },
     {
+      "name": "SB_SEND_HK",
+      "kind": "command",
+      "mid": "0x180B",
+      "function_code": 0,
+      "description": "Request one SB housekeeping packet (normally sent by SCH_LAB every 4.6 s).",
+      "fields": []
+    },
+    {
+      "name": "SB_HK",
+      "kind": "telemetry",
+      "mid": "0x0803",
+      "description": "cFE Software Bus housekeeping.",
+      "category": "housekeeping",
+      "fields": [
+        {
+          "name": "CommandCounter",
+          "type": "uint8",
+          "offset": 0,
+          "endian": "little",
+          "description": "SB valid command counter",
+          "units": ""
+        },
+        {
+          "name": "CommandErrorCounter",
+          "type": "uint8",
+          "offset": 1,
+          "endian": "little",
+          "description": "SB command error counter",
+          "units": ""
+        },
+        {
+          "name": "NoSubscribersCounter",
+          "type": "uint8",
+          "offset": 2,
+          "endian": "little",
+          "description": "Messages sent with no subscribers",
+          "units": ""
+        },
+        {
+          "name": "MsgSendErrorCounter",
+          "type": "uint8",
+          "offset": 3,
+          "endian": "little",
+          "description": "Message send errors",
+          "units": ""
+        },
+        {
+          "name": "MsgReceiveErrorCounter",
+          "type": "uint8",
+          "offset": 4,
+          "endian": "little",
+          "description": "Message receive errors",
+          "units": ""
+        },
+        {
+          "name": "InternalErrorCounter",
+          "type": "uint8",
+          "offset": 5,
+          "endian": "little",
+          "description": "Internal errors",
+          "units": ""
+        },
+        {
+          "name": "CreatePipeErrorCounter",
+          "type": "uint8",
+          "offset": 6,
+          "endian": "little",
+          "description": "Create pipe errors",
+          "units": ""
+        },
+        {
+          "name": "SubscribeErrorCounter",
+          "type": "uint8",
+          "offset": 7,
+          "endian": "little",
+          "description": "Subscribe errors",
+          "units": ""
+        },
+        {
+          "name": "PipeOptsErrorCounter",
+          "type": "uint8",
+          "offset": 8,
+          "endian": "little",
+          "description": "Set pipe options errors",
+          "units": ""
+        },
+        {
+          "name": "DuplicateSubscriptionsCounter",
+          "type": "uint8",
+          "offset": 9,
+          "endian": "little",
+          "description": "Duplicate subscriptions",
+          "units": ""
+        },
+        {
+          "name": "GetPipeIdByNameErrorCounter",
+          "type": "uint8",
+          "offset": 10,
+          "endian": "little",
+          "description": "Get pipe id by name errors",
+          "units": ""
+        },
+        {
+          "name": "PipeOverflowErrorCounter",
+          "type": "uint16",
+          "offset": 12,
+          "endian": "little",
+          "description": "Pipe overflow errors",
+          "units": ""
+        },
+        {
+          "name": "MsgLimitErrorCounter",
+          "type": "uint16",
+          "offset": 14,
+          "endian": "little",
+          "description": "Message limit errors",
+          "units": ""
+        },
+        {
+          "name": "MemPoolHandle",
+          "type": "uint32",
+          "offset": 16,
+          "endian": "little",
+          "description": "SB memory pool handle",
+          "units": ""
+        },
+        {
+          "name": "MemInUse",
+          "type": "uint32",
+          "offset": 20,
+          "endian": "little",
+          "description": "Memory in use",
+          "units": "bytes"
+        },
+        {
+          "name": "UnmarkedMem",
+          "type": "uint32",
+          "offset": 24,
+          "endian": "little",
+          "description": "Unmarked memory",
+          "units": "bytes"
+        }
+      ]
+    },
+    {
+      "name": "TBL_SEND_HK",
+      "kind": "command",
+      "mid": "0x180C",
+      "function_code": 0,
+      "description": "Request one TBL housekeeping packet (normally sent by SCH_LAB every 4.8 s).",
+      "fields": []
+    },
+    {
+      "name": "TBL_HK",
+      "kind": "telemetry",
+      "mid": "0x0804",
+      "description": "cFE Table Services housekeeping.",
+      "category": "housekeeping",
+      "fields": [
+        {
+          "name": "CommandCounter",
+          "type": "uint8",
+          "offset": 0,
+          "endian": "little",
+          "description": "TBL valid command counter",
+          "units": ""
+        },
+        {
+          "name": "CommandErrorCounter",
+          "type": "uint8",
+          "offset": 1,
+          "endian": "little",
+          "description": "TBL command error counter",
+          "units": ""
+        },
+        {
+          "name": "NumTables",
+          "type": "uint16",
+          "offset": 2,
+          "endian": "little",
+          "description": "Tables registered",
+          "units": ""
+        },
+        {
+          "name": "NumLoadPending",
+          "type": "uint16",
+          "offset": 4,
+          "endian": "little",
+          "description": "Tables with a load pending",
+          "units": ""
+        },
+        {
+          "name": "ValidationCounter",
+          "type": "uint16",
+          "offset": 6,
+          "endian": "little",
+          "description": "Completed table validations",
+          "units": ""
+        },
+        {
+          "name": "LastValCrc",
+          "type": "uint32",
+          "offset": 8,
+          "endian": "little",
+          "description": "Data integrity value of the last validated table",
+          "units": ""
+        },
+        {
+          "name": "LastValStatus",
+          "type": "int32",
+          "offset": 12,
+          "endian": "little",
+          "description": "Status returned by the last validation",
+          "units": ""
+        },
+        {
+          "name": "ActiveBuffer",
+          "type": "uint8",
+          "offset": 16,
+          "endian": "little",
+          "description": "Last validated buffer: 0 inactive, 1 active",
+          "units": ""
+        },
+        {
+          "name": "LastValTableName",
+          "type": "char[40]",
+          "offset": 17,
+          "endian": "little",
+          "description": "Name of the last validated table",
+          "units": ""
+        },
+        {
+          "name": "SuccessValCounter",
+          "type": "uint8",
+          "offset": 57,
+          "endian": "little",
+          "description": "Successful validations",
+          "units": ""
+        },
+        {
+          "name": "FailedValCounter",
+          "type": "uint8",
+          "offset": 58,
+          "endian": "little",
+          "description": "Failed validations",
+          "units": ""
+        },
+        {
+          "name": "NumValRequests",
+          "type": "uint8",
+          "offset": 59,
+          "endian": "little",
+          "description": "Validation requests made to apps",
+          "units": ""
+        },
+        {
+          "name": "NumFreeSharedBufs",
+          "type": "uint8",
+          "offset": 60,
+          "endian": "little",
+          "description": "Free shared working buffers",
+          "units": ""
+        },
+        {
+          "name": "MemPoolHandle",
+          "type": "uint32",
+          "offset": 64,
+          "endian": "little",
+          "description": "TBL memory pool handle",
+          "units": ""
+        },
+        {
+          "name": "LastUpdateTime_Seconds",
+          "type": "uint32",
+          "offset": 68,
+          "endian": "little",
+          "description": "Time of last table update - seconds",
+          "units": "s"
+        },
+        {
+          "name": "LastUpdateTime_Subseconds",
+          "type": "uint32",
+          "offset": 72,
+          "endian": "little",
+          "description": "Time of last table update - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "LastUpdatedTable",
+          "type": "char[40]",
+          "offset": 76,
+          "endian": "little",
+          "description": "Name of the last updated table",
+          "units": ""
+        },
+        {
+          "name": "LastFileLoaded",
+          "type": "char[64]",
+          "offset": 116,
+          "endian": "little",
+          "description": "Path of the last table file loaded",
+          "units": ""
+        },
+        {
+          "name": "LastFileDumped",
+          "type": "char[64]",
+          "offset": 180,
+          "endian": "little",
+          "description": "Path of the last file dumped to",
+          "units": ""
+        },
+        {
+          "name": "LastTableLoaded",
+          "type": "char[40]",
+          "offset": 244,
+          "endian": "little",
+          "description": "Name of the last table loaded",
+          "units": ""
+        }
+      ],
+      "payload_size": 284
+    },
+    {
       "name": "SAMPLE_APP_NOOP",
       "kind": "command",
       "mid": "0x1882",
@@ -1227,6 +1835,7 @@
       "kind": "telemetry",
       "mid": "0x0883",
       "description": "SAMPLE_APP housekeeping.",
+      "category": "housekeeping",
       "fields": [
         {
           "name": "CommandCounter",
@@ -1275,6 +1884,7 @@
       "kind": "telemetry",
       "mid": "0x0884",
       "description": "CI_LAB housekeeping.",
+      "category": "housekeeping",
       "fields": [
         {
           "name": "CommandCounter",
@@ -1452,6 +2062,7 @@
       "kind": "telemetry",
       "mid": "0x0880",
       "description": "TO_LAB housekeeping.",
+      "category": "housekeeping",
       "fields": [
         {
           "name": "CommandCounter",
@@ -1476,6 +2087,7 @@
       "kind": "telemetry",
       "mid": "0x0881",
       "description": "TO_LAB data-types test packet with fixed known values (after TO_LAB_SEND_DATA_TYPES). Offsets include natural alignment padding.",
+      "category": "commanded",
       "fields": [
         {
           "name": "synch",

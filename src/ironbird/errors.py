@@ -47,6 +47,8 @@ class Code(StrEnum):
     TX_SEND = "IB-TX-002"  # send failed or refused
     TX_RECV = "IB-TX-003"  # receive failed
     TX_OVERRUN = "IB-TX-004"  # receive queue overflow, datagrams dropped
+    # Events
+    EVT_NONE = "IB-EVT-001"  # no event telemetry is defined for the selected node(s)
     # Responder
     RSP_RULE = "IB-RSP-001"  # response rule failed
     # Ledger
@@ -57,7 +59,7 @@ class Code(StrEnum):
 
 
 MAX_SUMMARY_LEN = 600
-_USAGE_PREFIXES = ("IB-CFG-", "IB-HDR-", "IB-CCD-", "IB-CLI-")
+_USAGE_PREFIXES = ("IB-CFG-", "IB-HDR-", "IB-CCD-", "IB-CLI-", "IB-EVT-")
 
 
 class IronbirdError(Exception):

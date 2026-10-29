@@ -22,10 +22,29 @@ ib -c examples/mock.toml send fc MOCK_SET_MODE mode=SAFE pad=0 --verbose
 ib -c examples/mock.toml find mode
 ```
 
+Events (shell 2 instead of `listen`; the mock reports whatever event it is asked to raise):
+
+```bash
+ib -c examples/mock.toml events --min-type info
+ib -c examples/mock.toml send fc MOCK_RAISE_EVENT app=DEMO event_id=7 event_type=ERROR "message=bus voltage low"
+```
+
 `ib` is a short alias of `ironbird`. Global options: `--config/-c PATH` (or `$IRONBIRD_CONFIG`),
 `--as NODE`, `--verbose/-v`. Errors are one line, `error IB-XXX-NNN: summary`, on stderr; add
 `--verbose` for detail. Every action and error is recorded as JSON Lines in
 `$XDG_STATE_HOME/ironbird/` (override with `IRONBIRD_STATE_DIR`).
+
+## Events and telemetry categories
+
+cFS events are the most important telemetry. `ib events [--node X ...] [--min-type error]
+[--format line|json]` listens on every telemetry link of all (or the selected) nodes and
+prints only events: time, node, app, type, id, message. They also show in `ib listen`. The
+ledger records every received event in full.
+
+Telemetry messages carry a `category` in the CCDD, in priority order: `event`,
+`command_response`, `housekeeping`, `status`, `commanded`, `other` (default). An event message
+also has an `event` mapping naming its app/id/type/message fields; see `docs/plan.md`
+("Telemetry categories and events") and `examples/ccdd/cfs.json`.
 
 ## Configuration
 

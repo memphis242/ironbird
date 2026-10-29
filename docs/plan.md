@@ -43,8 +43,8 @@ Stage 1 is CLI send + receive.
     Proprietary extensions are edits to a profile, not to code (and from Stage 4 a TUI
     header-profile editor that writes the same TOML); an escape hatch
     (`computed = "python:module.func"`) covers anything the declarative form cannot.
-  - `ccdd/` - `model.py` (Message, Field, Enum; command vs telemetry; fixed and
-    variable-length fields), `loader.py` with a pluggable `Adapter` protocol and a
+  - `ccdd/` - `model.py` (Message, Field, Enum; command vs telemetry; telemetry category
+    and event mapping; fixed and variable-length fields), `loader.py` with a pluggable `Adapter` protocol and a
     placeholder JSON adapter. When your real JSON format is known, we write one adapter.
   - `codec.py` - encode command (header + args + CRC), decode telemetry into fields
     using `struct`-precompiled layouts per message (fast path).
@@ -59,6 +59,52 @@ Stage 1 is CLI send + receive.
   decode bug. Exports (CSV, text, xlsx) decode from it.
 - **Error UX**: one line, stable code, repeats coalesced (`x37 in 10 s`), rate-limited
   per code; full detail via `--verbose`/ledger (CLI) or a details pane (TUI).
+
+## Telemetry categories and events
+
+Not all telemetry is equally important, and cFS events are the most important: the
+operator's first question after any action is "what did the vehicle say about it?".
+Every telemetry message therefore has a **category**, declared in the CCDD
+(`"category"`, default `other`), and the category's **priority** (1 = most important)
+is the one ordering every view and alert path shares:
+
+| Priority | Category (`category`) | Meaning |
+|----------|-----------------------|---------|
+| 1 | `event` | cFS events (EVS long/short event packets) and project equivalents |
+| 2 | `command_response` | telemetry sent as the direct answer to a command |
+| 3 | `housekeeping` | periodic HK packets |
+| 4 | `status` | other periodic status telemetry |
+| 5 | `commanded` | sent only in response to a request (diagnostics, dumps, registry reports) |
+| 6 | `other` | anything else |
+
+- **Model.** `ccdd.model.Category` is an ordered enum (declaration order = priority,
+  `Category.priority`); commands have no category. The category is validated strictly:
+  an unknown value, a category on a command, or `event` without a mapping is a coded
+  CCDD error, not a silent default.
+- **Event mapping.** An event message also carries
+  `"event": {"app": <field>, "id": <field>, "type": <field>, "message": <field>}` naming
+  the fields that hold the app name, event id, event type and text (`id` and `type`
+  required; `app` and `message` optional, short-format events have no text). The
+  `type` field has an enum whose labels map onto the normalised severities
+  `DEBUG < INFO < WARNING < ERROR < CRITICAL` (case-insensitive, `INFORMATION` counts as
+  `INFO`), so `--min-type` and severity colouring work for any project's wire format.
+  Events render identically everywhere whatever the layout: `events.extract_event()` is
+  the one place that reads the mapping.
+- **Use.** Priority is the default sort, emphasis and filter-preset key in all views
+  (packet views, replay, exports; "events only", "events + command responses",
+  "housekeeping"), and orders alert prioritisation: an event outranks a decode warning
+  about housekeeping. `ib listen` lines and JSON records carry the category.
+- **Events page (TUI, Stage 3).** Besides appearing in the packet views like any packet,
+  events get their own **Events** page: one row per event received from *all* cFS
+  instances (all nodes), with node, time, app, event id, type/severity and message,
+  newest last, severity-coloured, filterable by node / app / minimum type, with the raw
+  packet one keypress away. It is fed by the same event extraction as the CLI.
+- **CLI (Stage 1).** `ib events [--node X ...] [--min-type debug|info|warning|error|critical]
+  [--format line|json]` listens on all telemetry links of all (or the selected) nodes at
+  once and prints only events, one line each: time, node, app, type, id, sanitized
+  message. The ledger records every received event in full (app, id, type, text, raw
+  packet), including those `--min-type` hides: events are rare and valuable, so they are
+  never sampled or truncated there.
 
 ## Execution model and performance
 
@@ -162,7 +208,8 @@ every agent applies them.
 Deliverables:
 1. Project scaffold: `pyproject.toml` (setuptools, ruff, pyright strict-ish, pytest + xdist),
    `src/ironbird/`, `tests/`, `examples/` (sample `ironbird.toml` with ground + flight computer nodes, header profiles,
-   sample CCDD JSON with a no-arg command, an arg command, and two telemetry packets).
+   sample CCDD JSON with a no-arg command, an arg command, and telemetry packets of several
+   categories including an event).
 2. `errors.py`, `ledger.py`, `config.py`, `header.py`, `ccdd/`, `codec.py`,
    `transport/udp.py`, `session.py`.
 3. CLI commands:
@@ -175,6 +222,9 @@ Deliverables:
    - `ib listen <node> [--mid ...] [--format line|json]` - decode and print
      incoming packets (telemetry as ground; commands when acting as a flight node);
      unknown MIDs reported once (coalesced), not per packet.
+   - `ib events [--node X ...] [--min-type ...] [--format line|json]` - listen on all
+     telemetry links of all (or selected) nodes concurrently and print only events (see
+     "Telemetry categories and events"); `ib listen` lines carry the category.
    - `ib respond --as <node>` - act as a flight-side node: decode received commands
      and answer with configured telemetry (e.g. a command-accepted HK packet).
 4. No separate simulator: ironbird acting as the vehicle node over loopback UDP is the
@@ -257,6 +307,11 @@ acceptance gate for each stage is a real cFS instance.
     or a `sample_app` command with a payload) is accepted and reflected in TIME HK/
     diag telemetry.
   - cFE TIME NOOP and HK/diag decode (clock state, MET, STCF).
+  - Events: `SAMPLE_APP` NOOP -> `ib events` shows the `SAMPLE_APP` information event
+    (id 3) with the right app, id, type and text and the ledger holds it in full;
+    `--min-type error` shows a TIME invalid-STCF error event and hides the information
+    event; events also appear in the `ib listen` stream with their category; EVS, SB and
+    TBL housekeeping decode.
   - cFE ES write-system-log-to-file command (the on-demand syslog dump; exact
     command name/code confirmed from source): command accepted, the file appears in
     the cFS filesystem path, ES HK counters reflect it.
@@ -272,8 +327,10 @@ acceptance gate for each stage is a real cFS instance.
 
 2. Recording + replay with filters (CLI), serial transport, variable-length payloads,
    CSV/text export.
-3. TUI: latest-per-packet view and time-scrolling view, hold / pause / stop, error
-   status line + details pane, ledger viewer.
+3. TUI: latest-per-packet view and time-scrolling view (sorted and emphasised by telemetry
+   category priority, with category filter presets), a dedicated **Events** page showing
+   only events from all nodes (node, time, app, event id, type/severity, message), hold /
+   pause / stop, error status line + details pane, ledger viewer.
 4. TUI command composer with tiered search and argument entry.
 5. Send modes: scheduled at T, repeat N, every M ms/s until T or for duration.
 6. xlsx export, optional semantic search (local sentence-transformer as an extra),
@@ -290,4 +347,6 @@ acceptance gate for each stage is a real cFS instance.
   `ib send fc SET_MODE mode=SAFE` from another are decoded correctly by the fc side,
   which answers with telemetry that `ib listen fc` decodes; a bad arg / unknown command / closed port each produce one-line coded
   errors and full ledger entries.
+- `ib events` against two mock flight nodes prints events from both (and honours
+  `--min-type`); category/event-mapping validation errors are coded one-liners.
 - Ledger file inspected for a complete, timestamped trace of the session.

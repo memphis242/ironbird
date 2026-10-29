@@ -7,7 +7,8 @@
       "Bash(git status *)",
       "Bash(git diff *)",
       "Bash(git log *)",
-      "Bash(git worktree list *)"
+      "Bash(git worktree list *)",
+      "Bash(git reset --hard origin/main)"
     ]
   },
   "effortLevel": "low"

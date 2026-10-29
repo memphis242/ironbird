@@ -382,6 +382,7 @@ codec fixture for every scalar type.
 
 Events appear on the cFS console (`EVS Port1 ...` lines) and, as long-event telemetry
 (MID `0x0808`), on the downlink (subscribed at `sample_defs/tables/to_lab_sub.c:73`).
+Layouts are in section 7.
 
 ## 6. Platform notes found while bringing it up
 
@@ -400,3 +401,39 @@ Events appear on the cFS console (`EVS Port1 ...` lines) and, as long-event tele
   `CFS_APPS="ALL"`).
 - Console lines carry a simulated `1980-...` epoch (cFE time before any time source is
   set), not wall time.
+
+## 7. EVS events and the other core housekeeping MIDs
+
+Topic IDs from `cfe/modules/{evs,sb,tbl}/fsw/inc/*_topicids.h`, offsets and sizes from the
+C probe described at the top, MIDs confirmed on the wire. "Payload offset" is after the
+16-byte telemetry header.
+
+| MID | Message | Packet | Payload |
+|-----|---------|--------|---------|
+| `0x0801` | EVS housekeeping (`CFE_EVS_HousekeepingTlm_t`) | 160 | 144 |
+| `0x0803` | SB housekeeping | 44 | 28 |
+| `0x0804` | TBL housekeeping | 300 | 284 |
+| `0x0808` | EVS **long event** | 172 | 156 |
+| `0x0809` | EVS short event (not in the installed TO_LAB subscription table) | 48 | 32 |
+
+Command side: EVS command `0x1801` (NOOP fc 0, RESET_COUNTERS fc 1; the NOOP emits event id 0),
+EVS send-HK `0x1809`, SB send-HK `0x180B`, TBL send-HK `0x180C`, all 8 bytes, fc 0.
+
+Long event payload (`default_cfe_evs_msgdefs.h`, `CFE_EVS_LongEventTlm_Payload_t`): +0
+`char AppName[20]` (`CFE_MISSION_MAX_API_LEN`), +20 `u16 EventID`, +22 `u16 EventType`
+(1 DEBUG, 2 INFORMATION, 3 ERROR, 4 CRITICAL: `default_cfe_evs_extern_typedefs.h:77-107`),
++24 `u32 SpacecraftID`, +28 `u32 ProcessorID`, +32 `char Message[122]`
+(`CFE_MISSION_EVS_MAX_MESSAGE_LENGTH`), +154 `u8 Padding[2]`. The short event is the first 32
+bytes only. Strings are NUL-padded; the message may contain newlines (ES NOOP's does).
+
+Events seen live after enabling TO_LAB output (app / id / type): `TO_LAB 3 INFORMATION` (output
+enabled), `SAMPLE_APP 3 INFORMATION` (`SAMPLE: NOOP command v..`), `CFE_ES 3 INFORMATION`
+(plus a version event, id 92), `CFE_EVS 0 INFORMATION`, `CFE_TIME 36 ERROR` (`Invalid STCF`),
+`SAMPLE_APP 8 INFORMATION` (DISPLAY_PARAM echo), `SAMPLE_APP 6 ERROR` (`Invalid Msg length`).
+No periodic event was observed; with a quiet system the event stream is silent.
+
+EVS HK payload: +0 u8 CommandCounter, +1 u8 CommandErrorCounter, +2 u8 MessageFormatMode (0 short,
+1 long; live 1), +3 u8 MessageTruncCounter, +4 u8 UnregisteredAppCounter, +5 u8 OutputPort, +6 u8
+LogFullFlag, +7 u8 LogMode, +8 u16 MessageSendCounter, +10 u16 LogOverflowCounter, +12 u8
+LogEnabled, +13 u8[3] Padding, +16 `AppData[16]` of 8-byte records (u32 AppID, u16
+AppMessageSentCounter, u8 AppEnableStatus, u8 AppMessageSquelchedCounter).

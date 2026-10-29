@@ -31,7 +31,7 @@ ERROR_FLUSH_MIN_INTERVAL_S: Final = 0.25
 MAX_RAW_HEX_BYTES: Final = 256
 
 _RESERVED: Final = frozenset({"ts", "session", "n", "kind", "event"})
-_KINDS: Final = frozenset({"action", "command", "state", "packet", "error"})
+_KINDS: Final = frozenset({"action", "command", "state", "packet", "event", "error"})
 
 _Entry = tuple[int, int, str, str, Mapping[str, Any]]
 

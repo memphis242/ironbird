@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
-from enum import StrEnum
+from dataclasses import dataclass, field
+from enum import IntEnum, StrEnum
 from types import MappingProxyType
 from typing import Final
 
@@ -15,6 +15,59 @@ from ironbird.errors import Code, IronbirdError
 class MessageKind(StrEnum):
     COMMAND = "command"
     TELEMETRY = "telemetry"
+
+
+class Category(StrEnum):
+    """What a telemetry message is for. The declaration order is the importance order.
+
+    ``priority`` (1 = most important) drives default sorting, emphasis, filter presets and
+    alert prioritisation in every view. Commands have no category.
+    """
+
+    EVENT = "event"
+    COMMAND_RESPONSE = "command_response"
+    HOUSEKEEPING = "housekeeping"
+    STATUS = "status"
+    COMMANDED = "commanded"  # sent in response to a request, e.g. diagnostics and dumps
+    OTHER = "other"
+
+    @property
+    def priority(self) -> int:
+        return _PRIORITY[self]
+
+    @classmethod
+    def by_priority(cls) -> tuple[Category, ...]:
+        return tuple(cls)
+
+
+_PRIORITY: Final[Mapping[Category, int]] = MappingProxyType(
+    {category: rank for rank, category in enumerate(Category, start=1)}
+)
+assert _PRIORITY[Category.EVENT] == 1 and _PRIORITY[Category.OTHER] == len(Category)
+
+
+class EventSeverity(IntEnum):
+    """Normalised event type; higher is more severe, so ``>=`` filters by minimum severity."""
+
+    DEBUG = 1
+    INFO = 2
+    WARNING = 3
+    ERROR = 4
+    CRITICAL = 5
+
+
+# Spellings projects use for an event type enum label, case-insensitive.
+SEVERITY_LABELS: Final[Mapping[str, EventSeverity]] = MappingProxyType(
+    {
+        "DEBUG": EventSeverity.DEBUG,
+        "INFO": EventSeverity.INFO,
+        "INFORMATION": EventSeverity.INFO,
+        "WARN": EventSeverity.WARNING,
+        "WARNING": EventSeverity.WARNING,
+        "ERROR": EventSeverity.ERROR,
+        "CRITICAL": EventSeverity.CRITICAL,
+    }
+)
 
 
 class Endian(StrEnum):
@@ -110,6 +163,22 @@ class FieldDef:
 
 
 @dataclass(frozen=True, slots=True)
+class EventSpec:
+    """Where an event message keeps the parts every event view shows.
+
+    Names refer to fields of the same message. ``id`` and ``type`` are integer fields,
+    ``app`` and ``message`` are char fields. ``type`` has an enum whose labels all map to an
+    :class:`EventSeverity`; ``severities`` is that mapping by wire value.
+    """
+
+    id: str
+    type: str
+    app: str | None = None
+    message: str | None = None
+    severities: Mapping[int, EventSeverity] = field(default_factory=lambda: MappingProxyType({}))
+
+
+@dataclass(frozen=True, slots=True)
 class Message:
     name: str
     kind: MessageKind
@@ -118,10 +187,18 @@ class Message:
     description: str
     fields: tuple[FieldDef, ...]
     payload_size: int
+    category: Category = Category.OTHER  # telemetry only
+    event: EventSpec | None = None  # set exactly when category is EVENT
 
     def __post_init__(self) -> None:
         assert (self.function_code is not None) == (self.kind is MessageKind.COMMAND)
         assert self.payload_size >= max((f.end for f in self.fields), default=0)
+        assert (self.event is not None) == (self.category is Category.EVENT)
+        assert self.kind is MessageKind.TELEMETRY or self.category is Category.OTHER
+        if self.event is not None:
+            names = {f.name for f in self.fields}
+            refs = (self.event.id, self.event.type, self.event.app, self.event.message)
+            assert all(ref in names for ref in refs if ref is not None)
 
     def field(self, name: str) -> FieldDef | None:
         for f in self.fields:
@@ -194,3 +271,6 @@ class CcddModel:
 
     def telemetry(self) -> tuple[Message, ...]:
         return tuple(m for m in self.messages if m.kind is MessageKind.TELEMETRY)
+
+    def event_messages(self) -> tuple[Message, ...]:
+        return tuple(m for m in self.messages if m.category is Category.EVENT)

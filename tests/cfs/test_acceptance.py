@@ -23,7 +23,8 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -148,6 +149,16 @@ class Ground:
                 self._proc.wait(timeout=5)
         if self._reader is not None:
             self._reader.join(timeout=5)
+
+    @contextmanager
+    def listener_paused(self) -> Generator[None, None, None]:
+        """Stop ``ib listen`` (it owns UDP 2234) for the block, then start it again."""
+        assert self._stderr_log is not None
+        self.stop_listener()
+        try:
+            yield
+        finally:
+            self.start_listener(self._stderr_log)
 
     def _read(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
@@ -584,3 +595,133 @@ def test_unknown_command_and_bad_argument_never_reach_the_wire(
     after_ci = ground.fresh("CI_LAB_HK", "CI_LAB_SEND_HK")
     # Only our own CI_LAB_SEND_HK request packets arrived in between.
     assert after_ci["IngestErrors"] == base_ci["IngestErrors"]
+
+
+# -- events: the special telemetry --------------------------------------------------------------
+
+
+@dataclass
+class EventsProcess:
+    """A running ``ib events`` collecting its output lines (JSON records with ``--format json``)."""
+
+    proc: subprocess.Popen[str]
+    lines: list[str] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _reader: threading.Thread | None = None
+
+    def start_reading(self) -> None:
+        self._reader = threading.Thread(target=self._read, daemon=True)
+        self._reader.start()
+
+    def _read(self) -> None:
+        assert self.proc.stdout is not None
+        for text in self.proc.stdout:
+            with self._lock:
+                self.lines.append(text.rstrip("\n"))
+
+    def snapshot(self) -> list[str]:
+        with self._lock:
+            return list(self.lines)
+
+    def wait_for(self, predicate: Callable[[str], bool], timeout: float = 20.0) -> str:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for text in self.snapshot():
+                if predicate(text):
+                    return text
+            assert self.proc.poll() is None, f"ib events exited early: {self.snapshot()}"
+            time.sleep(0.05)
+        raise AssertionError(f"no matching event within {timeout} s; saw: {self.snapshot()}")
+
+    def stop(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGINT)
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+        if self._reader is not None:
+            self._reader.join(timeout=5)
+
+
+@contextmanager
+def _events(ground: Ground, state_dir: Path, *args: str) -> Generator[EventsProcess, None, None]:
+    """``ib events`` (own ledger directory), started and listening; stopped on exit."""
+    proc = subprocess.Popen(
+        [*Ground._ib(), "events", "--timeout", "90", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**ground.env, "IRONBIRD_STATE_DIR": str(state_dir)},
+    )
+    running = EventsProcess(proc)
+    try:
+        assert proc.stderr is not None
+        banner = proc.stderr.readline()
+        assert "listening for events from fc" in banner, banner
+        running.start_reading()
+        yield running
+    finally:
+        running.stop()
+
+
+def test_events_command_shows_the_sample_app_noop_info_event(
+    ground: Ground, tmp_path: Path
+) -> None:
+    state = tmp_path / "events-state"
+    with ground.listener_paused(), _events(ground, state, "--format", "json") as events:
+        ground.send("SAMPLE_APP_NOOP")
+        record = json.loads(
+            events.wait_for(lambda text: '"app": "SAMPLE_APP"' in text and '"id": 3,' in text)
+        )
+    assert record["node"] == "fc" and record["mid"] == "0x0808"
+    assert (record["app"], record["id"], record["type"]) == ("SAMPLE_APP", 3, "INFORMATION")
+    assert record["severity"] == "INFO" and record["type_value"] == 2
+    assert record["message"].startswith("SAMPLE: NOOP command")
+    # The ledger holds the received event in full, with the raw packet.
+    logged = [e for e in _ledger_events(state) if e["event"] == "rx.event"]
+    mine = [e for e in logged if e["app"] == "SAMPLE_APP" and e["event_id"] == 3]
+    assert len(mine) == 1 and mine[0]["kind"] == "event" and mine[0]["raw"]
+    assert mine[0]["text"] == record["message"]
+
+
+def test_events_min_type_shows_only_the_error_but_the_ledger_keeps_the_info(
+    ground: Ground, tmp_path: Path
+) -> None:
+    state = tmp_path / "events-state"
+    with ground.listener_paused(), _events(ground, state, "--min-type", "error") as events:
+        ground.send("SAMPLE_APP_NOOP")  # information event: below the floor
+        ground.send("TIME_SET_STCF", "Seconds=7", "MicroSeconds=1000000")  # error event
+        shown = events.wait_for(lambda text: "CFE_TIME" in text)
+    assert " CFE_TIME ERROR id=36 Invalid STCF" in shown
+    assert not [text for text in events.snapshot() if "SAMPLE_APP" in text]
+    logged = {(e["app"], e["event_id"]) for e in _ledger_events(state) if e["event"] == "rx.event"}
+    assert {("SAMPLE_APP", 3), ("CFE_TIME", 36)} <= logged
+
+
+def test_events_also_appear_in_the_packet_stream_with_their_category(ground: Ground) -> None:
+    mark = ground.count()
+    ground.send("ES_NOOP")
+    packet = ground.wait_for(
+        "EVS_LONG_EVENT", lambda f: f["AppName"] == "CFE_ES" and f["EventID"] == 3, start=mark
+    )
+    assert packet["category"] == "event" and packet["labels"]["EventType"] == "INFORMATION"
+    assert ground.since(mark, "EVS_HK") == [] or all(
+        p["category"] == "housekeeping" for p in ground.since(mark, "EVS_HK")
+    )
+
+
+def test_evs_housekeeping_decodes_and_counts_its_noop(ground: Ground) -> None:
+    base = ground.fresh("EVS_HK", "EVS_SEND_HK")
+    ground.send("EVS_NOOP")
+    expected = (base["CommandCounter"] + 1) % 256
+    after = ground.wait_for(
+        "EVS_HK", lambda f: f["CommandCounter"] == expected, request="EVS_SEND_HK"
+    )["fields"]
+    assert after["CommandErrorCounter"] == base["CommandErrorCounter"]
+    assert after["MessageSendCounter"] >= base["MessageSendCounter"]
+    assert len(after["AppData"]) == 256  # 16 app records of 8 bytes, hex text
+    sb = ground.fresh("SB_HK", "SB_SEND_HK")
+    tbl = ground.fresh("TBL_HK", "TBL_SEND_HK")
+    assert sb["MemInUse"] > 0 and tbl["NumTables"] >= 1
