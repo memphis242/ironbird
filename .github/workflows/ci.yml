@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: lint, types, tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: python -m pip install -e '.[dev]'
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Type check
+        run: pyright
+      - name: Tests (real-cFS tests are opt-in and skipped here)
+        run: pytest -n auto
+
+  cfs:
+    name: real cFS acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # Outside the workspace so the cached tree has one stable absolute path.
+      CFS_BUILD_DIR: ${{ github.workspace }}/../cfs-build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Read pinned cFS commit
+        id: pin
+        run: |
+          commit="$(sed -n 's/^readonly DEFAULT_COMMIT="\(.*\)"$/\1/p' tools/cfs/build.sh)"
+          test -n "$commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Cache cFS checkout and build
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CFS_BUILD_DIR }}
+          key: cfs-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ hashFiles('tools/cfs/build.sh') }}
+      - name: Build cFS
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: tools/cfs/build.sh
+      - name: Install ironbird
+        run: python -m pip install -e '.[dev]'
+      - name: Real-cFS acceptance tests
+        env:
+          IRONBIRD_CFS: "1"
+        # One cFS instance owns fixed UDP ports and /dev/shm/osal:RAM: run serially.
+        run: pytest tests/cfs -m cfs -n0 -v --basetemp="$RUNNER_TEMP/pytest"
+      - name: Keep cFS console logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfs-logs
+          path: ${{ runner.temp }}/pytest
+          if-no-files-found: ignore

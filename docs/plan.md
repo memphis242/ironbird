@@ -241,13 +241,14 @@ acceptance gate for each stage is a real cFS instance.
   (OSAL permissive mode). Script it as `tools/cfs/build.sh` + `run.sh` and add a CI job
   that builds (cached) and runs it.
 - Messaging path: commands over UDP to `ci_lab` (default port 1234); telemetry from
-  `to_lab` (port 1235) after sending its enable-output command with our host address.
+  `to_lab` (port 2234) after sending its enable-output command with our host address.
 - CCDD for the test set: hand-authored placeholder CCDD JSON from the cFS headers for
   `sample_app`, `ci_lab`, `to_lab`, cFE `TIME` and cFE `ES`. Command/function codes and
   layouts are taken from the checked-out source, not memory.
 - Header profiles: `ccsds_v1_cfs_cmd.toml` must reproduce cFE's command secondary
-  header (function code + checksum) and its checksum algorithm exactly; cFS rejects
-  bad checksums, so a successful command is the proof.
+  header (function code + checksum) and its checksum algorithm exactly. The native
+  build does not validate command checksums (`tools/cfs/NOTES.md`), so a successful
+  command does not prove the checksum; unit tests against the algorithm cover it.
 - Stage 1 acceptance cases:
   - `TO_LAB` enable output -> telemetry starts flowing; `ib listen` decodes cFE ES and
     TIME housekeeping fields to sane values.
@@ -259,8 +260,13 @@ acceptance gate for each stage is a real cFS instance.
   - cFE ES write-system-log-to-file command (the on-demand syslog dump; exact
     command name/code confirmed from source): command accepted, the file appears in
     the cFS filesystem path, ES HK counters reflect it.
-  - Bad checksum / wrong length deliberately sent -> cFS error counter increments,
-    and ironbird's ledger records the full exchange.
+  - Deliberately malformed commands, ledgered with the exact bytes sent: a header length
+    shorter than the command the app expects -> that app's (ES/TIME/SAMPLE_APP) command
+    error counter increments; a header length larger than the datagram -> CI_LAB
+    `IngestErrors` increments; a bad checksum is accepted by this build (pinned as a
+    characterization test).
+  - Automated as `tests/cfs/test_acceptance.py` (marker `cfs`, opt-in: `IRONBIRD_CFS=1`
+    or `-m cfs`), driving the `ib` CLI against a cFS started by `tools/cfs/run.sh`.
 
 ## Later stages (outline; each gets its own plan)
 

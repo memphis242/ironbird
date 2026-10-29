@@ -1,0 +1,1 @@
+{"schema":"ironbird-ccdd/0","target":"t","messages":[{"name":"A","kind":"telemetry","mid":"0x1","fields":[{"name":"x","type":"uint8","bad\nkey\u001b[2J":1}]}]}

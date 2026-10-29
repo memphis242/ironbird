@@ -1,0 +1,30 @@
+# ironbird system description: ground station plus a real cFS flight computer.
+# Relative paths are resolved against this file's directory.
+#
+# Real cFS over UDP on one host: commands go to CI_LAB (default 127.0.0.1:1234); TO_LAB
+# sends telemetry to the host address it was given by its enable-output command, on
+# UDP port 2234, which ground listens on.
+
+[ironbird]
+acts_as = "ground"          # node this invocation acts as unless --as says otherwise
+max_packet_bytes = 2048     # datagrams above this are rejected (MTU plus margin)
+
+[nodes.ground]
+alias = "gnd"
+description = "Ground station (this host)"
+
+[nodes.fc]
+alias = "flight"
+description = "cFS flight computer (CI_LAB / TO_LAB)"
+ccdd = "ccdd/cfs.json"
+command_header = "headers/ccsds_v1_cfs_cmd.toml"
+telemetry_header = "headers/ccsds_v1_cfs_tlm.toml"
+
+# Commands flow from -> to. The 'to' node owns the CCDD and header profiles.
+[[links]]
+name = "ground-fc"
+from = "ground"
+to = "fc"
+transport = "udp"
+command_endpoint = "127.0.0.1:1234"     # where fc receives commands (CI_LAB)
+telemetry_endpoint = "127.0.0.1:2234"   # where ground receives telemetry (TO_LAB)

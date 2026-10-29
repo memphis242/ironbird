@@ -1,0 +1,62 @@
+# CCSDS v1 primary header (6 bytes) + cFS telemetry secondary header: 6 bytes of time
+# (4 bytes seconds, 2 bytes subseconds, big-endian) + 4 spare bytes (zero padding for 64-bit
+# payload alignment, see tools/cfs/NOTES.md). The payload starts at byte 16.
+
+name = "ccsds_v1_cfs_tlm"
+kind = "telemetry"
+description = "CCSDS v1 primary header + cFS telemetry secondary header (time + spare)"
+byte_order = "big"
+mid_fields = ["version", "packet_type", "sec_hdr_flag", "apid"]
+
+[[fields]]
+name = "version"
+bits = 3
+value = 0
+
+[[fields]]
+name = "packet_type"
+bits = 1
+value = 0            # 0 = telemetry
+
+[[fields]]
+name = "sec_hdr_flag"
+bits = 1
+value = 1
+
+[[fields]]
+name = "apid"
+bits = 11
+computed = "from_mid"
+
+[[fields]]
+name = "seq_flags"
+bits = 2
+value = 3
+check = false
+
+[[fields]]
+name = "sequence"
+bits = 14
+computed = "sequence"
+
+[[fields]]
+name = "length"
+bits = 16
+computed = "length"
+bias = -7
+
+[[fields]]
+name = "seconds"
+bits = 32
+computed = "time_seconds"
+
+[[fields]]
+name = "subseconds"
+bits = 16
+computed = "time_subseconds"
+
+[[fields]]
+name = "spare"
+bits = 32
+value = 0
+check = false

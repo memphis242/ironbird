@@ -1,0 +1,1624 @@
+{
+  "schema": "ironbird-ccdd/0",
+  "target": "cfs",
+  "messages": [
+    {
+      "name": "ES_NOOP",
+      "kind": "command",
+      "mid": "0x1806",
+      "function_code": 0,
+      "description": "ES no-op; increments ES command counter and emits an info event.",
+      "fields": []
+    },
+    {
+      "name": "ES_RESET_COUNTERS",
+      "kind": "command",
+      "mid": "0x1806",
+      "function_code": 1,
+      "description": "Reset ES command and error counters.",
+      "fields": []
+    },
+    {
+      "name": "ES_CLEAR_SYS_LOG",
+      "kind": "command",
+      "mid": "0x1806",
+      "function_code": 10,
+      "description": "Clear the ES system log.",
+      "fields": []
+    },
+    {
+      "name": "ES_WRITE_SYS_LOG",
+      "kind": "command",
+      "mid": "0x1806",
+      "function_code": 11,
+      "description": "Write the ES system log to a file (OSAL path; /ram/x maps to /dev/shm/osal:RAM/x on the native build; empty string selects the default /ram/cfe_es_syslog.log).",
+      "fields": [
+        {
+          "name": "FileName",
+          "type": "char[64]",
+          "offset": 0,
+          "description": "Full path and file name to write; NUL-padded",
+          "units": ""
+        }
+      ]
+    },
+    {
+      "name": "ES_SEND_HK",
+      "kind": "command",
+      "mid": "0x1808",
+      "function_code": 0,
+      "description": "Request one ES housekeeping packet (normally sent by SCH_LAB every 4.0 s).",
+      "fields": []
+    },
+    {
+      "name": "ES_HK",
+      "kind": "telemetry",
+      "mid": "0x0800",
+      "description": "cFE Executive Services housekeeping.",
+      "fields": [
+        {
+          "name": "CommandCounter",
+          "type": "uint8",
+          "offset": 0,
+          "endian": "little",
+          "description": "ES valid command counter",
+          "units": ""
+        },
+        {
+          "name": "CommandErrorCounter",
+          "type": "uint8",
+          "offset": 1,
+          "endian": "little",
+          "description": "ES command error counter",
+          "units": ""
+        },
+        {
+          "name": "CFECoreChecksum",
+          "type": "uint16",
+          "offset": 2,
+          "endian": "little",
+          "description": "Checksum of cFE core code",
+          "units": ""
+        },
+        {
+          "name": "CFEMajorVersion",
+          "type": "uint8",
+          "offset": 4,
+          "endian": "little",
+          "description": "cFE major version",
+          "units": ""
+        },
+        {
+          "name": "CFEMinorVersion",
+          "type": "uint8",
+          "offset": 5,
+          "endian": "little",
+          "description": "cFE minor version",
+          "units": ""
+        },
+        {
+          "name": "CFERevision",
+          "type": "uint8",
+          "offset": 6,
+          "endian": "little",
+          "description": "cFE revision",
+          "units": ""
+        },
+        {
+          "name": "CFEMissionRevision",
+          "type": "uint8",
+          "offset": 7,
+          "endian": "little",
+          "description": "cFE mission revision",
+          "units": ""
+        },
+        {
+          "name": "OSALMajorVersion",
+          "type": "uint8",
+          "offset": 8,
+          "endian": "little",
+          "description": "OSAL major version",
+          "units": ""
+        },
+        {
+          "name": "OSALMinorVersion",
+          "type": "uint8",
+          "offset": 9,
+          "endian": "little",
+          "description": "OSAL minor version",
+          "units": ""
+        },
+        {
+          "name": "OSALRevision",
+          "type": "uint8",
+          "offset": 10,
+          "endian": "little",
+          "description": "OSAL revision",
+          "units": ""
+        },
+        {
+          "name": "OSALMissionRevision",
+          "type": "uint8",
+          "offset": 11,
+          "endian": "little",
+          "description": "OSAL mission revision",
+          "units": ""
+        },
+        {
+          "name": "PSPMajorVersion",
+          "type": "uint8",
+          "offset": 12,
+          "endian": "little",
+          "description": "PSP major version",
+          "units": ""
+        },
+        {
+          "name": "PSPMinorVersion",
+          "type": "uint8",
+          "offset": 13,
+          "endian": "little",
+          "description": "PSP minor version",
+          "units": ""
+        },
+        {
+          "name": "PSPRevision",
+          "type": "uint8",
+          "offset": 14,
+          "endian": "little",
+          "description": "PSP revision",
+          "units": ""
+        },
+        {
+          "name": "PSPMissionRevision",
+          "type": "uint8",
+          "offset": 15,
+          "endian": "little",
+          "description": "PSP mission revision",
+          "units": ""
+        },
+        {
+          "name": "SysLogBytesUsed",
+          "type": "uint64",
+          "offset": 16,
+          "endian": "little",
+          "description": "Bytes used in the system log",
+          "units": "B"
+        },
+        {
+          "name": "SysLogSize",
+          "type": "uint64",
+          "offset": 24,
+          "endian": "little",
+          "description": "Total size of the system log",
+          "units": "B"
+        },
+        {
+          "name": "SysLogEntries",
+          "type": "uint32",
+          "offset": 32,
+          "endian": "little",
+          "description": "Entries in the system log",
+          "units": ""
+        },
+        {
+          "name": "SysLogMode",
+          "type": "uint32",
+          "offset": 36,
+          "endian": "little",
+          "description": "System log write mode",
+          "units": "",
+          "enum": {
+            "OVERWRITE": 0,
+            "DISCARD": 1
+          }
+        },
+        {
+          "name": "ERLogIndex",
+          "type": "uint32",
+          "offset": 40,
+          "endian": "little",
+          "description": "Current exception/reset log index (wraps)",
+          "units": ""
+        },
+        {
+          "name": "ERLogEntries",
+          "type": "uint32",
+          "offset": 44,
+          "endian": "little",
+          "description": "ER log entries made since power on",
+          "units": ""
+        },
+        {
+          "name": "RegisteredCoreApps",
+          "type": "uint32",
+          "offset": 48,
+          "endian": "little",
+          "description": "Core apps registered with ES",
+          "units": ""
+        },
+        {
+          "name": "RegisteredExternalApps",
+          "type": "uint32",
+          "offset": 52,
+          "endian": "little",
+          "description": "External apps registered with ES",
+          "units": ""
+        },
+        {
+          "name": "RegisteredTasks",
+          "type": "uint32",
+          "offset": 56,
+          "endian": "little",
+          "description": "Tasks (main and child) registered with ES",
+          "units": ""
+        },
+        {
+          "name": "RegisteredLibs",
+          "type": "uint32",
+          "offset": 60,
+          "endian": "little",
+          "description": "Libraries registered with ES",
+          "units": ""
+        },
+        {
+          "name": "ResetType",
+          "type": "uint32",
+          "offset": 64,
+          "endian": "little",
+          "description": "Last reset type",
+          "units": "",
+          "enum": {
+            "PROCESSOR": 1,
+            "POWERON": 2
+          }
+        },
+        {
+          "name": "ResetSubtype",
+          "type": "uint32",
+          "offset": 68,
+          "endian": "little",
+          "description": "Reset subtype (PSP-defined)",
+          "units": ""
+        },
+        {
+          "name": "ProcessorResets",
+          "type": "uint32",
+          "offset": 72,
+          "endian": "little",
+          "description": "Processor resets since last power on",
+          "units": ""
+        },
+        {
+          "name": "MaxProcessorResets",
+          "type": "uint32",
+          "offset": 76,
+          "endian": "little",
+          "description": "Max processor resets before a power-on reset",
+          "units": ""
+        },
+        {
+          "name": "BootSource",
+          "type": "uint32",
+          "offset": 80,
+          "endian": "little",
+          "description": "Boot source from the BSP",
+          "units": ""
+        },
+        {
+          "name": "PerfState",
+          "type": "uint32",
+          "offset": 84,
+          "endian": "little",
+          "description": "Performance analyzer state",
+          "units": ""
+        },
+        {
+          "name": "PerfMode",
+          "type": "uint32",
+          "offset": 88,
+          "endian": "little",
+          "description": "Performance analyzer mode",
+          "units": ""
+        },
+        {
+          "name": "PerfTriggerCount",
+          "type": "uint32",
+          "offset": 92,
+          "endian": "little",
+          "description": "Performance analyzer trigger count",
+          "units": ""
+        },
+        {
+          "name": "PerfFilterMask",
+          "type": "bytes[16]",
+          "offset": 96,
+          "description": "Performance filter masks (4 x uint32 little-endian)",
+          "units": ""
+        },
+        {
+          "name": "PerfTriggerMask",
+          "type": "bytes[16]",
+          "offset": 112,
+          "description": "Performance trigger masks (4 x uint32 little-endian)",
+          "units": ""
+        },
+        {
+          "name": "PerfDataStart",
+          "type": "uint32",
+          "offset": 128,
+          "endian": "little",
+          "description": "First stored entry in the performance log",
+          "units": ""
+        },
+        {
+          "name": "PerfDataEnd",
+          "type": "uint32",
+          "offset": 132,
+          "endian": "little",
+          "description": "Last stored entry in the performance log",
+          "units": ""
+        },
+        {
+          "name": "PerfDataCount",
+          "type": "uint32",
+          "offset": 136,
+          "endian": "little",
+          "description": "Entries put into the performance log",
+          "units": ""
+        },
+        {
+          "name": "PerfDataToWrite",
+          "type": "uint32",
+          "offset": 140,
+          "endian": "little",
+          "description": "Entries left to write to the dump file",
+          "units": ""
+        },
+        {
+          "name": "HeapBytesFree",
+          "type": "uint64",
+          "offset": 144,
+          "endian": "little",
+          "description": "Free bytes in the OS heap",
+          "units": "B"
+        },
+        {
+          "name": "HeapBlocksFree",
+          "type": "uint64",
+          "offset": 152,
+          "endian": "little",
+          "description": "Free blocks in the OS heap",
+          "units": ""
+        },
+        {
+          "name": "HeapMaxBlockSize",
+          "type": "uint64",
+          "offset": 160,
+          "endian": "little",
+          "description": "Largest free heap block",
+          "units": "B"
+        }
+      ]
+    },
+    {
+      "name": "TIME_NOOP",
+      "kind": "command",
+      "mid": "0x1805",
+      "function_code": 0,
+      "description": "TIME no-op; increments TIME command counter.",
+      "fields": []
+    },
+    {
+      "name": "TIME_RESET_COUNTERS",
+      "kind": "command",
+      "mid": "0x1805",
+      "function_code": 1,
+      "description": "Reset TIME command and error counters (and tone/1Hz counters).",
+      "fields": []
+    },
+    {
+      "name": "TIME_SEND_DIAGNOSTIC",
+      "kind": "command",
+      "mid": "0x1805",
+      "function_code": 2,
+      "description": "Request one TIME diagnostic packet (TIME_DIAG).",
+      "fields": []
+    },
+    {
+      "name": "TIME_SET_STATE",
+      "kind": "command",
+      "mid": "0x1805",
+      "function_code": 4,
+      "description": "Force the clock state (VALID or FLYWHEEL).",
+      "fields": [
+        {
+          "name": "ClockState",
+          "type": "int16",
+          "offset": 0,
+          "endian": "little",
+          "description": "Requested clock state",
+          "units": "",
+          "enum": {
+            "INVALID": -1,
+            "VALID": 0,
+            "FLYWHEEL": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "TIME_SET_TIME",
+      "kind": "command",
+      "mid": "0x1805",
+      "function_code": 7,
+      "description": "Set spacecraft time (server only); microseconds must be < 1000000.",
+      "fields": [
+        {
+          "name": "Seconds",
+          "type": "uint32",
+          "offset": 0,
+          "endian": "little",
+          "description": "Seconds",
+          "units": "s"
+        },
+        {
+          "name": "MicroSeconds",
+          "type": "uint32",
+          "offset": 4,
+          "endian": "little",
+          "description": "Microseconds",
+          "units": "us"
+        }
+      ]
+    },
+    {
+      "name": "TIME_SET_MET",
+      "kind": "command",
+      "mid": "0x1805",
+      "function_code": 8,
+      "description": "Set MET (server only); microseconds must be < 1000000.",
+      "fields": [
+        {
+          "name": "Seconds",
+          "type": "uint32",
+          "offset": 0,
+          "endian": "little",
+          "description": "Seconds",
+          "units": "s"
+        },
+        {
+          "name": "MicroSeconds",
+          "type": "uint32",
+          "offset": 4,
+          "endian": "little",
+          "description": "Microseconds",
+          "units": "us"
+        }
+      ]
+    },
+    {
+      "name": "TIME_SET_STCF",
+      "kind": "command",
+      "mid": "0x1805",
+      "function_code": 9,
+      "description": "Set the spacecraft time correction factor (server only); microseconds must be < 1000000.",
+      "fields": [
+        {
+          "name": "Seconds",
+          "type": "uint32",
+          "offset": 0,
+          "endian": "little",
+          "description": "STCF seconds",
+          "units": "s"
+        },
+        {
+          "name": "MicroSeconds",
+          "type": "uint32",
+          "offset": 4,
+          "endian": "little",
+          "description": "STCF microseconds",
+          "units": "us"
+        }
+      ]
+    },
+    {
+      "name": "TIME_SET_LEAP_SECONDS",
+      "kind": "command",
+      "mid": "0x1805",
+      "function_code": 10,
+      "description": "Set leap seconds (server only).",
+      "fields": [
+        {
+          "name": "LeapSeconds",
+          "type": "int16",
+          "offset": 0,
+          "endian": "little",
+          "description": "Leap seconds",
+          "units": "s"
+        }
+      ]
+    },
+    {
+      "name": "TIME_ADD_ADJUST",
+      "kind": "command",
+      "mid": "0x1805",
+      "function_code": 11,
+      "description": "Add a one-time adjustment to STCF (server only).",
+      "fields": [
+        {
+          "name": "Seconds",
+          "type": "uint32",
+          "offset": 0,
+          "endian": "little",
+          "description": "Adjustment seconds",
+          "units": "s"
+        },
+        {
+          "name": "MicroSeconds",
+          "type": "uint32",
+          "offset": 4,
+          "endian": "little",
+          "description": "Adjustment microseconds",
+          "units": "us"
+        }
+      ]
+    },
+    {
+      "name": "TIME_SUB_ADJUST",
+      "kind": "command",
+      "mid": "0x1805",
+      "function_code": 12,
+      "description": "Subtract a one-time adjustment from STCF (server only).",
+      "fields": [
+        {
+          "name": "Seconds",
+          "type": "uint32",
+          "offset": 0,
+          "endian": "little",
+          "description": "Adjustment seconds",
+          "units": "s"
+        },
+        {
+          "name": "MicroSeconds",
+          "type": "uint32",
+          "offset": 4,
+          "endian": "little",
+          "description": "Adjustment microseconds",
+          "units": "us"
+        }
+      ]
+    },
+    {
+      "name": "TIME_SEND_HK",
+      "kind": "command",
+      "mid": "0x180D",
+      "function_code": 0,
+      "description": "Request one TIME housekeeping packet (normally sent by SCH_LAB every 4.4 s).",
+      "fields": []
+    },
+    {
+      "name": "TIME_HK",
+      "kind": "telemetry",
+      "mid": "0x0805",
+      "description": "cFE Time Services housekeeping.",
+      "fields": [
+        {
+          "name": "CommandCounter",
+          "type": "uint8",
+          "offset": 0,
+          "endian": "little",
+          "description": "TIME valid command counter",
+          "units": ""
+        },
+        {
+          "name": "CommandErrorCounter",
+          "type": "uint8",
+          "offset": 1,
+          "endian": "little",
+          "description": "TIME command error counter",
+          "units": ""
+        },
+        {
+          "name": "ClockStateFlags",
+          "type": "uint16",
+          "offset": 2,
+          "endian": "little",
+          "description": "Clock state flag bits (CLKSET 0x8000, FLYING 0x4000, SRCINT 0x2000, SIGPRI 0x1000, SRVFLY 0x0800, CMDFLY 0x0400, ADDADJ 0x0200, ADD1HZ 0x0100, ADDTCL 0x0080, SERVER 0x0040, GDTONE 0x0020, REFERR 0x0010)",
+          "units": ""
+        },
+        {
+          "name": "ClockStateAPI",
+          "type": "int16",
+          "offset": 4,
+          "endian": "little",
+          "description": "Clock state as seen through the API",
+          "units": "",
+          "enum": {
+            "INVALID": -1,
+            "VALID": 0,
+            "FLYWHEEL": 1
+          }
+        },
+        {
+          "name": "LeapSeconds",
+          "type": "int16",
+          "offset": 6,
+          "endian": "little",
+          "description": "Current leap seconds",
+          "units": "s"
+        },
+        {
+          "name": "MET_Seconds",
+          "type": "uint32",
+          "offset": 8,
+          "endian": "little",
+          "description": "Current MET - seconds",
+          "units": "s"
+        },
+        {
+          "name": "MET_Subseconds",
+          "type": "uint32",
+          "offset": 12,
+          "endian": "little",
+          "description": "Current MET - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "STCF_Seconds",
+          "type": "uint32",
+          "offset": 16,
+          "endian": "little",
+          "description": "Current STCF - seconds",
+          "units": "s"
+        },
+        {
+          "name": "STCF_Subseconds",
+          "type": "uint32",
+          "offset": 20,
+          "endian": "little",
+          "description": "Current STCF - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "AdjustmentFactor_Seconds",
+          "type": "uint32",
+          "offset": 24,
+          "endian": "little",
+          "description": "Current adjustment factor (1 Hz STCF adjustment on a server; tone delay on a client) - seconds",
+          "units": "s"
+        },
+        {
+          "name": "AdjustmentFactor_Subseconds",
+          "type": "uint32",
+          "offset": 28,
+          "endian": "little",
+          "description": "Current adjustment factor (1 Hz STCF adjustment on a server; tone delay on a client) - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        }
+      ]
+    },
+    {
+      "name": "TIME_DIAG",
+      "kind": "telemetry",
+      "mid": "0x0806",
+      "description": "cFE Time Services diagnostics.",
+      "fields": [
+        {
+          "name": "AtToneMET_Seconds",
+          "type": "uint32",
+          "offset": 0,
+          "endian": "little",
+          "description": "MET at time of tone - seconds",
+          "units": "s"
+        },
+        {
+          "name": "AtToneMET_Subseconds",
+          "type": "uint32",
+          "offset": 4,
+          "endian": "little",
+          "description": "MET at time of tone - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "AtToneSTCF_Seconds",
+          "type": "uint32",
+          "offset": 8,
+          "endian": "little",
+          "description": "STCF at time of tone - seconds",
+          "units": "s"
+        },
+        {
+          "name": "AtToneSTCF_Subseconds",
+          "type": "uint32",
+          "offset": 12,
+          "endian": "little",
+          "description": "STCF at time of tone - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "AtToneDelay_Seconds",
+          "type": "uint32",
+          "offset": 16,
+          "endian": "little",
+          "description": "Adjustment for slow tone detection - seconds",
+          "units": "s"
+        },
+        {
+          "name": "AtToneDelay_Subseconds",
+          "type": "uint32",
+          "offset": 20,
+          "endian": "little",
+          "description": "Adjustment for slow tone detection - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "AtToneLatch_Seconds",
+          "type": "uint32",
+          "offset": 24,
+          "endian": "little",
+          "description": "Local clock latched at time of tone - seconds",
+          "units": "s"
+        },
+        {
+          "name": "AtToneLatch_Subseconds",
+          "type": "uint32",
+          "offset": 28,
+          "endian": "little",
+          "description": "Local clock latched at time of tone - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "AtToneLeapSeconds",
+          "type": "int16",
+          "offset": 32,
+          "endian": "little",
+          "description": "Leap seconds at time of tone",
+          "units": "s"
+        },
+        {
+          "name": "ClockStateAPI",
+          "type": "int16",
+          "offset": 34,
+          "endian": "little",
+          "description": "Clock state as seen through the API",
+          "units": "",
+          "enum": {
+            "INVALID": -1,
+            "VALID": 0,
+            "FLYWHEEL": 1
+          }
+        },
+        {
+          "name": "TimeSinceTone_Seconds",
+          "type": "uint32",
+          "offset": 36,
+          "endian": "little",
+          "description": "Time elapsed since the tone - seconds",
+          "units": "s"
+        },
+        {
+          "name": "TimeSinceTone_Subseconds",
+          "type": "uint32",
+          "offset": 40,
+          "endian": "little",
+          "description": "Time elapsed since the tone - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "CurrentLatch_Seconds",
+          "type": "uint32",
+          "offset": 44,
+          "endian": "little",
+          "description": "Local clock latched now - seconds",
+          "units": "s"
+        },
+        {
+          "name": "CurrentLatch_Subseconds",
+          "type": "uint32",
+          "offset": 48,
+          "endian": "little",
+          "description": "Local clock latched now - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "CurrentMET_Seconds",
+          "type": "uint32",
+          "offset": 52,
+          "endian": "little",
+          "description": "MET now - seconds",
+          "units": "s"
+        },
+        {
+          "name": "CurrentMET_Subseconds",
+          "type": "uint32",
+          "offset": 56,
+          "endian": "little",
+          "description": "MET now - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "CurrentTAI_Seconds",
+          "type": "uint32",
+          "offset": 60,
+          "endian": "little",
+          "description": "TAI now - seconds",
+          "units": "s"
+        },
+        {
+          "name": "CurrentTAI_Subseconds",
+          "type": "uint32",
+          "offset": 64,
+          "endian": "little",
+          "description": "TAI now - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "CurrentUTC_Seconds",
+          "type": "uint32",
+          "offset": 68,
+          "endian": "little",
+          "description": "UTC now - seconds",
+          "units": "s"
+        },
+        {
+          "name": "CurrentUTC_Subseconds",
+          "type": "uint32",
+          "offset": 72,
+          "endian": "little",
+          "description": "UTC now - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "ClockSetState",
+          "type": "int16",
+          "offset": 76,
+          "endian": "little",
+          "description": "Time has been set",
+          "units": ""
+        },
+        {
+          "name": "ClockFlyState",
+          "type": "int16",
+          "offset": 78,
+          "endian": "little",
+          "description": "Current flywheel state",
+          "units": ""
+        },
+        {
+          "name": "ClockSource",
+          "type": "int16",
+          "offset": 80,
+          "endian": "little",
+          "description": "Clock source (internal/external)",
+          "units": ""
+        },
+        {
+          "name": "ClockSignal",
+          "type": "int16",
+          "offset": 82,
+          "endian": "little",
+          "description": "Tone signal (primary/redundant)",
+          "units": ""
+        },
+        {
+          "name": "ServerFlyState",
+          "type": "int16",
+          "offset": 84,
+          "endian": "little",
+          "description": "Server flywheel state (clients only)",
+          "units": ""
+        },
+        {
+          "name": "Forced2Fly",
+          "type": "int16",
+          "offset": 86,
+          "endian": "little",
+          "description": "Commanded into flywheel",
+          "units": ""
+        },
+        {
+          "name": "ClockStateFlags",
+          "type": "uint16",
+          "offset": 88,
+          "endian": "little",
+          "description": "Clock state flag bits",
+          "units": ""
+        },
+        {
+          "name": "OneTimeDirection",
+          "type": "int16",
+          "offset": 90,
+          "endian": "little",
+          "description": "One-time STCF adjustment direction (add=1, subtract=2)",
+          "units": ""
+        },
+        {
+          "name": "OneHzDirection",
+          "type": "int16",
+          "offset": 92,
+          "endian": "little",
+          "description": "1 Hz STCF adjustment direction",
+          "units": ""
+        },
+        {
+          "name": "DelayDirection",
+          "type": "int16",
+          "offset": 94,
+          "endian": "little",
+          "description": "Client latency adjustment direction",
+          "units": ""
+        },
+        {
+          "name": "OneTimeAdjust_Seconds",
+          "type": "uint32",
+          "offset": 96,
+          "endian": "little",
+          "description": "Previous one-time STCF adjustment - seconds",
+          "units": "s"
+        },
+        {
+          "name": "OneTimeAdjust_Subseconds",
+          "type": "uint32",
+          "offset": 100,
+          "endian": "little",
+          "description": "Previous one-time STCF adjustment - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "OneHzAdjust_Seconds",
+          "type": "uint32",
+          "offset": 104,
+          "endian": "little",
+          "description": "Current 1 Hz STCF adjustment - seconds",
+          "units": "s"
+        },
+        {
+          "name": "OneHzAdjust_Subseconds",
+          "type": "uint32",
+          "offset": 108,
+          "endian": "little",
+          "description": "Current 1 Hz STCF adjustment - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "ToneSignalLatch_Seconds",
+          "type": "uint32",
+          "offset": 112,
+          "endian": "little",
+          "description": "Local clock at most recent tone signal - seconds",
+          "units": "s"
+        },
+        {
+          "name": "ToneSignalLatch_Subseconds",
+          "type": "uint32",
+          "offset": 116,
+          "endian": "little",
+          "description": "Local clock at most recent tone signal - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "ToneDataLatch_Seconds",
+          "type": "uint32",
+          "offset": 120,
+          "endian": "little",
+          "description": "Local clock at arrival of tone data - seconds",
+          "units": "s"
+        },
+        {
+          "name": "ToneDataLatch_Subseconds",
+          "type": "uint32",
+          "offset": 124,
+          "endian": "little",
+          "description": "Local clock at arrival of tone data - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "ToneMatchCounter",
+          "type": "uint32",
+          "offset": 128,
+          "endian": "little",
+          "description": "Tone signal/data verification count",
+          "units": ""
+        },
+        {
+          "name": "ToneMatchErrorCounter",
+          "type": "uint32",
+          "offset": 132,
+          "endian": "little",
+          "description": "Tone verification error count",
+          "units": ""
+        },
+        {
+          "name": "ToneSignalCounter",
+          "type": "uint32",
+          "offset": 136,
+          "endian": "little",
+          "description": "Tone signal detected message count",
+          "units": ""
+        },
+        {
+          "name": "ToneDataCounter",
+          "type": "uint32",
+          "offset": 140,
+          "endian": "little",
+          "description": "Time-at-the-tone data message count",
+          "units": ""
+        },
+        {
+          "name": "ToneIntCounter",
+          "type": "uint32",
+          "offset": 144,
+          "endian": "little",
+          "description": "Tone signal ISR execution count",
+          "units": ""
+        },
+        {
+          "name": "ToneIntErrorCounter",
+          "type": "uint32",
+          "offset": 148,
+          "endian": "little",
+          "description": "Tone signal ISR error count",
+          "units": ""
+        },
+        {
+          "name": "ToneTaskCounter",
+          "type": "uint32",
+          "offset": 152,
+          "endian": "little",
+          "description": "Tone task execution count",
+          "units": ""
+        },
+        {
+          "name": "VersionCounter",
+          "type": "uint32",
+          "offset": 156,
+          "endian": "little",
+          "description": "Count of modifications to time-at-tone reference data",
+          "units": ""
+        },
+        {
+          "name": "LocalIntCounter",
+          "type": "uint32",
+          "offset": 160,
+          "endian": "little",
+          "description": "Local 1 Hz ISR execution count",
+          "units": ""
+        },
+        {
+          "name": "LocalTaskCounter",
+          "type": "uint32",
+          "offset": 164,
+          "endian": "little",
+          "description": "Local 1 Hz task execution count",
+          "units": ""
+        },
+        {
+          "name": "VirtualMET",
+          "type": "uint32",
+          "offset": 168,
+          "endian": "little",
+          "description": "Software MET",
+          "units": "s"
+        },
+        {
+          "name": "MinElapsed",
+          "type": "uint32",
+          "offset": 172,
+          "endian": "little",
+          "description": "Min tone signal/data arrival window",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "MaxElapsed",
+          "type": "uint32",
+          "offset": 176,
+          "endian": "little",
+          "description": "Max tone signal/data arrival window",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "MaxLocalClock_Seconds",
+          "type": "uint32",
+          "offset": 180,
+          "endian": "little",
+          "description": "Max local clock value before rollover - seconds",
+          "units": "s"
+        },
+        {
+          "name": "MaxLocalClock_Subseconds",
+          "type": "uint32",
+          "offset": 184,
+          "endian": "little",
+          "description": "Max local clock value before rollover - subseconds (LSB = 2^-32 s)",
+          "units": "2^-32 s"
+        },
+        {
+          "name": "ToneOverLimit",
+          "type": "uint32",
+          "offset": 188,
+          "endian": "little",
+          "description": "Max between tone signal interrupts",
+          "units": ""
+        },
+        {
+          "name": "ToneUnderLimit",
+          "type": "uint32",
+          "offset": 192,
+          "endian": "little",
+          "description": "Min between tone signal interrupts",
+          "units": ""
+        },
+        {
+          "name": "DataStoreStatus",
+          "type": "uint32",
+          "offset": 196,
+          "endian": "little",
+          "description": "Data store status (preserved across processor reset)",
+          "units": ""
+        }
+      ]
+    },
+    {
+      "name": "SAMPLE_APP_NOOP",
+      "kind": "command",
+      "mid": "0x1882",
+      "function_code": 0,
+      "description": "SAMPLE_APP no-op; increments its command counter.",
+      "fields": []
+    },
+    {
+      "name": "SAMPLE_APP_RESET_COUNTERS",
+      "kind": "command",
+      "mid": "0x1882",
+      "function_code": 1,
+      "description": "Reset SAMPLE_APP command and error counters.",
+      "fields": []
+    },
+    {
+      "name": "SAMPLE_APP_PROCESS",
+      "kind": "command",
+      "mid": "0x1882",
+      "function_code": 2,
+      "description": "Process the example table via sample_lib; increments the command counter.",
+      "fields": []
+    },
+    {
+      "name": "SAMPLE_APP_DISPLAY_PARAM",
+      "kind": "command",
+      "mid": "0x1882",
+      "function_code": 3,
+      "description": "Echo the arguments in an info event; increments the command counter.",
+      "fields": [
+        {
+          "name": "ValU32",
+          "type": "uint32",
+          "offset": 0,
+          "endian": "little",
+          "description": "32-bit unsigned example value",
+          "units": ""
+        },
+        {
+          "name": "ValI16",
+          "type": "int16",
+          "offset": 4,
+          "endian": "little",
+          "description": "16-bit signed example value",
+          "units": ""
+        },
+        {
+          "name": "ValStr",
+          "type": "char[10]",
+          "offset": 6,
+          "description": "Example string (NUL-padded)",
+          "units": ""
+        }
+      ]
+    },
+    {
+      "name": "SAMPLE_APP_SEND_HK",
+      "kind": "command",
+      "mid": "0x1883",
+      "function_code": 0,
+      "description": "Request one SAMPLE_APP housekeeping packet (normally sent by SCH_LAB every 5.4 s). Counters in HK are copied only on this request.",
+      "fields": []
+    },
+    {
+      "name": "SAMPLE_APP_HK",
+      "kind": "telemetry",
+      "mid": "0x0883",
+      "description": "SAMPLE_APP housekeeping.",
+      "fields": [
+        {
+          "name": "CommandCounter",
+          "type": "uint8",
+          "offset": 0,
+          "endian": "little",
+          "description": "Valid command counter",
+          "units": ""
+        },
+        {
+          "name": "CommandErrorCounter",
+          "type": "uint8",
+          "offset": 1,
+          "endian": "little",
+          "description": "Command error counter",
+          "units": ""
+        }
+      ]
+    },
+    {
+      "name": "CI_LAB_NOOP",
+      "kind": "command",
+      "mid": "0x1884",
+      "function_code": 0,
+      "description": "CI_LAB no-op; increments its command counter.",
+      "fields": []
+    },
+    {
+      "name": "CI_LAB_RESET_COUNTERS",
+      "kind": "command",
+      "mid": "0x1884",
+      "function_code": 1,
+      "description": "Reset CI_LAB command, error, ingest-packet and ingest-error counters.",
+      "fields": []
+    },
+    {
+      "name": "CI_LAB_SEND_HK",
+      "kind": "command",
+      "mid": "0x1885",
+      "function_code": 0,
+      "description": "Request one CI_LAB housekeeping packet (normally sent by SCH_LAB every 5.0 s).",
+      "fields": []
+    },
+    {
+      "name": "CI_LAB_HK",
+      "kind": "telemetry",
+      "mid": "0x0884",
+      "description": "CI_LAB housekeeping.",
+      "fields": [
+        {
+          "name": "CommandCounter",
+          "type": "uint8",
+          "offset": 0,
+          "endian": "little",
+          "description": "Valid command counter",
+          "units": ""
+        },
+        {
+          "name": "CommandErrorCounter",
+          "type": "uint8",
+          "offset": 1,
+          "endian": "little",
+          "description": "Command error counter",
+          "units": ""
+        },
+        {
+          "name": "EnableChecksums",
+          "type": "uint8",
+          "offset": 2,
+          "endian": "little",
+          "description": "Declared in the packet but never written by CI_LAB (always 0)",
+          "units": ""
+        },
+        {
+          "name": "SocketConnected",
+          "type": "uint8",
+          "offset": 3,
+          "endian": "little",
+          "description": "UDP socket bound (1) or not (0)",
+          "units": ""
+        },
+        {
+          "name": "IngestPackets",
+          "type": "uint32",
+          "offset": 4,
+          "endian": "little",
+          "description": "Datagrams accepted and forwarded to the software bus",
+          "units": ""
+        },
+        {
+          "name": "IngestErrors",
+          "type": "uint32",
+          "offset": 8,
+          "endian": "little",
+          "description": "Datagrams dropped (too short, or header length larger than datagram)",
+          "units": ""
+        }
+      ]
+    },
+    {
+      "name": "TO_LAB_NOOP",
+      "kind": "command",
+      "mid": "0x1880",
+      "function_code": 0,
+      "description": "TO_LAB no-op; increments its command counter. Length is not verified.",
+      "fields": []
+    },
+    {
+      "name": "TO_LAB_RESET_STATUS",
+      "kind": "command",
+      "mid": "0x1880",
+      "function_code": 1,
+      "description": "Reset TO_LAB command and error counters.",
+      "fields": []
+    },
+    {
+      "name": "TO_LAB_ADD_PKT",
+      "kind": "command",
+      "mid": "0x1880",
+      "function_code": 2,
+      "description": "Subscribe the downlink pipe to a message ID. Payload is 8 bytes (1 trailing pad byte).",
+      "fields": [
+        {
+          "name": "Stream",
+          "type": "uint32",
+          "offset": 0,
+          "endian": "little",
+          "description": "Message ID (full 16-bit stream ID value) to forward",
+          "units": ""
+        },
+        {
+          "name": "QosPriority",
+          "type": "uint8",
+          "offset": 4,
+          "endian": "little",
+          "description": "SB QoS priority (0 low, 1 high)",
+          "units": ""
+        },
+        {
+          "name": "QosReliability",
+          "type": "uint8",
+          "offset": 5,
+          "endian": "little",
+          "description": "SB QoS reliability (0 low, 1 high)",
+          "units": ""
+        },
+        {
+          "name": "BufLimit",
+          "type": "uint8",
+          "offset": 6,
+          "endian": "little",
+          "description": "Max buffered messages of this ID (must be < pipe depth)",
+          "units": ""
+        },
+        {
+          "name": "Padding",
+          "type": "bytes[1]",
+          "offset": 7,
+          "description": "Struct tail padding; send 0",
+          "units": ""
+        }
+      ]
+    },
+    {
+      "name": "TO_LAB_SEND_DATA_TYPES",
+      "kind": "command",
+      "mid": "0x1880",
+      "function_code": 3,
+      "description": "Emit one TO_LAB_DATA_TYPES packet.",
+      "fields": []
+    },
+    {
+      "name": "TO_LAB_REMOVE_PKT",
+      "kind": "command",
+      "mid": "0x1880",
+      "function_code": 4,
+      "description": "Unsubscribe the downlink pipe from a message ID.",
+      "fields": [
+        {
+          "name": "Stream",
+          "type": "uint32",
+          "offset": 0,
+          "endian": "little",
+          "description": "Message ID to stop forwarding",
+          "units": ""
+        }
+      ]
+    },
+    {
+      "name": "TO_LAB_REMOVE_ALL_PKT",
+      "kind": "command",
+      "mid": "0x1880",
+      "function_code": 5,
+      "description": "Unsubscribe the downlink pipe from every message ID.",
+      "fields": []
+    },
+    {
+      "name": "TO_LAB_ENABLE_OUTPUT",
+      "kind": "command",
+      "mid": "0x1880",
+      "function_code": 6,
+      "description": "Start telemetry output: TO_LAB sends UDP datagrams to dest_IP port 2234 (cpu1).",
+      "fields": [
+        {
+          "name": "dest_IP",
+          "type": "char[16]",
+          "offset": 0,
+          "description": "Destination IPv4 address as dotted text, NUL-padded",
+          "units": ""
+        }
+      ]
+    },
+    {
+      "name": "TO_LAB_SEND_HK",
+      "kind": "command",
+      "mid": "0x1881",
+      "function_code": 0,
+      "description": "Request one TO_LAB housekeeping packet (normally sent by SCH_LAB every 5.2 s).",
+      "fields": []
+    },
+    {
+      "name": "TO_LAB_HK",
+      "kind": "telemetry",
+      "mid": "0x0880",
+      "description": "TO_LAB housekeeping.",
+      "fields": [
+        {
+          "name": "CommandCounter",
+          "type": "uint8",
+          "offset": 0,
+          "endian": "little",
+          "description": "Valid command counter",
+          "units": ""
+        },
+        {
+          "name": "CommandErrorCounter",
+          "type": "uint8",
+          "offset": 1,
+          "endian": "little",
+          "description": "Command error counter",
+          "units": ""
+        }
+      ]
+    },
+    {
+      "name": "TO_LAB_DATA_TYPES",
+      "kind": "telemetry",
+      "mid": "0x0881",
+      "description": "TO_LAB data-types test packet with fixed known values (after TO_LAB_SEND_DATA_TYPES). Offsets include natural alignment padding.",
+      "fields": [
+        {
+          "name": "synch",
+          "type": "uint16",
+          "offset": 0,
+          "endian": "little",
+          "description": "Sync word (0x6969)",
+          "units": ""
+        },
+        {
+          "name": "bl1",
+          "type": "uint8",
+          "offset": 2,
+          "endian": "little",
+          "description": "Boolean (0)",
+          "units": ""
+        },
+        {
+          "name": "bl2",
+          "type": "uint8",
+          "offset": 3,
+          "endian": "little",
+          "description": "Boolean (1)",
+          "units": ""
+        },
+        {
+          "name": "b1",
+          "type": "int8",
+          "offset": 4,
+          "endian": "little",
+          "description": "int8 (16)",
+          "units": ""
+        },
+        {
+          "name": "b2",
+          "type": "int8",
+          "offset": 5,
+          "endian": "little",
+          "description": "int8 (127)",
+          "units": ""
+        },
+        {
+          "name": "b3",
+          "type": "int8",
+          "offset": 6,
+          "endian": "little",
+          "description": "int8 (0x7F)",
+          "units": ""
+        },
+        {
+          "name": "b4",
+          "type": "int8",
+          "offset": 7,
+          "endian": "little",
+          "description": "int8 (0x45)",
+          "units": ""
+        },
+        {
+          "name": "w1",
+          "type": "int16",
+          "offset": 8,
+          "endian": "little",
+          "description": "int16 (0x2468)",
+          "units": ""
+        },
+        {
+          "name": "w2",
+          "type": "int16",
+          "offset": 10,
+          "endian": "little",
+          "description": "int16 (0x7FFF)",
+          "units": ""
+        },
+        {
+          "name": "dw1",
+          "type": "int32",
+          "offset": 12,
+          "endian": "little",
+          "description": "int32 (0x12345678)",
+          "units": ""
+        },
+        {
+          "name": "dw2",
+          "type": "int32",
+          "offset": 16,
+          "endian": "little",
+          "description": "int32 (0x87654321 as signed)",
+          "units": ""
+        },
+        {
+          "name": "f1",
+          "type": "float32",
+          "offset": 20,
+          "endian": "little",
+          "description": "float (90.01)",
+          "units": ""
+        },
+        {
+          "name": "f2",
+          "type": "float32",
+          "offset": 24,
+          "endian": "little",
+          "description": "float (0.0000045)",
+          "units": ""
+        },
+        {
+          "name": "padding",
+          "type": "bytes[4]",
+          "offset": 28,
+          "description": "Alignment padding before the doubles",
+          "units": ""
+        },
+        {
+          "name": "df1",
+          "type": "float64",
+          "offset": 32,
+          "endian": "little",
+          "description": "double (99.9)",
+          "units": ""
+        },
+        {
+          "name": "df2",
+          "type": "float64",
+          "offset": 40,
+          "endian": "little",
+          "description": "double (0.4444)",
+          "units": ""
+        },
+        {
+          "name": "str",
+          "type": "char[10]",
+          "offset": 48,
+          "description": "String 'ABCDEFGHIJ' (not NUL-terminated)",
+          "units": ""
+        },
+        {
+          "name": "tail_padding",
+          "type": "bytes[6]",
+          "offset": 58,
+          "description": "Struct tail padding",
+          "units": ""
+        }
+      ]
+    }
+  ]
+}

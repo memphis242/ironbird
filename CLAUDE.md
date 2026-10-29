@@ -12,7 +12,10 @@ replays telemetry across multiple aliased hardware targets.
   JSON and FSW C headers are generated from them. Never hand-edit generated output.
 - Packets are CCSDS space packets with project-specific header extensions; header
   layout must stay user-definable, not hard-coded.
-- The design spec is still being written in Plan mode; do not implement ahead of it.
+- `docs/plan.md` is the staged design; implement one stage at a time against it.
+- Branching: one short-lived branch per piece of work; after completion and review,
+  merge it into `main` and delete the branch (local and remote). No long-lived
+  per-stage branches.
 - All input is untrusted (wire packets, serial, recordings, imported CCDD/config/
   header files). Follow "Untrusted input and malformed data" in `docs/plan.md`:
   validate every length before unpacking, parse only through the single decode
