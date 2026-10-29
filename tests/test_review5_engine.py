@@ -25,22 +25,30 @@ state_dir = r2.state_dir
 
 # -- 1: the direct signal notice never blocks the exit ----------
 
-# stderr is a pipe nobody reads, filled to within five bytes of full; SIGTERM lands while the
-# ledger closes, so the notice is written with the shutdown signals held.
+# stderr is a pipe nobody reads. As the ledger closes, with everything else already written to
+# stderr (however much the host made the run print, e.g. an IB-TX-005 receive-buffer warning),
+# the pipe is filled to within five bytes of full and SIGTERM lands, so the notice is written
+# with the shutdown signals held.
 FULL_STDERR_SCRIPT = """
-import os, signal, sys, fcntl
+import os, signal, sys, fcntl, termios, struct
 import ironbird.cli.main as m
 from ironbird.ledger import Ledger
 r, w = os.pipe()
-cap = fcntl.fcntl(w, fcntl.F_GETPIPE_SZ)
-banner = len("listening for fc on udp 127.0.0.1:00000\\n")
-os.write(w, b"." * (cap - banner - 5))
 os.dup2(w, 2)
 original = Ledger.close
 fired = []
 def close(self):
     if not fired:
         fired.append(1)
+        cap = fcntl.fcntl(w, fcntl.F_GETPIPE_SZ)
+        queued = struct.unpack("i", fcntl.ioctl(r, termios.FIONREAD, bytes(4)))[0]
+        assert 0 < queued < cap - 5, (queued, cap)
+        os.set_blocking(w, False)  # a short write still leaves at most five bytes free
+        try:
+            os.write(w, b"." * (cap - queued - 5))
+        except BlockingIOError:
+            pass
+        os.set_blocking(w, True)
         os.kill(os.getpid(), signal.SIGTERM)
     return original(self)
 Ledger.close = close
