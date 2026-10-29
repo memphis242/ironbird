@@ -20,6 +20,7 @@ signals blocked, so a signal never lands in a thread that cannot act on it.
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import errno
 import os
@@ -33,6 +34,10 @@ from typing import Final, TextIO
 MAX_QUEUED_BYTES: Final = 512 * 1024
 CHUNK_BYTES: Final = 64 * 1024
 CLOSE_WAIT_S: Final = 1.0
+# One ``write`` call carries at most this many bytes. A blocking write of up to ``PIPE_BUF``
+# bytes to a pipe is atomic (all of it or none), so the bytes that reached a pipe are known
+# exactly, which is what makes the abandoned-line count exact.
+WRITE_SLICE: Final = getattr(select, "PIPE_BUF", 512)
 _GONE: Final = frozenset({errno.EPIPE, errno.ECONNRESET, errno.EBADF})
 HANDLED_SIGNALS: Final = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
@@ -72,8 +77,12 @@ class BoundedWriter:
         self._cond = threading.Condition()
         self._queue: deque[bytes] = deque()
         self._queued = 0
-        self._inflight = 0  # lines in the chunk the thread is writing right now
+        # The chunk the thread is writing right now: the end offset of each of its lines, and
+        # how many of its bytes have been written.
+        self._chunk_ends: list[int] = []
+        self._chunk_written = 0
         self._closing = False
+        self._abandoned = False
         self._reported = 0
         self.dropped_total = 0  # refused: queue full, or written after the close began
         self.abandoned_total = 0  # accepted, then given up on when a drain was cut short
@@ -110,24 +119,25 @@ class BoundedWriter:
         return self.dropped_total + self.abandoned_total + self.undelivered_total
 
     def write(self, text: str) -> None:
-        if self.unavailable:
-            self.undelivered_total += 1
-            return
-        if self.reader_gone:
-            if self.error is not None:  # a failing descriptor, not a reader that left
+        if self._fd is None and not self.unavailable:
+            if not self.reader_gone:
+                self._write_direct(text)
+            elif self.error is not None:  # a failing descriptor, not a reader that left
                 self.undelivered_total += 1
-            return
-        if self._fd is None:
-            self._write_direct(text)
             return
         data = (text + "\n").encode(self._encoding, "backslashreplace")
         with self._cond:
-            if self._closing or self._queued + len(data) > self._max_bytes:
+            if self.unavailable:
+                self.undelivered_total += 1
+            elif self.reader_gone:
+                if self.error is not None:  # a failing descriptor, not a reader that left
+                    self.undelivered_total += 1
+            elif self._closing or self._queued + len(data) > self._max_bytes:
                 self.dropped_total += 1
-                return
-            self._queue.append(data)
-            self._queued += len(data)
-            self._cond.notify()
+            else:
+                self._queue.append(data)
+                self._queued += len(data)
+                self._cond.notify()
 
     def take_new_drops(self) -> int:
         """Lines dropped since the previous call."""
@@ -140,7 +150,11 @@ class BoundedWriter:
     def queued_lines(self) -> int:
         """Lines accepted and not yet fully written."""
         with self._cond:
-            return len(self._queue) + self._inflight
+            return len(self._queue) + self._unwritten_lines()
+
+    def _unwritten_lines(self) -> int:
+        """Lines of the current chunk not yet fully written (``_cond`` held)."""
+        return len(self._chunk_ends) - bisect.bisect_right(self._chunk_ends, self._chunk_written)
 
     def begin_close(self) -> None:
         """Stop accepting lines; the thread ends once the queue is written."""
@@ -157,12 +171,18 @@ class BoundedWriter:
         return not thread.is_alive()
 
     def abandon(self) -> int:
-        """Give up on lines still queued or half written; returns how many (counted as lost)."""
+        """Give up on lines still queued or only partly written; returns how many (counted lost).
+
+        Lines that reached the descriptor are not counted. The thread writes nothing more.
+        """
         with self._cond:
-            count = len(self._queue) + self._inflight
+            count = len(self._queue) + self._unwritten_lines()
             self.abandoned_total += count
             self._queue.clear()
             self._queued = 0
+            self._chunk_ends = []
+            self._chunk_written = 0
+            self._abandoned = self._closing = True
             self._cond.notify_all()
         return count
 
@@ -195,7 +215,8 @@ class BoundedWriter:
             self._mark_gone()
 
     def _mark_gone(self) -> None:
-        self.reader_gone = True
+        with self._cond:
+            self.reader_gone = True
         callback = self._on_closed
         if callback is not None:
             callback()
@@ -207,18 +228,39 @@ class BoundedWriter:
                     return None
                 self._cond.wait()
             parts: list[bytes] = []
+            ends: list[int] = []
             size = 0
             while self._queue and size < CHUNK_BYTES:
                 part = self._queue.popleft()
                 parts.append(part)
                 size += len(part)
+                ends.append(size)
             self._queued -= size
-            self._inflight = len(parts)
+            self._chunk_ends = ends
+            self._chunk_written = 0
         return b"".join(parts)
 
-    def _chunk_done(self) -> None:
+    def _note_written(self, written: int) -> bool:
+        """Record progress on the current chunk; False once the owner abandoned the output."""
         with self._cond:
-            self._inflight = 0
+            if self._abandoned:
+                return False
+            self._chunk_written = written
+            return True
+
+    def _chunk_failed(self, exc: OSError) -> None:
+        """The descriptor failed: nothing more will be written, whoever writes next is told."""
+        with self._cond:
+            if not self._abandoned:
+                if exc.errno not in _GONE:
+                    self.error = exc
+                    self.undelivered_total += len(self._queue) + self._unwritten_lines()
+                self._queue.clear()
+                self._queued = 0
+                self._chunk_ends = []
+                self._chunk_written = 0
+            self.reader_gone = True  # before the lock is released: later lines are counted
+        self._mark_gone()
 
     def _pump(self) -> None:
         fd = self._fd
@@ -227,27 +269,22 @@ class BoundedWriter:
             signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
         while (chunk := self._next_chunk()) is not None:
             view = memoryview(chunk)
+            offset = 0
             try:
-                while view:
+                while offset < len(chunk):
                     try:
-                        written = os.write(fd, view)
+                        written = os.write(fd, view[offset : offset + WRITE_SLICE])
                     except BlockingIOError:
                         select.select([], [fd], [], 1.0)
                         continue
                     except InterruptedError:
                         continue
-                    view = view[written:]
+                    offset += written
+                    if not self._note_written(offset):
+                        return
             except OSError as exc:
-                with self._cond:
-                    if exc.errno not in _GONE:
-                        self.error = exc
-                        self.undelivered_total += len(self._queue) + self._inflight
-                    self._queue.clear()
-                    self._queued = 0
-                    self._inflight = 0
-                self._mark_gone()
+                self._chunk_failed(exc)
                 return
-            self._chunk_done()
 
 
 class Console:

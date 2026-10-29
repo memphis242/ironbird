@@ -63,7 +63,9 @@ def free_udp_ports(count: int) -> list[int]:
 
 @pytest.fixture(autouse=True)
 def _isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Every test writes its ledger under tmp_path, never the user's state dir."""
+    """Every test writes its ledger under tmp_path, never the user's state dir, and runs with
+    tmp_path as its working directory, so a relative path can never write into the source tree."""
+    monkeypatch.chdir(tmp_path)
     state = tmp_path / "state"
     monkeypatch.setenv("IRONBIRD_STATE_DIR", str(state))
     monkeypatch.delenv("IRONBIRD_CONFIG", raising=False)

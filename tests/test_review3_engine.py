@@ -45,6 +45,7 @@ from test_review2_engine import (
     kill_quietly,
     patched_argv,
     read_ledger,
+    shm_row,
     start_blocked_listen,
     wait_for_file_text,
     wait_for_text,
@@ -252,31 +253,26 @@ def test_clean_sh_run_as_root_cleans_the_segments_of_the_cfs_run_uid(tmp_path: P
     keyfile.write_text("")
     st = keyfile.stat()
     key = (0x52 << 24) | ((st.st_dev & 0xFF) << 16) | (st.st_ino & 0xFFFF)
-    rows = "\n".join(
-        [
-            f"0x{key:08x} 101        svc          600        4096       0",  # cFS's user: removed
-            f"0x{key:08x} 102        root         600        4096       0",  # not cFS's user
-            f"0x{key:08x} 103        svc          600        4096       2",  # still attached
-        ]
-    )
+    rows = [
+        shm_row(key, 101, 0, 4242),  # cFS's uid: removed
+        shm_row(key, 102, 0, 0),  # not cFS's uid
+        shm_row(key, 103, 2, 4242),  # still attached
+    ]
     bin_dir = tmp_path / "stubs"
     bin_dir.mkdir()
     log = tmp_path / "ipcrm.log"
-    (bin_dir / "ipcs").write_text(
-        "#!/usr/bin/env bash\n"
-        "echo 'key        shmid      owner      perms      bytes      nattch     status'\n"
-        f"cat <<'EOF'\n{rows}\nEOF\n"
-    )
+    table = tmp_path / "shm"
+    table.write_text("header\n" + "\n".join(rows) + "\n")
     (bin_dir / "ipcrm").write_text(f'#!/usr/bin/env bash\necho "$@" >> {log}\n')
-    (bin_dir / "id").write_text(
-        '#!/usr/bin/env bash\ncase "$1" in -u) echo 0;; -un) echo root;; *) exit 1;; esac\n'
-    )
-    (bin_dir / "getent").write_text(
-        '#!/usr/bin/env bash\n[ "$1 $2" = "passwd 4242" ] && echo "svc:x:4242:4242::/:/bin/false"\n'
-    )
+    (bin_dir / "id").write_text('#!/usr/bin/env bash\ncase "$1" in -u) echo 0;; *) exit 1;; esac\n')
     for stub in bin_dir.iterdir():
         stub.chmod(0o755)
-    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "CFS_RUN_UID": "4242"}
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "CFS_RUN_UID": "4242",
+        "CFS_SHM_TABLE": str(table),
+    }
     done = subprocess.run(
         [str(TOOLS / "clean.sh"), str(run_dir)],
         env=env,
@@ -522,6 +518,7 @@ def test_relative_state_dir_override_is_refused_with_a_remedy() -> None:
 def test_send_with_a_relative_state_dir_sends_nothing(
     mock_config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.chdir(tmp_path)  # the relative directory resolves under tmp_path, never the tree
     monkeypatch.setenv("IRONBIRD_STATE_DIR", "relative/state")
     command_ep, _ = endpoints(mock_config_path)
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

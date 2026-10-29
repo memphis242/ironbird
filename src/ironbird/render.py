@@ -8,6 +8,7 @@ from typing import Any
 
 from ironbird.ccdd.model import FieldDef, MessageKind, TypeClass
 from ironbird.codec import DecodedPacket
+from ironbird.config import format_hostport
 from ironbird.events import Event
 from ironbird.ledger import format_ts
 from ironbird.sanitize import DEFAULT_MAX_LEN, clean_json, clean_terminal
@@ -138,7 +139,7 @@ def event_record(event: Event) -> dict[str, Any]:
 
 
 def _where(addr: tuple[str, int] | None) -> str:
-    return f" on udp {addr[0]}:{addr[1]}" if addr else ""
+    return f" on udp {format_hostport(*addr)}" if addr else ""
 
 
 def listen_banner(node: str, addr: tuple[str, int] | None) -> str:
@@ -147,7 +148,7 @@ def listen_banner(node: str, addr: tuple[str, int] | None) -> str:
 
 def events_banner(endpoints: list[tuple[str, tuple[str, int] | None]]) -> str:
     where = ", ".join(
-        f"{term(name, err=True)} (udp {addr[0]}:{addr[1]})" if addr else term(name, err=True)
+        f"{term(name, err=True)} (udp {format_hostport(*addr)})" if addr else term(name, err=True)
         for name, addr in endpoints
     )
     return f"listening for events from {where}"

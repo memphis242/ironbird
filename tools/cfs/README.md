@@ -47,8 +47,9 @@ Behind the agent proxy a failed clone is a proxy problem, see `/root/.ccr/README
 (keyed off the run directory's `.*keyfile`s; `run.sh` calls it before recreating the run
 directory, otherwise a key collision eventually fails the start with `Cannot shmget ...
 Invalid argument`). Run it after stopping cFS to leave nothing behind. It removes only the
-unattached segments of the user cFS ran as: the invoking user, or `CFS_RUN_UID` (default 65534)
-when invoked as root, which is who `run.sh` drops to.
+unattached segments of the uid cFS ran as: the invoking uid, or `CFS_RUN_UID` (default 65534)
+when invoked as root, which is who `run.sh` drops to. Uids are compared as numbers from
+`/proc/sysvipc/shm`, never as the (truncated) names `ipcs` prints.
 
 Automated acceptance: `IRONBIRD_CFS=1 pytest tests/cfs -n0` (`tests/cfs/test_acceptance.py`).
 

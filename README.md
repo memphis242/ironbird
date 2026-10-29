@@ -48,8 +48,11 @@ ib -c examples/mock.toml send fc MOCK_RAISE_EVENT app=DEMO event_id=7 event_type
 Output never blocks the tool while it runs: a stalled stdout (unread pipe, paused pager) drops
 lines with one coalesced `IB-OUT-001` notice instead of freezing signals and `--timeout`; the
 ledger keeps everything. When the command ends normally it then waits, with no deadline, for a
-slow reader to take the lines already queued (one `IB-OUT-003` line says so after 2 s; a signal
-abandons them), so `ib listen --count N | slow-consumer` loses nothing. Whatever was lost is
+slow reader to take the lines already queued (one `IB-OUT-003` line, also in the ledger, says so
+after 2 s; a signal abandons them), so `--timeout` bounds the run, not the output: lines may keep
+draining after it. `ib listen --count N | slow-consumer` is lossless only while the backlog fits
+the 512 KiB output queue; beyond that the overflow is dropped while stdout is not draining, and
+the command exits 4 with the counts in the `IB-OUT-002` line. Whatever was lost is
 summed up in one `IB-OUT-002` line, in the ledger, and in exit code 4. Datagrams the kernel drops because the socket buffer is full are reported as
 `IB-TX-004`; if the kernel grants a smaller receive buffer than requested, `IB-TX-005` says to
 raise `net.core.rmem_max` (`sysctl -w net.core.rmem_max=...`).

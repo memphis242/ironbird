@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import inspect
 import json
 import math
@@ -107,7 +108,10 @@ TimeoutOption = Annotated[
     typer.Option(
         "--timeout",
         callback=_check_timeout,
-        help="Stop after this many seconds (exit 3 if --count was not reached).",
+        help=(
+            "Stop after this many seconds (exit 3 if --count was not reached). Output already "
+            "queued may keep draining after the timeout (see README)."
+        ),
     ),
 ]
 
@@ -140,16 +144,23 @@ class _SignalState:
     """SIGINT/SIGTERM/SIGHUP end the command orderly, whatever it is doing.
 
     While the event loop runs, the handler cancels the main task, so ``finally`` blocks and
-    ``async with`` exits unwind normally; before and after the loop it raises
-    :class:`_Terminated`. Only the first signal acts; repeats while shutting down are ignored.
+    ``async with`` exits unwind normally; before the command and while the loop is torn down it
+    raises :class:`_Terminated`. From :meth:`detach` on (the command is over and only the
+    shutdown remains) it just records the signal, so none can escape the shutdown unannounced:
+    :func:`_finish` announces whatever was recorded and not yet :attr:`announced`. Only the
+    first signal acts; repeats while shutting down are ignored.
     """
 
     def __init__(self) -> None:
         self.signum = 0
+        self.announced = False  # the ledger and the user were told about ``signum``
+        self._raises = True
         self._task: asyncio.Task[Any] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def install(self) -> None:
+        self.signum, self.announced, self._raises = 0, False, True
+        self._task = self._loop = None
         for sig in _SIGNALS:
             with contextlib.suppress(ValueError, OSError):  # not the main thread
                 signal.signal(sig, self._handle)
@@ -158,6 +169,7 @@ class _SignalState:
         self._task, self._loop = task, loop
 
     def detach(self) -> None:
+        self._raises = False
         self._task = self._loop = None
 
     def _handle(self, signum: int, _frame: object) -> None:
@@ -167,7 +179,7 @@ class _SignalState:
         task, loop = self._task, self._loop
         if task is not None and loop is not None and not task.done():
             loop.call_soon_threadsafe(task.cancel)
-        else:
+        elif self._raises:
             raise _Terminated(signum)
 
 
@@ -295,8 +307,8 @@ def _check_descriptors() -> None:
         limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
         raise IronbirdError(
             Code.SYS_RESOURCE,
-            f"too few file descriptors left to run (limit {limit}, need {MIN_FREE_FDS} free); "
-            "raise the limit with 'ulimit -n' or close other files",
+            f"too few file descriptors free to run (limit {limit}, {len(held)} free, need "
+            f"{MIN_FREE_FDS}); raise the limit with 'ulimit -n' or close other files",
             cause=exc,
         ) from exc
     finally:
@@ -304,8 +316,15 @@ def _check_descriptors() -> None:
             os.close(fd)
 
 
-def _record_signal(name: str, signum: int, run: _Run, ledger: Ledger, console: Console) -> int:
-    """Ledger and announce a signal that ended the command; returns the exit code 128+n."""
+def _record_signal(
+    name: str, signum: int, run: _Run, ledger: Ledger, console: Console, *, direct: bool = False
+) -> int:
+    """Ledger and announce a signal that ended the command; returns the exit code 128+n.
+
+    ``direct`` writes the notice to the process's stderr instead of the console, for when the
+    console's stderr writer is already closed.
+    """
+    _STATE.announced = True
     notice = _interrupt_notice(name, signum, run)
     tx = run.session.last_tx if run.session is not None else None
     ledger.record(
@@ -318,7 +337,10 @@ def _record_signal(name: str, signum: int, run: _Run, ledger: Ledger, console: C
         tx_command=tx.command if tx else None,
         tx_went_out=tx.went_out if tx else None,
     )
-    console.err(notice)
+    if not direct:
+        console.err(notice)
+    elif not console.stderr.lost and not console.stderr.reader_gone:
+        _stderr_line(notice)  # only when stderr is known to be flowing: signals are held here
     return 128 + int(signum)
 
 
@@ -379,15 +401,15 @@ def _stdout_loss(console: Console, name: str, run: _Run) -> IronbirdError | None
     return IronbirdError(Code.OUT_LOST, summary)
 
 
-def _finish(
-    name: str, run: _Run, ledger: Ledger, console: Console, code: int, *, late_signal: int = 0
-) -> int:
+def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -> int:
     """Write out everything still queued, close the ledger and return the exit code.
 
     A normal end waits for the reader of stdout with no deadline, so a slow reader loses
     nothing; a signal (taken with ``sigtimedwait`` while the signals are held, so it can never
     run a handler mid-flush) cuts the wait short and the rest is abandoned and counted. After a
-    signal already ended the run, the drain is bounded by :data:`CLOSE_WAIT_S`. Anything lost
+    signal already ended the run, the drain is bounded by :data:`CLOSE_WAIT_S`. A signal that
+    was recorded but not yet announced (it arrived after the loop ended) is announced here.
+    Anything lost
     on stdout is reported once, ledgered with its counts, and turns an exit code of 0 into
     :data:`EXIT_OUTPUT_LOST`.
     """
@@ -395,18 +417,19 @@ def _finish(
     with signals_held():
         ledger.flush()
         signum = _STATE.signum
-        fresh = late_signal  # a signal that still has to be ledgered
-        if late_signal and not signum:
-            signum = _STATE.signum = late_signal
+        fresh = 0 if _STATE.announced else signum  # a signal that still has to be ledgered
 
         def waiting() -> None:
-            console.err(
-                IronbirdError(
-                    Code.OUT_WAITING,
-                    f"stdout is not being read: {out.queued_lines} line(s) still queued; "
-                    "waiting for the reader (send a signal to abandon them)",
-                ).user_line()
+            queued = out.queued_lines
+            notice = IronbirdError(
+                Code.OUT_WAITING,
+                f"stdout is not being read: {queued} line(s) still queued; "
+                "waiting for the reader (send a signal to abandon them)",
             )
+            # Ledgered and on disk first: the wait has no deadline and may end in SIGKILL.
+            ledger.record_error(notice, stdout_queued=queued)
+            ledger.flush()
+            console.err(notice.user_line())
 
         if not signum and (got := _drain(out, waiting)):
             signum = fresh = _STATE.signum = got
@@ -444,7 +467,7 @@ def _finish(
             )
         ledger.close()
         if not signum and (got := _poll_signal(0)):  # arrived while the ledger was closing
-            code = _record_signal(name, got, run, ledger, console)
+            code = _record_signal(name, got, run, ledger, console, direct=True)
             ledger.close()
     return code
 
@@ -522,11 +545,8 @@ def _run(
             if main_coro is not None:
                 main_coro.close()  # no "never awaited" warning when the loop never started
     finally:
-        _STATE.detach()
-        try:
-            code = _finish(name, run, ledger, console, code)
-        except _Terminated as stop:  # a signal in the instant before the signals were held
-            code = _finish(name, run, ledger, console, code, late_signal=stop.signum)
+        _STATE.detach()  # from here a signal is only recorded; _finish announces it
+        code = _finish(name, run, ledger, console, code)
     raise typer.Exit(code)
 
 
@@ -893,6 +913,29 @@ def _stderr_line(text: str) -> None:
         print(term(text, 1000, err=True), file=sys.stderr, flush=True)
 
 
+def _fill_standard_descriptors() -> None:
+    """Point any closed descriptor 0-2 at ``/dev/null``.
+
+    Otherwise the next file the process opens (the ledger, a socket) would take descriptor 1 or
+    2 and receive whatever a library later writes to "standard output".
+    """
+    for fd in range(3):  # ascending: ``open`` returns the lowest free descriptor
+        try:
+            os.fstat(fd)
+            continue
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                continue
+        try:
+            opened = os.open(os.devnull, os.O_RDWR)
+        except OSError:
+            return  # no descriptors left; _check_descriptors reports it
+        if opened != fd:
+            with contextlib.suppress(OSError):
+                os.dup2(opened, fd)
+            os.close(opened)
+
+
 def main() -> int:
     """Console-script entry. Usage errors become coded one-liners (exit 2).
 
@@ -901,6 +944,7 @@ def main() -> int:
     moved between releases, so exceptions are recognised by shape (``format_message``) rather
     than by importing click classes.
     """
+    _fill_standard_descriptors()
     for stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(AttributeError, OSError, ValueError):
             stream.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]

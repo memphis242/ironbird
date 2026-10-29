@@ -26,13 +26,18 @@ MAX_PORT_DIGITS: Final = 5
 SUPPORTED_TRANSPORTS: Final = ("udp",)
 
 
+def format_hostport(host: str, port: int) -> str:
+    """``host:port``, with an IPv6 literal in brackets (``[::1]:5000``)."""
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
 @dataclass(frozen=True, slots=True)
 class Endpoint:
     host: str
     port: int
 
     def __str__(self) -> str:
-        return f"{self.host}:{self.port}"
+        return format_hostport(self.host, self.port)
 
 
 @dataclass(frozen=True, slots=True)

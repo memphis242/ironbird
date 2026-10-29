@@ -880,25 +880,32 @@ def test_run_sh_refuses_a_second_instance_and_leaves_the_first_alone(tmp_path: P
         subprocess.run([str(TOOLS / "clean.sh"), str(build / "run" / "cpu1")], check=False)
 
 
-def fake_ipc(tmp_path: Path, rows: str, user: str) -> dict[str, str]:
-    """PATH with stub ``ipcs``/``ipcrm``/``id``: ``ipcs -m`` prints ``rows``, ``ipcrm`` logs its
-    args and ``id`` says the invoking user is the unprivileged ``user``."""
+def shm_row(key: int, shmid: int, nattch: int, uid: int) -> str:
+    """One row of /proc/sysvipc/shm (decimal key)."""
+    cols = [key, shmid, 600, 4096, 1, 1, nattch, uid, uid, uid, uid, 0, 0, 0, 0, 0]
+    return " ".join(str(c) for c in cols)
+
+
+def fake_ipc(tmp_path: Path, rows: list[str], uid: int) -> dict[str, str]:
+    """Environment with a fixture shared-memory table of ``rows``, a stub ``ipcrm`` that logs its
+    args, and an ``id`` that says the invoking user is the unprivileged ``uid``."""
     bin_dir = tmp_path / "stubs"
     bin_dir.mkdir()
     log = tmp_path / "ipcrm.log"
-    (bin_dir / "ipcs").write_text(
-        "#!/usr/bin/env bash\n"
-        "echo; echo '------ Shared Memory Segments --------'\n"
-        "echo 'key        shmid      owner      perms      bytes      nattch     status'\n"
-        f"cat <<'EOF'\n{rows}\nEOF\n"
-    )
+    table = tmp_path / "shm"
+    header = "key shmid perms size cpid lpid nattch uid gid cuid cgid atime dtime ctime rss swap"
+    table.write_text("\n".join([header, *rows]) + "\n")
     (bin_dir / "ipcrm").write_text(f'#!/usr/bin/env bash\necho "$@" >> {log}\n')
     (bin_dir / "id").write_text(
-        f'#!/usr/bin/env bash\ncase "$1" in -u) echo 1000;; -un) echo {user};; *) exit 1;; esac\n'
+        f'#!/usr/bin/env bash\ncase "$1" in -u) echo {uid};; -un) echo tester;; *) exit 1;; esac\n'
     )
     for stub in bin_dir.iterdir():
         stub.chmod(0o755)
-    return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "IPCRM_LOG": str(log)}
+    return {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "CFS_SHM_TABLE": str(table),
+    }
 
 
 def test_clean_sh_removes_only_own_unattached_segments_of_its_run_dir(tmp_path: Path) -> None:
@@ -908,15 +915,13 @@ def test_clean_sh_removes_only_own_unattached_segments_of_its_run_dir(tmp_path: 
     keyfile.write_text("")
     st = keyfile.stat()
     key = (0x52 << 24) | ((st.st_dev & 0xFF) << 16) | (st.st_ino & 0xFFFF)
-    me = "tester"
-    rows = "\n".join(
-        [
-            f"0x{key:08x} 101        {me}  600        4096       0",  # ours: removed
-            f"0x{key:08x} 102        nobody-else  600        4096       0",  # other owner
-            f"0x{key:08x} 103        {me}  600        4096       2",  # still attached
-            f"0x{key ^ 1:08x} 104        {me}  600        4096       0",  # another key
-        ]
-    )
+    me = 1000
+    rows = [
+        shm_row(key, 101, 0, me),  # ours: removed
+        shm_row(key, 102, 0, me + 1),  # other owner
+        shm_row(key, 103, 2, me),  # still attached
+        shm_row(key ^ 1, 104, 0, me),  # another key
+    ]
     env = fake_ipc(tmp_path, rows, me)
     done = subprocess.run(
         [str(TOOLS / "clean.sh"), str(run_dir)],

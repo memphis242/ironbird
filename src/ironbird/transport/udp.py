@@ -28,7 +28,7 @@ import time
 from collections.abc import AsyncIterator, Collection, Iterable
 from typing import Any, Final
 
-from ironbird.config import Endpoint
+from ironbird.config import Endpoint, format_hostport
 from ironbird.errors import Code, IronbirdError
 from ironbird.transport import Datagram
 
@@ -228,7 +228,7 @@ class UdpTransport:
                     counter = struct.unpack_from("=I", data)[0]
                     self._ovfl_total += (counter - self._ovfl_last) & _U32
                     self._ovfl_last = counter
-            source = f"{addr[0]}:{addr[1]}" if addr else "?"
+            source = format_hostport(addr[0], addr[1]) if addr else "?"
             try:
                 queue.put_nowait(Datagram(bytes(self._view[:size]), stamp, source))
             except asyncio.QueueFull:
@@ -270,31 +270,36 @@ class UdpTransport:
             infos = await loop.getaddrinfo(endpoint.host, endpoint.port, type=socket.SOCK_DGRAM)
         except (OSError, UnicodeError) as exc:
             raise self._open_error("resolve host of", endpoint, exc) from exc
-        last: OSError = OSError("no usable address")
-        step = "open a socket for"
+        # A socket() failure (this family is unsupported here) says less than a bind/connect
+        # failure on an address that exists, so the latter is the error to report.
+        socket_failure: OSError | None = None
+        attach_failure: tuple[str, OSError] | None = None
         sock: socket.socket | None = None
         for family, kind, proto, _canon, address in infos:
             try:
                 candidate = socket.socket(family, kind, proto)
             except OSError as exc:  # e.g. EAFNOSUPPORT for IPv6 on a host without it, EMFILE
-                last, step = exc, "open a socket for"
+                socket_failure = socket_failure or exc
                 continue
+            step = "bind" if self._local is not None else "connect to"
             try:
                 candidate.setblocking(False)
                 if self._local is not None:
                     self._tune_listener(candidate)
-                    step = "bind"
                     candidate.bind(address)
                 else:
-                    step = "connect to"
                     candidate.connect(address)
             except OSError as exc:
                 candidate.close()
-                last = exc
+                attach_failure = attach_failure or (step, exc)
                 continue
             sock = candidate
             break
         if sock is None:
+            if attach_failure is not None:
+                step, last = attach_failure
+            else:
+                step, last = "open a socket for", socket_failure or OSError("no usable address")
             raise self._open_error(step, endpoint, last) from last
         try:
             self._inode = os.fstat(sock.fileno()).st_ino

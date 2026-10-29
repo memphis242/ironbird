@@ -1,6 +1,0 @@
-{"ts":"2026-10-29T14:38:13.700923Z","session":"ad13e8080122","n":1,"kind":"action","event":"cli.invoke","command":"send","argv":[]}
-{"ts":"2026-10-29T14:38:13.701914Z","session":"ad13e8080122","n":2,"kind":"action","event":"session.start","role":"ground","config":"/tmp/pytest-of-root/pytest-112/popen-gw2/test_send_with_a_relative_stat0/mock.toml","pid":13694,"ledger":"/home/user/worktree/ironbird/stage-1/relative/state/20261029T143813Z-ad13e8080122.jsonl"}
-{"ts":"2026-10-29T14:38:13.703391Z","session":"ad13e8080122","n":3,"kind":"state","event":"codec.loaded","node":"fc","ccdd":"/home/user/worktree/ironbird/stage-1/examples/ccdd/mock.json","messages":7}
-{"ts":"2026-10-29T14:38:13.703411Z","session":"ad13e8080122","n":4,"kind":"action","event":"send.request","node":"fc","command":"MOCK_NOOP","args":{},"tamper":{},"link":"ground-fc"}
-{"ts":"2026-10-29T14:38:13.758647Z","session":"ad13e8080122","n":5,"kind":"command","event":"tx.command","node":"fc","command":"MOCK_NOOP","mid":6288,"function_code":0,"sequence":0,"size":8,"endpoint":"127.0.0.1:60774","result":"sent","sent":true,"raw":"18 90 c0 00 00 01 00 b6"}
-{"ts":"2026-10-29T14:38:13.758823Z","session":"ad13e8080122","n":6,"kind":"action","event":"session.end","role":"ground"}
