@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import stat
@@ -206,3 +207,74 @@ def test_find_output_sanitizes_ccdd_descriptions(tmp_path: Path) -> None:
     result = CliRunner().invoke(app, ["-c", str(config_path), "find", "evil"])
     assert result.exit_code == 0, result.output
     assert "\x1b" not in result.output and "\x07" not in result.output
+
+
+# -- ledger robustness (formatting never raises, bounded error flush, raw evidence) ---------
+
+
+def _strict_loads(line: str) -> dict[str, object]:
+    def refuse(token: str) -> object:
+        raise AssertionError(f"non-standard JSON constant {token}")
+
+    return json.loads(line, parse_constant=refuse)
+
+
+def test_ledger_survives_unformattable_fields_and_keeps_neighbours(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path, session_id="s")
+    cycle: list[object] = []
+    cycle.append(cycle)
+    ledger.record("state", "before")
+    ledger.record("state", "tuple-keys", table={(1, 2): "x", None: 1})
+    ledger.record("state", "cycle", loop=cycle)
+    ledger.record("state", "nan", values=[float("nan"), float("inf"), -float("inf"), 1.5])
+    ledger.record("state", "after")
+    ledger.flush()
+    records = [_strict_loads(line) for line in ledger.path.read_text().splitlines()]
+    assert [r["event"] for r in records] == ["before", "tuple-keys", "cycle", "nan", "after"]
+    assert records[3]["values"] == ["nan", "inf", "-inf", 1.5]
+
+
+def test_ledger_unformattable_record_falls_back_to_repr(tmp_path: Path) -> None:
+    class Hostile:
+        def __repr__(self) -> str:
+            raise RuntimeError("no repr for you")
+
+    ledger = Ledger(tmp_path, session_id="s")
+    ledger.record("state", "hostile", thing=Hostile())
+    ledger.record("state", "after")
+    ledger.flush()
+    records = [_strict_loads(line) for line in ledger.path.read_text().splitlines()]
+    assert [r["event"] for r in records] == ["hostile", "after"]
+
+
+def test_record_error_flushes_in_bounded_slices_and_drain_task_finishes(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path, session_id="s")
+    for i in range(5000):
+        ledger.record("packet", "rx", i=i)
+    ledger.record_error(IronbirdError(Code.DEC_CHECKSUM, "bad"))
+    assert 0 < ledger.pending < 5001  # one bounded slice written, the rest left to the loop
+
+    async def finish() -> None:
+        task = asyncio.get_running_loop().create_task(ledger.drain_task())
+        for _ in range(500):
+            if not ledger.pending:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(finish())
+    assert ledger.pending == 0
+    lines = ledger.path.read_text().splitlines()
+    assert len(lines) == 5001 and json.loads(lines[-1])["event"] == "IB-DEC-005"
+
+
+def test_ledger_raw_evidence_is_kept_up_to_the_max_packet_size(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path, session_id="s", max_raw_bytes=2048)
+    ledger.record("packet", "rx", raw=bytes(range(256)) * 8)
+    ledger.record("packet", "rx", raw=bytes(2049))
+    ledger.flush()
+    first, second = (json.loads(x) for x in ledger.path.read_text().splitlines())
+    assert len(bytes.fromhex(first["raw"])) == 2048
+    assert "...(+1B)" in second["raw"]

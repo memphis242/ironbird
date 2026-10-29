@@ -205,6 +205,8 @@ class Codec:
             raise IronbirdError(
                 Code.ENC_FIT, f"{telemetry_profile.source}: not a telemetry header profile"
             )
+        for profile in (command_profile, telemetry_profile):
+            self._validate_profile(profile)
         assert max_packet_bytes > 0
         self.model: CcddModel = model
         self.max_packet_bytes: int = max_packet_bytes
@@ -220,6 +222,23 @@ class Codec:
             self._validate_fit(msg)
             layouts[msg.name] = _compile_layout(msg)
         self._layouts: Mapping[str, _Layout] = layouts
+
+    @staticmethod
+    def _validate_profile(profile: HeaderProfile) -> None:
+        """Reject, at load time, profiles the codec cannot drive or decode."""
+        if not profile.mid_fields:
+            raise IronbirdError(
+                Code.HDR_SCHEMA,
+                f"{profile.source}: profile {profile.name} defines no mid_fields; "
+                "a codec needs them to route packets",
+            )
+        for f in profile.input_fields:
+            if f.value is None and f.name != profile.function_code_field:
+                raise IronbirdError(
+                    Code.HDR_SCHEMA,
+                    f"{profile.source}: input field {f.name} has no default and nothing "
+                    "supplies it; add 'default = N'",
+                )
 
     def profile(self, kind: MessageKind) -> HeaderProfile:
         return self._profiles[kind]
@@ -397,7 +416,9 @@ class Codec:
         try:
             if layout.identity:
                 values: tuple[object, ...] = (
-                    layout.segments[0].struct.unpack_from(data, base) if layout.segments else ()
+                    layout.segments[0].struct.unpack_from(data, base + layout.segments[0].start)
+                    if layout.segments
+                    else ()
                 )
             else:
                 out: list[object] = [None] * len(msg.fields)

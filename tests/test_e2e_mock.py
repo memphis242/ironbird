@@ -300,3 +300,54 @@ def test_cli_processes_end_to_end(mock_config_path: Path, tmp_path: Path) -> Non
     assert records[1]["fields"]["mode"] == 1 and records[1]["labels"]["mode"] == "SAFE"
     assert respond_out.count("rx MOCK_") == 2
     assert listen.returncode == 0 and respond.returncode == 0
+
+
+def test_wildcard_rule_with_echo_reports_rsp_rule_and_responder_survives(
+    mock_config_path: Path, tmp_path: Path
+) -> None:
+    """Config validation rejects this; the runtime guard covers a rule that slips past it."""
+    import dataclasses
+
+    config = load_config(mock_config_path)
+
+    async def scenario(ground: Session, fc: Session, _gn: list[str], fc_notes: list[str]) -> None:
+        responder = await fc.respond()
+        rules = dict(responder._rules)
+        rules["*"] = dataclasses.replace(rules["*"], echo={"mode": "mode"})
+        responder._rules = rules
+        handled = aiter(responder)
+        try:
+            await ground.send_command("fc", "MOCK_NOOP")
+            event: Handled = await _next(handled)
+            assert event.command is not None and event.reply is None
+            await ground.send_command("fc", "MOCK_NOOP")  # the responder is still alive
+            event = await _next(handled)
+            assert event.command is not None
+        finally:
+            await responder.close()
+        assert any(Code.RSP_RULE.value in note for note in fc_notes)
+
+    _, fc_ledger = _run(config, tmp_path, scenario)
+    assert any(e.get("event") == Code.RSP_RULE.value for e in _events(fc_ledger))
+
+
+def test_session_exit_flushes_and_reports_when_a_background_task_died(
+    mock_config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(mock_config_path)
+    ledger = _ledger(tmp_path, "ground")
+    notes: list[str] = []
+
+    async def broken_drain(self: Ledger) -> None:
+        raise RuntimeError("drain exploded")
+
+    monkeypatch.setattr(Ledger, "drain_task", broken_drain)
+
+    async def main() -> None:
+        async with Session(config, role="ground", ledger=ledger, notify=notes.append) as ground:
+            ground.ledger.record("action", "marker")
+            await asyncio.sleep(0.1)
+
+    asyncio.run(main())  # must not raise
+    assert any(Code.INTERNAL.value in n for n in notes)
+    assert any(e["event"] == "marker" for e in _events(ledger))

@@ -324,3 +324,15 @@ def test_config_parser_on_mutated_valid_configs(doc: Any) -> None:
         parse_config(doc, Path("fuzz.toml"))
     except IronbirdError as err:
         assert err.code.value.startswith("IB-CFG-")
+
+
+@pytest.mark.parametrize("path", _corpus("codec-hdr-*.toml"), ids=lambda p: p.stem)
+def test_corpus_profiles_the_codec_cannot_drive_are_rejected_at_load(path: Path) -> None:
+    from ironbird.ccdd.model import CcddModel
+
+    profile = header.load_profile(path)  # parses on its own
+    empty = CcddModel.build("T", "t", ())
+    with pytest.raises(IronbirdError) as info:
+        Codec(empty, CMD_PROFILE, profile)
+    assert info.value.code is Code.HDR_SCHEMA
+    assert "\n" not in info.value.user_line()

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import traceback
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -106,6 +107,7 @@ class Session:
         self.config: SystemConfig = config
         self.node: Node = config.resolve(role) if role else config.nodes[config.acts_as]
         self.ledger: Ledger = ledger
+        ledger.set_max_raw_bytes(config.max_packet_bytes)
         self.coalescer: Coalescer = Coalescer(notify)
         self._codecs: dict[str, Codec] = {}
         self._tasks: list[asyncio.Task[None]] = []
@@ -120,6 +122,8 @@ class Session:
             loop.create_task(self.ledger.drain_task(), name="ledger-drain"),
             loop.create_task(self._ticker(), name="coalescer-tick"),
         ]
+        for task in self._tasks:
+            task.add_done_callback(self._background_done)
         self.ledger.record(
             "action",
             "session.start",
@@ -132,13 +136,34 @@ class Session:
 
     async def __aexit__(self, *exc_info: object) -> None:
         self.ledger.record("action", "session.end", role=self.node.name)
-        for task in self._tasks:
-            task.cancel()
-        for task in self._tasks:
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        self.coalescer.flush()
-        self.ledger.flush()
+        try:
+            for task in self._tasks:
+                task.cancel()
+            for task in self._tasks:
+                # A task that died is already reported by its done-callback.
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+        finally:
+            try:
+                self.coalescer.flush()
+            finally:
+                self.ledger.flush()
+
+    def _background_done(self, task: asyncio.Task[None]) -> None:
+        """Report a background task that died instead of being cancelled."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        self.report(
+            IronbirdError(
+                Code.INTERNAL,
+                f"background task {task.get_name()} stopped: {type(exc).__name__}: {exc}",
+                details="".join(traceback.format_exception(exc)),
+                cause=exc,
+            )
+        )
 
     async def _ticker(self) -> None:
         while True:
@@ -717,6 +742,8 @@ def _validate_rules(node: Node, codec: Codec, config: SystemConfig) -> Mapping[s
                 raise IronbirdError(
                     Code.CFG_REF, f"{where}: reply {reply.name} has no field {name!r}"
                 )
+        if command is None and rule.echo:
+            raise IronbirdError(Code.CFG_SCHEMA, f"{where}.echo: not allowed on a '*' rule")
         if command is not None:
             for arg in rule.echo.values():
                 if command.field(arg) is None:
@@ -791,6 +818,15 @@ class Responder:
         values: dict[str, Any] = dict(rule.fields)
         args = command.as_dict()
         for reply_field, arg in rule.echo.items():
+            if arg not in args:
+                session.report(
+                    IronbirdError(
+                        Code.RSP_RULE,
+                        f"rule {rule.on!r}: command {command.message.name} has no argument "
+                        f"{arg!r} to echo into {reply_field}; no reply sent",
+                    )
+                )
+                return None
             values[reply_field] = args[arg]
         reply = self._codec.model.by_name[rule.reply]
         for counter, count in (

@@ -327,6 +327,23 @@ acceptance gate for each stage is a real cFS instance.
 
 2. Recording + replay with filters (CLI), serial transport, variable-length payloads,
    CSV/text export.
+
+   Carried over from Stage 1 review:
+   - Engine yields raw frozen `Frame(seq, time_ns, direction, node, link, source, mid, data)`;
+     decode happens in the consumer, and malformed frames are yielded too (recorded raw).
+   - Transport factory keyed on `link.transport`, and a `Transport.send` signature that
+     includes `confirm`.
+   - Structured `Notice(code, key, summary, count, window_s, ledger_n)` replaces the `str`
+     notify callback.
+   - Byte-bounded memory: enforce `max_packet_bytes` at the transport edge, truncate raw
+     data at record creation, bound the UDP queue by bytes.
+   - Surface UDP `error_received` as a coalesced `TX_RECV`; ledger the effective
+     `SO_RCVBUF` and warn when it is below the target.
+   - Header profiles: per-field endianness, trailer and partial-span checksums,
+     non-contiguous MID fields (msgid_v2), per-message and per-send header values,
+     configurable time epoch, `frame_length()` for serial streams.
+   - Immutable shared data: `MappingProxyType` for `Header.values`, registries and stats
+     snapshots.
 3. TUI: latest-per-packet view and time-scrolling view (sorted and emphasised by telemetry
    category priority, with category filter presets), a dedicated **Events** page showing
    only events from all nodes (node, time, app, event id, type/severity, message), hold /

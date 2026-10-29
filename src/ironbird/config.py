@@ -196,6 +196,10 @@ def _parse_response(ctx: _Ctx, raw: object, path: str) -> ResponseRule:
         if not isinstance(value, str):
             raise ctx.fail(f"{path}.echo.{key}", "must be a command argument name")
         echo[key] = value
+    if on == "*" and echo:
+        raise ctx.fail(
+            f"{path}.echo", "not allowed on a '*' rule; commands differ in arguments, name one"
+        )
     counters: dict[str, str | None] = {}
     for key in ("accepted_counter", "rejected_counter"):
         counters[key] = ctx.ident(raw[key], f"{path}.{key}") if key in raw else None

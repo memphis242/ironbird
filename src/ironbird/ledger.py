@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import time
 import uuid
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from ironbird.errors import Code, IronbirdError
+from ironbird.header import DEFAULT_MAX_PACKET_BYTES
 
 FORCE_AGE_S: Final = 1.0
 FORCE_COUNT: Final = 10_000
@@ -28,7 +30,8 @@ POLL_S: Final = 0.01
 SLICE: Final = 256
 MAX_QUEUE: Final = 200_000
 ERROR_FLUSH_MIN_INTERVAL_S: Final = 0.25
-MAX_RAW_HEX_BYTES: Final = 256
+MAX_DEPTH: Final = 16
+MAX_FALLBACK_REPR: Final = 2000
 
 _RESERVED: Final = frozenset({"ts", "session", "n", "kind", "event"})
 _KINDS: Final = frozenset({"action", "command", "state", "packet", "event", "error"})
@@ -53,20 +56,51 @@ def format_ts(time_ns: int) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) + f".{ns // 1000:06d}Z"
 
 
-def _json_default(value: object) -> object:
-    if isinstance(value, bytes | bytearray | memoryview):
-        raw = bytes(value)
-        text = raw[:MAX_RAW_HEX_BYTES].hex(" ")
-        return (
-            text
-            if len(raw) <= MAX_RAW_HEX_BYTES
-            else f"{text} ...(+{len(raw) - MAX_RAW_HEX_BYTES}B)"
-        )
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, BaseException):
-        return f"{type(value).__name__}: {value}"
-    return repr(value)
+def _make_default(max_raw_bytes: int) -> Callable[[object], object]:
+    """JSON fallback for non-JSON values; raw bytes are kept up to ``max_raw_bytes``."""
+
+    def default(value: object) -> object:
+        if isinstance(value, bytes | bytearray | memoryview):
+            raw = bytes(value)
+            text = raw[:max_raw_bytes].hex(" ")
+            return (
+                text if len(raw) <= max_raw_bytes else f"{text} ...(+{len(raw) - max_raw_bytes}B)"
+            )
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, BaseException):
+            return f"{type(value).__name__}: {value}"
+        return _safe_repr(value)
+
+    return default
+
+
+def _safe_repr(value: object) -> str:
+    try:
+        return repr(value)[:MAX_FALLBACK_REPR]
+    except Exception:
+        return f"<unrepresentable {type(value).__name__}>"
+
+
+def _plain(value: object, seen: frozenset[int], depth: int) -> object:
+    """Copy ``value`` into JSON-safe form: string keys, finite floats, no cycles."""
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        return "nan" if math.isnan(value) else ("inf" if value > 0 else "-inf")
+    if isinstance(value, Mapping | list | tuple | set | frozenset):
+        if id(value) in seen:
+            return "<cycle>"
+        if depth >= MAX_DEPTH:
+            return _safe_repr(value)
+        inner = seen | {id(value)}
+        if isinstance(value, Mapping):
+            return {
+                (k if isinstance(k, str) else _safe_repr(k)): _plain(v, inner, depth + 1)
+                for k, v in value.items()
+            }
+        return [_plain(v, inner, depth + 1) for v in value]
+    return value
 
 
 class Ledger:
@@ -79,11 +113,15 @@ class Ledger:
         session_id: str | None = None,
         on_failure: Callable[[IronbirdError], None] | None = None,
         enabled: bool = True,
+        max_raw_bytes: int = DEFAULT_MAX_PACKET_BYTES,
     ) -> None:
+        assert max_raw_bytes > 0
         self.directory: Path = directory
         self.session_id: str = session_id or uuid.uuid4().hex[:12]
         self._on_failure = on_failure
         self._enabled = enabled
+        self._default = _make_default(max_raw_bytes)
+        self._urgent = False
         self._queue: deque[_Entry] = deque(maxlen=MAX_QUEUE)
         self._seq = 0
         self._dropped = 0
@@ -113,6 +151,11 @@ class Ledger:
     def dropped(self) -> int:
         return self._dropped
 
+    def set_max_raw_bytes(self, max_raw_bytes: int) -> None:
+        """Keep raw packet evidence up to this many bytes per field (the packet size cap)."""
+        assert max_raw_bytes > 0
+        self._default = _make_default(max_raw_bytes)
+
     def mark_busy(self) -> None:
         """Called by hot paths; the drain task waits for ``IDLE_S`` of quiet after this."""
         self._last_busy = time.monotonic()
@@ -141,11 +184,16 @@ class Ledger:
             **fields,
         )
         if time.monotonic() - self._last_flush >= ERROR_FLUSH_MIN_INTERVAL_S:
-            self.flush()
+            # One bounded slice here; the drain task finishes the rest without waiting for idle,
+            # so a flood of errors never blocks the loop (and its socket reads) for long.
+            self._drain(SLICE)
+            self._last_flush = time.monotonic()
+            self._urgent = bool(self._queue)
 
     # -- writer side ---------------------------------------------------------------------
 
     def _format(self, entry: _Entry) -> str:
+        """One JSON line for ``entry``. Never raises: bad fields degrade to a repr fallback."""
         time_ns, seq, kind, event, fields = entry
         record: dict[str, Any] = {
             "ts": format_ts(time_ns),
@@ -157,7 +205,20 @@ class Ledger:
         record.update(fields)
         # ensure_ascii escapes control and non-ASCII characters, so the file is inert
         # when viewed in a terminal.
-        return json.dumps(record, default=_json_default, separators=(",", ":"))
+        try:
+            return json.dumps(record, default=self._default, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError, RecursionError):
+            pass
+        try:
+            record.update({k: _plain(v, frozenset(), 0) for k, v in fields.items()})
+            return json.dumps(record, default=self._default, separators=(",", ":"), allow_nan=False)
+        except Exception:
+            envelope = {
+                k: v for k, v in record.items() if k in ("ts", "session", "n", "kind", "event")
+            }
+            envelope["format_error"] = "fields could not be serialized"
+            envelope["fields_repr"] = _safe_repr(dict(fields))
+            return json.dumps(envelope, default=repr, separators=(",", ":"), allow_nan=False)
 
     def _fail(self, exc: OSError) -> None:
         self._failed = True
@@ -225,9 +286,14 @@ class Ledger:
         while True:
             await asyncio.sleep(POLL_S)
             if not self._queue:
+                self._urgent = False
                 continue
             now = time.monotonic()
-            forced = len(self._queue) >= FORCE_COUNT or now - self._oldest_mono >= FORCE_AGE_S
+            forced = (
+                self._urgent
+                or len(self._queue) >= FORCE_COUNT
+                or now - self._oldest_mono >= FORCE_AGE_S
+            )
             if not forced and now - self._last_busy < IDLE_S:
                 continue
             self._drain(SLICE)

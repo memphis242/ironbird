@@ -294,6 +294,8 @@ def parse_profile(data: Mapping[str, Any], source: str = "<memory>") -> HeaderPr
             if not isinstance(raw["check"], bool):
                 raise ctx.fail(f"{path}.check", "must be true or false")
             check = raw["check"]
+            if not check and fkind is not FieldKind.FIXED:
+                raise ctx.fail(f"{path}.check", "only valid on fixed fields (value = N)")
         fields.append(
             HeaderField(
                 name=raw["name"],

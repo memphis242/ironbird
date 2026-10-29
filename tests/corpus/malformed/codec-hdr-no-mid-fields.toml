@@ -1,0 +1,7 @@
+# Loads as a profile, but a codec cannot route packets without mid_fields.
+name = "p"
+kind = "telemetry"
+[[fields]]
+name = "a"
+bits = 16
+value = 1
