@@ -63,7 +63,7 @@ def test_drain_notice_is_ledgered_so_a_kill_during_the_wait_leaves_a_trace(
     finally:
         kill_quietly(proc)
     (waiting,) = events_named(state_dir, Code.OUT_WAITING.value)
-    assert waiting["kind"] == "error" and "queued" in waiting["summary"]
+    assert waiting["kind"] == "warning" and "queued" in waiting["summary"]
 
 
 # -- 3, 4: a signal in the gaps still ends the command by signal, announced ----------
@@ -161,7 +161,9 @@ def ftok_key(path: Path) -> int:
     return (0x52 << 24) | ((st.st_dev & 0xFF) << 16) | (st.st_ino & 0xFFFF)
 
 
-def run_clean(tmp_path: Path, table: Path, run_dir: Path, **extra: str) -> list[str]:
+def run_clean(
+    tmp_path: Path, table: Path, run_dir: Path, errors: list[str] | None = None, **extra: str
+) -> list[str]:
     bin_dir = tmp_path / "stubs"
     bin_dir.mkdir(exist_ok=True)
     log = tmp_path / "ipcrm.log"
@@ -182,6 +184,8 @@ def run_clean(tmp_path: Path, table: Path, run_dir: Path, **extra: str) -> list[
         check=False,
     )
     assert done.returncode == 0, done.stderr
+    if errors is not None:
+        errors.append(done.stderr)
     return log.read_text().split() if log.exists() else []
 
 

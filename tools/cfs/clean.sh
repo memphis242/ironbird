@@ -37,16 +37,34 @@ if [[ "$(id -u)" -eq 0 ]]; then
 else
     me="$(id -u)"
 fi
-readonly me
 if [[ ! "$me" =~ ^[0-9]+$ ]]; then
     echo "clean.sh: CFS_RUN_UID must be a number, got '$me'" >&2
     exit 2
 fi
+me="$((10#$me))"  # canonical decimal, so the string comparisons below match the table's
+readonly me
 
 readonly SHM_TABLE="${CFS_SHM_TABLE:-/proc/sysvipc/shm}"
 command -v ipcrm >/dev/null && [[ -r "$SHM_TABLE" ]] || exit 0  # nothing to clean up with
 
 segments="$(cat "$SHM_TABLE" 2>/dev/null || true)"
+
+# /proc/sysvipc/shm rows: key shmid perms size cpid lpid nattch uid gid cuid cgid ...
+# Every number there is canonical decimal. Fields are compared as strings, never with bash
+# arithmetic (a leading zero would read as octal, and "089" as an error), so a row whose
+# numeric fields are not canonical decimal is reported once and ignored. The header row (its
+# first field is the word "key") and blank lines are skipped silently. `rows` keeps
+# "key shmid nattch uid" for every good row.
+rows=""
+while read -r seg_key shmid _perms _size _cpid _lpid nattch owner _rest; do
+    [[ -z "$seg_key" || "$seg_key" == "key" ]] && continue
+    if [[ ! "$seg_key" =~ ^-?(0|[1-9][0-9]*)$ || ! "$shmid" =~ ^(0|[1-9][0-9]*)$ ||
+        ! "$nattch" =~ ^(0|[1-9][0-9]*)$ || ! "$owner" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        echo "clean.sh: ignoring malformed row in $SHM_TABLE: $seg_key $shmid ... $nattch $owner" >&2
+        continue
+    fi
+    rows+="$seg_key $shmid $nattch $owner"$'\n'
+done <<< "$segments"
 
 for name in .cdskeyfile .resetkeyfile .reservedkeyfile; do
     keyfile="$RUN_DIR/$name"
@@ -54,10 +72,8 @@ for name in .cdskeyfile .resetkeyfile .reservedkeyfile; do
     # glibc ftok(path, 'R'): 'R' << 24 | (st_dev & 0xff) << 16 | (st_ino & 0xffff)
     read -r dev ino < <(stat -c '%d %i' "$keyfile")
     key=$(( (0x52 << 24) | ((dev & 0xff) << 16) | (ino & 0xffff) ))
-    # /proc/sysvipc/shm rows: key shmid perms size cpid lpid nattch uid gid cuid cgid ...
-    # (the key is decimal; the header row and malformed rows fail the numeric test below)
-    while read -r seg_key shmid _perms _size _cpid _lpid nattch owner _rest; do
-        [[ "$seg_key" =~ ^-?[0-9]+$ && "$seg_key" -eq "$key" ]] || continue
+    while read -r seg_key shmid nattch owner; do
+        [[ "$seg_key" == "$key" ]] || continue
         if [[ "$owner" != "$me" ]]; then
             echo "clean.sh: leaving segment $shmid (key $key): owned by uid $owner, not uid $me" >&2
         elif [[ "$nattch" != "0" ]]; then
@@ -65,5 +81,5 @@ for name in .cdskeyfile .resetkeyfile .reservedkeyfile; do
         else
             ipcrm -m "$shmid" 2>/dev/null || echo "clean.sh: could not remove segment $shmid" >&2
         fi
-    done <<< "$segments"
+    done <<< "$rows"
 done

@@ -154,6 +154,7 @@ class _SignalState:
     def __init__(self) -> None:
         self.signum = 0
         self.announced = False  # the ledger and the user were told about ``signum``
+        self._installed = False  # the handlers are ours (``main`` ran, not an in-process caller)
         self._raises = True
         self._task: asyncio.Task[Any] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -164,6 +165,21 @@ class _SignalState:
         for sig in _SIGNALS:
             with contextlib.suppress(ValueError, OSError):  # not the main thread
                 signal.signal(sig, self._handle)
+                self._installed = True
+
+    def restore_default(self) -> None:
+        """Give the signals their default action back, once the shutdown is complete.
+
+        Called with the signals still blocked: one that is pending then ends the process by that
+        signal when the mask is lifted, instead of landing in a handler that has nothing left to
+        record it in. A no-op where :meth:`install` did not run.
+        """
+        if not self._installed:
+            return
+        self._installed = False
+        for sig in _SIGNALS:
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(sig, signal.SIG_DFL)
 
     def attach(self, task: asyncio.Task[Any], loop: asyncio.AbstractEventLoop) -> None:
         self._task, self._loop = task, loop
@@ -322,7 +338,10 @@ def _record_signal(
     """Ledger and announce a signal that ended the command; returns the exit code 128+n.
 
     ``direct`` writes the notice to the process's stderr instead of the console, for when the
-    console's stderr writer is already closed.
+    console's stderr writer is already closed. The record is on disk before the notice is
+    written, and the notice goes through a fresh :class:`BoundedWriter` closed after
+    :data:`CLOSE_WAIT_S`: the signals are held here, so a stderr nobody reads must not be able
+    to stall the exit.
     """
     _STATE.announced = True
     notice = _interrupt_notice(name, signum, run)
@@ -339,8 +358,13 @@ def _record_signal(
     )
     if not direct:
         console.err(notice)
-    elif not console.stderr.lost and not console.stderr.reader_gone:
-        _stderr_line(notice)  # only when stderr is known to be flowing: signals are held here
+        return 128 + int(signum)
+    ledger.flush()
+    if sys.stderr is not None:  # closed with ``2>&-``: nobody to tell
+        late = BoundedWriter(sys.stderr)
+        late.write(term(notice, 1000, err=True))
+        if not late.close(CLOSE_WAIT_S):
+            ledger.record("state", "output.stderr_lost", lost=late.lost, notice=notice)
     return 128 + int(signum)
 
 
@@ -421,15 +445,15 @@ def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -
 
         def waiting() -> None:
             queued = out.queued_lines
-            notice = IronbirdError(
-                Code.OUT_WAITING,
+            summary = (
                 f"stdout is not being read: {queued} line(s) still queued; "
-                "waiting for the reader (send a signal to abandon them)",
+                "waiting for the reader (send a signal to abandon them)"
             )
-            # Ledgered and on disk first: the wait has no deadline and may end in SIGKILL.
-            ledger.record_error(notice, stdout_queued=queued)
+            # A wait, not a failure: nothing is lost unless a signal cuts it short. Ledgered and
+            # on disk first, because the wait has no deadline and may end in SIGKILL.
+            ledger.record("warning", Code.OUT_WAITING.value, summary=summary, stdout_queued=queued)
             ledger.flush()
-            console.err(notice.user_line())
+            console.err(f"warning {Code.OUT_WAITING.value}: {summary}")
 
         if not signum and (got := _drain(out, waiting)):
             signum = fresh = _STATE.signum = got
@@ -469,6 +493,7 @@ def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -
         if not signum and (got := _poll_signal(0)):  # arrived while the ledger was closing
             code = _record_signal(name, got, run, ledger, console, direct=True)
             ledger.close()
+        _STATE.restore_default()  # a later signal ends the process by that signal, not silently
     return code
 
 

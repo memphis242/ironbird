@@ -36,7 +36,8 @@ CHUNK_BYTES: Final = 64 * 1024
 CLOSE_WAIT_S: Final = 1.0
 # One ``write`` call carries at most this many bytes. A blocking write of up to ``PIPE_BUF``
 # bytes to a pipe is atomic (all of it or none), so the bytes that reached a pipe are known
-# exactly, which is what makes the abandoned-line count exact.
+# to within the one slice that may be in flight when the output is abandoned (see
+# :meth:`BoundedWriter.abandon`).
 WRITE_SLICE: Final = getattr(select, "PIPE_BUF", 512)
 _GONE: Final = frozenset({errno.EPIPE, errno.ECONNRESET, errno.EBADF})
 HANDLED_SIGNALS: Final = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
@@ -57,6 +58,23 @@ def signals_held() -> Generator[None]:
         yield
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def slice_end(chunk: bytes, offset: int) -> int:
+    """End of the next slice of ``chunk`` from ``offset``: at most :data:`WRITE_SLICE` bytes.
+
+    A slice that does not reach the end of the chunk is cut after the last newline it holds, so
+    a line no longer than the slice limit is never split across two writes (and so never
+    interleaved with another writer's output on a shared pipe); a longer line is cut at the limit.
+    """
+    assert 0 <= offset < len(chunk)
+    end = min(offset + WRITE_SLICE, len(chunk))
+    if end < len(chunk):
+        newline = chunk.rfind(b"\n", offset, end)
+        if newline >= 0:
+            end = newline + 1
+    assert offset < end
+    return end
 
 
 class BoundedWriter:
@@ -173,7 +191,12 @@ class BoundedWriter:
     def abandon(self) -> int:
         """Give up on lines still queued or only partly written; returns how many (counted lost).
 
-        Lines that reached the descriptor are not counted. The thread writes nothing more.
+        Lines that reached the descriptor are not counted. The thread writes nothing more once it
+        sees the flag, which it checks before every write. The count is exact except for at most
+        one in-flight slice (:data:`WRITE_SLICE` bytes): a ``write`` already blocked on a full
+        pipe when this runs can still complete once the reader catches up, so those lines reach
+        the reader although they were counted as abandoned. The report can exceed the true loss
+        by that slice and never falls short of it.
         """
         with self._cond:
             count = len(self._queue) + self._unwritten_lines()
@@ -272,8 +295,12 @@ class BoundedWriter:
             offset = 0
             try:
                 while offset < len(chunk):
+                    # Checked before every write, the retries after a refusal included: once the
+                    # owner abandons the output, nothing more reaches the descriptor.
+                    if self._abandoned:
+                        return
                     try:
-                        written = os.write(fd, view[offset : offset + WRITE_SLICE])
+                        written = os.write(fd, view[offset : slice_end(chunk, offset)])
                     except BlockingIOError:
                         select.select([], [fd], [], 1.0)
                         continue

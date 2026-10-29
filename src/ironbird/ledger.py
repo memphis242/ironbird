@@ -35,7 +35,7 @@ MAX_DEPTH: Final = 16
 MAX_FALLBACK_REPR: Final = 2000
 
 _RESERVED: Final = frozenset({"ts", "session", "n", "kind", "event"})
-_KINDS: Final = frozenset({"action", "command", "state", "packet", "event", "error"})
+_KINDS: Final = frozenset({"action", "command", "state", "packet", "event", "warning", "error"})
 
 _Entry = tuple[int, int, str, str, Mapping[str, Any]]
 

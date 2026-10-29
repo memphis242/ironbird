@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import shutil
 import socket
+import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -59,6 +62,32 @@ def free_udp_ports(count: int) -> list[int]:
     finally:
         for sock in socks:
             sock.close()
+
+
+def _tree_status() -> str | None:
+    """``git status`` of the repository (untracked files listed one by one); None if unknown."""
+    git = shutil.which("git")
+    if git is None or not (REPO / ".git").exists():
+        return None
+    done = subprocess.run(
+        [git, "-C", str(REPO), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return done.stdout if done.returncode == 0 else None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _source_tree_unchanged() -> Iterator[None]:
+    """Fail the run if the tests leave anything in the source tree (a stray ledger, recording or
+    output file written to a relative path), judged by ``git status`` before and after."""
+    before = _tree_status()
+    yield
+    after = _tree_status()
+    if before is not None and after is not None and before != after:
+        changed = sorted(set(before.splitlines()) ^ set(after.splitlines()))
+        pytest.fail("the test run changed the source tree:\n" + "\n".join(changed), pytrace=False)
 
 
 @pytest.fixture(autouse=True)
