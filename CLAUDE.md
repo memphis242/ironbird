@@ -13,6 +13,16 @@ replays telemetry across multiple aliased hardware targets.
 - Packets are CCSDS space packets with project-specific header extensions; header
   layout must stay user-definable, not hard-coded.
 - The design spec is still being written in Plan mode; do not implement ahead of it.
+- Error reporting is a first-class, pervasive feature, not an afterthought:
+    - Every step that can fail (config load, CCDD parse, transport open/read/write,
+      encode/decode, recording I/O, export) has a defined path to the user and to
+      the log. No failure is silent.
+    - The user-facing message is succinct: what failed and what to do, with a
+      stable error code. Full detail (cause chain, raw bytes, context) sits one
+      step away: a details pane/modal in the TUI, `--verbose` or the log in the CLI.
+    - The log is an action ledger, not just an error log: timestamped (UTC, ISO
+      8601, sub-millisecond) records of user actions, commands sent, state changes,
+      and errors, so the exact sequence leading to a failure can be traced later.
 
 # General Guidelines
 
@@ -194,10 +204,10 @@ replays telemetry across multiple aliased hardware targets.
     - Scouting (read-only search): `scout` (Haiku).
     - Research, implementation, and testing of small-to-medium tasks:
       `researcher`, `implementer`, `tester` (Sonnet).
-    - Architecture, deep audits, high-stakes reviews: `architect` (Opus, or Fable
-      when a model override is warranted).
+    - Architecture, deep audits, high-stakes reviews: `architect` (Opus).
     - Hard debugging (concurrency, timing, transports, decode mismatches):
-      `debugger` (Opus, or Fable).
+      `debugger` (Opus by default; escalate to Fable via a model override after a
+      few unsuccessful attempts, or on user request).
     - **Never poll** a background subagent for completion:
       no `until`/`while` + `pgrep`/`sleep` loops, no repeated `cat`/`tail` of
       its output. Launch it in the background, then do other independent work

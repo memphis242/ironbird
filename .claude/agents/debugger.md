@@ -1,6 +1,6 @@
 ---
 name: debugger
-description: Hard debugging: intermittent failures, concurrency/timing issues, serial/UDP transport problems, decode mismatches, performance regressions. Use when an implementer or tester is stuck.
+description: Hard debugging (Opus by default; the root escalates to Fable after a few failed attempts or on user request): intermittent failures, concurrency/timing issues, serial/UDP transport problems, decode mismatches, performance regressions. Use when an implementer or tester is stuck.
 model: opus
 effort: high
 ---
