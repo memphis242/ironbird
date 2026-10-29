@@ -1,0 +1,7 @@
+[nodes.a]
+alias = "x"
+
+[[nodes.a.responses]]
+on = "*"
+reply = "HK"
+echo = { mode = "mode" }

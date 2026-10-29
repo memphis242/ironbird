@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ironbird"
+version = "0.1.0"
+description = "Terminal integrated/system test tool for cFS flight software vehicles"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { file = "LICENSE" }
+dependencies = [
+    "typer>=0.12,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",  # pytest-benchmark 5.x is not yet compatible with pytest 9
+    "pytest-xdist>=3.5,<4",
+    "hypothesis>=6.100,<7",
+    "pytest-benchmark>=4.0,<6",
+    "ruff>=0.5,<0.18",  # lint and format rules change between minor releases
+    "pyright>=1.1.370,<1.2",
+]
+fuzz = ["atheris>=2.3,<4"]
+# constraints-dev.txt pins the exact tool versions CI installs with (pip install -c ...).
+
+[project.scripts]
+ironbird = "ironbird.cli.main:main"
+ib = "ironbird.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ironbird = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --benchmark-disable-gc --benchmark-min-rounds=5"
+markers = [
+    "benchmark: pytest-benchmark performance test",
+    "cfs: needs a real cFS build (tools/cfs); opt-in via IRONBIRD_CFS=1 or -m cfs",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "RUF", "PL", "S"]
+ignore = [
+    "PLR2004",  # magic values are common in wire-format code
+    "PLR0913",  # keyword-heavy constructors are intentional
+    "PLR0917",
+    "PLR0911",
+    "PLR0912",
+    "PLR0915",
+    "S101",     # asserts are the project's assertive-programming tool
+    "RUF012",
+    "S311",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLC0415", "S104", "S108", "S603", "S607", "PLR0915"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportUnknownParameterType = false
+reportUnknownLambdaType = false
+reportPrivateUsage = false
+reportMissingParameterType = false

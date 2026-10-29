@@ -1,0 +1,13 @@
+# Exact versions of the development tools CI installs with:
+#   pip install -c constraints-dev.txt -e '.[dev]'
+# Linters, type checkers and test plugins change behaviour between releases; bump these
+# deliberately (re-run ruff, pyright and the tests, fix what moved) instead of letting a new
+# release break an unrelated change. Transitive packages are left free.
+typer==0.27.3
+pytest==8.4.2
+pytest-xdist==3.8.0
+pytest-benchmark==5.3.0
+hypothesis==6.170.13
+ruff==0.17.3
+pyright==1.1.414
+atheris==3.0.0

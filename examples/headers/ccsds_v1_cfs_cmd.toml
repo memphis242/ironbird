@@ -1,0 +1,65 @@
+# CCSDS v1 primary header (6 bytes) + cFS command secondary header (2 bytes).
+# Fields are big-endian bitfields packed MSB-first, in wire order.
+# In cFS the message ID is the first 16 bits (version, type, secondary-header flag, APID),
+# so MID 0x1805 is the stream-id word 0x1805 on the wire.
+
+name = "ccsds_v1_cfs_cmd"
+kind = "command"
+description = "CCSDS v1 primary header + cFS command secondary header (function code, checksum)"
+byte_order = "big"
+function_code_field = "function_code"
+mid_fields = ["version", "packet_type", "sec_hdr_flag", "apid"]
+
+[[fields]]
+name = "version"
+bits = 3
+value = 0
+
+[[fields]]
+name = "packet_type"
+bits = 1
+value = 1            # 1 = command
+description = "CCSDS packet type (1 = command)"
+
+[[fields]]
+name = "sec_hdr_flag"
+bits = 1
+value = 1
+
+[[fields]]
+name = "apid"
+bits = 11
+computed = "from_mid"
+
+[[fields]]
+name = "seq_flags"
+bits = 2
+value = 3            # unsegmented
+check = false
+
+[[fields]]
+name = "sequence"
+bits = 14
+computed = "sequence"
+
+[[fields]]
+name = "length"
+bits = 16
+computed = "length"
+bias = -7            # CCSDS length = total packet bytes - 7 (6-byte primary header, minus 1)
+
+[[fields]]
+name = "reserved"
+bits = 1
+value = 0
+check = false
+
+[[fields]]
+name = "function_code"
+bits = 7
+
+[[fields]]
+name = "checksum"
+bits = 8
+computed = "checksum"
+algorithm = "xor8_cfs"   # XOR of the whole packet equals 0xFF

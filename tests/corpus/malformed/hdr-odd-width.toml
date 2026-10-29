@@ -1,0 +1,6 @@
+name = "p"
+kind = "telemetry"
+[[fields]]
+name = "a"
+bits = 7
+value = 1

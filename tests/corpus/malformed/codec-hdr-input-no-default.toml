@@ -1,0 +1,11 @@
+# An input field nothing supplies would only fail at send time.
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+[[fields]]
+name = "mission_flags"
+bits = 16

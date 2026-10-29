@@ -1,0 +1,108 @@
+{
+  "schema": "ironbird-ccdd/0",
+  "target": "mock",
+  "messages": [
+    {
+      "name": "MOCK_NOOP",
+      "kind": "command",
+      "mid": "0x1890",
+      "function_code": 0,
+      "description": "No-operation command; increments the accepted counter",
+      "fields": []
+    },
+    {
+      "name": "MOCK_SET_MODE",
+      "kind": "command",
+      "mid": "0x1890",
+      "function_code": 1,
+      "description": "Select the operating mode",
+      "fields": [
+        {
+          "name": "mode",
+          "type": "uint8",
+          "enum": {"SAFE": 1, "NOMINAL": 2, "SCIENCE": 3},
+          "description": "Target operating mode"
+        },
+        {"name": "pad", "type": "uint8", "description": "Spare, send 0"}
+      ]
+    },
+    {
+      "name": "MOCK_SET_LABEL",
+      "kind": "command",
+      "mid": "0x1890",
+      "function_code": 2,
+      "description": "Set a free-text label shown in housekeeping",
+      "fields": [
+        {"name": "label", "type": "char[8]", "description": "ASCII label, NUL padded"}
+      ]
+    },
+    {
+      "name": "MOCK_HK",
+      "kind": "telemetry",
+      "mid": "0x0890",
+      "description": "Housekeeping: command counters and mode",
+      "category": "housekeeping",
+      "fields": [
+        {"name": "cmd_counter", "type": "uint8", "description": "Accepted commands"},
+        {"name": "err_counter", "type": "uint8", "description": "Rejected commands"},
+        {
+          "name": "mode",
+          "type": "uint8",
+          "enum": {"SAFE": 1, "NOMINAL": 2, "SCIENCE": 3},
+          "description": "Current operating mode"
+        },
+        {"name": "pad", "type": "uint8"},
+        {"name": "label", "type": "char[8]", "description": "Current label"}
+      ]
+    },
+    {
+      "name": "MOCK_STATUS",
+      "kind": "telemetry",
+      "mid": "0x0891",
+      "description": "Environment status: temperature and bus voltage",
+      "category": "status",
+      "fields": [
+        {"name": "temperature_c", "type": "float32", "units": "degC"},
+        {"name": "bus_voltage_v", "type": "float32", "units": "V"},
+        {"name": "uptime_s", "type": "uint32", "endian": "big", "units": "s"}
+      ]
+    },
+    {
+      "name": "MOCK_RAISE_EVENT",
+      "kind": "command",
+      "mid": "0x1890",
+      "function_code": 3,
+      "description": "Make the mock node report an event with the given contents",
+      "fields": [
+        {"name": "app", "type": "char[8]", "description": "Reporting app name"},
+        {"name": "event_id", "type": "uint16", "description": "App-defined event id"},
+        {
+          "name": "event_type",
+          "type": "uint16",
+          "enum": {"DEBUG": 1, "INFORMATION": 2, "ERROR": 3, "CRITICAL": 4},
+          "description": "Event type"
+        },
+        {"name": "message", "type": "char[32]", "description": "Event text"}
+      ]
+    },
+    {
+      "name": "MOCK_EVENT",
+      "kind": "telemetry",
+      "mid": "0x0892",
+      "description": "Event report: app, id, type and text",
+      "category": "event",
+      "event": {"app": "app", "id": "event_id", "type": "event_type", "message": "message"},
+      "fields": [
+        {"name": "app", "type": "char[8]", "description": "Reporting app name"},
+        {"name": "event_id", "type": "uint16", "description": "App-defined event id"},
+        {
+          "name": "event_type",
+          "type": "uint16",
+          "enum": {"DEBUG": 1, "INFORMATION": 2, "ERROR": 3, "CRITICAL": 4},
+          "description": "Event type"
+        },
+        {"name": "message", "type": "char[32]", "description": "Event text"}
+      ]
+    }
+  ]
+}

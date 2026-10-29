@@ -1,0 +1,60 @@
+# ironbird-vs-ironbird mock: no hardware, no cFS. Distinct ports so it can run next to a
+# real cFS setup (examples/ironbird.toml).
+#
+#   shell 1:  ib -c examples/mock.toml respond --as fc
+#   shell 2:  ib -c examples/mock.toml listen fc
+#   shell 3:  ib -c examples/mock.toml send fc MOCK_NOOP
+#             ib -c examples/mock.toml send fc MOCK_SET_MODE mode=SAFE pad=0
+#   events:   ib -c examples/mock.toml events           (shell 2, instead of listen)
+#             ib -c examples/mock.toml send fc MOCK_RAISE_EVENT app=DEMO event_id=7 \
+#                 event_type=ERROR "message=bus voltage low"
+
+[ironbird]
+acts_as = "ground"
+
+[nodes.ground]
+alias = "gnd"
+description = "Ground station (this host)"
+
+[nodes.fc]
+alias = "flight"
+description = "Mock flight computer (ironbird acting as fc)"
+ccdd = "ccdd/mock.json"
+command_header = "headers/ccsds_v1_cfs_cmd.toml"
+telemetry_header = "headers/ccsds_v1_cfs_tlm.toml"
+
+# Every accepted command is answered with housekeeping carrying the counters.
+[[nodes.fc.responses]]
+on = "MOCK_SET_MODE"
+reply = "MOCK_HK"
+accepted_counter = "cmd_counter"
+rejected_counter = "err_counter"
+echo = { mode = "mode" }          # reply field = command argument
+
+[[nodes.fc.responses]]
+on = "MOCK_SET_LABEL"
+reply = "MOCK_HK"
+accepted_counter = "cmd_counter"
+rejected_counter = "err_counter"
+echo = { label = "label" }
+
+# The mock reports whatever event it is asked to raise.
+[[nodes.fc.responses]]
+on = "MOCK_RAISE_EVENT"
+reply = "MOCK_EVENT"
+echo = { app = "app", event_id = "event_id", event_type = "event_type", message = "message" }
+
+[[nodes.fc.responses]]
+on = "*"
+reply = "MOCK_HK"
+accepted_counter = "cmd_counter"
+rejected_counter = "err_counter"
+fields = { mode = 2 }
+
+[[links]]
+name = "ground-fc"
+from = "ground"
+to = "fc"
+transport = "udp"
+command_endpoint = "127.0.0.1:41234"
+telemetry_endpoint = "127.0.0.1:41235"

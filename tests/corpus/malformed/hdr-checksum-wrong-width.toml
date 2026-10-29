@@ -1,0 +1,7 @@
+name = "p"
+kind = "telemetry"
+[[fields]]
+name = "c"
+bits = 8
+computed = "checksum"
+algorithm = "crc16_ccitt"

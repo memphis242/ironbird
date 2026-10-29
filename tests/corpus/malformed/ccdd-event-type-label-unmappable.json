@@ -1,0 +1,37 @@
+{
+  "schema": "ironbird-ccdd/0",
+  "target": "corpus",
+  "messages": [
+    {
+      "name": "EVT",
+      "kind": "telemetry",
+      "mid": "0x0801",
+      "event": {
+        "id": "id",
+        "type": "kind"
+      },
+      "fields": [
+        {
+          "name": "app",
+          "type": "char[8]"
+        },
+        {
+          "name": "id",
+          "type": "uint16"
+        },
+        {
+          "name": "kind",
+          "type": "uint16",
+          "enum": {
+            "INFORMATION": 2,
+            "PANIC": 9
+          }
+        },
+        {
+          "name": "text",
+          "type": "char[16]"
+        }
+      ]
+    }
+  ]
+}

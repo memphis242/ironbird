@@ -1,0 +1,8 @@
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+check = false

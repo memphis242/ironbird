@@ -1,0 +1,10 @@
+[nodes.a]
+[nodes.b]
+ccdd="c.json"
+command_header="c.toml"
+telemetry_header="t.toml"
+[[links]]
+from="a"
+to="b"
+command_endpoint="h:99999"
+telemetry_endpoint="h:2"
