@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final
 
 from ironbird.ccdd.model import (
+    MAX_ENUM_ENTRIES,
     MAX_PAYLOAD_BYTES,
     SEVERITY_LABELS,
     Category,
@@ -37,10 +38,28 @@ MAX_MESSAGES: Final = 20_000
 MAX_FIELDS: Final = 1024
 MAX_TEXT: Final = 1024
 
-_NAME_RE: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
-_ENUM_NAME_RE: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]{0,63}$")
-_MID_RE: Final = re.compile(r"^(0[xX][0-9a-fA-F]{1,8}|[0-9]{1,10})$")
+_NAME_RE: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+_ENUM_NAME_RE: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_.\-]{0,63}")
+_MID_RE: Final = re.compile(r"0[xX][0-9a-fA-F]{1,8}|[0-9]{1,10}")
 MAX_MID: Final = 0xFFFFFFFF
+
+
+def _no_duplicate_keys(source: str) -> Callable[[list[tuple[str, Any]]], dict[str, Any]]:
+    """A ``json`` object hook that rejects repeated keys instead of letting the last win."""
+
+    def hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in out:
+                siblings = ", ".join(repr(k[:24]) for k in list(out)[:6])
+                raise IronbirdError(
+                    Code.CCD_FILE,
+                    f"{source}: duplicate key {key[:40]!r} in an object with keys {siblings}",
+                )
+            out[key] = value
+        return out
+
+    return hook
 
 
 class _Ctx:
@@ -80,7 +99,7 @@ def _int(ctx: _Ctx, value: object, path: str, lo: int, hi: int) -> int:
 
 def _parse_mid(ctx: _Ctx, value: object, path: str) -> int:
     if isinstance(value, str):
-        if not _MID_RE.match(value):
+        if not _MID_RE.fullmatch(value):
             raise ctx.fail(path, 'must be a hex string like "0x1805" or a decimal integer')
         number = int(value, 0) if value.lower().startswith("0x") else int(value, 10)
         return _int(ctx, number, path, 0, MAX_MID)
@@ -92,11 +111,13 @@ def _parse_enum(ctx: _Ctx, raw: object, path: str, ftype: FieldType) -> Mapping[
         raise ctx.fail(path, "enum is only valid on integer fields")
     if not isinstance(raw, dict) or not raw:
         raise ctx.fail(path, "must be a non-empty object of NAME: integer")
+    if len(raw) > MAX_ENUM_ENTRIES:
+        raise ctx.fail(path, f"more than {MAX_ENUM_ENTRIES} enum entries")
     lo, hi = ftype.bit_range
     out: dict[str, int] = {}
     seen: dict[int, str] = {}
     for label, number in raw.items():
-        if not _ENUM_NAME_RE.match(label):
+        if not _ENUM_NAME_RE.fullmatch(label):
             raise ctx.fail(f"{path}.{label}", "invalid enum name")
         value = _int(ctx, number, f"{path}.{label}", lo, hi)
         if value in seen:
@@ -119,7 +140,7 @@ def _parse_field(ctx: _Ctx, raw: object, path: str, next_offset: int, names: set
         {"name", "type"},
     )
     name = raw["name"]
-    if not isinstance(name, str) or not _NAME_RE.match(name):
+    if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
         raise ctx.fail(f"{path}.name", "must be an identifier (letters, digits, underscore)")
     if name in names:
         raise ctx.fail(f"{path}.name", f"duplicate field name {name!r}", Code.CCD_LAYOUT)
@@ -239,7 +260,7 @@ def _parse_message(ctx: _Ctx, raw: object, index: int) -> Message:
     if not isinstance(raw, dict):
         raise ctx.fail(path, "must be an object")
     label = raw.get("name")
-    if isinstance(label, str) and _NAME_RE.match(label):
+    if isinstance(label, str) and _NAME_RE.fullmatch(label):
         path = f"messages[{index}]({label})"
     _check_keys(
         ctx,
@@ -259,7 +280,7 @@ def _parse_message(ctx: _Ctx, raw: object, index: int) -> Message:
         {"name", "kind", "mid"},
     )
     name = raw["name"]
-    if not isinstance(name, str) or not _NAME_RE.match(name):
+    if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
         raise ctx.fail(f"{path}.name", "must be an identifier (letters, digits, underscore)")
     try:
         kind = MessageKind(raw["kind"])
@@ -337,7 +358,7 @@ def parse_model(data: object, source: str) -> CcddModel:
     if data["schema"] != SCHEMA_ID:
         raise ctx.fail("schema", f"must be {SCHEMA_ID!r}, got {str(data['schema'])[:40]!r}")
     target = data["target"]
-    if not isinstance(target, str) or not _NAME_RE.match(target):
+    if not isinstance(target, str) or not _NAME_RE.fullmatch(target):
         raise ctx.fail("target", "must be an identifier")
     raw_messages = data["messages"]
     if not isinstance(raw_messages, list):
@@ -364,7 +385,7 @@ class JsonAdapter:
         if len(raw) > MAX_FILE_BYTES:
             raise IronbirdError(Code.CCD_FILE, f"{path}: CCDD file larger than 8 MiB")
         try:
-            data = json.loads(raw.decode("utf-8"))
+            data = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys(str(path)))
         except (ValueError, RecursionError) as exc:
             # json.JSONDecodeError and UnicodeDecodeError are both ValueError subclasses.
             raise IronbirdError(Code.CCD_FILE, f"{path}: invalid JSON ({exc})", cause=exc) from exc

@@ -24,9 +24,11 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: |
+            pyproject.toml
+            constraints-dev.txt
       - name: Install
-        run: python -m pip install -e '.[dev]'
+        run: python -m pip install -c constraints-dev.txt -e '.[dev]'
       - name: Lint
         run: |
           ruff check .
@@ -35,6 +37,10 @@ jobs:
         run: pyright
       - name: Tests (real-cFS tests are opt-in and skipped here)
         run: pytest -n auto
+      # pytest-benchmark disables itself under xdist, so the ceilings above are only enforced
+      # by a serial run.
+      - name: Benchmarks (serial, so the performance ceilings are enforced)
+        run: pytest tests/test_benchmarks.py -n0
 
   cfs:
     name: real cFS acceptance
@@ -49,7 +55,9 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: |
+            pyproject.toml
+            constraints-dev.txt
       - name: Read pinned cFS commit
         id: pin
         run: |
@@ -66,7 +74,7 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: tools/cfs/build.sh
       - name: Install ironbird
-        run: python -m pip install -e '.[dev]'
+        run: python -m pip install -c constraints-dev.txt -e '.[dev]'
       - name: Real-cFS acceptance tests
         env:
           IRONBIRD_CFS: "1"
@@ -92,8 +100,21 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: |
+            pyproject.toml
+            constraints-dev.txt
       - name: Install
-        run: python -m pip install -e '.[fuzz]'
+        run: python -m pip install -c constraints-dev.txt -e '.[fuzz]'
       - name: Fuzz Codec.decode and header.unpack
-        run: python tools/fuzz/fuzz_decode.py -max_total_time=900
+        # libFuzzer writes the failing input (crash-*, timeout-*, oom-*) under the artifact prefix.
+        run: |
+          mkdir -p "$RUNNER_TEMP/fuzz-crashes"
+          python tools/fuzz/fuzz_decode.py -max_total_time=900 \
+            -artifact_prefix="$RUNNER_TEMP/fuzz-crashes/"
+      - name: Keep crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: ${{ runner.temp }}/fuzz-crashes
+          if-no-files-found: ignore

@@ -46,13 +46,17 @@ class Code(StrEnum):
     TX_OPEN = "IB-TX-001"  # cannot open / bind
     TX_SEND = "IB-TX-002"  # send failed or refused
     TX_RECV = "IB-TX-003"  # receive failed
-    TX_OVERRUN = "IB-TX-004"  # receive queue overflow, datagrams dropped
+    TX_OVERRUN = "IB-TX-004"  # datagrams dropped: receive queue overflow or kernel socket buffer
+    TX_RCVBUF = "IB-TX-005"  # kernel granted a smaller receive buffer than requested
     # Events
     EVT_NONE = "IB-EVT-001"  # no event telemetry is defined for the selected node(s)
     # Responder
     RSP_RULE = "IB-RSP-001"  # response rule failed
     # Ledger
     LED_WRITE = "IB-LED-001"  # ledger cannot be written
+    LED_DIR = "IB-LED-002"  # no usable ledger/state directory (HOME unset, path unusable)
+    # Output
+    OUT_DROPPED = "IB-OUT-001"  # output lines dropped because stdout/stderr is not draining
     # CLI / internal
     CLI_USAGE = "IB-CLI-001"  # command line usage error
     INTERNAL = "IB-INT-001"  # unexpected internal error (bug)
@@ -122,7 +126,9 @@ class DecodeError:
 
     def to_error(self, context: str = "") -> IronbirdError:
         prefix = f"{context}: " if context else ""
-        mid = f" (MID 0x{self.mid:04X})" if self.mid is not None else ""
+        mid_text = f"0x{self.mid:04X}" if self.mid is not None else ""
+        # Many reasons already name the MID; say it once.
+        mid = f" (MID {mid_text})" if mid_text and mid_text not in self.reason else ""
         return IronbirdError(
             self.code,
             f"{prefix}{self.reason}{mid}",

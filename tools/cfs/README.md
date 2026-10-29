@@ -8,8 +8,13 @@ acceptance target for ironbird stages. Everything stays outside the source tree;
     tools/cfs/run.sh > cfs.log 2>&1 &   # background
 
 Pinned version: bundle tag `v7.0.1` at commit `088b2fa828db9ff7e00733f1908e0eeb59f66ce3`
-(`build.sh` refuses a checkout whose tag resolves elsewhere and writes the bundle plus every
-submodule commit to `$CFS_BUILD_DIR/PINNED_VERSION`).
+(`build.sh` refuses a checkout whose tag resolves elsewhere. After a *successful* build it
+writes the checked-out tag and commit plus every submodule commit to
+`$CFS_BUILD_DIR/PINNED_VERSION`; a failed build leaves no such file.)
+
+`run.sh` allows one instance per `$CFS_BUILD_DIR` (a `flock` on `run/.run.lock`), because it
+recreates the run directory on every start. `clean.sh` removes only shared-memory segments that
+belong to the invoking user, derive from the run directory's key files, and have nothing attached.
 
 | Variable | Default | Used by |
 |----------|---------|---------|

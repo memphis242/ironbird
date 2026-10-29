@@ -1,0 +1,11 @@
+[nodes.ground]
+[nodes.fc]
+ccdd = "x.json"
+command_header = "c.toml"
+telemetry_header = "t.toml"
+
+[[links]]
+from = "ground"
+to = "fc"
+command_endpoint = "localhost\n:41234"
+telemetry_endpoint = "127.0.0.1:41235"

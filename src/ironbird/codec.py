@@ -9,10 +9,12 @@ with no slicing copies.
 from __future__ import annotations
 
 import math
+import re
 import struct
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Final
 
 from ironbird import header as hdr
@@ -47,6 +49,20 @@ class _Layout:
     segments: tuple[_Segment, ...]
     text_indices: tuple[int, ...]  # char[N] fields needing bytes -> str
     identity: bool  # single segment already in definition order, no char fields
+
+
+class DatagramClass(StrEnum):
+    """Result of :meth:`Codec.classify`."""
+
+    MALFORMED = "malformed"  # too short for the header, over the size cap, or no readable MID
+    UNKNOWN_MID = "unknown_mid"  # well enough formed, but the MID is not in the CCDD
+    KNOWN_MID = "known_mid"  # the MID is in the CCDD (decode may still reject the rest)
+
+
+@dataclass(frozen=True, slots=True)
+class DatagramInfo:
+    kind: DatagramClass
+    mid: int | None  # the MID when it could be read, even for a MALFORMED datagram
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +135,19 @@ def _arg_error(message: Message, field: FieldDef, why: str) -> IronbirdError:
     )
 
 
+_SPELLED_NON_FINITE: Final = re.compile(r"[+-]?(inf|infinity|nan)", re.IGNORECASE)
+MAX_ENUM_HINT_NAMES: Final = 16
+
+
+def _enum_hint(field: FieldDef) -> str:
+    """``; names: A, B, ...`` for an enum field, bounded however large the enum is."""
+    if not field.enum:
+        return ""
+    names = list(field.enum)[:MAX_ENUM_HINT_NAMES]
+    more = f", ... ({len(field.enum)} in all)" if len(field.enum) > len(names) else ""
+    return f"; names: {', '.join(names)}{more}"
+
+
 def coerce_value(message: Message, field: FieldDef, value: object) -> object:
     """Convert a CLI string (or a typed Python value) into the field's wire value."""
     ftype = field.type
@@ -132,7 +161,7 @@ def coerce_value(message: Message, field: FieldDef, value: object) -> object:
                     try:
                         number = int(value, 0)
                     except ValueError:
-                        hint = f"; names: {', '.join(field.enum)}" if field.enum else ""
+                        hint = _enum_hint(field)
                         raise _arg_error(
                             message, field, f"{value[:40]!r} is not an integer{hint}"
                         ) from None
@@ -150,12 +179,21 @@ def coerce_value(message: Message, field: FieldDef, value: object) -> object:
                     flt = float(value)
                 except ValueError:
                     raise _arg_error(message, field, f"{value[:40]!r} is not a number") from None
+                if not math.isfinite(flt) and not _SPELLED_NON_FINITE.fullmatch(value.strip()):
+                    # Text such as "1e400" parses to inf; only the literal spellings are inf.
+                    raise _arg_error(message, field, f"{value[:40]!r} overflows {ftype.text}")
             elif isinstance(value, int | float) and not isinstance(value, bool):
-                flt = float(value)
+                try:
+                    flt = float(value)
+                except OverflowError:
+                    raise _arg_error(message, field, "integer too large for a float") from None
             else:
                 raise _arg_error(message, field, f"unsupported value {value!r}")
-            if ftype.size == 4 and math.isfinite(flt) and abs(flt) > 3.4028234663852886e38:
-                raise _arg_error(message, field, f"{flt} overflows float32")
+            if ftype.size == 4 and math.isfinite(flt):
+                try:
+                    struct.pack("<f", flt)  # rounds to nearest float32; overflow raises
+                except OverflowError:
+                    raise _arg_error(message, field, f"{flt} overflows float32") from None
             return flt
         case TypeClass.CHAR:
             if not isinstance(value, str):
@@ -257,6 +295,14 @@ class Codec:
             raise IronbirdError(
                 Code.ENC_FIT,
                 f"{where}: packet of {total} bytes exceeds the {self.max_packet_bytes}-byte cap",
+            )
+        lf = profile.length_field
+        if lf is not None and not 0 <= total + lf.bias <= lf.mask:
+            raise IronbirdError(
+                Code.ENC_FIT,
+                f"{where}: packet of {total} bytes does not fit the {lf.bits}-bit "
+                f"{lf.name} field of profile {profile.name}",
+                details=profile.source,
             )
         if msg.kind is MessageKind.COMMAND:
             assert profile.function_code_field is not None and msg.function_code is not None
@@ -369,6 +415,21 @@ class Codec:
 
     def peek_mid(self, kind: MessageKind, data: bytes | bytearray | memoryview) -> int | None:
         return hdr.peek_mid(self._profiles[kind], data)
+
+    def classify(self, kind: MessageKind, data: bytes | bytearray | memoryview) -> DatagramInfo:
+        """Cheaply sort one datagram without decoding it: malformed, unknown MID, or known MID.
+
+        Reads only the MID window, so it is safe on the receive path. ``KNOWN_MID`` means the
+        datagram is long enough to hold a header and its MID is in the CCDD; full validation
+        (length field, checksum, payload size) is still ``decode``'s job and may reject it.
+        """
+        profile = self._profiles[kind]
+        size = len(data)
+        mid = hdr.peek_mid(profile, data)
+        if mid is None or size < profile.size_bytes or size > self.max_packet_bytes:
+            return DatagramInfo(DatagramClass.MALFORMED, mid)
+        known = self.is_known_mid(kind, mid)
+        return DatagramInfo(DatagramClass.KNOWN_MID if known else DatagramClass.UNKNOWN_MID, mid)
 
     def is_known_mid(self, kind: MessageKind, mid: int) -> bool:
         if kind is MessageKind.TELEMETRY:

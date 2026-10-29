@@ -29,7 +29,8 @@ from ironbird.errors import Code, DecodeError, IronbirdError
 DEFAULT_MAX_PACKET_BYTES: Final = 2048
 MAX_HEADER_BYTES: Final = 64
 MAX_PROFILE_FILE_BYTES: Final = 64 * 1024
-_NAME_RE: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_NAME_RE: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+MAX_DESCRIPTION_CHARS: Final = 1024
 
 
 class FieldKind(StrEnum):
@@ -145,6 +146,8 @@ def _str(ctx: _Ctx, table: Mapping[str, Any], key: str, path: str) -> str:
     value = table[key]
     if not isinstance(value, str):
         raise ctx.fail(f"{path}.{key}", "must be a string")
+    if len(value) > MAX_DESCRIPTION_CHARS:
+        raise ctx.fail(f"{path}.{key}", f"longer than {MAX_DESCRIPTION_CHARS} characters")
     return value
 
 
@@ -167,7 +170,7 @@ def parse_profile(data: Mapping[str, Any], source: str = "<memory>") -> HeaderPr
         {"name", "kind", "fields"},
     )
     name = _str(ctx, data, "name", "")
-    if not _NAME_RE.match(name):
+    if not _NAME_RE.fullmatch(name):
         raise ctx.fail("name", "must be an identifier (letters, digits, underscore)")
     kind_text = _str(ctx, data, "kind", "")
     try:
@@ -211,7 +214,7 @@ def parse_profile(data: Mapping[str, Any], source: str = "<memory>") -> HeaderPr
             {"name", "bits"},
         )
         fname = _str(ctx, raw, "name", path)
-        if not _NAME_RE.match(fname):
+        if not _NAME_RE.fullmatch(fname):
             raise ctx.fail(f"{path}.name", "must be an identifier")
         if fname in names:
             raise ctx.fail(f"{path}.name", f"duplicate field name {fname!r}")
@@ -401,7 +404,9 @@ def load_profile(path: Path) -> HeaderProfile:
         raise IronbirdError(Code.HDR_FILE, f"{path}: header profile larger than 64 KiB")
     try:
         data = tomllib.loads(raw.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+    except (ValueError, RecursionError) as exc:
+        # TOMLDecodeError and UnicodeDecodeError are ValueErrors; so is the int-digit limit.
+        # RecursionError is deeply nested arrays/tables.
         raise IronbirdError(Code.HDR_FILE, f"{path}: invalid TOML ({exc})", cause=exc) from exc
     return parse_profile(data, str(path))
 

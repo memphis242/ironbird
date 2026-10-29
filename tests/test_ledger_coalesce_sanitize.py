@@ -181,7 +181,7 @@ def test_telemetry_string_with_escape_sequences_renders_inert(mock_codec: Codec)
     assert _no_active_chars(line) and "\\x1b" in line
     record = json.dumps(render.record("fc", 0, decoded))
     assert "\x1b" not in record and "\x07" not in record
-    assert _no_active_chars(json.loads(record)["fields"]["label"])
+    assert json.loads(record)["fields"]["label"] == "\x1b[2J\x07\x1b]0"  # data as is
 
 
 def test_error_lines_sanitize_untrusted_text() -> None:

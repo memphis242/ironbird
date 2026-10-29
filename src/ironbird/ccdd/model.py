@@ -104,6 +104,7 @@ class FieldType:
 
 
 MAX_ARRAY_LEN: Final = 4096
+MAX_ENUM_ENTRIES: Final = 65536
 MAX_PAYLOAD_BYTES: Final = 65535
 
 _SCALARS: Final[Mapping[str, FieldType]] = MappingProxyType(
@@ -120,7 +121,7 @@ _SCALARS: Final[Mapping[str, FieldType]] = MappingProxyType(
         "float64": FieldType("float64", TypeClass.FLOAT, 8, "d"),
     }
 )
-_ARRAY_RE: Final = re.compile(r"^(char|bytes)\[([0-9]{1,5})\]$")
+_ARRAY_RE: Final = re.compile(r"(char|bytes)\[([0-9]{1,5})\]")
 
 
 def parse_type(text: str) -> FieldType | str:
@@ -128,7 +129,7 @@ def parse_type(text: str) -> FieldType | str:
     scalar = _SCALARS.get(text)
     if scalar is not None:
         return scalar
-    match = _ARRAY_RE.match(text)
+    match = _ARRAY_RE.fullmatch(text)
     if match is None:
         return "unknown type; use uint8/16/32/64, int8/16/32/64, float32/64, char[N] or bytes[N]"
     length = int(match.group(2))
@@ -147,6 +148,16 @@ class FieldDef:
     enum: Mapping[str, int] | None = None
     units: str = ""
     description: str = ""
+    # value -> label, built once from ``enum`` so lookups are O(1)
+    enum_by_value: Mapping[int, str] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        by_value: dict[int, str] = {}
+        if self.enum is not None:
+            assert len(self.enum) <= MAX_ENUM_ENTRIES
+            by_value = {number: label for label, number in self.enum.items()}
+            assert len(by_value) == len(self.enum), "enum values must be unique"
+        object.__setattr__(self, "enum_by_value", MappingProxyType(by_value))
 
     @property
     def end(self) -> int:
@@ -154,12 +165,9 @@ class FieldDef:
 
     def enum_label(self, value: object) -> str | None:
         """Name for ``value`` if this field has an enum containing it."""
-        if self.enum is None or not isinstance(value, int):
+        if self.enum is None or not isinstance(value, int) or isinstance(value, bool):
             return None
-        for label, number in self.enum.items():
-            if number == value:
-                return label
-        return None
+        return self.enum_by_value.get(value)
 
 
 @dataclass(frozen=True, slots=True)

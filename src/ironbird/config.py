@@ -19,9 +19,10 @@ from ironbird.errors import Code, IronbirdError
 from ironbird.header import DEFAULT_MAX_PACKET_BYTES
 
 MAX_CONFIG_BYTES: Final = 1024 * 1024
-_NAME_RE: Final = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]{0,31}$")
-_IDENT_RE: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
-_HOST_RE: Final = re.compile(r"^[A-Za-z0-9._\-:\[\]]{1,253}$")
+_NAME_RE: Final = re.compile(r"[A-Za-z][A-Za-z0-9_\-]{0,31}")
+_IDENT_RE: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+_HOST_RE: Final = re.compile(r"[A-Za-z0-9._\-:\[\]]{1,253}")
+MAX_PORT_DIGITS: Final = 5
 SUPPORTED_TRANSPORTS: Final = ("udp",)
 
 
@@ -137,12 +138,12 @@ class _Ctx:
         return value
 
     def name(self, value: object, path: str) -> str:
-        if not isinstance(value, str) or not _NAME_RE.match(value):
+        if not isinstance(value, str) or not _NAME_RE.fullmatch(value):
             raise self.fail(path, "must start with a letter; letters, digits, '-' and '_' only")
         return value
 
     def ident(self, value: object, path: str) -> str:
-        if not isinstance(value, str) or not _IDENT_RE.match(value):
+        if not isinstance(value, str) or not _IDENT_RE.fullmatch(value):
             raise self.fail(path, "must be a CCDD identifier (letters, digits, underscore)")
         return value
 
@@ -159,8 +160,13 @@ class _Ctx:
         if not isinstance(value, str) or ":" not in value:
             raise self.fail(path, 'must be a string "host:port"')
         host, _, port_text = value.rpartition(":")
-        if not _HOST_RE.match(host) or not port_text.isascii() or not port_text.isdigit():
-            raise self.fail(path, 'must be a string "host:port"')
+        if (
+            not _HOST_RE.fullmatch(host)
+            or not port_text.isascii()
+            or not port_text.isdigit()
+            or len(port_text) > MAX_PORT_DIGITS
+        ):
+            raise self.fail(path, 'must be a string "host:port" with a port in 1..65535')
         port = int(port_text)
         if not 1 <= port <= 65535:
             raise self.fail(path, f"port must be 1..65535, got {port}")
@@ -185,6 +191,7 @@ def _parse_response(ctx: _Ctx, raw: object, path: str) -> ResponseRule:
     if not isinstance(raw_fields, dict):
         raise ctx.fail(f"{path}.fields", "must be a table")
     for key, value in raw_fields.items():
+        ctx.ident(key, f"{path}.fields.{key}")
         if isinstance(value, bool) or not isinstance(value, int | float | str):
             raise ctx.fail(f"{path}.fields.{key}", "must be a number or string")
         fields[key] = value
@@ -193,9 +200,8 @@ def _parse_response(ctx: _Ctx, raw: object, path: str) -> ResponseRule:
     if not isinstance(raw_echo, dict):
         raise ctx.fail(f"{path}.echo", "must be a table")
     for key, value in raw_echo.items():
-        if not isinstance(value, str):
-            raise ctx.fail(f"{path}.echo.{key}", "must be a command argument name")
-        echo[key] = value
+        ctx.ident(key, f"{path}.echo.{key}")
+        echo[key] = ctx.ident(value, f"{path}.echo.{key}")
     if on == "*" and echo:
         raise ctx.fail(
             f"{path}.echo", "not allowed on a '*' rule; commands differ in arguments, name one"
@@ -243,7 +249,9 @@ def _parse_node(ctx: _Ctx, name: str, raw: object) -> Node:
         alias=alias,
         description=ctx.string(raw, "description", path),
         ccdd=ctx.file(raw, "ccdd", path),
-        ccdd_adapter=ctx.string(raw, "ccdd_adapter", path, "json"),
+        ccdd_adapter=ctx.ident(
+            ctx.string(raw, "ccdd_adapter", path, "json"), f"{path}.ccdd_adapter"
+        ),
         command_header=ctx.file(raw, "command_header", path),
         telemetry_header=ctx.file(raw, "telemetry_header", path),
         responses=responses,
@@ -329,7 +337,7 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
                 f"unsupported transport {transport[:20]!r}; "
                 f"supported: {', '.join(SUPPORTED_TRANSPORTS)}",
             )
-        lname = ctx.string(raw, "name", lpath, f"{ends[0]}-{ends[1]}")
+        lname = ctx.name(raw["name"], f"{lpath}.name") if "name" in raw else f"{ends[0]}-{ends[1]}"
         if lname in seen_names:
             raise ctx.fail(f"{lpath}.name", f"duplicate link name {lname!r}")
         seen_names.add(lname)
@@ -396,6 +404,8 @@ def load_config(path: Path) -> SystemConfig:
         raise IronbirdError(Code.CFG_FILE, f"{path}: config larger than 1 MiB")
     try:
         data = tomllib.loads(raw.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+    except (ValueError, RecursionError) as exc:
+        # TOMLDecodeError and UnicodeDecodeError are ValueErrors; so is the int-digit limit.
+        # RecursionError is deeply nested arrays/tables.
         raise IronbirdError(Code.CFG_SYNTAX, f"{path}: invalid TOML ({exc})", cause=exc) from exc
     return parse_config(data, path)

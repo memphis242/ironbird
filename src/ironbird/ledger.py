@@ -13,6 +13,7 @@ import asyncio
 import json
 import math
 import os
+import pwd
 import time
 import uuid
 from collections import deque
@@ -40,14 +41,33 @@ _Entry = tuple[int, int, str, str, Mapping[str, Any]]
 
 
 def default_state_dir(environ: Mapping[str, str] | None = None) -> Path:
-    """``$IRONBIRD_STATE_DIR``, else ``$XDG_STATE_HOME/ironbird``, else ``~/.local/state``."""
+    """``$IRONBIRD_STATE_DIR``, else ``$XDG_STATE_HOME/ironbird``, else ``~/.local/state``.
+
+    Per the XDG specification a relative ``XDG_STATE_HOME`` is invalid and ignored. An empty or
+    relative home would put the ledger in the current directory, so it is refused with a coded
+    error that names the remedy.
+    """
     env = os.environ if environ is None else environ
     override = env.get("IRONBIRD_STATE_DIR")
     if override:
-        return Path(override)
+        return Path(override).absolute()
     xdg = env.get("XDG_STATE_HOME")
-    base = Path(xdg) if xdg else Path.home() / ".local" / "state"
-    return base / "ironbird"
+    if xdg and os.path.isabs(xdg):
+        return Path(xdg) / "ironbird"
+    home = env.get("HOME")
+    if home is None:
+        try:
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except KeyError:
+            home = ""
+    if not home or not os.path.isabs(home):
+        raise IronbirdError(
+            Code.LED_DIR,
+            "cannot locate a state directory for the ledger (HOME is "
+            f"{'empty' if not home else 'not an absolute path'}); "
+            "set IRONBIRD_STATE_DIR to an absolute, writable directory",
+        )
+    return Path(home) / ".local" / "state" / "ironbird"
 
 
 def format_ts(time_ns: int) -> str:
@@ -164,7 +184,7 @@ class Ledger:
         """Queue one record. Cheap by design: no formatting, no I/O."""
         assert kind in _KINDS, f"unknown ledger kind {kind!r}"
         assert not (fields.keys() & _RESERVED), "field name collides with a ledger envelope key"
-        if not self._enabled:
+        if not self._enabled or self._failed:
             return
         queue = self._queue
         if len(queue) == MAX_QUEUE:
@@ -224,21 +244,48 @@ class Ledger:
         self._failed = True
         error = IronbirdError(
             Code.LED_WRITE,
-            f"cannot write ledger {self.path}: {exc.strerror or exc}; ledger disabled",
+            f"cannot write ledger {self.path}: {exc.strerror or exc}; ledger disabled "
+            "(set IRONBIRD_STATE_DIR to a writable directory)",
             details=f"directory {self.directory}",
             cause=exc,
         )
         if self._on_failure is not None:
             self._on_failure(error)
 
+    def _open_file(self) -> None:
+        if self._file is None:
+            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            self._file = os.fdopen(fd, "a", encoding="utf-8")
+
+    def open(self) -> None:
+        """Create the ledger directory and file now.
+
+        Raises ``IB-LED-002`` when they cannot be created, so a caller that must not act without
+        a trace (sending a command) can refuse before it does.
+        """
+        if not self._enabled:
+            return
+        try:
+            self._open_file()
+        except OSError as exc:
+            raise IronbirdError(
+                Code.LED_DIR,
+                f"cannot use ledger directory {self.directory}: {exc.strerror or exc}; "
+                "set IRONBIRD_STATE_DIR to a writable directory",
+                cause=exc,
+            ) from exc
+
+    def disable(self) -> None:
+        """Discard everything from now on (the caller has already told the user)."""
+        self._failed = True
+        self._queue.clear()
+
     def _write_lines(self, lines: list[str]) -> bool:
         if self._failed:
             return False
         try:
-            if self._file is None:
-                self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-                fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-                self._file = os.fdopen(fd, "a", encoding="utf-8")
+            self._open_file()
             self._file.write("\n".join(lines) + "\n")
             self._file.flush()
         except OSError as exc:

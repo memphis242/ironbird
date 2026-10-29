@@ -1,0 +1,13 @@
+name = "narrow"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+
+[[fields]]
+name = "length"
+bits = 8
+computed = "length"

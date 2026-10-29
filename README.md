@@ -34,6 +34,26 @@ ib -c examples/mock.toml send fc MOCK_RAISE_EVENT app=DEMO event_id=7 event_type
 `--verbose` for detail. Every action and error is recorded as JSON Lines in
 `$XDG_STATE_HOME/ironbird/` (override with `IRONBIRD_STATE_DIR`).
 
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Normal end: done, `--count` reached, `--timeout` elapsed without `--count`, or the reader of stdout went away (`\| head -1`) |
+| 1 | Runtime error (`error IB-...`), `find` with no match |
+| 2 | Usage, configuration, CCDD or header-profile error |
+| 3 | `listen`, `events` or `respond` had `--count N` and `--timeout` elapsed first |
+| 128+n | Ended by signal n: 130 (Ctrl-C), 129 (SIGHUP), 143 (SIGTERM). The ledger is flushed first; an interrupted `send` says whether the command went out |
+
+Output never blocks the tool: a stalled stdout (unread pipe, paused pager) drops lines with one
+coalesced `IB-OUT-001` notice instead of freezing signals and `--timeout`; the ledger keeps
+everything. Datagrams the kernel drops because the socket buffer is full are reported as
+`IB-TX-004`; if the kernel grants a smaller receive buffer than requested, `IB-TX-005` says to
+raise `net.core.rmem_max` (`sysctl -w net.core.rmem_max=...`).
+
+The ledger directory is `$IRONBIRD_STATE_DIR`, else an absolute `$XDG_STATE_HOME/ironbird`,
+else `~/.local/state/ironbird`. `send` and `respond` refuse to run (`IB-LED-002`, nothing sent)
+when it cannot be created.
+
 ## Events and telemetry categories
 
 cFS events are the most important telemetry. `ib events [--node X ...] [--min-type error]

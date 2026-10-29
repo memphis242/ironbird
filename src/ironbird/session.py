@@ -20,8 +20,8 @@ from typing import Any, Final
 from ironbird.ccdd.loader import load_ccdd
 from ironbird.ccdd.model import CcddModel, EventSeverity, Message, MessageKind, TypeClass
 from ironbird.coalesce import Coalescer
-from ironbird.codec import Codec, DecodedPacket, EncodedPacket
-from ironbird.config import Link, Node, ResponseRule, SystemConfig
+from ironbird.codec import Codec, DatagramClass, DecodedPacket, EncodedPacket
+from ironbird.config import Endpoint, Link, Node, ResponseRule, SystemConfig
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
 from ironbird.header import load_profile
@@ -79,6 +79,21 @@ class Handled:
 
 
 @dataclass(slots=True)
+class TxAttempt:
+    """The most recent command send, updated as it progresses (read by signal handling)."""
+
+    command: str
+    went_out: bool = False
+
+
+@dataclass(slots=True)
+class _DropWatch:
+    label: str
+    queue_seen: int = 0
+    kernel_seen: int = 0
+
+
+@dataclass(slots=True)
 class MidStat:
     count: int
     last_ns: int
@@ -113,6 +128,10 @@ class Session:
         self._tasks: list[asyncio.Task[None]] = []
         self.stats: dict[int, MidStat] = {}
         self.stats_overflow = 0
+        self.malformed_total = 0  # unknown-MID and malformed datagrams, filtered or not
+        self.last_tx: TxAttempt | None = None
+        self._watches: dict[UdpTransport, _DropWatch] = {}
+        self._rcvbuf_warned = False
 
     # -- lifecycle -----------------------------------------------------------------
 
@@ -169,6 +188,8 @@ class Session:
         while True:
             await asyncio.sleep(TICK_S)
             self.coalescer.tick()
+            for transport in tuple(self._watches):
+                self._poll_drops(transport, refresh=True)
 
     # -- error reporting ---------------------------------------------------------------
 
@@ -337,13 +358,24 @@ class Session:
             link=route.link.name,
         )
         encoded = codec.encode_command(command, args, tamper=tamper)
+        attempt = TxAttempt(encoded.message.name)
+        self.last_tx = attempt
         transport = UdpTransport(remote=endpoint)
-        result = "sent"
+        result = "not_sent"
         try:
             await transport.open()
-            await transport.send(encoded.data, confirm=True)
+            transport.send_nowait(encoded.data)
+            attempt.went_out = True
+            result = "sent"
+            await transport.confirm()
         except IronbirdError as exc:
             result = exc.code.value
+            raise
+        except asyncio.CancelledError:
+            result = "sent" if attempt.went_out else "cancelled"
+            raise
+        except BaseException as exc:
+            result = type(exc).__name__
             raise
         finally:
             await transport.close()
@@ -358,6 +390,7 @@ class Session:
                 size=len(encoded.data),
                 endpoint=str(endpoint),
                 result=result,
+                sent=attempt.went_out,
                 raw=encoded.data,
             )
         assert encoded.function_code is not None
@@ -375,6 +408,7 @@ class Session:
     # -- shared ingest (peek, filter, count, decode through the boundary) -------------
 
     def _count(self, mid: int, time_ns: int) -> None:
+        """Per-MID statistics; only called for MIDs the CCDD defines, so garbage cannot fill it."""
         stat = self.stats.get(mid)
         if stat is not None:
             stat.count += 1
@@ -385,6 +419,12 @@ class Session:
         else:
             self.stats_overflow += 1
 
+    def _reject(self, error: DecodeError, datagram: Datagram, source_label: str) -> DecodeError:
+        self.malformed_total += 1
+        self.ledger.record("packet", "rx.malformed", raw=datagram.data, source=datagram.source)
+        self.report(error, context=f"from {source_label}")
+        return error
+
     def _ingest(
         self,
         codec: Codec,
@@ -393,38 +433,104 @@ class Session:
         mids: frozenset[int] | None,
         source_label: str,
     ) -> DecodedPacket | DecodeError | None:
-        """``None`` means filtered out; errors are already reported (coalesced)."""
+        """``None`` means filtered out; errors are already reported (coalesced) and ledgered.
+
+        A MID filter only hides *valid* packets of other MIDs. Unknown-MID and malformed
+        datagrams are counted, reported and ledgered whether or not they would have matched.
+        """
         self.ledger.mark_busy()
         data = datagram.data
-        mid = codec.peek_mid(kind, data)
-        if mid is not None:
-            if mids is not None and mid not in mids:
-                self._count(mid, datagram.time_ns)
-                return None
-            self._count(mid, datagram.time_ns)
-            if not codec.is_known_mid(kind, mid):
-                error = DecodeError(
-                    Code.DEC_UNKNOWN, 0, f"unknown {kind.value} MID 0x{mid:04X}", mid
-                )
-                self.ledger.record("packet", "rx.malformed", raw=data, source=datagram.source)
-                self.report(error, context=f"from {source_label}")
-                return error
-        result = codec.decode(kind, data)
+        info = codec.classify(kind, data)
+        if info.kind is DatagramClass.UNKNOWN_MID:
+            assert info.mid is not None
+            return self._reject(
+                DecodeError(
+                    Code.DEC_UNKNOWN, 0, f"unknown {kind.value} MID 0x{info.mid:04X}", info.mid
+                ),
+                datagram,
+                source_label,
+            )
+        if info.kind is DatagramClass.KNOWN_MID:
+            assert info.mid is not None
+            self._count(info.mid, datagram.time_ns)
+        result = codec.decode(kind, data)  # the single validation boundary
         if isinstance(result, DecodeError):
-            self.ledger.record("packet", "rx.malformed", raw=data, source=datagram.source)
-            self.report(result, context=f"from {source_label}")
+            return self._reject(result, datagram, source_label)
+        if mids is not None and result.message.mid not in mids:
+            return None
         return result
 
-    def _check_drops(self, transport: UdpTransport, seen: int, label: str) -> int:
-        dropped = transport.dropped
-        if dropped != seen:
+    # -- drop accounting (user-space queue overflow and kernel socket-buffer overflow) ----
+
+    def _watch_drops(self, transport: UdpTransport, label: str) -> None:
+        self._watches[transport] = _DropWatch(label)
+
+    def _unwatch_drops(self, transport: UdpTransport) -> None:
+        self._poll_drops(transport, refresh=True)
+        self._watches.pop(transport, None)
+
+    def _poll_drops(self, transport: UdpTransport, *, refresh: bool) -> None:
+        """Report new drops of ``transport`` since the last poll (coalesced, ledgered).
+
+        ``refresh`` also re-reads the kernel's counter (a file read), which the 1 Hz ticker does;
+        the per-datagram path only looks at counters already in memory.
+        """
+        watch = self._watches.get(transport)
+        if watch is None:
+            return
+        queue = transport.dropped
+        if queue != watch.queue_seen:
+            delta, watch.queue_seen = queue - watch.queue_seen, queue
+            self.ledger.record(
+                "state", "rx.queue_drops", label=watch.label, delta=delta, total=queue
+            )
             self.report(
                 IronbirdError(
                     Code.TX_OVERRUN,
-                    f"{label}: receive queue overflow, {dropped - seen} datagram(s) dropped",
-                )
+                    f"{watch.label}: receive queue overflow, {queue} datagram(s) dropped so far",
+                ),
+                context=f"queue {watch.label}",
             )
-        return dropped
+        kernel = transport.refresh_kernel_drops() if refresh else transport.kernel_dropped
+        if kernel != watch.kernel_seen:
+            delta, watch.kernel_seen = kernel - watch.kernel_seen, kernel
+            self.ledger.record(
+                "state", "rx.kernel_drops", label=watch.label, delta=delta, total=kernel
+            )
+            self.report(
+                IronbirdError(
+                    Code.TX_OVERRUN,
+                    f"{watch.label}: kernel dropped {kernel} datagram(s) so far "
+                    "(socket buffer full; see net.core.rmem_max)",
+                ),
+                context=f"kernel {watch.label}",
+            )
+
+    async def _open_listening(
+        self, transport: UdpTransport, endpoint: Endpoint, label: str
+    ) -> None:
+        """Open ``transport``, ledger its effective receive buffer, start watching its drops."""
+        await transport.open()
+        self.ledger.record(
+            "state",
+            "udp.open",
+            endpoint=str(endpoint),
+            rcvbuf_requested=transport.rcvbuf_requested,
+            rcvbuf_effective=transport.rcvbuf_effective,
+            drop_counter="SO_RXQ_OVFL" if transport.overflow_counter_active else "/proc/net/udp",
+        )
+        if transport.rcvbuf_below_target and not self._rcvbuf_warned:
+            self._rcvbuf_warned = True
+            self.report(
+                IronbirdError(
+                    Code.TX_RCVBUF,
+                    f"{label}: kernel receive buffer is {transport.rcvbuf_effective} bytes, "
+                    f"below the {transport.rcvbuf_requested} requested; bursts may be lost - "
+                    "raise net.core.rmem_max (sysctl)",
+                ),
+                context=label,
+            )
+        self._watch_drops(transport, label)
 
     # -- listen (either side) -----------------------------------------------------
 
@@ -441,7 +547,7 @@ class Session:
         else:
             kind, endpoint = MessageKind.COMMAND, route.link.command_endpoint
         transport = UdpTransport(local=endpoint)
-        await transport.open()
+        await self._open_listening(transport, endpoint, f"udp {endpoint}")
         self.ledger.record(
             "action",
             "listen.start",
@@ -565,7 +671,9 @@ class Session:
         codec = self.codec_for(me)
         rules = _validate_rules(self.node, codec, self.config)
         transport = UdpTransport(local=chosen.command_endpoint, reply_to=chosen.telemetry_endpoint)
-        await transport.open()
+        await self._open_listening(
+            transport, chosen.command_endpoint, f"udp {chosen.command_endpoint}"
+        )
         self.ledger.record(
             "action",
             "respond.start",
@@ -609,11 +717,10 @@ class Listener:
         return self._iterate()
 
     async def _iterate(self) -> AsyncIterator[Received]:
-        seen_drops = 0
         label = self._route.peer.name
         async for datagram in self._transport.receive():
             result = self._session._ingest(self._codec, self._kind, datagram, self._mids, label)
-            seen_drops = self._session._check_drops(self._transport, seen_drops, "listen")
+            self._session._poll_drops(self._transport, refresh=False)
             if isinstance(result, DecodedPacket):
                 yield Received(
                     datagram.time_ns,
@@ -624,6 +731,7 @@ class Listener:
                 )
 
     async def close(self) -> None:
+        self._session._unwatch_drops(self._transport)
         await self._transport.close()
         self._session.ledger.record("action", "listen.stop", peer=self._route.peer.name)
 
@@ -785,11 +893,10 @@ class Responder:
 
     async def _iterate(self) -> AsyncIterator[Handled]:
         session = self._session
-        seen_drops = 0
         label = self._route.peer.name
         async for datagram in self._transport.receive():
             result = session._ingest(self._codec, MessageKind.COMMAND, datagram, None, label)
-            seen_drops = session._check_drops(self._transport, seen_drops, "respond")
+            session._poll_drops(self._transport, refresh=False)
             if result is None:  # pragma: no cover - no filter is set
                 continue
             if isinstance(result, DecodeError):
@@ -856,6 +963,7 @@ class Responder:
         return encoded
 
     async def close(self) -> None:
+        self._session._unwatch_drops(self._transport)
         await self._transport.close()
         self._session.ledger.record(
             "action", "respond.stop", accepted=self.accepted, rejected=self.rejected

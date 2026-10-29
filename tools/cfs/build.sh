@@ -51,16 +51,15 @@ if [[ -n "$CFS_COMMIT" && "$actual_commit" != "$CFS_COMMIT" ]]; then
     die "checkout is at $actual_commit but $CFS_REF is pinned to $CFS_COMMIT; remove $SRC_DIR or fix CFS_REF/CFS_COMMIT"
 fi
 
-# Record exactly what was built (bundle commit + every submodule commit).
-{
-    echo "bundle_url=$CFS_URL"
-    echo "bundle_ref=$CFS_REF"
-    echo "bundle_commit=$actual_commit"
-    echo "config=$CFS_CONFIG"
-    echo "submodules:"
-    git -C "$SRC_DIR" submodule status | sed 's/^/  /'
-} > "$CFS_BUILD_DIR/PINNED_VERSION"
-echo "build.sh: recorded $CFS_BUILD_DIR/PINNED_VERSION"
+# A stale record must never describe a build that did not finish.
+rm -f "$CFS_BUILD_DIR/PINNED_VERSION"
+
+# What is actually checked out (not what was asked for): the exact tag if HEAD is on one.
+actual_ref="$(git -C "$SRC_DIR" describe --tags --exact-match 2>/dev/null || true)"
+[[ -n "$actual_ref" ]] || actual_ref="$(git -C "$SRC_DIR" rev-parse --abbrev-ref HEAD)"
+if [[ "$actual_ref" != "$CFS_REF" ]]; then
+    echo "build.sh: warning: $SRC_DIR is at $actual_ref, not the requested $CFS_REF" >&2
+fi
 
 cd "$SRC_DIR"
 make "${CFS_CONFIG}.prep"
@@ -68,4 +67,17 @@ make -j"$JOBS" "${CFS_CONFIG}.install"
 
 readonly EXE_DIR="$SRC_DIR/build-${CFS_CONFIG}/exe/cpu1"
 [[ -x "$EXE_DIR/core-cpu1" ]] || die "build finished but $EXE_DIR/core-cpu1 is missing"
-echo "build.sh: OK - $EXE_DIR/core-cpu1 (cFS $CFS_REF, $actual_commit)"
+
+# Record exactly what was built (bundle commit + every submodule commit), only now that the
+# build succeeded; write-then-rename so a reader never sees a half-written file.
+{
+    echo "bundle_url=$CFS_URL"
+    echo "bundle_ref=$actual_ref"
+    echo "bundle_commit=$actual_commit"
+    echo "config=$CFS_CONFIG"
+    echo "submodules:"
+    git -C "$SRC_DIR" submodule status | sed 's/^/  /'
+} > "$CFS_BUILD_DIR/PINNED_VERSION.tmp"
+mv "$CFS_BUILD_DIR/PINNED_VERSION.tmp" "$CFS_BUILD_DIR/PINNED_VERSION"
+echo "build.sh: recorded $CFS_BUILD_DIR/PINNED_VERSION"
+echo "build.sh: OK - $EXE_DIR/core-cpu1 (cFS $actual_ref, $actual_commit)"

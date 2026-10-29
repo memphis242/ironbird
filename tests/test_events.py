@@ -255,8 +255,11 @@ def test_any_event_payload_extracts_without_raising_and_renders_inert(payload: b
     packet = _decode(codec, header + payload)
     event = extract_event("fc", 1, packet)
     assert event is not None
-    for text in (event_line(event), *map(str, event_record(event).values())):
-        assert "\n" not in text and text.isprintable()
+    line = event_line(event)
+    assert "\n" not in line and line.isprintable()
+    # JSON values carry the data as is; json.dumps makes the serialised record inert.
+    serialised = json.dumps(event_record(event))
+    assert "\n" not in serialised and serialised.isprintable()
     assert event.severity is None or event.type_label != ""
 
 
@@ -545,5 +548,6 @@ def test_cli_events_across_two_nodes_end_to_end(two_node_config_path: Path) -> N
         ("fc", "ALPHA", 7, "ERROR", "ERROR"),
         ("fc2", "BETA", 9, "CRITICAL", "CRITICAL"),
     ]
-    assert records[1]["message"] == "\\x1b[2Jreset"  # inert in the output
+    assert "\x1b" not in out  # the serialised record is inert
+    assert records[1]["message"] == "\x1b[2Jreset"  # the data itself is not altered
     assert events.returncode == 0

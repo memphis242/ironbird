@@ -337,13 +337,25 @@ acceptance gate for each stage is a real cFS instance.
      notify callback.
    - Byte-bounded memory: enforce `max_packet_bytes` at the transport edge, truncate raw
      data at record creation, bound the UDP queue by bytes.
-   - Surface UDP `error_received` as a coalesced `TX_RECV`; ledger the effective
-     `SO_RCVBUF` and warn when it is below the target.
+   - Surface UDP receive-side socket errors as a coalesced `TX_RECV` (the effective
+     `SO_RCVBUF` and kernel drops are already ledgered and reported in Stage 1).
    - Header profiles: per-field endianness, trailer and partial-span checksums,
      non-contiguous MID fields (msgid_v2), per-message and per-send header values,
      configurable time epoch, `frame_length()` for serial streams.
    - Immutable shared data: `MappingProxyType` for `Header.values`, registries and stats
      snapshots.
+   - **Ledger growth under hostile or garbage floods** (a design decision, deliberately not
+     implemented in Stage 1: the ledger keeps every malformed datagram in full, so a flood can
+     write on the order of 1 GB in 10 s). Stage 2 decides and builds: raw-evidence sampling
+     per key and window (every packet counted, the first N and a periodic sample kept raw,
+     the rest reduced to a per-key count record); a ledger size cap per session and per state
+     directory with a coded error when reached (and a defined "stop sending or keep going"
+     policy for transmitting commands); and rotation plus retention (age and total size) of
+     old ledger files.
+   - Output and signals: the bounded stdout/stderr writer, the signal-to-cancel path and the
+     exit codes (0 normal, 1 error, 2 usage/config, 3 `--count` not reached before `--timeout`,
+     128+n signal) are Stage 1 behaviour the TUI front-end must keep equivalent (a stalled
+     terminal never stalls capture; SIGHUP is an orderly shutdown).
 3. TUI: latest-per-packet view and time-scrolling view (sorted and emphasised by telemetry
    category priority, with category filter presets), a dedicated **Events** page showing
    only events from all nodes (node, time, app, event id, type/severity, message), hold /

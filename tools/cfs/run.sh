@@ -48,6 +48,14 @@ if [[ -e "$RAM_DIR" && "$(stat -c %u "$RAM_DIR")" != "$run_uid" ]]; then
     die "$RAM_DIR exists and is not owned by uid $run_uid; remove it if no other cFS instance is running"
 fi
 
+# One instance per build dir: the run directory is wiped below, which would pull the rug from
+# under a live instance. The lock is held on fd 9 for as long as cFS runs (the exec below keeps
+# the descriptor), and released by the kernel when the process ends, however it ends.
+command -v flock >/dev/null || die "'flock' is unavailable (util-linux); cannot guard against a second instance"
+mkdir -p "$CFS_BUILD_DIR/run"
+exec 9>"$CFS_BUILD_DIR/run/.run.lock"
+flock -n 9 || die "another run.sh is already running against $CFS_BUILD_DIR; stop it first (lock: $CFS_BUILD_DIR/run/.run.lock)"
+
 # The previous run's shared-memory segments are keyed off the directory deleted next.
 [[ -d "$RUN_DIR" ]] && "$(dirname "$0")/clean.sh" "$RUN_DIR"
 rm -rf "$RUN_DIR"
