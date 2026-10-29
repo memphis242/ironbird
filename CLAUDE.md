@@ -16,6 +16,10 @@ replays telemetry across multiple aliased hardware targets.
 - Branching: one short-lived branch per piece of work; after completion and review,
   merge it into `main` and delete the branch (local and remote). No long-lived
   per-stage branches.
+- Before merging any PR, run an antagonistic review of the PR's full contents
+  against `main`: independent reviewers (not the authors) actively try to break it
+  with concrete failing inputs, and every finding is either fixed or explicitly
+  deferred in `docs/plan.md` before the merge.
 - All input is untrusted (wire packets, serial, recordings, imported CCDD/config/
   header files). Follow "Untrusted input and malformed data" in `docs/plan.md`:
   validate every length before unpacking, parse only through the single decode
