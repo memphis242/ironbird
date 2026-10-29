@@ -43,14 +43,20 @@ _Entry = tuple[int, int, str, str, Mapping[str, Any]]
 def default_state_dir(environ: Mapping[str, str] | None = None) -> Path:
     """``$IRONBIRD_STATE_DIR``, else ``$XDG_STATE_HOME/ironbird``, else ``~/.local/state``.
 
-    Per the XDG specification a relative ``XDG_STATE_HOME`` is invalid and ignored. An empty or
-    relative home would put the ledger in the current directory, so it is refused with a coded
-    error that names the remedy.
+    Per the XDG specification a relative ``XDG_STATE_HOME`` is invalid and ignored. A relative
+    ``IRONBIRD_STATE_DIR`` and an empty or relative home would put the ledger in the current
+    directory, so they are refused with a coded error that names the remedy.
     """
     env = os.environ if environ is None else environ
     override = env.get("IRONBIRD_STATE_DIR")
     if override:
-        return Path(override).absolute()
+        if not os.path.isabs(override):
+            raise IronbirdError(
+                Code.LED_DIR,
+                "IRONBIRD_STATE_DIR is not an absolute path; set it to an absolute, "
+                "writable directory",
+            )
+        return Path(override)
     xdg = env.get("XDG_STATE_HOME")
     if xdg and os.path.isabs(xdg):
         return Path(xdg) / "ironbird"

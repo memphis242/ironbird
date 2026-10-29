@@ -177,7 +177,8 @@ def test_responder_survives_a_flood_of_malformed_commands_and_coalesces(
         assert any(f"x{flood}" in n for n in shown)
 
     _, fc_ledger = _run(config, tmp_path, scenario)
-    errors = [e for e in _events(fc_ledger) if e["kind"] == "error"]
+    # Other errors (IB-TX-005 on a host with a small net.core.rmem_max) are not the flood.
+    errors = [e for e in _events(fc_ledger) if e["kind"] == "error" and e["event"] == "IB-DEC-005"]
     assert len(errors) == flood  # the ledger keeps every one in full
 
 

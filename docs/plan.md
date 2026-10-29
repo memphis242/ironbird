@@ -354,6 +354,7 @@ acceptance gate for each stage is a real cFS instance.
      old ledger files.
    - Output and signals: the bounded stdout/stderr writer, the signal-to-cancel path and the
      exit codes (0 normal, 1 error, 2 usage/config, 3 `--count` not reached before `--timeout`,
+     4 command succeeded but stdout lines were lost,
      128+n signal) are Stage 1 behaviour the TUI front-end must keep equivalent (a stalled
      terminal never stalls capture; SIGHUP is an orderly shutdown).
 3. TUI: latest-per-packet view and time-scrolling view (sorted and emphasised by telemetry

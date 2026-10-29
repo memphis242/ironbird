@@ -13,17 +13,28 @@
 # segment that belongs to something else. A segment is therefore removed only when all of
 # these hold:
 #   - its key is the one derived from a key file in this run directory,
-#   - it is owned by the invoking user (root's ipcrm would otherwise remove anyone's),
+#   - it is owned by the user cFS ran as (root's ipcrm would otherwise remove anyone's):
+#     the invoking user, or, when invoked as root, the CFS_RUN_UID user that run.sh drops to,
 #   - nothing is attached to it (a live cFS instance keeps its segments attached).
 # Segments that match the key but fail another test are reported and left alone.
 #
 # Environment overrides:
 #   CFS_BUILD_DIR  root used by build.sh (default /home/user/build/cfs)
+#   CFS_RUN_UID    uid cFS runs as when run.sh is started as root (default 65534)
 set -euo pipefail
 
 CFS_BUILD_DIR="${CFS_BUILD_DIR:-/home/user/build/cfs}"
 readonly RUN_DIR="${1:-$CFS_BUILD_DIR/run/cpu1}"
-me="$(id -un)"
+CFS_RUN_UID="${CFS_RUN_UID:-65534}"
+# The owner whose segments are ours: whoever cFS ran as. run.sh started as root drops to
+# CFS_RUN_UID, so a root-invoked clean.sh compares against that user (ipcs prints the user
+# name, or the bare uid when the uid has no name).
+if [[ "$(id -u)" -eq 0 ]]; then
+    me="$(getent passwd "$CFS_RUN_UID" 2>/dev/null | cut -d: -f1 || true)"
+    me="${me:-$CFS_RUN_UID}"
+else
+    me="$(id -un)"
+fi
 readonly me
 
 command -v ipcs >/dev/null && command -v ipcrm >/dev/null || exit 0  # nothing to clean up with

@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import math
+import os
+import resource
 import signal
 import sys
+import time
 import traceback
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
@@ -23,16 +27,26 @@ import typer
 
 from ironbird import render
 from ironbird.ccdd.model import EventSeverity, MessageKind
-from ironbird.cli.output import Console
+from ironbird.cli.output import (
+    CLOSE_WAIT_S,
+    HANDLED_SIGNALS,
+    BoundedWriter,
+    Console,
+    signals_held,
+)
 from ironbird.config import SystemConfig, find_config, load_config
 from ironbird.errors import Code, IronbirdError
 from ironbird.ledger import Ledger, default_state_dir
 from ironbird.session import Session, Side
 
 EXIT_TIMEOUT: Final = 3  # --count was given and not reached before --timeout
+EXIT_OUTPUT_LOST: Final = 4  # the command completed but stdout lines were lost
 MAX_TIMEOUT_S: Final = 365 * 24 * 3600.0
 OUTPUT_POLL_S: Final = 0.5
-_SIGNALS: Final = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+DRAIN_NOTICE_S: Final = 2.0  # waiting this long for the reader of stdout earns one notice
+SIGNAL_POLL_S: Final = 0.02
+MIN_FREE_FDS: Final = 8  # event loop (3), UDP sockets, ledger, resolver threads, margin
+_SIGNALS: Final = HANDLED_SIGNALS
 
 app = typer.Typer(
     name="ironbird",
@@ -160,19 +174,6 @@ class _SignalState:
 _STATE = _SignalState()
 
 
-@contextlib.contextmanager
-def _signals_blocked() -> Any:
-    """Hold signals back while the ledger and output are closed; they act afterwards."""
-    blocked = hasattr(signal, "pthread_sigmask")
-    if blocked:
-        signal.pthread_sigmask(signal.SIG_BLOCK, _SIGNALS)
-    try:
-        yield
-    finally:
-        if blocked:
-            signal.pthread_sigmask(signal.SIG_UNBLOCK, _SIGNALS)
-
-
 # -- plumbing --------------------------------------------------------------------------
 
 
@@ -224,9 +225,20 @@ async def _main(glob: Globals, ledger: Ledger, body: Body, run: _Run) -> int:
     pipe_closed = run.pipe_closed
 
     def reader_gone() -> None:  # called from the writer thread
-        loop.call_soon_threadsafe(pipe_closed.set)
+        # The loop may be gone (the reader left during the final drain); the writer's
+        # ``reader_gone`` flag is what the code after the loop looks at.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(pipe_closed.set)
 
     console.stdout.set_on_closed(reader_gone)
+    try:
+        return await _main_body(glob, ledger, body, run)
+    finally:
+        console.stdout.set_on_closed(None)  # nothing may call into the loop once it is closing
+
+
+async def _main_body(glob: Globals, ledger: Ledger, body: Body, run: _Run) -> int:
+    console = run.console
     try:
         config = load_config(find_config(glob.config))
     except IronbirdError as exc:
@@ -269,6 +281,174 @@ def _interrupt_notice(name: str, signum: int, run: _Run) -> str:
     return f"interrupted ({sig}): {tx.command} was not sent"
 
 
+def _check_descriptors() -> None:
+    """Refuse up front when too few file descriptors are left for the event loop and sockets.
+
+    Failing inside the event loop's own setup would leave a half-built loop behind and a
+    coroutine that was never awaited.
+    """
+    held: list[int] = []
+    try:
+        for _ in range(MIN_FREE_FDS):
+            held.append(os.open(os.devnull, os.O_RDONLY))
+    except OSError as exc:
+        limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        raise IronbirdError(
+            Code.SYS_RESOURCE,
+            f"too few file descriptors left to run (limit {limit}, need {MIN_FREE_FDS} free); "
+            "raise the limit with 'ulimit -n' or close other files",
+            cause=exc,
+        ) from exc
+    finally:
+        for fd in held:
+            os.close(fd)
+
+
+def _record_signal(name: str, signum: int, run: _Run, ledger: Ledger, console: Console) -> int:
+    """Ledger and announce a signal that ended the command; returns the exit code 128+n."""
+    notice = _interrupt_notice(name, signum, run)
+    tx = run.session.last_tx if run.session is not None else None
+    ledger.record(
+        "state",
+        "cli.signal",
+        command=name,
+        signal=signal.Signals(signum).name,
+        signum=int(signum),
+        notice=notice,
+        tx_command=tx.command if tx else None,
+        tx_went_out=tx.went_out if tx else None,
+    )
+    console.err(notice)
+    return 128 + int(signum)
+
+
+def _poll_signal(wait_s: float) -> int:
+    """Take one held shutdown signal if it is (or becomes, within ``wait_s``) pending; else 0."""
+    take = getattr(signal, "sigtimedwait", None)
+    if take is None:  # pragma: no cover - not Linux
+        time.sleep(wait_s)
+        return 0
+    info = take(_SIGNALS, wait_s)
+    return int(info.si_signo) if info is not None else 0
+
+
+def _drain(writer: BoundedWriter, on_slow: Callable[[], None] | None = None) -> int:
+    """Wait with no deadline until ``writer`` has written every line it accepted.
+
+    Runs with the shutdown signals held, so one that arrives is taken here and returned (the
+    wait is over, the caller abandons what is left); 0 means everything was written.
+    ``on_slow`` runs once if the wait lasts :data:`DRAIN_NOTICE_S`.
+    """
+    writer.begin_close()
+    if not hasattr(signal, "sigtimedwait"):  # pragma: no cover - not Linux
+        writer.wait(CLOSE_WAIT_S)
+        return 0
+    slow_at = time.monotonic() + DRAIN_NOTICE_S
+    while not writer.wait(0.001):
+        if on_slow is not None and time.monotonic() >= slow_at:
+            on_slow()
+            on_slow = None
+        if signum := _poll_signal(SIGNAL_POLL_S):
+            return signum
+    return 0
+
+
+def _stdout_loss(console: Console, name: str, run: _Run) -> IronbirdError | None:
+    out = console.stdout
+    if not out.lost:
+        return None
+    tx = run.session.last_tx if run.session is not None else None
+    sent = f"; {tx.command} was sent" if name == "send" and tx is not None and tx.went_out else ""
+    if out.unavailable:
+        summary = f"stdout is closed: {out.lost} line(s) of output could not be shown{sent}"
+    else:
+        parts = [
+            f"{count} {what}"
+            for count, what in (
+                (out.dropped_total, "dropped while it was not draining"),
+                (out.abandoned_total, "abandoned at exit"),
+                (out.undelivered_total, "undeliverable"),
+            )
+            if count
+        ]
+        cause = f" ({os.strerror(out.error.errno)})" if out.error and out.error.errno else ""
+        summary = (
+            f"stdout lost {out.lost} line(s) - {', '.join(parts)}{cause}; output is incomplete, "
+            f"read it faster or write it to a file{sent}"
+        )
+    return IronbirdError(Code.OUT_LOST, summary)
+
+
+def _finish(
+    name: str, run: _Run, ledger: Ledger, console: Console, code: int, *, late_signal: int = 0
+) -> int:
+    """Write out everything still queued, close the ledger and return the exit code.
+
+    A normal end waits for the reader of stdout with no deadline, so a slow reader loses
+    nothing; a signal (taken with ``sigtimedwait`` while the signals are held, so it can never
+    run a handler mid-flush) cuts the wait short and the rest is abandoned and counted. After a
+    signal already ended the run, the drain is bounded by :data:`CLOSE_WAIT_S`. Anything lost
+    on stdout is reported once, ledgered with its counts, and turns an exit code of 0 into
+    :data:`EXIT_OUTPUT_LOST`.
+    """
+    out, err = console.stdout, console.stderr
+    with signals_held():
+        ledger.flush()
+        signum = _STATE.signum
+        fresh = late_signal  # a signal that still has to be ledgered
+        if late_signal and not signum:
+            signum = _STATE.signum = late_signal
+
+        def waiting() -> None:
+            console.err(
+                IronbirdError(
+                    Code.OUT_WAITING,
+                    f"stdout is not being read: {out.queued_lines} line(s) still queued; "
+                    "waiting for the reader (send a signal to abandon them)",
+                ).user_line()
+            )
+
+        if not signum and (got := _drain(out, waiting)):
+            signum = fresh = _STATE.signum = got
+        out.close()  # bounded when a signal ended things; abandons what is left
+        if not signum and (got := _poll_signal(0)):
+            signum = fresh = _STATE.signum = got
+        if fresh:
+            code = _record_signal(name, fresh, run, ledger, console)
+        loss = _stdout_loss(console, name, run)
+        if loss is not None:
+            ledger.record_error(
+                loss,
+                stdout_lost=out.lost,
+                stdout_dropped=out.dropped_total,
+                stdout_abandoned=out.abandoned_total,
+                stdout_undelivered=out.undelivered_total,
+                stdout_unavailable=out.unavailable,
+            )
+            console.err(loss.user_line())
+            if code == 0:
+                code = EXIT_OUTPUT_LOST
+        if not signum and (got := _drain(err)):
+            signum = fresh = _STATE.signum = got
+            code = _record_signal(name, got, run, ledger, console)
+        err.close()
+        if out.reader_gone:
+            ledger.record("state", "output.pipe_closed", stream="stdout")
+        if err.lost or err.reader_gone:
+            ledger.record(
+                "state",
+                "output.stderr_lost",
+                lost=err.lost,
+                unavailable=err.unavailable,
+                reader_gone=err.reader_gone,
+            )
+        ledger.close()
+        if not signum and (got := _poll_signal(0)):  # arrived while the ledger was closing
+            code = _record_signal(name, got, run, ledger, console)
+            ledger.close()
+    return code
+
+
 def _run(
     ctx: typer.Context,
     as_node: str | None,
@@ -302,42 +482,51 @@ def _run(
                 raise typer.Exit(exc.exit_code) from exc
             ledger.disable()
         ledger.record("action", "cli.invoke", command=name, argv=sys.argv[1:])
+        main_coro: Coroutine[Any, Any, int] | None = None
         try:
-            code = asyncio.run(_main(glob, ledger, body, run))
+            _check_descriptors()
+            main_coro = _main(glob, ledger, body, run)
+            code = asyncio.run(main_coro)
         except (_Terminated, asyncio.CancelledError) as stop:
             if not _STATE.signum:
                 raise
             signum = stop.signum if isinstance(stop, _Terminated) else _STATE.signum
-            notice = _interrupt_notice(name, signum, run)
-            tx = run.session.last_tx if run.session is not None else None
-            ledger.record(
-                "state",
-                "cli.signal",
-                command=name,
-                signal=signal.Signals(signum).name,
-                signum=int(signum),
-                notice=notice,
-                tx_command=tx.command if tx else None,
-                tx_went_out=tx.went_out if tx else None,
-            )
-            console.err(notice)
-            code = 128 + int(signum)
+            code = _record_signal(name, signum, run, ledger, console)
+        except IronbirdError as exc:
+            ledger.record_error(exc)
+            _print_error(console, exc, glob.verbose)
+            code = exc.exit_code
         except Exception as exc:
-            err = IronbirdError(
-                Code.INTERNAL,
-                f"unexpected {type(exc).__name__}: {exc}",
-                details=traceback.format_exc(),
-                cause=exc,
+            not_started = (
+                main_coro is not None
+                and inspect.getcoroutinestate(main_coro) == inspect.CORO_CREATED
             )
+            if isinstance(exc, OSError) and not_started:  # the event loop could not be set up
+                err: IronbirdError = IronbirdError(
+                    Code.SYS_RESOURCE,
+                    f"cannot start the event loop: {exc.strerror or exc}; "
+                    "raise the limit with 'ulimit -n' or close other files",
+                    cause=exc,
+                )
+            else:
+                err = IronbirdError(
+                    Code.INTERNAL,
+                    f"unexpected {type(exc).__name__}: {exc}",
+                    details=traceback.format_exc(),
+                    cause=exc,
+                )
             ledger.record_error(err)
             _print_error(console, err, glob.verbose)
-        if console.stdout.reader_gone:
-            ledger.record("state", "output.pipe_closed", stream="stdout")
+            code = err.exit_code
+        finally:
+            if main_coro is not None:
+                main_coro.close()  # no "never awaited" warning when the loop never started
     finally:
         _STATE.detach()
-        with _signals_blocked():
-            ledger.close()
-            console.close()
+        try:
+            code = _finish(name, run, ledger, console, code)
+        except _Terminated as stop:  # a signal in the instant before the signals were held
+            code = _finish(name, run, ledger, console, code, late_signal=stop.signum)
     raise typer.Exit(code)
 
 
@@ -445,7 +634,7 @@ def find(
         if len(matches) > limit:
             run.console.err(f"{len(matches) - limit} more matches not shown (raise --limit)")
         if not matches:
-            run.console.err(f"no match for {term(query, 40, err=True)!r}")
+            run.console.err(f"no match for '{term(query, 40, err=True)}'")
             return 1
         return 0
 
@@ -698,6 +887,8 @@ def respond(
 
 def _stderr_line(text: str) -> None:
     """Direct (unbuffered-queue) line on stderr for errors raised outside a command run."""
+    if sys.stderr is None:  # closed with ``2>&-``; print(file=None) would use stdout
+        return
     with contextlib.suppress(OSError, ValueError):
         print(term(text, 1000, err=True), file=sys.stderr, flush=True)
 

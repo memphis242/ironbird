@@ -9,7 +9,6 @@ values so the surface can later be exposed over a control socket unchanged.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 import traceback
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -27,7 +26,7 @@ from ironbird.events import Event, extract_event
 from ironbird.header import load_profile
 from ironbird.ledger import Ledger
 from ironbird.transport import Datagram
-from ironbird.transport.udp import UdpTransport
+from ironbird.transport.udp import UdpTransport, scan_kernel_drops
 
 MAX_TRACKED_MIDS: Final = 1024
 TICK_S: Final = 1.0
@@ -158,10 +157,10 @@ class Session:
         try:
             for task in self._tasks:
                 task.cancel()
-            for task in self._tasks:
-                # A task that died is already reported by its done-callback.
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
+            # A task that died is already reported by its done-callback. Collecting the results
+            # (rather than suppressing CancelledError around each await) lets a cancellation of
+            # this very task, such as a signal, propagate.
+            await asyncio.gather(*self._tasks, return_exceptions=True)
         finally:
             try:
                 self.coalescer.flush()
@@ -188,8 +187,10 @@ class Session:
         while True:
             await asyncio.sleep(TICK_S)
             self.coalescer.tick()
-            for transport in tuple(self._watches):
-                self._poll_drops(transport, refresh=True)
+            watched = tuple(self._watches)
+            await scan_kernel_drops([t for t in watched if t.kernel_scan_due()])
+            for transport in watched:
+                self._poll_drops(transport)
 
     # -- error reporting ---------------------------------------------------------------
 
@@ -466,14 +467,15 @@ class Session:
         self._watches[transport] = _DropWatch(label)
 
     def _unwatch_drops(self, transport: UdpTransport) -> None:
-        self._poll_drops(transport, refresh=True)
+        """Report the final counts and stop watching; call after the transport has closed."""
+        self._poll_drops(transport)
         self._watches.pop(transport, None)
 
-    def _poll_drops(self, transport: UdpTransport, *, refresh: bool) -> None:
+    def _poll_drops(self, transport: UdpTransport) -> None:
         """Report new drops of ``transport`` since the last poll (coalesced, ledgered).
 
-        ``refresh`` also re-reads the kernel's counter (a file read), which the 1 Hz ticker does;
-        the per-datagram path only looks at counters already in memory.
+        Only counters already in memory are looked at; the 1 Hz ticker refreshes the kernel's
+        counter from ``/proc/net/udp`` (off the loop) first when that is due.
         """
         watch = self._watches.get(transport)
         if watch is None:
@@ -491,7 +493,7 @@ class Session:
                 ),
                 context=f"queue {watch.label}",
             )
-        kernel = transport.refresh_kernel_drops() if refresh else transport.kernel_dropped
+        kernel = transport.kernel_dropped
         if kernel != watch.kernel_seen:
             delta, watch.kernel_seen = kernel - watch.kernel_seen, kernel
             self.ledger.record(
@@ -720,7 +722,7 @@ class Listener:
         label = self._route.peer.name
         async for datagram in self._transport.receive():
             result = self._session._ingest(self._codec, self._kind, datagram, self._mids, label)
-            self._session._poll_drops(self._transport, refresh=False)
+            self._session._poll_drops(self._transport)
             if isinstance(result, DecodedPacket):
                 yield Received(
                     datagram.time_ns,
@@ -731,8 +733,10 @@ class Listener:
                 )
 
     async def close(self) -> None:
-        self._session._unwatch_drops(self._transport)
-        await self._transport.close()
+        try:
+            await self._transport.close()
+        finally:  # drops counted while closing are part of the final report
+            self._session._unwatch_drops(self._transport)
         self._session.ledger.record("action", "listen.stop", peer=self._route.peer.name)
 
 
@@ -896,7 +900,7 @@ class Responder:
         label = self._route.peer.name
         async for datagram in self._transport.receive():
             result = session._ingest(self._codec, MessageKind.COMMAND, datagram, None, label)
-            session._poll_drops(self._transport, refresh=False)
+            session._poll_drops(self._transport)
             if result is None:  # pragma: no cover - no filter is set
                 continue
             if isinstance(result, DecodeError):
@@ -963,8 +967,10 @@ class Responder:
         return encoded
 
     async def close(self) -> None:
-        self._session._unwatch_drops(self._transport)
-        await self._transport.close()
+        try:
+            await self._transport.close()
+        finally:  # drops counted while closing are part of the final report
+            self._session._unwatch_drops(self._transport)
         self._session.ledger.record(
             "action", "respond.stop", accepted=self.accepted, rejected=self.rejected
         )

@@ -57,6 +57,10 @@ class Code(StrEnum):
     LED_DIR = "IB-LED-002"  # no usable ledger/state directory (HOME unset, path unusable)
     # Output
     OUT_DROPPED = "IB-OUT-001"  # output lines dropped because stdout/stderr is not draining
+    OUT_LOST = "IB-OUT-002"  # final tally: output lines dropped, abandoned or never deliverable
+    OUT_WAITING = "IB-OUT-003"  # ending, but still waiting for the reader of stdout to take lines
+    # System resources
+    SYS_RESOURCE = "IB-SYS-001"  # the OS refused a resource needed to start (file descriptors)
     # CLI / internal
     CLI_USAGE = "IB-CLI-001"  # command line usage error
     INTERNAL = "IB-INT-001"  # unexpected internal error (bug)

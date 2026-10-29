@@ -25,7 +25,7 @@ import socket
 import struct
 import sys
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Collection, Iterable
 from typing import Any, Final
 
 from ironbird.config import Endpoint
@@ -45,6 +45,14 @@ SO_RXQ_OVFL: Final = getattr(socket, "SO_RXQ_OVFL", 40)
 _U32: Final = 0xFFFFFFFF
 
 _OPEN_REMEDY: Final = {
+    errno.EAFNOSUPPORT: (
+        "this host does not support that address family (is IPv6 disabled?) - use an "
+        "address of another family in the config"
+    ),
+    errno.EMFILE: "too many open files - raise the limit with 'ulimit -n' or close other files",
+    errno.ENFILE: "the system is out of file descriptors - close other programs, then retry",
+    errno.ENOBUFS: "the system is out of socket buffer memory - free memory, then retry",
+    errno.ENOMEM: "the system is out of memory - free memory, then retry",
     errno.EADDRINUSE: (
         "another listener (ib listen/respond, cFS) may own the port - stop it or change "
         "the port in the config"
@@ -52,6 +60,45 @@ _OPEN_REMEDY: Final = {
     errno.EADDRNOTAVAIL: "that address is not on this host - fix the host in the config",
     errno.EACCES: "ports below 1024 need privileges - use a higher port in the config",
 }
+
+
+def read_proc_drops(inodes: Iterable[int]) -> dict[int, int]:
+    """Kernel drop counters of the UDP sockets with these inodes, in one pass over the tables.
+
+    Blocking file reads: call from a worker thread when the event loop is running. A socket
+    that is not in the tables (already closed) is absent from the result.
+    """
+    wanted = {str(inode): inode for inode in inodes}
+    found: dict[int, int] = {}
+    for table in PROC_TABLES:
+        if len(found) == len(wanted):
+            break
+        try:
+            with open(table, encoding="ascii", errors="replace") as handle:
+                next(handle, None)  # header
+                for row in handle:
+                    parts = row.split()
+                    if len(parts) < PROC_MIN_COLUMNS:
+                        continue
+                    inode = wanted.get(parts[PROC_INODE_COLUMN])
+                    if inode is not None:
+                        with contextlib.suppress(ValueError):
+                            found[inode] = int(parts[-1])
+        except OSError:
+            continue
+    return found
+
+
+async def scan_kernel_drops(transports: Collection[UdpTransport]) -> None:
+    """Refresh the kernel drop counters of ``transports`` with one scan, off the event loop."""
+    inodes = {t.inode: t for t in transports if t.inode is not None}
+    if not inodes:
+        return
+    found = await asyncio.to_thread(read_proc_drops, tuple(inodes))
+    for inode, transport in inodes.items():
+        value = found.get(inode)
+        if value is not None:
+            transport.note_proc_drops(value)
 
 
 class UdpTransport:
@@ -79,6 +126,9 @@ class UdpTransport:
         self._ovfl_total = 0
         self._proc_drops = 0
         self._ovfl_active = False
+        self._rx_total = 0  # datagrams read from the socket
+        self._rx_seen = 0  # ``_rx_total`` at the previous :meth:`kernel_scan_due`
+        self._tail_unchecked = False
         self._inode: int | None = None
         self._pending_error: OSError | None = None
         self._closed = False
@@ -117,23 +167,42 @@ class UdpTransport:
         name = self._sock.getsockname()
         return (str(name[0]), int(name[1])) if name else None
 
+    @property
+    def inode(self) -> int | None:
+        """Socket inode (the key of its row in ``/proc/net/udp``), once open."""
+        return self._inode
+
+    def note_proc_drops(self, value: int) -> None:
+        """Record a drop count read from ``/proc/net/udp`` (it only ever grows)."""
+        self._proc_drops = max(self._proc_drops, value)
+
+    def kernel_scan_due(self) -> bool:
+        """Whether the periodic tick should read ``/proc/net/udp`` for this socket now.
+
+        Without ``SO_RXQ_OVFL`` the table is the only source, so every tick. With it, drops ride
+        on the datagrams that arrive; only the tail of a burst (datagrams dropped after the last
+        one that got through) is invisible, so one scan is due on the first tick that finds the
+        socket quiet after traffic. Call once per tick.
+        """
+        if not self._ovfl_active:
+            return True
+        busy = self._rx_total != self._rx_seen
+        self._rx_seen = self._rx_total
+        if busy:
+            self._tail_unchecked = True
+            return False
+        due, self._tail_unchecked = self._tail_unchecked, False
+        return due
+
     def refresh_kernel_drops(self) -> int:
-        """Re-read the kernel's drop counter for this socket; returns the cumulative count."""
-        inode = str(self._inode) if self._inode is not None else None
-        if inode is None:
-            return self.kernel_dropped
-        for table in PROC_TABLES:
-            try:
-                with open(table, encoding="ascii", errors="replace") as handle:
-                    next(handle, None)  # header
-                    for row in handle:
-                        parts = row.split()
-                        if len(parts) >= PROC_MIN_COLUMNS and parts[PROC_INODE_COLUMN] == inode:
-                            with contextlib.suppress(ValueError):
-                                self._proc_drops = max(self._proc_drops, int(parts[-1]))
-                            return self.kernel_dropped
-            except OSError:
-                continue
+        """Re-read the kernel's drop counter now (blocking); returns the cumulative count.
+
+        The running session uses :func:`scan_kernel_drops` instead, which does not block the loop.
+        """
+        if self._inode is not None:
+            found = read_proc_drops((self._inode,)).get(self._inode)
+            if found is not None:
+                self.note_proc_drops(found)
         return self.kernel_dropped
 
     # -- receive (event-loop thread) ----------------------------------------------------
@@ -153,6 +222,7 @@ class UdpTransport:
                 self._pending_error = exc
                 return
             stamp = time.time_ns()
+            self._rx_total += 1
             for level, kind, data in ancillary:
                 if level == socket.SOL_SOCKET and kind == SO_RXQ_OVFL and len(data) >= 4:
                     counter = struct.unpack_from("=I", data)[0]
@@ -201,15 +271,22 @@ class UdpTransport:
         except (OSError, UnicodeError) as exc:
             raise self._open_error("resolve host of", endpoint, exc) from exc
         last: OSError = OSError("no usable address")
+        step = "open a socket for"
         sock: socket.socket | None = None
         for family, kind, proto, _canon, address in infos:
-            candidate = socket.socket(family, kind, proto)
+            try:
+                candidate = socket.socket(family, kind, proto)
+            except OSError as exc:  # e.g. EAFNOSUPPORT for IPv6 on a host without it, EMFILE
+                last, step = exc, "open a socket for"
+                continue
             try:
                 candidate.setblocking(False)
                 if self._local is not None:
                     self._tune_listener(candidate)
+                    step = "bind"
                     candidate.bind(address)
                 else:
+                    step = "connect to"
                     candidate.connect(address)
             except OSError as exc:
                 candidate.close()
@@ -218,13 +295,16 @@ class UdpTransport:
             sock = candidate
             break
         if sock is None:
-            action = "bind" if self._local else "connect to"
-            raise self._open_error(action, endpoint, last) from last
+            raise self._open_error(step, endpoint, last) from last
+        try:
+            self._inode = os.fstat(sock.fileno()).st_ino
+            if self._local is not None:
+                self.rcvbuf_effective = int(sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
+            loop.add_reader(sock.fileno(), self._on_readable)
+        except OSError as exc:
+            sock.close()
+            raise self._open_error("open a socket for", endpoint, exc) from exc
         self._sock = sock
-        self._inode = os.fstat(sock.fileno()).st_ino
-        if self._local is not None:
-            self.rcvbuf_effective = int(sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
-        loop.add_reader(sock.fileno(), self._on_readable)
 
     def _tune_listener(self, sock: socket.socket) -> None:
         """Ask for a big receive buffer and the kernel's drop counter (both best effort)."""
@@ -305,10 +385,16 @@ class UdpTransport:
             return
         self._closed = True
         sock = self._sock
-        if sock is not None:
-            if self._loop is not None:
-                with contextlib.suppress(ValueError, OSError):
-                    self._loop.remove_reader(sock.fileno())
-            self.refresh_kernel_drops()  # the socket's counter goes away with it
-            sock.close()
-        self._enqueue_sentinel()
+        try:
+            if sock is not None:
+                if self._loop is not None:
+                    with contextlib.suppress(ValueError, OSError):
+                        self._loop.remove_reader(sock.fileno())
+                if self._local is not None:
+                    # The socket's counter goes away with it; this also catches the tail of a
+                    # burst that no datagram reported.
+                    await scan_kernel_drops((self,))
+        finally:
+            if sock is not None:
+                sock.close()
+            self._enqueue_sentinel()

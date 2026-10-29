@@ -341,11 +341,18 @@ def test_blocked_stdout_does_not_stop_timeout_and_dropped_lines_are_reported(
 ) -> None:
     proc, errfile = start_blocked_listen(mock_config_path, tmp_path, "--timeout", "2")
     try:
+        wait_for_file_text(errfile, Code.OUT_DROPPED.value, proc, timeout=20)
+        deadline = time.monotonic() + 15
+        while not events_named(state_dir, "listen.ending") and time.monotonic() < deadline:
+            time.sleep(0.05)  # the timeout ends the run although stdout never drained
+        assert events_named(state_dir, "listen.ending")[-1]["reason"] == "timeout"
+        assert proc.poll() is None  # shutdown now waits for the reader instead of abandoning lines
+        assert proc.stdout is not None
+        proc.stdout.read()
         proc.wait(timeout=15)
     finally:
         kill_quietly(proc)
-    assert proc.returncode == 0  # a timeout without --count is a normal end
-    assert Code.OUT_DROPPED.value in errfile.read_text()
+    assert proc.returncode == 4  # the command completed, but lines were lost (README: exit codes)
     assert any(e["event"] == Code.OUT_DROPPED.value for e in ledger_events(state_dir))
 
 
@@ -873,8 +880,9 @@ def test_run_sh_refuses_a_second_instance_and_leaves_the_first_alone(tmp_path: P
         subprocess.run([str(TOOLS / "clean.sh"), str(build / "run" / "cpu1")], check=False)
 
 
-def fake_ipc(tmp_path: Path, rows: str) -> dict[str, str]:
-    """PATH with stub ``ipcs``/``ipcrm``: ``ipcs -m`` prints ``rows``, ``ipcrm`` logs its args."""
+def fake_ipc(tmp_path: Path, rows: str, user: str) -> dict[str, str]:
+    """PATH with stub ``ipcs``/``ipcrm``/``id``: ``ipcs -m`` prints ``rows``, ``ipcrm`` logs its
+    args and ``id`` says the invoking user is the unprivileged ``user``."""
     bin_dir = tmp_path / "stubs"
     bin_dir.mkdir()
     log = tmp_path / "ipcrm.log"
@@ -885,6 +893,9 @@ def fake_ipc(tmp_path: Path, rows: str) -> dict[str, str]:
         f"cat <<'EOF'\n{rows}\nEOF\n"
     )
     (bin_dir / "ipcrm").write_text(f'#!/usr/bin/env bash\necho "$@" >> {log}\n')
+    (bin_dir / "id").write_text(
+        f'#!/usr/bin/env bash\ncase "$1" in -u) echo 1000;; -un) echo {user};; *) exit 1;; esac\n'
+    )
     for stub in bin_dir.iterdir():
         stub.chmod(0o755)
     return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "IPCRM_LOG": str(log)}
@@ -897,7 +908,7 @@ def test_clean_sh_removes_only_own_unattached_segments_of_its_run_dir(tmp_path: 
     keyfile.write_text("")
     st = keyfile.stat()
     key = (0x52 << 24) | ((st.st_dev & 0xFF) << 16) | (st.st_ino & 0xFFFF)
-    me = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
+    me = "tester"
     rows = "\n".join(
         [
             f"0x{key:08x} 101        {me}  600        4096       0",  # ours: removed
@@ -906,7 +917,7 @@ def test_clean_sh_removes_only_own_unattached_segments_of_its_run_dir(tmp_path: 
             f"0x{key ^ 1:08x} 104        {me}  600        4096       0",  # another key
         ]
     )
-    env = fake_ipc(tmp_path, rows)
+    env = fake_ipc(tmp_path, rows, me)
     done = subprocess.run(
         [str(TOOLS / "clean.sh"), str(run_dir)],
         env=env,

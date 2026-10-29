@@ -658,8 +658,15 @@ def _events(ground: Ground, state_dir: Path, *args: str) -> Generator[EventsProc
     running = EventsProcess(proc)
     try:
         assert proc.stderr is not None
-        banner = proc.stderr.readline()
-        assert "listening for events from fc" in banner, banner
+        # Notices (for example IB-TX-005 on a host with a small net.core.rmem_max) may precede
+        # the banner.
+        seen: list[str] = []
+        for line in iter(proc.stderr.readline, ""):
+            seen.append(line)
+            if "listening for events from fc" in line:
+                break
+        else:
+            raise AssertionError(f"no events banner; stderr so far: {seen}")
         running.start_reading()
         yield running
     finally:

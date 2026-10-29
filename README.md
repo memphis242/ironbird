@@ -42,15 +42,19 @@ ib -c examples/mock.toml send fc MOCK_RAISE_EVENT app=DEMO event_id=7 event_type
 | 1 | Runtime error (`error IB-...`), `find` with no match |
 | 2 | Usage, configuration, CCDD or header-profile error |
 | 3 | `listen`, `events` or `respond` had `--count N` and `--timeout` elapsed first |
+| 4 | The command otherwise succeeded but stdout lines were lost (`IB-OUT-002`): dropped while stdout was not draining, abandoned when a signal cut the final drain short, or stdout is closed (`>&-`). An error (1, 2), 3 or a signal (128+n) takes precedence. A `send` that exits 4 still went out |
 | 128+n | Ended by signal n: 130 (Ctrl-C), 129 (SIGHUP), 143 (SIGTERM). The ledger is flushed first; an interrupted `send` says whether the command went out |
 
-Output never blocks the tool: a stalled stdout (unread pipe, paused pager) drops lines with one
-coalesced `IB-OUT-001` notice instead of freezing signals and `--timeout`; the ledger keeps
-everything. Datagrams the kernel drops because the socket buffer is full are reported as
+Output never blocks the tool while it runs: a stalled stdout (unread pipe, paused pager) drops
+lines with one coalesced `IB-OUT-001` notice instead of freezing signals and `--timeout`; the
+ledger keeps everything. When the command ends normally it then waits, with no deadline, for a
+slow reader to take the lines already queued (one `IB-OUT-003` line says so after 2 s; a signal
+abandons them), so `ib listen --count N | slow-consumer` loses nothing. Whatever was lost is
+summed up in one `IB-OUT-002` line, in the ledger, and in exit code 4. Datagrams the kernel drops because the socket buffer is full are reported as
 `IB-TX-004`; if the kernel grants a smaller receive buffer than requested, `IB-TX-005` says to
 raise `net.core.rmem_max` (`sysctl -w net.core.rmem_max=...`).
 
-The ledger directory is `$IRONBIRD_STATE_DIR`, else an absolute `$XDG_STATE_HOME/ironbird`,
+The ledger directory is an absolute `$IRONBIRD_STATE_DIR` (a relative one is refused), else an absolute `$XDG_STATE_HOME/ironbird`,
 else `~/.local/state/ironbird`. `send` and `respond` refuse to run (`IB-LED-002`, nothing sent)
 when it cannot be created.
 
