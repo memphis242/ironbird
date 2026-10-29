@@ -13,6 +13,12 @@ replays telemetry across multiple aliased hardware targets.
 - Packets are CCSDS space packets with project-specific header extensions; header
   layout must stay user-definable, not hard-coded.
 - The design spec is still being written in Plan mode; do not implement ahead of it.
+- All input is untrusted (wire packets, serial, recordings, imported CCDD/config/
+  header files). Follow "Untrusted input and malformed data" in `docs/plan.md`:
+  validate every length before unpacking, parse only through the single decode
+  boundary, never `pickle`/`eval` data, bound every cache, sanitize strings before
+  display or export, and add a malformed-input test (and corpus entry) for every
+  parser change or bug.
 - Error reporting is a first-class, pervasive feature, not an afterthought:
     - Every step that can fail (config load, CCDD parse, transport open/read/write,
       encode/decode, recording I/O, export) has a defined path to the user and to
