@@ -20,6 +20,11 @@ replays telemetry across multiple aliased hardware targets.
     - The user-facing message is succinct: what failed and what to do, with a
       stable error code. Full detail (cause chain, raw bytes, context) sits one
       step away: a details pane/modal in the TUI, `--verbose` or the log in the CLI.
+    - Guard against alert fatigue: long or frequent messages become noise users
+      learn to ignore. Keep messages to one line, coalesce repeats (e.g. "decode
+      failed for MID 0x0881 (x37 in 10 s)") instead of re-alerting, rate-limit
+      by error code, and surface only what the user can act on. Everything still
+      goes to the ledger in full.
     - The log is an action ledger, not just an error log: timestamped (UTC, ISO
       8601, sub-millisecond) records of user actions, commands sent, state changes,
       and errors, so the exact sequence leading to a failure can be traced later.
