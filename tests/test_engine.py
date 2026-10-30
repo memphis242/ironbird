@@ -148,8 +148,8 @@ def test_a_consumer_that_falls_behind_is_reported_once_and_loses_nothing_from_th
         blast(addr, [hk] * 50)
         await until(lambda: len(sink.frames) == 50)
         await asyncio.sleep(0.2)
-        overflow = [n for n in notices if n.code is Code.TX_OVERRUN]
-        assert len(overflow) == 1 and "dropped from the consumer view" in overflow[0].summary
+        overflow = [n for n in notices if n.code is Code.ENG_LAG]
+        assert len(overflow) == 1 and "48" in overflow[0].summary
         await capture.close()
         assert len(sink.frames) == 50
 

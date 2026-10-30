@@ -64,6 +64,32 @@ def free_udp_ports(count: int) -> list[int]:
             sock.close()
 
 
+_PROC_UDP_TABLES = ("/proc/net/udp", "/proc/net/udp6")
+
+
+def udp_rx_queued_bytes(port: int) -> int | None:
+    """Bytes queued unread in the receive buffers of the UDP sockets bound to local ``port``
+    (the ``rx_queue`` column of ``/proc/net/udp``), or None where the tables cannot be read.
+
+    A sender that waits for this to reach 0 before each chunk of datagrams cannot overrun the
+    receiver's socket buffer, however slowly the receiving process is scheduled.
+    """
+    assert 0 < port < 0x10000
+    suffix = f":{port:04X}"
+    total: int | None = None
+    for table in _PROC_UDP_TABLES:
+        try:
+            rows = Path(table).read_text(encoding="ascii", errors="replace").splitlines()[1:]
+        except OSError:
+            continue
+        total = total or 0
+        for row in rows:
+            parts = row.split()
+            if len(parts) > 4 and parts[1].endswith(suffix):
+                total += int(parts[4].partition(":")[2], 16)
+    return total
+
+
 def _tree_status() -> str | None:
     """``git status`` of the repository (untracked files listed one by one); None if unknown."""
     git = shutil.which("git")

@@ -10,7 +10,11 @@ One transport is one link end. Up to two sockets, chosen by which endpoints are 
   transport is send-only).
 
 The receive path never blocks and never queues: each wakeup reads a batch of datagrams with
-``recvmsg`` and hands each one to the receiver the transport was opened with. Datagrams the
+``recvmsg`` and hands each one to the receiver the transport was opened with. The read buffer is
+``max_packet_bytes`` long and ``MSG_TRUNC`` makes the kernel report the datagram's true size, so a
+datagram over the cap is cut by the kernel's own copy: at most ``max_packet_bytes`` is ever
+copied into user space, and the receiver is told the size on the wire. A read that fails is
+counted and reported as ``IB-TX-003``; a failure that cannot clear ends the capture. Datagrams the
 *kernel* discarded because the socket buffer was full never reach user space, so they are
 counted from the kernel itself: the ``SO_RXQ_OVFL`` ancillary counter on every received
 datagram, and the ``drops`` column of ``/proc/net/udp`` (which also covers the tail of a flood,
@@ -34,13 +38,32 @@ from typing import Any, Final
 
 from ironbird.config import Endpoint, format_hostport
 from ironbird.errors import Code, IronbirdError
-from ironbird.transport.base import NO_FLAGS, Receiver, TransportClosed, TransportStats
+from ironbird.frame import FLAG_TRUNCATED
+from ironbird.header import DEFAULT_MAX_PACKET_BYTES
+from ironbird.transport.base import (
+    NO_FLAGS,
+    FailureHandler,
+    Receiver,
+    TransportClosed,
+    TransportStats,
+)
 
 RCVBUF_BYTES: Final = 4 * 1024 * 1024
 CONFIRM_WAIT_S: Final = 0.05
 BATCH: Final = 256  # datagrams read per wakeup before yielding to the loop
 SOURCE_CACHE_SIZE: Final = 64  # peers whose text form is remembered (bounded: peers are untrusted)
 MAX_DATAGRAM: Final = 65536
+# A read error that is not one of the fatal errnos is treated as transient until reads have been
+# failing, with no good read in between, for RECV_FAIL_WINDOW_S (the clock decides, so a short
+# burst of errors never ends a capture, however many reads it takes; two failures further apart
+# than the window are separate episodes) or for RECV_FAIL_BACKSTOP reads (a failing read leaves
+# the datagram queued, so the loop retries at once; the count ends the capture long before a
+# host that fails this fast would have spun for the whole window).
+RECV_FAIL_WINDOW_S: Final = 5.0
+RECV_FAIL_BACKSTOP: Final = 100_000
+# A read failing with one of these cannot succeed later: the socket itself is gone or unusable.
+_FATAL_RECV_ERRNOS: Final = frozenset({errno.EBADF, errno.ENOTSOCK, errno.EINVAL})
+_DISCARD_BYTES: Final = 1  # a read of the send socket keeps nothing, so it needs no room
 UNREAD_COUNT_LIMIT: Final = 1 << 20  # datagrams counted at close before giving up
 PROC_TABLES: Final = ("/proc/net/udp", "/proc/net/udp6")
 PROC_INODE_COLUMN: Final = 9
@@ -118,27 +141,40 @@ class UdpTransport:
         remote: Endpoint | None = None,
         reply_to: Endpoint | None = None,
         report: Callable[[IronbirdError], None] | None = None,
+        failed: FailureHandler | None = None,
+        max_packet_bytes: int = DEFAULT_MAX_PACKET_BYTES,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         assert local is not None or remote is not None, "need a local or remote endpoint"
         assert remote is None or reply_to is None, "connected sockets cannot also reply_to"
+        assert 0 < max_packet_bytes <= MAX_DATAGRAM, "the read buffer is the packet cap"
         self._local = local
         self._remote = remote
         self._reply_to = reply_to
         self._report = report
+        self._failed = failed
+        self._cap = max_packet_bytes
+        self._clock = clock
         self._receiver: Receiver | None = None
         self._rx: socket.socket | None = None
         self._tx: socket.socket | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._reply_addr: tuple[Any, ...] | None = None
-        self._buf = bytearray(MAX_DATAGRAM)
+        self._buf = bytearray(max_packet_bytes)  # holds at most one datagram's first bytes
         self._view = memoryview(self._buf)
+        self._discard = bytearray(_DISCARD_BYTES)
         self._sources: dict[Any, str] = {}
         self._ovfl_last = 0
         self._ovfl_total = 0
         self._proc_drops = 0
         self._ovfl_active = False
         self._rx_total = 0  # datagrams read from the socket
-        self._rx_bytes = 0
+        self._rx_bytes = 0  # bytes on the wire, including what was cut
+        self._rx_errors = 0
+        self._rx_error_streak = 0  # reads that failed since the last good one
+        self._rx_failing_since: float | None = None  # clock reading of the first of them
+        self._rx_last_failure: float | None = None  # ... and of the latest
+        self._rx_dead = False  # a read failed for good; nothing more is delivered
         self._rx_seen = 0  # ``_rx_total`` at the previous :meth:`kernel_scan_due`
         self._tx_total = 0
         self._tx_bytes = 0
@@ -196,12 +232,14 @@ class UdpTransport:
             tx_bytes=self._tx_bytes,
             kernel_dropped=self.kernel_dropped,
             unread_at_close=self._unread_at_close,
+            rx_errors=self._rx_errors,
         )
 
     def facts(self) -> Mapping[str, object]:
         return MappingProxyType(
             {
                 "endpoint": str(self._local),
+                "max_packet_bytes": self._cap,
                 "rcvbuf_requested": self.rcvbuf_requested,
                 "rcvbuf_effective": self.rcvbuf_effective,
                 "drop_counter": "SO_RXQ_OVFL" if self._ovfl_active else "/proc/net/udp",
@@ -261,18 +299,21 @@ class UdpTransport:
 
     def _on_readable(self) -> None:
         sock, receiver = self._rx, self._receiver
-        if sock is None or receiver is None:
+        if sock is None or receiver is None or self._rx_dead:
             return
-        buf, view = self._buf, self._view
+        buf, view, cap = self._buf, self._view, self._cap
         space = socket.CMSG_SPACE(4) if self._ovfl_active else 0
         for _ in range(BATCH):
             try:
-                size, ancillary, _flags, addr = sock.recvmsg_into([buf], space)
+                # MSG_TRUNC: ``size`` is the datagram's length on the wire even when it is longer
+                # than ``buf``; the kernel copies only ``cap`` bytes of it.
+                size, ancillary, _flags, addr = sock.recvmsg_into([buf], space, socket.MSG_TRUNC)
             except (BlockingIOError, InterruptedError):
                 return
-            except OSError as exc:  # e.g. ICMP "connection refused" on a connected socket
-                self._pending_error = exc
+            except OSError as exc:
+                self._receive_failed(exc)
                 return
+            self._rx_failing_since = None  # a good read ends the failing episode
             stamp = time.time_ns()
             self._rx_total += 1
             self._rx_bytes += size
@@ -281,7 +322,65 @@ class UdpTransport:
                     counter = struct.unpack_from("=I", data)[0]
                     self._ovfl_total += (counter - self._ovfl_last) & _U32
                     self._ovfl_last = counter
-            receiver(bytes(view[:size]), stamp, self._source_text(addr), size, NO_FLAGS)
+            if size > cap:
+                receiver(
+                    bytes(view), stamp, self._source_text(addr), size, NO_FLAGS | FLAG_TRUNCATED
+                )
+            else:
+                receiver(bytes(view[:size]), stamp, self._source_text(addr), size, NO_FLAGS)
+
+    def _receive_failed(self, exc: OSError) -> None:
+        """A read of the receive socket failed (anything but "nothing to read" or a signal).
+
+        Counted and reported as ``IB-TX-003`` (the report is coalesced downstream). One that
+        cannot clear, because the socket itself is unusable or reads have been failing, with no
+        good one between, for ``RECV_FAIL_WINDOW_S`` (or ``RECV_FAIL_BACKSTOP`` reads), stops the
+        transport receiving and tells the engine, which ends the captures fed from it with that
+        error.
+        """
+        now = self._clock()
+        self._rx_errors += 1
+        last = self._rx_last_failure
+        quiet_s = 0.0 if last is None else now - last
+        if self._rx_failing_since is None or quiet_s >= RECV_FAIL_WINDOW_S:
+            self._rx_failing_since, self._rx_error_streak = now, 0  # a new episode
+        self._rx_error_streak += 1
+        self._rx_last_failure = now
+        failing_s = now - self._rx_failing_since
+        name = errno.errorcode.get(exc.errno or 0, "unknown errno")
+        reason = f"{exc.strerror or exc} ({name})"
+        fatal = (
+            exc.errno in _FATAL_RECV_ERRNOS
+            or failing_s >= RECV_FAIL_WINDOW_S
+            or self._rx_error_streak >= RECV_FAIL_BACKSTOP
+        )
+        if not fatal:
+            if self._report is not None:
+                self._report(
+                    IronbirdError(
+                        Code.TX_RECV,
+                        f"{self.description}: receive failed: {reason}; {self._rx_errors} read "
+                        "error(s) so far",
+                        cause=exc,
+                    )
+                )
+            return
+        self._rx_dead = True
+        sock, loop = self._rx, self._loop
+        if sock is not None and loop is not None:
+            with contextlib.suppress(ValueError, OSError):
+                loop.remove_reader(sock.fileno())
+        error = IronbirdError(
+            Code.TX_RECV,
+            f"{self.description}: receive failed: {reason}; "
+            f"{self._rx_errors} read error(s), the link end can no longer receive - "
+            "restart the command",
+            cause=exc,
+        )
+        if self._failed is not None:
+            self._failed(error)
+        elif self._report is not None:
+            self._report(error)
 
     def _on_tx_readable(self) -> None:
         """The connected send socket is never read for data; reading it surfaces ICMP errors."""
@@ -290,7 +389,7 @@ class UdpTransport:
             return
         for _ in range(BATCH):
             try:
-                sock.recv(MAX_DATAGRAM)
+                sock.recv_into(self._discard)  # whatever a peer sends here is dropped, uncopied
             except (BlockingIOError, InterruptedError):
                 return
             except OSError as exc:

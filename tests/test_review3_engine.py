@@ -27,7 +27,7 @@ import pytest
 from typer.testing import CliRunner
 
 import test_review2_engine as r2
-from conftest import REPO
+from conftest import REPO, udp_rx_queued_bytes
 from ironbird.cli.main import app
 from ironbird.cli.output import BoundedWriter
 from ironbird.config import Endpoint
@@ -58,20 +58,45 @@ EXIT_OUTPUT_LOST = 4
 TOOLS = REPO / "tools" / "cfs"
 
 
+BURST_CHUNK = 100  # datagrams per chunk: far below any socket buffer (100 x ~1 KiB truesize)
+BURST_DRAIN_S = 15.0  # longest a listener may take to read one chunk off its socket
+
+
 def send_burst(config: Path, count: int, label: str = "x") -> None:
+    """Send ``count`` HK packets to the telemetry port in chunks, each sent only once the
+    listener has read everything before it off its socket.
+
+    The tests that use this count every line, so a datagram the kernel drops would fail them for
+    a reason that is the host's, not the tool's: with a small ``net.core.rmem_max`` (GitHub
+    runners: 212992) the socket holds about 500 of these packets, which a listener starved of
+    CPU by other test processes overruns in a few milliseconds. Waiting for the socket to drain
+    makes the burst lossless by construction on a host of any speed or load.
+    """
     _, telemetry = endpoints(config)
     wire = hk_wire(config, label)
     raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        for i in range(count):
-            raw.sendto(wire, (telemetry.host, telemetry.port))
-            if i % 100 == 99:
-                time.sleep(0.005)
+        for start in range(0, count, BURST_CHUNK):
+            _wait_until_read(telemetry.port)
+            for _ in range(min(BURST_CHUNK, count - start)):
+                raw.sendto(wire, (telemetry.host, telemetry.port))
     finally:
         raw.close()
 
 
-# -- 1: normal end drains with no deadline; losses are reported --
+def _wait_until_read(port: int) -> None:
+    deadline = time.monotonic() + BURST_DRAIN_S
+    while (queued := udp_rx_queued_bytes(port)) != 0:
+        if queued is None:  # no /proc/net/udp: fall back to a pause per chunk
+            time.sleep(0.005)
+            return
+        assert time.monotonic() < deadline, (
+            f"the listener left {queued} bytes unread on its socket for {BURST_DRAIN_S} s"
+        )
+        time.sleep(0.001)
+
+
+# -- 1: normal end drains with no deadline; losses are reported ----------------------------------
 
 
 def test_slow_reader_receives_every_line_when_listen_ends_normally(
@@ -104,7 +129,7 @@ def test_slow_reader_receives_every_line_when_listen_ends_normally(
         proc.wait(timeout=15)
     finally:
         kill_quietly(proc)
-    assert out.count(b"\n") == count
+    assert out.count(b"\n") == count, errfile.read_text()
     assert proc.returncode == 0, errfile.read_text()
     assert "IB-OUT" not in errfile.read_text().replace("IB-OUT-003", "")
 

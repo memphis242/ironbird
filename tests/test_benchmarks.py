@@ -20,8 +20,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
-from conftest import EXAMPLES
+from conftest import EXAMPLES, REPO
 from ironbird import render
 from ironbird.ccdd.model import MessageKind
 from ironbird.coalesce import Coalescer
@@ -42,6 +43,17 @@ LISTEN_OVERHEAD_RATIO = 1.5  # listen path vs. the bare decode + render it must 
 FLOOR_PPS = 1_000  # the plan's hard floor, aggregate packets per second
 TARGET_PPS = 10_000  # the plan's design target
 PACKET_BYTES = 200  # the plan's average packet size
+
+# A guard whose threshold is a rate or a cost ratio measured on the host. Under xdist the other
+# workers keep every core busy, so such a measurement says more about the scheduler than about
+# the tool: a listener off-CPU for a few milliseconds overruns a socket buffer capped by a small
+# net.core.rmem_max (212992 on GitHub runners), and a timed loop shares its core with another
+# test. These run, and are enforced, in the serial run of this file (CI's "Benchmarks" step,
+# ``pytest tests/test_benchmarks.py -n0``), as pytest-benchmark's own ceilings are.
+needs_a_quiet_host = pytest.mark.skipif(
+    "PYTEST_XDIST_WORKER" in os.environ,
+    reason="host-timing guard: enforced by the serial run (pytest tests/test_benchmarks.py -n0)",
+)
 
 
 def _check_ceiling(benchmark: Any, ceiling: float) -> None:
@@ -240,6 +252,7 @@ def _loopback_run(tmp_path: Path, count: int, rate: int) -> tuple[int, int, floa
     return count, ingested, seconds
 
 
+@needs_a_quiet_host
 def test_ingest_only_saturation_rate_on_loopback(benchmark: Any, tmp_path: Path) -> None:
     """INGEST ONLY: the most packets/s one engine ingests (and a draining consumer discards)
     from an unpaced sender. Nothing is decoded or printed, so this is not the rate ``ib listen``
@@ -261,6 +274,7 @@ def test_ingest_only_saturation_rate_on_loopback(benchmark: Any, tmp_path: Path)
     assert best >= FLOOR_PPS
 
 
+@needs_a_quiet_host
 def test_ingest_only_at_the_target_rate_loses_nothing_on_loopback(tmp_path: Path) -> None:
     """INGEST ONLY: paced at the floor and, on a host with room, at the design target: nothing
     is lost between the socket and a draining consumer."""
@@ -274,6 +288,7 @@ def test_ingest_only_at_the_target_rate_loses_nothing_on_loopback(tmp_path: Path
 # -- the whole listen path --
 
 
+@needs_a_quiet_host
 def test_listen_path_costs_little_over_decode_and_render(tmp_path: Path) -> None:
     """The per-packet cost of receive + queue + decode + JSON render, against the cost of the
     bare decode + render it wraps, measured in the same process so the ratio holds on any host.
@@ -370,6 +385,7 @@ def _run_listen_cli(tmp_path: Path, count: int, rate: int) -> tuple[int, int, st
     return count, len(out_path.read_bytes().splitlines()), err_path.read_text()
 
 
+@needs_a_quiet_host
 def test_listen_cli_at_the_target_rate_loses_no_output(tmp_path: Path) -> None:
     """END TO END: a separate ``ib listen --format json`` process writing to a file, fed by a
     separate sender at the design target rate. Output lines must not be dropped by the tool
@@ -378,7 +394,9 @@ def test_listen_cli_at_the_target_rate_loses_no_output(tmp_path: Path) -> None:
     sent, lines, errors = _run_listen_cli(tmp_path, LISTEN_PACKETS, LISTEN_RATE)
     print(f"\nib listen at {LISTEN_RATE:,} pkt/s: {lines}/{sent} lines written")
     assert "IB-OUT-" not in errors, errors
-    assert lines >= 0.95 * sent, f"{sent - lines} of {sent} packets did not reach the output"
+    assert lines >= 0.95 * sent, (
+        f"{sent - lines} of {sent} packets did not reach the output; stderr: {errors}"
+    )
 
 
 # -- recording --
@@ -406,6 +424,7 @@ def test_recorder_append_cost(benchmark: Any, tmp_path: Path) -> None:
     _check_ceiling(benchmark, 100e-6)
 
 
+@needs_a_quiet_host
 def test_recorder_writer_throughput_and_reader_rate(tmp_path: Path) -> None:
     """WRITER: frames/s and MB/s from append to a closed, fsynced file; READER: frames/s with
     every CRC and rule checked."""
@@ -492,6 +511,7 @@ def _run_record_cli(tmp_path: Path, count: int, rate: int) -> tuple[int, Any, st
     return count, rec_inspect.scan(out_path), err_path.read_text(), cpu
 
 
+@needs_a_quiet_host
 def test_record_cli_at_the_target_rate_loses_no_frame(tmp_path: Path) -> None:
     """END TO END: a separate ``ib record`` process, a separate sender at the design target rate.
     Every datagram that reached the socket is in the recording: recorded frames plus the kernel's
@@ -508,3 +528,50 @@ def test_record_cli_at_the_target_rate_loses_no_frame(tmp_path: Path) -> None:
     assert report.frames + kernel == sent, f"{sent - report.frames - kernel} frames unaccounted for"
     assert report.frames >= 0.95 * sent  # the host's own datagram loss is tolerated, not hidden
     assert report.lost_by_reason.get("recorder_overrun", 0) == 0
+
+
+# -- the serial run that enforces the guards above --
+
+WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
+PARALLEL_RUN = "pytest -n auto"
+SERIAL_RUN = "pytest tests/test_benchmarks.py -n0"
+
+
+def _unenforced_jobs(workflow_text: str) -> list[str]:
+    """Jobs that run the suite under xdist (where the host-timing guards skip) without a later,
+    failure-reporting serial run of this file; empty if every such job enforces them."""
+    document = yaml.safe_load(workflow_text)
+    assert isinstance(document, dict) and isinstance(document.get("jobs"), dict)
+    problems: list[str] = []
+    for name, job in document["jobs"].items():
+        steps = job.get("steps", []) if isinstance(job, dict) else []
+        runs = [(str(step.get("run", "")), step) for step in steps if isinstance(step, dict)]
+        parallel = [i for i, (run, _) in enumerate(runs) if PARALLEL_RUN in run]
+        if not parallel:
+            continue
+        serial = [
+            i
+            for i, (run, step) in enumerate(runs)
+            if SERIAL_RUN in run and not step.get("continue-on-error")
+        ]
+        if not any(i > parallel[-1] for i in serial):
+            problems.append(f"{name}: runs '{PARALLEL_RUN}' but no later '{SERIAL_RUN}' step")
+    return problems
+
+
+def test_every_parallel_ci_job_enforces_the_host_timing_guards_serially() -> None:
+    assert _unenforced_jobs(WORKFLOW.read_text()) == []
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        (SERIAL_RUN, "pytest tests/test_benchmarks.py -n auto"),
+        (f"run: {SERIAL_RUN}\n", f"run: {SERIAL_RUN}\n        continue-on-error: true\n"),
+    ],
+    ids=["serial run made parallel", "serial run allowed to fail"],
+)
+def test_the_enforcement_check_catches_a_lost_serial_run(old: str, new: str) -> None:
+    text = WORKFLOW.read_text()
+    assert old in text, f"mutation anchor not found: {old!r}"
+    assert _unenforced_jobs(text.replace(old, new))

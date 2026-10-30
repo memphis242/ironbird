@@ -10,8 +10,11 @@ Data flow (one process, one event loop)::
 Ingest is cheap and never decodes fields. A frame that fails ``Codec.check`` is still a frame:
 it reaches the sinks and every consumer, so nothing a link carried is hidden. A frame that
 passes carries the check's result, which a live consumer's decode reuses. A consumer that falls
-behind loses frames from its own queue only (counted and reported); the sinks have already seen
-them.
+behind loses frames from its own queue only (counted and reported as ``IB-ENG-001``); the sinks
+have already seen them. Memory is bounded at every hop: a transport copies at most
+``max_packet_bytes`` per datagram out of the OS, and a consumer queue holds at most
+``queue_bytes`` (every frame is charged its data plus a fixed overhead), counting frames the
+consumer has taken in a batch and not yet finished with.
 
 The engine owns the transports a session has open, one per link end, shared by that end's
 sends and receives.
@@ -49,6 +52,11 @@ from ironbird.transport import LinkEnd, Receiver, Transport, TransportClosed, op
 
 MAX_TRACKED_MIDS: Final = 1024
 CONSUMER_QUEUE_FRAMES: Final = 16384
+CONSUMER_QUEUE_BYTES: Final = 32 * 1024 * 1024
+# What a queued frame costs besides its data: the Frame tuple, the bytes object header and the
+# check token the frame carries. An estimate, deliberately on the high side.
+FRAME_OVERHEAD_BYTES: Final = 320
+_RELEASE_EVERY: Final = 64  # offers between releases of the charges of frames a consumer popped
 READ_BATCH_FRAMES: Final = 512  # most frames one ``next_batch`` hands a consumer
 _MAX_STREAMS: Final = MAX_STREAM_ID + 1
 OPEN_TIMEOUT_S: Final = 5.0  # longest a transport may take to open (name resolution, bind)
@@ -106,6 +114,9 @@ class CaptureStats:
     frames: int  # offered to this capture's queue
     not_shown: int  # refused because the queue was full (sinks saw them either way)
     unread: int = 0  # queued and not yet read
+    queued_bytes: int = 0  # charged to the queue now: unread frames plus a batch still held
+    peak_bytes: int = 0  # most the queue ever counted as held (never below what it held)
+    not_shown_bytes: int = 0  # data bytes of the frames in ``not_shown``
 
 
 class _Closing(Exception):
@@ -124,38 +135,120 @@ def _second_reader() -> IronbirdError:
 
 
 class _FrameQueue:
-    """Bounded FIFO between ingest (producer, event loop) and one consumer (event loop)."""
+    """Bounded FIFO between ingest (producer, event loop) and one consumer (event loop).
 
-    __slots__ = ("_closed", "_limit", "_waiter", "dropped", "items", "offered")
+    Bounded by frame count and by bytes. Every queued frame is charged ``len(data) +
+    FRAME_OVERHEAD_BYTES``; a frame that would take either bound over is refused (newest
+    dropped, counted). The charge is released when the consumer is done with the frame:
 
-    def __init__(self, limit: int) -> None:
-        assert limit > 0
+    * a frame taken off the left of ``items`` (``popleft``, which is how a consumer reads the live
+      deque) is released by a ``put`` that finds the bound reached (and every few offers), which
+      compares the charges with ``items``;
+    * a batch taken with :meth:`take` stays charged until the consumer asks for more
+      (:meth:`wait`), so frames it is still processing count against the bound.
+    """
+
+    __slots__ = (
+        "_bytes",
+        "_charges",
+        "_closed",
+        "_held",
+        "_limit",
+        "_limit_bytes",
+        "_waiter",
+        "dropped",
+        "dropped_bytes",
+        "error",
+        "items",
+        "offered",
+        "peak_bytes",
+    )
+
+    def __init__(self, limit: int, limit_bytes: int) -> None:
+        assert limit > 0 and limit_bytes > 0
         self.items: deque[Frame] = deque()
+        self._charges: deque[int] = deque()  # the charge of each of ``items``, same order
+        self._bytes = 0  # charges of ``items`` not yet released, plus ``_held``
+        self._held = 0  # charges of the batch the consumer holds
         self._limit = limit
+        self._limit_bytes = limit_bytes
         self._waiter: asyncio.Future[None] | None = None
         self._closed = False
+        self.error: IronbirdError | None = None  # why the queue was closed, if it failed
         self.offered = 0
         self.dropped = 0
+        self.dropped_bytes = 0
+        self.peak_bytes = 0
 
     @property
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def queued_bytes(self) -> int:
+        """Bytes charged to the queue now (unread frames and the held batch)."""
+        self._release_taken()
+        return self._bytes
+
+    def _release_taken(self) -> None:
+        """Release the charges of frames the consumer popped off ``items`` itself."""
+        charges = self._charges
+        excess = len(charges) - len(self.items)
+        assert excess >= 0, "frames may only leave the queue from the left"
+        while excess:
+            self._bytes -= charges.popleft()
+            excess -= 1
+
     def put(self, frame: Frame) -> bool:
-        """Queue ``frame``; ``False`` (newest dropped, counted) when the queue is full."""
-        self.offered += 1
-        if len(self.items) >= self._limit:
-            self.dropped += 1
+        """Queue ``frame``; ``False`` (newest dropped, counted) when either bound would be passed
+        or the queue is closed.
+
+        The charges of frames the consumer has popped are released lazily: when the byte bound
+        would be passed, and every ``_RELEASE_EVERY`` offers so the charge list stays short. In
+        between the queue counts those frames as still queued, so its figure is never below the
+        truth and the bound holds."""
+        if self._closed:
             return False
-        self.items.append(frame)
+        self.offered += 1
+        if not self.offered % _RELEASE_EVERY:
+            self._release_taken()
+        size = len(frame.data) + FRAME_OVERHEAD_BYTES
+        total = self._bytes + size
+        items = self.items
+        if total > self._limit_bytes:
+            self._release_taken()
+            total = self._bytes + size
+        if total > self._limit_bytes or len(items) >= self._limit:
+            self.dropped += 1
+            self.dropped_bytes += size - FRAME_OVERHEAD_BYTES
+            return False
+        items.append(frame)
+        self._charges.append(size)
+        self._bytes = total
+        if total > self.peak_bytes:  # noqa: PLR1730 - the hot path avoids a call
+            self.peak_bytes = total
         waiter = self._waiter
         if waiter is not None and not waiter.done():
             waiter.set_result(None)
         return True
 
-    def close(self) -> None:
-        """No more frames; the consumer drains what is queued, then its iteration ends."""
+    def take(self, count: int) -> list[Frame]:
+        """Remove up to ``count`` oldest frames for the consumer to hold. Their charge stays on
+        the queue until the consumer waits for more."""
+        assert not self._held, "the previous batch is released by waiting for the next"
+        self._release_taken()
+        taken = min(count, len(self.items))
+        popleft, charge = self.items.popleft, self._charges.popleft
+        batch = [popleft() for _ in range(taken)]
+        self._held = sum([charge() for _ in range(taken)])
+        return batch
+
+    def close(self, error: IronbirdError | None = None) -> None:
+        """No more frames; the consumer drains what is queued, then its iteration ends, or raises
+        ``error`` when the queue was closed because its source failed."""
         self._closed = True
+        if self.error is None:
+            self.error = error
         waiter = self._waiter
         if waiter is not None and not waiter.done():
             waiter.set_result(None)
@@ -163,15 +256,23 @@ class _FrameQueue:
     async def wait(self) -> None:
         """Wait until a frame is queued or the queue is closed; ``items`` is empty afterwards only
         when the queue is closed and drained. One waiter at a time: a queue has a single wake-up
-        slot, so a second waiter would be starved or would split the stream, and is refused."""
+        slot, so a second waiter would be starved or would split the stream, and is refused.
+
+        Asking for more means the consumer is done with the batch it took last, so that is
+        released here. Raises the error the queue was closed with once it is drained."""
         if self._waiter is not None:
             raise _second_reader()
+        if self._held:
+            self._bytes -= self._held
+            self._held = 0
         if not self.items and not self._closed:
             self._waiter = asyncio.get_running_loop().create_future()
             try:
                 await self._waiter
             finally:
                 self._waiter = None
+        if not self.items and self.error is not None:
+            raise self.error
 
 
 @dataclass(slots=True, eq=False)
@@ -231,6 +332,7 @@ class _LinkIO:
         self.kernel = _KernelWatch()
         self.opening: asyncio.Future[None] | None = None  # the transport open in progress
         self.lossy = False  # a consumer queue of this end has refused a frame
+        self.failure: IronbirdError | None = None  # the receiving transport failed for good
 
     def on_data(self, data: bytes, time_ns: int, source: str, orig_len: int, flags: int) -> None:
         """The transport's receiver. A bug in ingest is reported, never raised into the loop."""
@@ -292,7 +394,10 @@ class Capture:
 
         The consumer takes frames off the left (``popleft``) as it handles them; what it has not
         taken stays in the capture for the next read, so a consumer that stops early loses
-        nothing. The deque is live: frames that arrive meanwhile are appended to it.
+        nothing. The deque is live: frames that arrive meanwhile are appended to it. A frame
+        stops counting against the capture's byte bound once it is taken, so a consumer holds
+        frames only one at a time. Raises the failure that ended the capture (``IB-TX-003``)
+        once everything received before it was read.
         """
         await self._queue.wait()
         return self._queue.items
@@ -302,22 +407,24 @@ class Capture:
         empty once the capture is closed (or its engine shut down) and everything was read.
 
         The caller owns the frames it is given. A consumer that decodes per frame loops over the
-        batch itself, which is cheaper than iterating the capture. A capture has one reader: a
-        second read that waits while the first is waiting raises ``IB-INT-001``.
+        batch itself, which is cheaper than iterating the capture. The batch stays charged to the
+        capture's byte bound until the next call, so a consumer cannot hold more than the bound
+        allows by sitting on batches. A capture has one reader: a second read that waits while
+        the first is waiting raises ``IB-INT-001``.
         """
-        items = await self.wait_frames()
-        popleft = items.popleft
-        return [popleft() for _ in range(min(len(items), READ_BATCH_FRAMES))]
-
-    @property
-    def overloaded(self) -> bool:
-        """Whether this capture has lost frames: its queue refused some, or the kernel dropped
-        datagrams of a link end it receives from."""
-        return self._queue.dropped > 0 or any(sub.io.kernel.seen for sub in self._subs)
+        await self._queue.wait()
+        return self._queue.take(READ_BATCH_FRAMES)
 
     def stats(self) -> CaptureStats:
         queue = self._queue
-        return CaptureStats(queue.offered, queue.dropped, len(queue.items))
+        return CaptureStats(
+            queue.offered,
+            queue.dropped,
+            len(queue.items),
+            queue.queued_bytes,
+            queue.peak_bytes,
+            queue.dropped_bytes,
+        )
 
     async def close(self) -> None:
         """Stop receiving; transports no other capture needs are closed. Queued frames can still
@@ -381,8 +488,11 @@ class Engine:
         ledger: Ledger,
         report: Reporter,
         codec_for: Callable[[str], Codec],
+        *,
+        withdraw: Callable[[Code, str], None] | None = None,
     ) -> None:
         self._config = config
+        self._withdraw = withdraw
         self._max_packet_bytes = config.max_packet_bytes
         self._ledger = ledger
         self._report = report
@@ -532,7 +642,38 @@ class Engine:
         self._report(err, context=label)
 
     def _new_transport(self, io: _LinkIO) -> Transport:
-        return open_transport(io.link, io.end, lambda err: self._transport_report(err, io.label))
+        return open_transport(
+            io.link,
+            io.end,
+            lambda err: self._transport_report(err, io.label),
+            failed=lambda err: self._receive_failed(io, err),
+            max_packet_bytes=self._max_packet_bytes,
+        )
+
+    def _receive_failed(self, io: _LinkIO, error: IronbirdError) -> None:
+        """The receiving transport of ``io`` cannot receive any more (``IB-TX-003``).
+
+        Every capture fed from it ends once it has read what arrived before the failure, by
+        raising ``error``; the failure is ledgered here and again by whoever handles the raised
+        error, so the trace shows both when it happened and where it surfaced. A capture opened
+        on the end afterwards is refused with the same error until the transport is replaced.
+        """
+        if io.failure is not None:
+            return
+        io.failure = error
+        if self._withdraw is not None:  # the raised error is the last word on this failure
+            self._withdraw(error.code, io.label)
+        self._ledger.record(
+            "state",
+            "rx.failed",
+            evidence=False,
+            label=io.description,
+            code=error.code.value,
+            summary=error.summary,
+        )
+        for sub in list(io.subs):
+            self._poll_sub(sub)
+            sub.queue.close(error)
 
     async def _open_transport(
         self, io: _LinkIO, transport: Transport, receiver: Receiver | None
@@ -575,6 +716,8 @@ class Engine:
         async with io.lock:
             if self._closed:
                 raise _capture_after_close()
+            if io.failure is not None:
+                raise io.failure
             if not io.receiving:
                 transport = self._new_transport(io)
                 try:
@@ -608,7 +751,7 @@ class Engine:
             finally:  # drops counted while closing are part of the final report
                 self._poll_kernel(io, transport)
                 self._note_unread(io, transport)
-                io.transport, io.receiving = None, False
+                io.transport, io.receiving, io.failure = None, False, None
 
     async def open_capture(
         self,
@@ -616,13 +759,25 @@ class Engine:
         *,
         sinks: Sequence[FrameSink] = (),
         queue_frames: int | None = None,
+        queue_bytes: int | None = None,
     ) -> Capture:
         """Start receiving on ``ends``; every frame they receive reaches ``sinks`` and the
-        returned capture. ``sinks`` stay attached to the whole engine until the capture closes."""
+        returned capture. ``sinks`` stay attached to the whole engine until the capture closes.
+
+        The capture's queue holds at most ``queue_frames`` frames and ``queue_bytes`` bytes
+        (frame data plus ``FRAME_OVERHEAD_BYTES`` each); frames past either are not shown to this
+        capture's consumer, and counted."""
         assert len({(link.name, end) for link, end in ends}) == len(ends), "duplicate link end"
         if self._closed:
             raise _capture_after_close()
-        queue = _FrameQueue(CONSUMER_QUEUE_FRAMES if queue_frames is None else queue_frames)
+        room = self._max_packet_bytes + FRAME_OVERHEAD_BYTES
+        assert queue_bytes is None or queue_bytes >= room, (
+            f"a queue of {queue_bytes} bytes could not hold one frame of {room}"
+        )
+        queue = _FrameQueue(
+            CONSUMER_QUEUE_FRAMES if queue_frames is None else queue_frames,
+            CONSUMER_QUEUE_BYTES if queue_bytes is None else queue_bytes,
+        )
         capture = Capture(self, queue, sinks)
         for sink in sinks:
             self.add_sink(sink)
@@ -771,7 +926,9 @@ class Engine:
     def reject(self, frame: Frame, error: DecodeError) -> None:
         """Count, ledger (raw bytes) and report (coalesced) one frame that failed the boundary."""
         self._malformed_total += 1
-        self._ledger.record("packet", "rx.malformed", raw=frame.data, source=frame.source)
+        self._ledger.record(
+            "packet", "rx.malformed", raw=frame.data, wire_len=frame.orig_len, source=frame.source
+        )
         self._report(error, context=f"from {self._labels[frame.stream.id]}", evidence=True)
 
     def _ingest(
@@ -789,6 +946,8 @@ class Engine:
         bits = int(flags)
         assert not bits & ~KNOWN_FLAG_BITS, f"a transport passed unknown frame flag bits {bits:#x}"
         if size > self._max_packet_bytes:
+            # A transport cuts at the edge (UDP does, with MSG_TRUNC), so no copy of the whole
+            # datagram reaches here; this keeps a transport that does not from breaking the cap.
             data = data[: self._max_packet_bytes]
             bits |= FLAG_TRUNCATED
         stream, codec = io.rx_stream, io.codec
@@ -831,7 +990,10 @@ class Engine:
             assert error is not None
             self.reject(frame, error)
         for sub in io.subs:
-            if not sub.queue.put(frame):
+            queue = sub.queue
+            if not queue.put(frame):
+                if queue.closed:  # ended (a failed link end of the same capture): not a lag
+                    continue
                 io.lossy = True
                 sub.dropped += 1
                 if self._sinks:
@@ -881,15 +1043,22 @@ class Engine:
         delta, sub.reported = total - sub.reported, total
         label = sub.io.description
         kept = sub.dropped_to_sinks
+        queue = sub.queue
         self._ledger.record(
-            "state", "rx.queue_drops", label=label, delta=delta, total=total, seen_by_sinks=kept
+            "state",
+            "rx.queue_drops",
+            label=label,
+            delta=delta,
+            total=total,
+            seen_by_sinks=kept,
+            queue_dropped_bytes=queue.dropped_bytes,
+            queue_peak_bytes=queue.peak_bytes,
         )
         tail = f"; {kept} of them still reached a sink" if kept else ""
         self._report(
             IronbirdError(
-                Code.TX_OVERRUN,
-                f"{label}: consumer queue overflow, {total} frame(s) dropped from the "
-                f"consumer view so far{tail}",
+                Code.ENG_LAG,
+                f"{label}: consumer fell behind, {total} frame(s) not shown so far{tail}",
             ),
             context=f"queue {label}",
         )
@@ -970,7 +1139,9 @@ class Engine:
 
 
 __all__ = [
+    "CONSUMER_QUEUE_BYTES",
     "CONSUMER_QUEUE_FRAMES",
+    "FRAME_OVERHEAD_BYTES",
     "MAX_TRACKED_MIDS",
     "Capture",
     "CaptureStats",

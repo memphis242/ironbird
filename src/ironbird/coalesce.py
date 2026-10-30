@@ -121,6 +121,14 @@ class Coalescer:
             self._summary(self._entries[key], now)
             del self._entries[key]
 
+    def discard(self, key: str) -> None:
+        """Drop the open window of ``key`` without emitting its summary.
+
+        For an error that ends the matter (a fatal failure that is raised to the user): a
+        "(xN in T s)" line about the failures it ends would arrive after it and read as news.
+        """
+        self._entries.pop(key, None)
+
     def flush(self) -> None:
         """Emit all pending summaries (shutdown)."""
         now = self._clock()
