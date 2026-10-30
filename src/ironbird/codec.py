@@ -61,11 +61,18 @@ class _Layout:
 class Resolved(NamedTuple):
     """What :meth:`Codec.resolve` established about a packet that passed the check: the message
     it is and the header word. :meth:`Codec.decode_resolved` unpacks the fields from it without
-    repeating the check; it is only valid for the bytes (``size`` of them) it was made from."""
+    repeating the check.
+
+    The token keeps the codec, message kind and bytes it was made from, and
+    :meth:`Codec.decode_resolved` only trusts it for exactly those (by identity), so a token that
+    is stale, foreign or paired with other bytes is never believed.
+    """
 
     message: Message
     word: int
-    size: int
+    codec: Codec
+    kind: MessageKind
+    data: bytes | bytearray | memoryview
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,7 +494,7 @@ class Codec:
                 f"CCDD says {msg.payload_size}",
                 mid,
             )
-        return Resolved(msg, word, size)
+        return Resolved(msg, word, self, kind, data)
 
     def check(self, kind: MessageKind, data: bytes | bytearray | memoryview) -> DecodeError | None:
         """Validate one whole packet without unpacking its fields; ``None`` means well formed.
@@ -505,7 +512,7 @@ class Codec:
         resolved = self.resolve(kind, data)
         if isinstance(resolved, DecodeError):
             return resolved
-        return self.decode_resolved(kind, resolved, data)
+        return self._unpack(kind, resolved, data)
 
     def decode_resolved(
         self, kind: MessageKind, resolved: Resolved, data: bytes | bytearray | memoryview
@@ -513,11 +520,27 @@ class Codec:
         """Unpack the fields of ``data``, which :meth:`resolve` already accepted as ``resolved``.
 
         This is the second half of :meth:`decode`, for a caller that kept the first half's
-        result (the engine's ingest ran it on every frame). It does not validate the packet
-        again, so ``resolved`` must come from ``resolve(kind, data)`` for these very bytes.
+        result (the engine's ingest ran it on every frame). The token is believed only when it
+        was made by this codec, for this kind, from this very ``bytes`` object (immutable, so its
+        content is what was checked); any other pairing takes the whole :meth:`decode`. Never
+        raises, whatever the pairing.
         """
-        msg, word, size = resolved
-        assert len(data) == size, "resolved token used with other bytes"
+        if (
+            type(resolved) is not Resolved
+            or resolved.codec is not self
+            or resolved.kind is not kind
+            or resolved.data is not data
+            or type(data) is not bytes
+        ):
+            return self.decode(kind, data)
+        return self._unpack(kind, resolved, data)
+
+    def _unpack(
+        self, kind: MessageKind, resolved: Resolved, data: bytes | bytearray | memoryview
+    ) -> DecodedPacket | DecodeError:
+        """The fields of ``data``, which ``resolved`` was made from by this codec."""
+        msg, word = resolved.message, resolved.word
+        size = len(data)
         profile = self._profiles[kind]
         parsed = hdr.parse_word(profile, word, msg.mid)
         layout = self._layouts[msg.name]

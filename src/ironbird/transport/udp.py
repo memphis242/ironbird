@@ -41,6 +41,7 @@ CONFIRM_WAIT_S: Final = 0.05
 BATCH: Final = 256  # datagrams read per wakeup before yielding to the loop
 SOURCE_CACHE_SIZE: Final = 64  # peers whose text form is remembered (bounded: peers are untrusted)
 MAX_DATAGRAM: Final = 65536
+UNREAD_COUNT_LIMIT: Final = 1 << 20  # datagrams counted at close before giving up
 PROC_TABLES: Final = ("/proc/net/udp", "/proc/net/udp6")
 PROC_INODE_COLUMN: Final = 9
 PROC_MIN_COLUMNS: Final = 13  # the last one is "drops"
@@ -142,6 +143,7 @@ class UdpTransport:
         self._tx_total = 0
         self._tx_bytes = 0
         self._tail_unchecked = False
+        self._unread_at_close = 0
         self._inode: int | None = None
         self._pending_error: OSError | None = None
         self._opened = False
@@ -193,6 +195,7 @@ class UdpTransport:
             tx_frames=self._tx_total,
             tx_bytes=self._tx_bytes,
             kernel_dropped=self.kernel_dropped,
+            unread_at_close=self._unread_at_close,
         )
 
     def facts(self) -> Mapping[str, object]:
@@ -530,5 +533,19 @@ class UdpTransport:
                 # The socket's counter goes away with it; this also catches the tail of a
                 # burst that no datagram reported.
                 await scan_kernel_drops((self,))
+                self._unread_at_close = self._count_unread(rx)
         finally:
             self._release()
+
+    def _count_unread(self, sock: socket.socket) -> int:
+        """Datagrams waiting in the receive buffer, read and discarded so they can be counted."""
+        count = 0
+        while count < UNREAD_COUNT_LIMIT:
+            try:
+                sock.recvmsg_into([self._buf])
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+            count += 1
+        return count

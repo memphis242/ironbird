@@ -51,6 +51,7 @@ class TransportStats:
     tx_frames: int = 0
     tx_bytes: int = 0
     kernel_dropped: int = 0  # lost to the OS before the transport saw them (buffer overflow)
+    unread_at_close: int = 0  # still in the OS buffer when the transport closed, discarded
 
 
 # What a factory may call to surface a problem found away from any caller (e.g. at open time).

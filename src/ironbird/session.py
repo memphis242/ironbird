@@ -675,9 +675,13 @@ class Listener:
         return self._iterate()
 
     async def _iterate(self) -> AsyncIterator[Decoded]:
-        mids, decode, next_batch = self._mids, self._decoder.decode, self._capture.next_batch
-        while batch := await next_batch():
-            for frame in batch:
+        # Frames are taken off the capture's own queue as they are handled, so an iteration that
+        # is abandoned (a ``break``) leaves the rest for the next one.
+        mids, decode, wait_frames = self._mids, self._decoder.decode, self._capture.wait_frames
+        while unread := await wait_frames():
+            popleft = unread.popleft
+            while unread:
+                frame = popleft()
                 if mids is not None and frame.mid not in mids:
                     continue  # a MID filter hides valid packets only; ingest reported the rest
                 result = decode(frame)
@@ -686,7 +690,18 @@ class Listener:
 
     async def close(self) -> None:
         await self._capture.close()
-        self._session.ledger.record("action", "listen.stop", peer=self._route.peer.name)
+        stats = self._capture.stats()
+        self._session.ledger.record(
+            "action", "listen.stop", peer=self._route.peer.name, unread=stats.unread
+        )
+        if stats.unread and self._capture.overloaded:
+            # The user already has drop notices; say what the end adds to them.
+            self._session.report(
+                IronbirdError(
+                    Code.TX_OVERRUN,
+                    f"listening ended with {stats.unread} frame(s) received but not shown",
+                )
+            )
 
 
 class EventStream:

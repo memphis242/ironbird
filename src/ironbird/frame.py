@@ -11,17 +11,23 @@ decodes to as a :class:`Decoded`.
 Frames are built once per received packet, so both types are tuples: immutable, built without
 a Python-level ``__init__`` per field, and (for :class:`Frame`) validated by one assert-only
 ``__new__`` that does not exist under ``python -O``.
+
+A frame's identity is its eight packet fields. The ninth, ``checked``, is a cache of what live
+ingest established: it takes no part in equality, hashing, copying or pickling, and every way
+of rebuilding a frame (``_replace``, ``_make``, ``copy``, unpickling) leaves it behind.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import IntFlag, StrEnum
-from typing import Final, NamedTuple
+from typing import Any, Final, NamedTuple, Self
 
 from ironbird.ccdd.model import MessageKind
 from ironbird.codec import DecodedPacket, Resolved
 
+IDENTITY_FIELDS: Final = 8  # the packet fields of a frame; ``checked`` follows them
 MAX_FRAME_BYTES: Final = 65535  # the largest max_packet_bytes the config accepts
 MAX_STREAM_ID: Final = 0xFFFF
 MAX_MID: Final = 0xFFFFFFFF  # MIDs are 32 bits (the CCDD and the header codec enforce it)
@@ -83,7 +89,8 @@ class _FrameFields(NamedTuple):
     orig_len: int  # == len(data) unless TRUNCATED
     data: bytes  # len(data) <= max_packet_bytes
     # What ingest's check established, so a live consumer need not repeat it. ``None`` for a
-    # frame that failed the check and for any frame not built by live ingest (replay).
+    # frame that failed the check and for any frame not built by live ingest (replay). A cache,
+    # not part of the frame's identity; the codec trusts it only for the bytes it was made from.
     checked: Resolved | None = None
 
 
@@ -117,10 +124,51 @@ class Frame(_FrameFields):
                 assert not bits & (FLAG_HAS_MID | FLAG_TRUNCATED), "garbage has no MID"
             if bits & (FLAG_GARBAGE | FLAG_STALE):
                 assert stream.transport == SERIAL_TRANSPORT, "only a serial stream resynchronises"
-            assert checked is None or checked.size == size, "a check token belongs to its data"
+            assert checked is None or checked.data is data, "a check token belongs to its data"
             return super().__new__(
                 cls, seq, time_ns, stream, source, mid, flags, orig_len, data, checked
             )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Frame):
+            return NotImplemented
+        return self[:IDENTITY_FIELDS] == other[:IDENTITY_FIELDS]
+
+    def __ne__(self, other: object) -> bool:
+        if not isinstance(other, Frame):
+            return NotImplemented
+        return self[:IDENTITY_FIELDS] != other[:IDENTITY_FIELDS]
+
+    def __hash__(self) -> int:
+        return hash(self[:IDENTITY_FIELDS])
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (Frame, tuple(self[:IDENTITY_FIELDS]))
+
+    def __copy__(self) -> Self:
+        return self.__class__(*self[:IDENTITY_FIELDS])
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Self:
+        return self.__class__(*self[:IDENTITY_FIELDS])
+
+    @classmethod
+    def _make(cls, iterable: Iterable[Any]) -> Self:  # pyright: ignore[reportIncompatibleMethodOverride]
+        """A frame from its fields, through the same checks as the constructor. Takes the eight
+        packet fields (a ninth, the check token, is accepted and dropped)."""
+        fields = tuple(iterable)
+        if len(fields) not in (IDENTITY_FIELDS, IDENTITY_FIELDS + 1):
+            raise TypeError(f"Expected {IDENTITY_FIELDS} or {IDENTITY_FIELDS + 1} fields")
+        return cls(*fields[:IDENTITY_FIELDS])
+
+    def _replace(self, **changes: Any) -> Self:  # pyright: ignore[reportIncompatibleMethodOverride]
+        """A copy with ``changes`` applied, through the same checks as the constructor; the check
+        token is dropped, because it described the bytes this frame held."""
+        unknown = changes.keys() - set(self._fields)
+        if unknown:
+            raise ValueError(f"Got unexpected field names: {sorted(unknown)!r}")
+        changes.pop("checked", None)
+        values = {name: changes.get(name, getattr(self, name)) for name in self._fields[:-1]}
+        return self.__class__(**values)
 
 
 class Decoded(NamedTuple):

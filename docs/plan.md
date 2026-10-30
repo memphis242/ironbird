@@ -785,7 +785,10 @@ As built (where the build differs from, or settles, the text above)
   `IB-TX-004`, worded as frames dropped from the consumer view. No recorder exists in 2b, so
   the notice says "still reached a sink" only for the frames a sink had received when they were
   dropped (counted per subscription), never "captured" unconditionally. A capture has one
-  reader: a second concurrent `next_batch()`/iteration raises `IB-INT-001`.
+  reader: a second reader that waits while the first is waiting raises `IB-INT-001` (the waiting
+  reader is never the one refused). Ownership is not bound to the first reading task: on
+  Python 3.11 `asyncio.wait_for(it.__anext__(), t)` runs each call in a new task, so a per-task
+  owner would refuse that idiom; deferred to 2c with the byte bound if a real case appears.
 - `Codec.classify`/`DatagramClass` are gone: `Codec.check` does their job and the rest of the
   boundary. Errors come in a fixed order: over the cap, shorter than the header, MID not in the
   CCDD, length field, fixed fields (`HeaderProfile.fixed_mask`/`fixed_value`, one compare),
@@ -800,25 +803,46 @@ As built (where the build differs from, or settles, the text above)
   in a `__new__` that exists only when `__debug__`), `FrameFlag` stays an `IntFlag` for
   consumers while ingest works on plain-int `FLAG_*` constants and picks the `FrameFlag` from
   `FLAGS_BY_BITS`. A frame has a ninth field, `checked`: the `Codec.Resolved` token (message, header
-  word, size) of a frame that passed `Codec.check` at live ingest, `None` for a failed check and
-  for any frame not built by live ingest. `FrameDecoder.decode` uses it to call
-  `Codec.decode_resolved` (the second half of `decode`) instead of checking the packet again;
-  a frame without it takes the whole `Codec.decode`. `Codec.resolve` is the one place the check
+  word, plus the codec, kind and `bytes` it was made from) of a frame that passed `Codec.check`
+  at live ingest, `None` for a failed check and for any frame not built by live ingest.
+  `FrameDecoder.decode` uses it to call `Codec.decode_resolved` (the second half of `decode`)
+  instead of checking the packet again; a frame without it takes the whole `Codec.decode`.
+  `decode_resolved` believes a token only when `token.codec is self`, the kind matches and
+  `token.data is data` (a real check, also under `-O`), else it runs the whole `decode`; it never
+  raises. `checked` is a cache, not identity: `Frame` equality, hashing, `copy` and pickling use
+  the eight packet fields only (live frames are hashable and picklable and equal their
+  replay-built twins), and `_replace`/`_make` rebuild through the constructor's invariant
+  checks and drop the token. `Codec.resolve` is the one place the check
   runs, so the decode boundary stays single.
-- Consumers read a capture in batches (`Capture.next_batch()`, at most 512 frames); `Listener`
-  does so, so the receive-to-print path is one async generator, not a chain of them.
+- The capture's queue owns every unread frame: iterating takes one frame as it is yielded, and
+  `Capture.wait_frames()` hands the consumer the live deque to `popleft` from (`Listener` does
+  so, so the receive-to-print path is one async generator, not a chain of them), so breaking out
+  of an iteration and iterating again loses nothing. `Capture.next_batch()` (at most 512 frames)
+  transfers what it returns to the caller.
   `BoundedWriter` writes whole chunks to a regular file or a terminal and `PIPE_BUF` slices only
   to pipes and sockets, where atomicity matters.
 - Sinks are attached once however many holders ask (reference counted by identity), so one sink
   on two captures sees each frame once. A sink that raises is detached on its first failure and
-  reported and ledgered once (`sink.detached`), never once per frame.
+  reported and ledgered once (`sink.detached`), never once per frame; its holders stay counted,
+  so asking for it again re-attaches it and an old holder's release cannot detach it from a
+  newer one.
+- Datagrams still in a UDP receive buffer when its transport closes are read, discarded and
+  counted (`TransportStats.unread_at_close`, ledger `rx.unread_at_close`); on a link end that
+  was already losing frames the count is reported (`IB-TX-004`), and `Listener.close` reports the
+  frames left unread in the queue, so a SIGTERM under overload accounts for every frame:
+  `sent == shown + kernel drops + unread in the socket + unread in the queue`.
 - Per-MID statistics count only frames that pass `Codec.check`.
 - A link end's transport is opened, joined and closed under the end's lock: a capture subscribes
   inside the lock, the closer re-checks the subscribers inside it, and the end's state changes
   only after the close completes, so a close and an open of the same end cannot race for the
   port. A send that finds its transport closed under it is made again on the one that replaces
   it (`TransportClosed`, never reported as a link failure); a send after `Engine.close` is an
-  `IB-TX-002` "not sent: the session is closing". `Engine.close` ends every capture's iteration.
+  `IB-TX-002` "not sent: the session is closing". `Engine.close` ends every capture's iteration. A transport open is bounded
+  (`OPEN_TIMEOUT_S`, 5 s, `IB-TX-001`) and cut short by `Engine.close`, so a resolver that does
+  not answer cannot hold the link end's lock; `_attach` re-checks `closed` under the lock, so a
+  capture opened across a close raises (`IB-INT-001`, "the session is closed") and its transport
+  is closed, never an iteration that does not end. A send made twice on a closed transport says
+  whether the session is closing or another consumer closed the end twice.
 - Ingest-only benchmarks (`tests/test_benchmarks.py`, names `*ingest_only*`): they time the
   receive side alone (a 200-byte valid telemetry packet from a separate sender process into a
   capture with a draining consumer that discards, 4-core dev host): one frame through ingest

@@ -43,12 +43,13 @@ from ironbird.frame import (
     Stream,
 )
 from ironbird.ledger import Ledger
-from ironbird.transport import LinkEnd, Transport, TransportClosed, open_transport
+from ironbird.transport import LinkEnd, Receiver, Transport, TransportClosed, open_transport
 
 MAX_TRACKED_MIDS: Final = 1024
 CONSUMER_QUEUE_FRAMES: Final = 16384
 READ_BATCH_FRAMES: Final = 512  # most frames one ``next_batch`` hands a consumer
 _MAX_STREAMS: Final = 0x10000
+OPEN_TIMEOUT_S: Final = 5.0  # longest a transport may take to open (name resolution, bind)
 
 Reporter = Callable[..., None]  # Session.report: (error, *, context, level, evidence)
 
@@ -81,6 +82,22 @@ class CaptureStats:
 
     frames: int  # offered to this capture's queue
     not_shown: int  # refused because the queue was full (sinks saw them either way)
+    unread: int = 0  # queued and not yet read
+
+
+class _Closing(Exception):
+    """The engine shut down while a transport was opening; the caller reports it in its terms."""
+
+
+def _capture_after_close() -> IronbirdError:
+    return IronbirdError(Code.INTERNAL, "the session is closed; it cannot capture again")
+
+
+def _second_reader() -> IronbirdError:
+    return IronbirdError(
+        Code.INTERNAL,
+        "a capture has one reader; a second consumer is reading it at the same time",
+    )
 
 
 class _FrameQueue:
@@ -120,24 +137,18 @@ class _FrameQueue:
         if waiter is not None and not waiter.done():
             waiter.set_result(None)
 
-    async def next_batch(self) -> list[Frame]:
-        """Up to :data:`READ_BATCH_FRAMES` queued frames, waiting for the first; ``[]`` once the
-        queue is closed and drained. One reader at a time: a queue has a single wake-up slot, so
-        a second reader would be starved or would split the stream, and is refused."""
+    async def wait(self) -> None:
+        """Wait until a frame is queued or the queue is closed; ``items`` is empty afterwards only
+        when the queue is closed and drained. One waiter at a time: a queue has a single wake-up
+        slot, so a second waiter would be starved or would split the stream, and is refused."""
         if self._waiter is not None:
-            raise IronbirdError(
-                Code.INTERNAL,
-                "a capture has one reader; a second consumer is reading it at the same time",
-            )
-        items = self.items
-        if not items and not self._closed:
+            raise _second_reader()
+        if not self.items and not self._closed:
             self._waiter = asyncio.get_running_loop().create_future()
             try:
                 await self._waiter
             finally:
                 self._waiter = None
-        popleft = items.popleft
-        return [popleft() for _ in range(min(len(items), READ_BATCH_FRAMES))]
 
 
 @dataclass(slots=True, eq=False)
@@ -149,6 +160,15 @@ class _Subscription:
     dropped: int = 0  # frames the queue refused
     dropped_to_sinks: int = 0  # of those, frames a sink had already received
     reported: int = 0
+
+
+@dataclass(slots=True, eq=False)
+class _SinkRef:
+    """How many holders asked for a sink, and whether it receives frames (not after a failure)."""
+
+    sink: FrameSink
+    holders: int = 0
+    attached: bool = False
 
 
 @dataclass(slots=True)
@@ -184,6 +204,8 @@ class _LinkIO:
         self.lock = asyncio.Lock()
         self.subs: list[_Subscription] = []
         self.kernel = _KernelWatch()
+        self.opening: asyncio.Future[None] | None = None  # the transport open in progress
+        self.lossy = False  # a consumer queue of this end has refused a frame
 
     def on_data(self, data: bytes, time_ns: int, source: str, orig_len: int, flags: int) -> None:
         """The transport's receiver. A bug in ingest is reported, never raised into the loop."""
@@ -227,22 +249,50 @@ class Capture:
         return self._iterate()
 
     async def _iterate(self) -> AsyncIterator[Frame]:
-        while batch := await self._queue.next_batch():
-            for frame in batch:
-                yield frame
+        # The capture's queue holds the unread frames; one is taken only as it is yielded, so an
+        # iteration that is abandoned (a ``break``) leaves the rest for the next one.
+        queue = self._queue
+        items = queue.items
+        while True:
+            if not items:
+                await queue.wait()
+                if not items:
+                    return
+            yield items.popleft()
+
+    async def wait_frames(self) -> deque[Frame]:
+        """Wait until a frame is unread, then return the capture's own queue of unread frames,
+        oldest first (empty once the capture is closed or its engine shut down and everything was
+        read).
+
+        The consumer takes frames off the left (``popleft``) as it handles them; what it has not
+        taken stays in the capture for the next read, so a consumer that stops early loses
+        nothing. The deque is live: frames that arrive meanwhile are appended to it.
+        """
+        await self._queue.wait()
+        return self._queue.items
 
     async def next_batch(self) -> list[Frame]:
-        """The frames that arrived since the last call, oldest first, waiting for at least one;
+        """Up to :data:`READ_BATCH_FRAMES` unread frames, oldest first, waiting for at least one;
         empty once the capture is closed (or its engine shut down) and everything was read.
 
-        A consumer that decodes per frame loops over the batch itself, which is cheaper than
-        iterating the capture. A capture has one reader: a second concurrent call raises
-        ``IB-INT-001``.
+        The caller owns the frames it is given. A consumer that decodes per frame loops over the
+        batch itself, which is cheaper than iterating the capture. A capture has one reader: a
+        second read that waits while the first is waiting raises ``IB-INT-001``.
         """
-        return await self._queue.next_batch()
+        items = await self.wait_frames()
+        popleft = items.popleft
+        return [popleft() for _ in range(min(len(items), READ_BATCH_FRAMES))]
+
+    @property
+    def overloaded(self) -> bool:
+        """Whether this capture has lost frames: its queue refused some, or the kernel dropped
+        datagrams of a link end it receives from."""
+        return self._queue.dropped > 0 or any(sub.io.kernel.seen for sub in self._subs)
 
     def stats(self) -> CaptureStats:
-        return CaptureStats(self._queue.offered, self._queue.dropped)
+        queue = self._queue
+        return CaptureStats(queue.offered, queue.dropped, len(queue.items))
 
     async def close(self) -> None:
         """Stop receiving; transports no other capture needs are closed. Queued frames can still
@@ -315,7 +365,7 @@ class Engine:
         self._seq = 0
         self._closed = False
         self._sinks: tuple[FrameSink, ...] = ()
-        self._sink_refs: dict[int, tuple[FrameSink, int]] = {}  # id(sink) -> (sink, holders)
+        self._sink_refs: dict[int, _SinkRef] = {}  # by id(sink)
         self._ios: dict[tuple[str, LinkEnd], _LinkIO] = {}
         self._labels: dict[int, str] = {}
         self._stats: dict[int, _MidStat] = {}
@@ -347,32 +397,38 @@ class Engine:
     def add_sink(self, sink: FrameSink) -> None:
         """Attach ``sink``. A sink is attached once however many holders ask (a session-level
         attach and several captures, say) and stays until the last holder removes it, so it sees
-        each frame once."""
-        held = self._sink_refs.get(id(sink))
-        self._sink_refs[id(sink)] = (sink, 1 if held is None else held[1] + 1)
-        if held is None:
+        each frame once. Asking for a sink that failed and was detached attaches it again."""
+        ref = self._sink_refs.get(id(sink))
+        if ref is None:
+            ref = self._sink_refs[id(sink)] = _SinkRef(sink)
+        ref.holders += 1
+        if not ref.attached:
+            ref.attached = True
             self._sinks = (*self._sinks, sink)
 
     def remove_sink(self, sink: FrameSink) -> None:
         """Release one holder of ``sink``; it detaches when the last holder lets go. A sink that
-        is not attached (never added, or detached after it failed) is ignored."""
-        held = self._sink_refs.get(id(sink))
-        if held is None:
+        was never added is ignored; one that failed is still held until each holder releases it."""
+        ref = self._sink_refs.get(id(sink))
+        if ref is None:
             return
-        if held[1] > 1:
-            self._sink_refs[id(sink)] = (sink, held[1] - 1)
+        ref.holders -= 1
+        if ref.holders > 0:
             return
-        self._detach_sink(sink)
+        del self._sink_refs[id(sink)]
+        self._drop_from_ingest(sink)
 
-    def _detach_sink(self, sink: FrameSink) -> None:
-        self._sink_refs.pop(id(sink), None)
+    def _drop_from_ingest(self, sink: FrameSink) -> None:
         self._sinks = tuple(s for s in self._sinks if s is not sink)
 
     def _sink_failed(self, sink: FrameSink, frame: Frame, exc: Exception) -> None:
         """A sink raised: it is detached at once (it would fail on every later frame as well),
         and the failure is reported and ledgered this one time."""
         name = type(sink).__name__
-        self._detach_sink(sink)
+        ref = self._sink_refs.get(id(sink))
+        if ref is not None:
+            ref.attached = False  # its holders still count, so a later holder cannot be undone
+        self._drop_from_ingest(sink)
         self._ledger.record(
             "state", "sink.detached", sink=name, seq=frame.seq, error=type(exc).__name__
         )
@@ -444,16 +500,53 @@ class Engine:
     def _new_transport(self, io: _LinkIO) -> Transport:
         return open_transport(io.link, io.end, lambda err: self._transport_report(err, io.label))
 
+    async def _open_transport(
+        self, io: _LinkIO, transport: Transport, receiver: Receiver | None
+    ) -> None:
+        """Open ``transport``, bounded in time and cut short by :meth:`close`.
+
+        Runs under the link end's lock, which a close (and every other user of the end) waits
+        for, so a resolver that never answers must not hold it for long. Raises
+        :class:`_Closing` when the engine shut down meanwhile.
+        """
+        task = asyncio.ensure_future(transport.open(receiver))
+        io.opening = task
+        me = asyncio.current_task()
+        try:
+            async with asyncio.timeout(OPEN_TIMEOUT_S):
+                await task
+        except TimeoutError as exc:
+            raise IronbirdError(
+                Code.TX_OPEN,
+                f"cannot open {transport.description}: no answer within {OPEN_TIMEOUT_S:g} s "
+                "(is the host name resolvable?)",
+                cause=exc,
+            ) from exc
+        except asyncio.CancelledError:
+            if task.cancelled() and self._closed and me is not None and me.cancelling() == 0:
+                raise _Closing from None  # close() cut the open short; our caller is not cancelled
+            raise
+        finally:
+            io.opening = None
+        if self._closed:
+            await transport.close()
+            raise _Closing
+
     async def _attach(self, io: _LinkIO, sub: _Subscription) -> None:
         """Subscribe ``sub`` to ``io``, opening its receiving transport if none is open.
 
         The subscription is added under the link end's lock, so a close that is deciding whether
-        the transport is still needed sees it.
+        the transport is still needed sees it. A closed engine opens nothing.
         """
         async with io.lock:
+            if self._closed:
+                raise _capture_after_close()
             if not io.receiving:
                 transport = self._new_transport(io)
-                await transport.open(io.on_data)
+                try:
+                    await self._open_transport(io, transport, io.on_data)
+                except _Closing:
+                    raise _capture_after_close() from None
                 previous, io.transport, io.receiving = io.transport, transport, True
                 io.description = transport.description
                 io.kernel = _KernelWatch()
@@ -480,6 +573,7 @@ class Engine:
                 await transport.close()
             finally:  # drops counted while closing are part of the final report
                 self._poll_kernel(io, transport)
+                self._note_unread(io, transport)
                 io.transport, io.receiving = None, False
 
     async def open_capture(
@@ -493,7 +587,7 @@ class Engine:
         returned capture. ``sinks`` stay attached to the whole engine until the capture closes."""
         assert len({(link.name, end) for link, end in ends}) == len(ends), "duplicate link end"
         if self._closed:
-            raise IronbirdError(Code.INTERNAL, "the session is closed; it cannot capture again")
+            raise _capture_after_close()
         queue = _FrameQueue(CONSUMER_QUEUE_FRAMES if queue_frames is None else queue_frames)
         capture = Capture(self, queue, sinks)
         for sink in sinks:
@@ -564,7 +658,12 @@ class Engine:
                     )
                 if io.transport is None:
                     transport = self._new_transport(io)
-                    await transport.open(None)
+                    try:
+                        await self._open_transport(io, transport, None)
+                    except _Closing:
+                        raise IronbirdError(
+                            Code.TX_SEND, "not sent: the session is closing (not a link failure)"
+                        ) from None
                     io.transport = transport
                 transport = io.transport
             try:
@@ -575,10 +674,14 @@ class Engine:
                 closed = exc
                 continue
             return
+        reason = (
+            "the session is closing"
+            if self._closed
+            else "another consumer of this link end closed it twice under the send; send again"
+        )
         raise IronbirdError(
             Code.TX_SEND,
-            f"not sent: {io.description} was closed while sending "
-            "(the session is closing; this is not a link failure)",
+            f"not sent: {io.description} was closed while sending ({reason}; not a link failure)",
             cause=closed,
         )
 
@@ -589,13 +692,13 @@ class Engine:
         failure: BaseException | None = None
         ios = list(self._ios.values())
         for io in ios:
-            for sub in io.subs:
-                self._poll_sub(sub)
-                sub.queue.close()
-            io.subs.clear()
+            if io.opening is not None:  # an open in progress must not hold the lock for its timeout
+                io.opening.cancel()
+            self._end_subscriptions(io)
         for io in ios:
             try:
                 async with io.lock:
+                    self._end_subscriptions(io)  # a capture that joined while the lock was held
                     transport = io.transport
                     if transport is None:
                         continue
@@ -604,11 +707,18 @@ class Engine:
                     finally:
                         if io.receiving:
                             self._poll_kernel(io, transport)
+                        self._note_unread(io, transport)
                         io.transport, io.receiving = None, False
             except BaseException as exc:  # the other link ends are still closed
                 failure = failure or exc
         if failure is not None:
             raise failure
+
+    def _end_subscriptions(self, io: _LinkIO) -> None:
+        for sub in io.subs:
+            self._poll_sub(sub)
+            sub.queue.close()
+        io.subs.clear()
 
     # -- ingest (event-loop thread, per frame) -----------------------------------------------
 
@@ -688,6 +798,7 @@ class Engine:
             self.reject(frame, error)
         for sub in io.subs:
             if not sub.queue.put(frame):
+                io.lossy = True
                 sub.dropped += 1
                 if self._sinks:
                     sub.dropped_to_sinks += 1
@@ -748,6 +859,25 @@ class Engine:
             ),
             context=f"queue {label}",
         )
+
+    def _note_unread(self, io: _LinkIO, transport: Transport) -> None:
+        """Account for datagrams still in the socket buffer when ``transport`` closed (they are
+        discarded unread). Always ledgered; reported only on a link end that was already losing
+        frames, where the count completes the picture rather than adding noise."""
+        left = transport.stats().unread_at_close
+        if not left:
+            return
+        label = io.description
+        self._ledger.record("state", "rx.unread_at_close", label=label, datagrams=left)
+        if io.lossy or transport.stats().kernel_dropped:
+            self._report(
+                IronbirdError(
+                    Code.TX_OVERRUN,
+                    f"{label}: {left} more datagram(s) were still in the socket buffer when it "
+                    "closed and were not read",
+                ),
+                context=f"close {label}",
+            )
 
     def _poll_kernel(self, io: _LinkIO, transport: Transport) -> None:
         """Report new kernel-side drops of ``transport`` since the last poll."""
