@@ -2197,8 +2197,8 @@ Deliverables
 - `ib replay FILE [--where EXPR] [--from T] [--to T] [--speed X] [--follow]
   [--format line|json|hex] [--defs recording|config] [--skip-damage] [--count N]`.
   `T` is ISO 8601 UTC or `+offset` from the first frame (`+90s`, `+1m30s`). `--speed 0`
-  (default) runs as fast as possible; `1` paces by recorded `time_ns` deltas (negative
-  deltas from clock steps clamp to zero).
+  (default) runs as fast as possible; `1` paces by recorded `time_ns` deltas (each negative
+  delta from a clock step clamps to zero, so the frames after a step keep their own spacing).
 - Chunk selection by time range and candidate MID set from the index or chunk
   summaries; frames decoded with the recording's embedded definitions by default
   (`IB-REC-009` info when they differ from the current config, error when an adapter is
@@ -2250,58 +2250,75 @@ As built (where the build differs from, or settles, the text above)
   made of frame-level names (a name it cannot check says `IB-REC-009` is why).
 - Definitions: the BLOBs at the head are read with `head_records` (at most 4096 records, 64 MiB,
   256 nodes), each digest must equal the one META names (`IB-REC-009` if not; a META digest that
-  is not text is ignored), a repeated definition that differs is a problem recorded in the head
-  and refused when definitions are needed, never at open. Loading goes through the strict loaders
+  is not text is ignored), a repeated definition that differs, or a head longer than those limits,
+  is a problem recorded in the head (so streams and definitions past a cut are never taken for
+  frames of a node the recording lacks) and refused when definitions are needed, never at open. Loading goes through the strict loaders
   with the recording's `max_packet_bytes`, and the `python:` header escape hatch is refused in
   `load_profile_bytes`. Every failure there (any loader, `Codec`, adapter, missing definition) is
   `IB-REC-009`, exit 1 (a bad file, not the user's configuration), naming `--defs config` and
   `--format hex`. `--defs config` uses the configuration's files with the recording's cap and its
-  aliases (a node it lacks is `IB-REC-009`). With the default, when a configuration is found and a
+  aliases (a node it lacks is `IB-REC-009`; a message that does not fit the recording's cap is
+  `IB-ENC-004` saying the cap is the recording's). With the default, when a configuration is found and a
   file's digest differs from the embedded one, one `info IB-REC-009` line lists `node:kind`s and the
   ledger records them; no configuration is not mentioned (ledger only).
 - Ranges and chunk selection: `--from/--to` are ISO 8601 with a zone or `+<n>h|m|s|ms` offsets
-  (decimals allowed, at most 100 years) from the first frame of the first part; half open on
-  `time_ns`. With a closed file whose index checks out (`read_trailer`, `read_chunks`), a chunk is
+  (decimals allowed, at most 100 years) from the first frame of the first part actually read (after
+  damage that `--skip-damage` goes past; damage that ends the replay before any frame is reported
+  as usual and nothing is selected); half open on `time_ns`. `--from` not earlier than `--to` is
+  `IB-CLI-001` (two times or two offsets before the file is opened; a time against an offset once
+  the first frame is known). With a closed file whose index checks out (`read_trailer`, `read_chunks`), a chunk is
   skipped when its summary shows no time in range, no frames, or (summary not overflowed) none of
   the filter's candidate MIDs; the reader jumps to the next chunk after learning the skipped chunk's
   stream and source definitions from its head and restarting the sequence check, because a chunk's
   frames may use definitions made in an earlier one. The index stays a hint: damage inside a
-  skipped chunk is not seen, and a bad index is `IB-REC-008` (info) and a full read.
+  skipped chunk is not seen (the summary counts the chunks skipped unchecked), the GAP records at
+  a skipped chunk's head are still counted when they overlap the range, and a bad index is
+  `IB-REC-008` (info) and a full read.
 - Pace: `Pacer` anchors a schedule at the first frame and sleeps in 100 ms slices (so a closed output
-  or a signal ends it at once); a backward step counts as zero, a late consumer is not waited for,
+  or a signal ends it at once); the schedule advances by `max(0, t - previous t)` for each frame, so
+  every backward step counts as zero and the frames after it keep their spacing (a step back by an
+  hour does not leave the next hour unpaced); a late consumer is not waited for,
   `--speed` is 0 or 1e-6..1e9. Frames outside the filter still count for time. A forward clock step
   is not corrected (no `--max-gap`): a recorded hour of silence is an hour.
 - Sets: one file that is part 1 plays `name.p0002.ibrec`, ... in order (found by name; the
-  parts' META must give the same session and cap, part numbers ascending, else `IB-CLI-001`); a
-  part that is missing (a later one exists, or the named parts skip a number) is `IB-REC-006`
-  (error line, exit 5, the rest still plays). Several FILEs play as given. Mid-file damage without
+  parts' META must give the same session and cap, part numbers ascending, else `IB-CLI-001`); the
+  search for names goes on past a missing number until 8 names in a row are absent. A part that is
+  missing (a later one exists, or the named parts skip a number) is reported once, listing the
+  numbers, as `IB-REC-006` (error line, exit 5); every later part that exists still plays. Several FILEs play as given. Mid-file damage without
   `--skip-damage` ends the whole replay; a torn tail ends only its part.
 - Damage and exit codes: 0 normal (including `--count` reached, a closed pipe, a torn tail or a
   recording never closed: `warning IB-REC-007`; a file a recorder holds open is not torn, it says
   `--follow` keeps reading); 5 mid-file damage seen (`IB-REC-006`, at most 3 lines printed and 100
   ledgered, the stop record and the summary count all) or a missing part (not when `--count` ended
-  the run first); 1 `IB-REC-004..009`; 2 usage and `IB-FLT-*`; 4 stdout closed or failing;
-  128+n a signal. 6 (2d) is not produced here.
+  the run first); 1 `IB-REC-004..009`; 2 usage and `IB-FLT-*`; 4 stdout closed from the start or
+  failing (a reader that goes away, as `| head` does, is a normal end: 0); 128+n a signal. 5 wins
+  over 4 (4 only replaces an exit of 0; the `IB-OUT-002` line still reports the loss). 6 (2d) is
+  not produced here. "Shown" (the summary, `--count`) means accepted by the output queue.
 - Follow: `Follower` probes `flock(LOCK_SH | LOCK_NB)` on part 1 (the lock the writer holds for the
   whole session), `Replay` polls every 100 ms for growth, treats an incomplete last record or a bad
   record with no valid chain yet as pending (`items(wait=)`), reads once more when the probe says
   the writer is gone, and moves on to the next part when the file ends at its trailer and the writer
   is still alive. No lock support (probe `ENOLCK`/`EINVAL`/`EOPNOTSUPP`) without `--follow-idle` is
   `IB-CLI-001` before anything is read; `--follow-idle S` ends after S seconds without growth. A
-  recorder that ran unlocked (`IB-LED-009`, 2d) looks dead to the probe.
+  recorder that ran unlocked (`IB-LED-009`, 2d) looks dead to the probe. Following a later part
+  probes part 1's lock (found by name), and a part that appears while following goes through the
+  same session, order and cap check as the parts named at the start. The "not closed cleanly"
+  warning (`IB-REC-007`) is given only when the probe found the writer gone (or no follow was
+  asked for); a follow that ended on `--follow-idle`, or because the output went away, says why it
+  stopped instead and does not claim the recorder left the file unclosed.
 - Output: replay writes with `write_wait`, so a reader that stops reading stops replay and nothing
   is dropped (`IB-OUT-001` cannot occur); a signal ends the wait, and whatever was queued is
   abandoned and counted by the existing `IB-OUT-002` path. Per frame costs the ledger nothing; the
   ledger gets `replay.start`, `replay.stop` (reason, counts, rejects by code, chunks skipped), the
   first 100 damage records and any definition note.
-- Tests: `test_replay.py` (57: records equal `listen`'s, flagged frames, ranges, chunk skipping
+- Tests: `test_replay.py` (67: records equal `listen`'s, flagged frames, ranges, chunk skipping
   against a straight read, pacing with a fake clock, count, split sets, damage, definitions,
   filter compilation, follow with a partial record, a dead writer, idle and a lockless file system,
   `write_wait`), `test_replay_malformed.py` (31: the 20-file corpus `rpl-*.ibrec` built by
   `tests/replay_corpus.py` and run through the CLI, Hypothesis over mutated and arbitrary BLOB
   contents, over bit flips and cuts of a file with embedded definitions in every format, over any
   payload in any frame, and over ranges with clock steps equal to a frame-by-frame selection, plus
-  a flip of every 97th bit and a cut every 37 bytes of the head), `test_replay_cli.py` (34 over
+  a flip of every 97th bit and a cut every 37 bytes of the head), `test_replay_cli.py` (41 over
   loopback on ports 58000-58999: the `respond` + `listen --record` round trip against replay by
   record, nothing sent, exit codes, SIGTERM during pacing and while blocked, closed and slow
   readers, following a real `ib record` to a clean close and to `kill -9`), a `cfs` acceptance
@@ -2319,8 +2336,9 @@ As built (where the build differs from, or settles, the text above)
   1.5x the bare path, a filter that selects little at 0.9x of the unfiltered time or better.
 - Deferred: the index of a recording is read whole for a selection (memory grows with the chunk
   count, as `rec info`'s does); no `--max-gap` for pacing; `--mid` is not offered (use
-  `--where 'mid in [...]'`); a skipped chunk's GAP records are not counted; the atheris target has
-  not run on a real fuzzer.
+  `--where 'mid in [...]'`); the atheris target has not run on a real fuzzer. The `rpl-defs-*`
+  corpus entries carry the META digests of their own content so each reaches its loader (the test
+  asserts the loader's reason for every entry).
 
 ### 2h - Export CSV and text
 

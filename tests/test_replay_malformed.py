@@ -74,6 +74,8 @@ def test_corpus_files_end_in_a_coded_error_and_hex_still_shows_the_frames(
     assert done.returncode == expect.exit_code, done.stderr
     if expect.code is not None:
         assert f"error {expect.code.value}" in done.stderr, done.stderr
+        # The reason is the loader's own, not the digest check or another stage standing in front.
+        assert expect.reason in done.stderr, done.stderr
         assert done.stdout == "" or expect.exit_code == 5
     hexed = run_ib(tmp_path, ["replay", str(path), "--format", "hex"], env)
     assert "Traceback" not in hexed.stderr and "IB-INT-001" not in hexed.stderr, hexed.stderr
@@ -291,7 +293,7 @@ def test_any_payload_in_any_frame_is_shown_exactly_once(
 @FUZZ
 @given(
     low=st.integers(-5, 130),
-    span=st.integers(0, 140),
+    span=st.integers(1, 140),
     only_mid=st.booleans(),
     clock_steps=st.lists(st.integers(-40, 40), max_size=4),
 )

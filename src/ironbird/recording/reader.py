@@ -564,21 +564,26 @@ class RecordingReader:
         if len(self.damage) < MAX_DAMAGE_KEPT:
             self.damage.append(damage)
 
-    def skip_chunk(self, start: int, stop: int) -> None:
+    def skip_chunk(self, start: int, stop: int) -> list[fmt.Gap]:
         """Account for a chunk the caller jumps over: its stream and source definitions are
         learned from its head (they may be the only place a later chunk's frames find theirs), and
-        the sequence check starts afresh, since the frames in between are not seen.
+        the sequence check starts afresh, since the frames in between are not seen. The GAP
+        records of the chunk (they sit at its head, before any frame) are returned.
 
         A definition that disagrees with one already known is ignored; a frame that needs it is
         then damage, as it would be in a straight read. Nothing in the chunk is validated further.
         """
         state = self._state
+        gaps: list[fmt.Gap] = []
         for item in self.head_records(start, stop):
             if item.rtype == RecordType.STREAM:
                 state.streams.setdefault(item.value.id, item.value)
             elif item.rtype == RecordType.SOURCE:
                 state.sources.setdefault(item.value[0], item.value[1])
+            elif item.rtype == RecordType.GAP:
+                gaps.append(item.value)
         state.last_seq = 0
+        return gaps
 
     def items(
         self,

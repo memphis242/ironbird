@@ -73,6 +73,12 @@ def read_head(reader: RecordingReader) -> Head:
     for count, item in enumerate(reader.head_records(reader.body_start, reader.size())):
         seen_bytes += item.end - item.offset
         if count >= MAX_HEAD_RECORDS or seen_bytes > MAX_HEAD_BYTES:
+            # Streams and definitions past the limit are not known; say so rather than let
+            # frames of those streams look like frames of nodes the recording never had.
+            problem = problem or (
+                f"its head holds more than {MAX_HEAD_RECORDS} records or "
+                f"{MAX_HEAD_BYTES // (1024 * 1024)} MiB, past what is read for definitions"
+            )
             break
         if item.rtype == RecordType.STREAM:
             streams.setdefault(item.value.id, item.value)
@@ -192,12 +198,24 @@ def config_codecs(
                 f"node {clean(name, 64)} has no ccdd/command_header/telemetry_header in "
                 f"{config.path}; replay without --defs config to use the recording's own",
             )
-        codecs[name] = Codec(
-            load_ccdd(node.ccdd, node.ccdd_adapter),
-            load_profile(node.command_header),
-            load_profile(node.telemetry_header),
-            max_packet_bytes=max_packet_bytes,
-        )
+        try:
+            codecs[name] = Codec(
+                load_ccdd(node.ccdd, node.ccdd_adapter),
+                load_profile(node.command_header),
+                load_profile(node.telemetry_header),
+                max_packet_bytes=max_packet_bytes,
+            )
+        except IronbirdError as exc:
+            if exc.code is not Code.ENC_FIT or "-byte cap" not in exc.summary:
+                raise
+            raise IronbirdError(
+                exc.code,
+                f"{exc.summary}; the {max_packet_bytes}-byte cap is the recording's, not the "
+                f"configuration's; replay without --defs config to use the recording's own "
+                "definitions",
+                details=exc.detail_text(),
+                cause=exc,
+            ) from exc
     return codecs
 
 

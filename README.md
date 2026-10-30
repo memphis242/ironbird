@@ -150,15 +150,21 @@ ib replay run1.ibrec --follow                                 # a recording stil
   the recording's definitions, so `status == malformed` selects what `listen` cannot show.
 - **Ranges.** `--from` and `--to` take ISO 8601 with `Z` or an offset (`2026-10-30T12:00:00Z`) or
   `+90s`, `+1m30s`, `+250ms` from the first frame; the range is half open (`from <= time < to`) on
-  the frames' receive times. Where the file has a usable index, chunks outside the range or without
-  a message the filter can match are skipped from their summaries (the summary line says how many;
-  skipped chunks are not checked for damage). A missing or bad index falls back to reading every
-  record (`info IB-REC-008`).
+  the frames' receive times. `--from` must be earlier than `--to` (`IB-CLI-001`, also when one is an
+  offset and one a time, once the first frame is known). A `+offset` counts from the first frame
+  actually read, after any damage that `--skip-damage` goes past. Where the file has a usable
+  index, chunks outside the range or without a message the filter can match are skipped from their
+  summaries: the summary line says how many were skipped unchecked, and damage inside a skipped
+  chunk is not seen (its GAP records are still counted when they overlap the range). A missing or
+  bad index falls back to reading every record (`info IB-REC-008`).
 - **Pace.** `--speed 0` (default) runs as fast as possible; `--speed 1` follows the recorded time
-  between frames, `--speed 2` twice as fast. A recorded clock step backwards counts as no time.
+  between frames, `--speed 2` twice as fast. Each backward step of the recorded clock between two
+  frames counts as zero time (the frames after it keep their own spacing); a forward step is not
+  shortened, so an hour of recorded silence is an hour.
 - **Split recordings.** Part 1 of a split recording plays all its parts in order; several files
   play as given (same session, ascending part numbers, else `IB-CLI-001`). A part that is missing
-  is `IB-REC-006` and exit 5.
+  is `IB-REC-006` and exit 5 (not when `--count` ended the run first); the parts that exist after
+  it still play.
 - **Damage.** A torn tail, or a recording that was never closed, is a warning (`IB-REC-007`) after
   everything before it was replayed (exit 0); a recording a recorder still holds open is not called
   torn. Mid-file damage is `IB-REC-006` with its offset and span: replay stops there (exit 5), or
@@ -171,11 +177,17 @@ ib replay run1.ibrec --follow                                 # a recording stil
   for ever, so when nothing new has arrived it probes the recorder's file lock
   (`flock(LOCK_SH | LOCK_NB)` on part 1, held until the session ends or the process dies): granted
   means the recorder is gone, the end of the file is read once more, and a partial record is a torn
-  tail. On a file system without usable locks (some NFS mounts) `--follow` needs `--follow-idle S`,
-  which ends after S seconds without growth; a recorder that ran unlocked looks dead to the probe.
-- **Output.** Replay never drops a line: a reader that stops reading stops replay, unlike a live
-  listener. A reader that goes away (`| head`) ends it quietly (exit 0). `--count N` stops after N
-  frames are shown. The ledger records the start (files, options) and the end (counts, how it
+  tail. Following a later part (`run.p0003.ibrec`) probes part 1's lock all the same, and a part that
+  appears while following must belong to the same session. On a file system without usable locks
+  (some NFS mounts) `--follow` needs `--follow-idle S`, which ends after S seconds without growth
+  (the recorder may still be alive then, so the file is not called unclosed); a recorder that ran
+  unlocked looks dead to the probe.
+- **Output.** Replay blocks rather than drops: when the reader of stdout is slow, replay waits for
+  room and loses no line, where `ib listen` has to keep up with the wire and drops lines with
+  `IB-OUT-001` instead. A reader that goes away (`| head`) ends replay quietly (exit 0); stdout
+  closed from the start (`>&-`) or failing is exit 4. "Shown" (in the summary and for `--count N`,
+  which stops after N frames are shown) means accepted by the output queue; a reader that leaves
+  at once may not have been handed the last of them. The ledger records the start (files, options) and the end (counts, how it
   ended); malformed frames are not ledgered one by one, the recording is their evidence.
 
 ## Exit codes
@@ -187,7 +199,7 @@ ib replay run1.ibrec --follow                                 # a recording stil
 | 2 | Usage, configuration, CCDD or header-profile error |
 | 3 | `listen`, `events` or `respond` had `--count N` and `--timeout` elapsed first |
 | 5 | The output was produced, but the input recording was damaged mid-file: `ib rec repair` left valid frames after the damage out of the copy; `ib replay` stopped at the damage (or, with `--skip-damage`, went past it) or a part of a split recording is missing |
-| 4 | The command otherwise succeeded but stdout lines were lost (`IB-OUT-002`): dropped while stdout was not draining, abandoned when a signal cut the final drain short, or stdout is closed (`>&-`). An error (1, 2), 3 or a signal (128+n) takes precedence. A `send` that exits 4 still went out |
+| 4 | The command otherwise succeeded but stdout lines were lost (`IB-OUT-002`): dropped while stdout was not draining, abandoned when a signal cut the final drain short, or stdout is closed (`>&-`). An error (1, 2), 3, 5 or a signal (128+n) takes precedence. A `send` that exits 4 still went out |
 | 128+n | Ended by signal n: 130 (Ctrl-C), 129 (SIGHUP), 143 (SIGTERM). The ledger is flushed first; an interrupted `send` says whether the command went out |
 
 Output never blocks the tool while it runs: a stalled stdout (unread pipe, paused pager) drops

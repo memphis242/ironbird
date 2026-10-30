@@ -38,6 +38,7 @@ from replayutil import (
     hk,
     hk_frames,
     last_frame_end,
+    meta_data,
     mock_codec,
     records,
     replay_in_process,
@@ -283,6 +284,38 @@ def test_chunks_without_a_candidate_mid_are_skipped(tmp_path: Path) -> None:
     assert unfiltered.lines == run.lines
 
 
+def test_a_chunk_whose_mid_summary_overflowed_is_never_skipped_for_its_mids(
+    tmp_path: Path,
+) -> None:
+    """More distinct MIDs in a chunk than the summary holds: the one wanted may be a MID the
+    summary does not list, so the chunk has to be read."""
+    wanted = 0x7FF
+    frames = [
+        frame(seq, stream=RX, data=hk(seq), mid=0x100 + seq, time_ns=T0 + seq * 1000)
+        for seq in range(1, fmt.MAX_CHUNK_MIDS + 40)
+    ] + [frame(10_000, stream=RX, data=hk(1), mid=wanted, time_ns=T0 + 10_000 * 1000)]
+    path = tmp_path / "wide.ibrec"
+    write_recording(
+        path,
+        frames,
+        options=RecorderOptions(min_free_bytes=0, chunk_bytes=10_000_000, chunk_ns=10**13),
+    )
+    with RecordingReader(path) as reader:
+        located = reader.read_trailer()
+        assert located is not None
+        chunks = reader.read_chunks(located[1], located[0])
+    assert len(chunks) == 1 and chunks[0][1].mid_overflow
+    assert wanted not in {mid for mid, _ in chunks[0][1].mids}
+    replaying = Replay([path])
+    replaying.select_mids(frozenset({wanted}))
+    try:
+        got = list(replaying.frames())
+        stats = replaying.stats
+    finally:
+        replaying.close()
+    assert stats.chunks_skipped == 0 and stats.frames_read == len(frames) == len(got)
+
+
 def test_skipping_chunks_changes_no_frame_the_range_selects(tmp_path: Path) -> None:
     """Every chunk boundary as the start of the range: the same frames as a straight read."""
     write_recording(tmp_path / "r.ibrec", hk_frames(120), options=SMALL_CHUNKS)
@@ -292,6 +325,67 @@ def test_skipping_chunks_changes_no_frame_the_range_selects(tmp_path: Path) -> N
     for first in range(0, 120, 7):
         got = frames_of(path, start=TimeSpec(absolute_ns=everything[first].time_ns))
         assert got == everything[first:], first
+
+
+def gappy_recording(path: Path) -> None:
+    """200 frames, 10 ms apart, without 21-23 (a gap of 3) and 101-105 (a gap of 5)."""
+    import asyncio
+
+    from ironbird.frame import GapReason
+    from ironbird.recording.writer import Recorder
+    from recutil import RX
+    from replayutil import blob_specs, meta_data
+
+    frames = hk_frames(200)
+    recorder = Recorder.open(
+        path, meta_data(), blobs=blob_specs(), streams=(RX, TX), options=SMALL_CHUNKS
+    )
+    for item in frames:
+        if item.seq in (21, 101):
+            lost = 3 if item.seq == 21 else 5
+            first = item.time_ns
+            recorder.gap(
+                RX, GapReason.RECORDER_OVERRUN, lost, first, first + (lost - 1) * STEP_NS,
+                item.seq, item.seq + lost - 1,
+            )  # fmt: skip
+        if item.seq in (21, 22, 23) or item.seq in range(101, 106):
+            continue
+        recorder.append(item)
+    asyncio.run(recorder.close())
+
+
+def test_gaps_overlapping_the_range_are_counted_even_in_chunks_the_index_skips(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "gaps.ibrec"
+    gappy_recording(path)
+    for start, end, expect in (
+        (None, None, [(2, 8)]),
+        (T0 + 150 * STEP_NS, None, [(0, 0)]),
+        (None, T0 + 50 * STEP_NS, [(1, 3)]),
+        (T0 + 100 * STEP_NS, T0 + 103 * STEP_NS, [(1, 5)]),
+    ):
+        spec = {
+            "start": TimeSpec(absolute_ns=start) if start is not None else None,
+            "end": TimeSpec(absolute_ns=end) if end is not None else None,
+        }
+        # No chunk holds the candidate MID: every chunk is skipped, only its head is looked at.
+        replaying = Replay([path], **spec)  # type: ignore[arg-type]
+        replaying.select_mids(frozenset({0x1}))
+        try:
+            assert list(replaying.frames()) == []
+            stats = replaying.stats
+        finally:
+            replaying.close()
+        assert stats.chunks_skipped > 3 and stats.frames_read == 0
+        assert [(stats.gaps, stats.gap_frames)] == expect, (start, end)
+        # The same range read straight through counts the same.
+        straight = Replay([path], **spec)  # type: ignore[arg-type]
+        try:
+            list(straight.frames())
+        finally:
+            straight.close()
+        assert (straight.stats.gaps, straight.stats.gap_frames) == expect[0], (start, end)
 
 
 def test_a_lying_index_cannot_make_replay_read_a_frame_that_was_not_written(
@@ -337,10 +431,19 @@ def test_speed_one_waits_the_recorded_time_and_speed_two_half_of_it() -> None:
     assert paced(0.0, stamps).slept == []
 
 
-def test_a_clock_step_backwards_counts_as_no_time_and_later_frames_keep_their_schedule() -> None:
+def test_a_clock_step_backwards_counts_as_no_time_and_later_frames_keep_their_spacing() -> None:
     stamps = [T0, T0 + 10**9, T0 - 5 * 10**9, T0 + 2 * 10**9]
     fake = paced(1.0, stamps)
-    assert sum(fake.slept) == pytest.approx(2.0, abs=1e-6)  # never waits for the negative step
+    # 1 s, then 0 for the step back, then 7 s from the stepped-back time to the last frame.
+    assert sum(fake.slept) == pytest.approx(8.0, abs=1e-6)
+
+
+def test_frames_after_a_big_step_backwards_are_paced_at_their_own_rate() -> None:
+    """A clock that jumped back by an hour must not make the next hour of frames go unpaced."""
+    hour = 3600 * 10**9
+    stamps = [T0 + i * 10**9 for i in range(3)] + [T0 - hour + i * 10**9 for i in range(5)]
+    fake = paced(1.0, stamps)
+    assert sum(fake.slept) == pytest.approx(2.0 + 0.0 + 4.0, abs=1e-6)
 
 
 def test_a_slow_consumer_does_not_stretch_the_schedule() -> None:
@@ -430,22 +533,41 @@ def test_parts_out_of_order_or_of_another_session_are_a_usage_error(tmp_path: Pa
     )
 
 
-def test_a_missing_part_is_reported_and_the_rest_still_plays(tmp_path: Path) -> None:
+def test_a_missing_part_is_reported_and_every_later_part_still_plays(tmp_path: Path) -> None:
     base, frames = split_set(tmp_path)
-    kept = frames_of(base)
+    count = len([n for n in range(1, 30) if part_path(base, n).exists()])
+    assert count >= 3
+    lost = frames_of(part_path(base, 2))
+    assert lost
     part_path(base, 2).unlink()
     replaying = Replay([base])
     try:
         assert replaying.stats.missing_parts == [2]
+        assert len(replaying.parts) == count - 1  # parts 3.. are found past the hole
         played = list(replaying.frames())
     finally:
         replaying.close()
-    assert played == kept[: len(played)] and len(played) < len(frames)
+    assert played == [f for f in frames if f not in lost]
     named = Replay([base, part_path(base, 3)])
     try:
         assert named.stats.missing_parts == [2]
     finally:
         named.close()
+
+
+def test_several_missing_parts_are_all_listed(
+    tmp_path: Path,
+) -> None:
+    base, _ = split_set(tmp_path, 120)
+    count = len([n for n in range(1, 40) if part_path(base, n).exists()])
+    assert count >= 5
+    for number in (2, 3):
+        part_path(base, number).unlink()
+    replaying = Replay([base])
+    try:
+        assert replaying.stats.missing_parts == [2, 3] and len(replaying.parts) == count - 2
+    finally:
+        replaying.close()
 
 
 # -- damage --
@@ -486,6 +608,26 @@ def test_mid_file_damage_stops_the_replay_unless_skip_damage_resumes(tmp_path: P
     assert resumed.replay.stats.mid_file_damage and resumed.replay.stats.damage == 1  # type: ignore[union-attr]
 
 
+def test_an_offset_is_measured_from_the_first_frame_read_even_when_damage_comes_first(
+    tmp_path: Path,
+) -> None:
+    write_recording(tmp_path / "r.ibrec", hk_frames(300), options=SMALL_CHUNKS)
+    bad = flip_in_frame(tmp_path / "r.ibrec", 0, tmp_path / "bad.ibrec")
+    for spec in (
+        {"start": parse_time_spec("+1s", "--from")},
+        {"end": parse_time_spec("+1s", "--to")},
+    ):
+        stopped = replay_in_process(bad, **spec)  # type: ignore[arg-type]
+        stats = stopped.replay.stats  # type: ignore[union-attr]
+        assert stats.mid_file_damage and stats.damage == 1 and len(stopped.damage) == 1
+        assert stopped.result.shown == 0 and stopped.result.ending is Ending.DAMAGE
+    # The offset counts from the first frame read (the second written): 1 s later is frame 102.
+    resumed = replay_in_process(bad, skip_damage=True, start=parse_time_spec("+1s", "--from"))
+    assert resumed.result.shown == 199  # (the damaged chunk is outside the range: skipped)
+    ended = replay_in_process(bad, skip_damage=True, end=parse_time_spec("+1s", "--to"))
+    assert ended.result.shown == 100 and len(ended.damage) == 1  # the damage is inside the range
+
+
 def test_a_recording_still_being_written_is_not_called_torn(tmp_path: Path) -> None:
     write_recording(tmp_path / "r.ibrec", hk_frames(8))
     raw = (tmp_path / "r.ibrec").read_bytes()
@@ -520,6 +662,26 @@ def test_a_recording_without_definitions_needs_hex_or_the_configuration(tmp_path
     assert replay_in_process(tmp_path / "r.ibrec", fmt_=OutputFormat.HEX).result.shown == 3
     run = replay_in_process(tmp_path / "r.ibrec", codecs={"fc": mock_codec()})
     assert run.result.shown == 3
+
+
+def test_a_head_cut_by_the_limits_is_a_definitions_error_not_silently_shorter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ironbird.recording import defs
+
+    write_recording(tmp_path / "r.ibrec", hk_frames(5))
+    for limit in ("MAX_HEAD_RECORDS", "MAX_HEAD_BYTES"):
+        monkeypatch.setattr(defs, limit, 3 if limit == "MAX_HEAD_RECORDS" else 2000)
+        with pytest.raises(IronbirdError) as caught:
+            replay_in_process(tmp_path / "r.ibrec")
+        assert caught.value.code is Code.REC_DEFS and "head holds more than" in caught.value.summary
+        # Output that needs no definitions still works; a filter says why it cannot be checked.
+        assert replay_in_process(tmp_path / "r.ibrec", fmt_=OutputFormat.HEX).result.shown == 5
+        with pytest.raises(IronbirdError) as caught:
+            replay_in_process(tmp_path / "r.ibrec", fmt_=OutputFormat.HEX, where='link == "x"')
+        assert caught.value.code is Code.REC_DEFS
+        monkeypatch.undo()
+    assert replay_in_process(tmp_path / "r.ibrec").result.shown == 5
 
 
 def test_a_filter_is_compiled_against_the_recordings_definitions(tmp_path: Path) -> None:
@@ -604,6 +766,38 @@ def test_follow_waits_for_a_writer_that_is_quiet_and_idle_ends_it(tmp_path: Path
     finally:
         os.close(fd)
     assert 0.35 <= took < 5 and run.result.shown == 2
+    stats = run.replay.stats  # type: ignore[union-attr]
+    # The writer may well be alive: the file is not said to have been left unclosed.
+    assert stats.unclosed == 0 and run.replay.follow_ended == "idle"  # type: ignore[union-attr]
+
+
+def test_follow_stopped_because_the_reader_left_does_not_call_the_file_unclosed(
+    tmp_path: Path,
+) -> None:
+    builder = crafted(good_blobs(), frames=2)
+    path = tmp_path / "quiet.ibrec"
+    path.write_bytes(bytes(builder.out))
+    fd = os.open(path, os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    stop = threading.Event()
+    replaying = Replay([path], follow=True, stop=stop.is_set)
+    threading.Timer(0.3, stop.set).start()
+    try:
+        assert len(list(replaying.frames())) == 2
+    finally:
+        replaying.close()
+        os.close(fd)
+    assert replaying.stats.unclosed == 0 and replaying.follow_ended == "stopped"
+
+
+def test_follow_of_a_writer_that_died_without_a_trailer_is_called_unclosed(
+    tmp_path: Path,
+) -> None:
+    builder = crafted(good_blobs(), frames=2)
+    path = tmp_path / "dead.ibrec"
+    path.write_bytes(bytes(builder.out))  # whole records, no trailer, nobody holds the lock
+    run = replay_in_process(path, follow=True)
+    assert run.replay.stats.unclosed == 1 and run.replay.follow_ended == "writer gone"  # type: ignore[union-attr]
 
 
 def test_follow_of_a_closed_recording_ends_at_its_trailer(tmp_path: Path) -> None:
@@ -647,6 +841,75 @@ def test_follow_continues_into_the_next_part_of_a_split_recording(tmp_path: Path
     base, frames = split_set(tmp_path, 40)
     run = replay_in_process(base, follow=True)
     assert run.result.shown == len(frames)
+
+
+def follow_in_thread(
+    paths: list[Path], stop: threading.Event
+) -> tuple[threading.Thread, dict[str, object]]:
+    result: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            replaying = Replay(paths, follow=True, stop=stop.is_set)
+            try:
+                result["frames"] = list(replaying.frames())
+            finally:
+                replaying.close()
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, result
+
+
+def test_following_a_later_part_asks_part_one_whether_the_writer_is_alive(tmp_path: Path) -> None:
+    base, _ = split_set(tmp_path, 40)
+    last = max(p for p in (part_path(base, n) for n in range(1, 20)) if p.exists())
+    assert last != base
+    fd = os.open(base, os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # the writer: it holds part 1 for the whole session
+    stop = threading.Event()
+    thread, result = follow_in_thread([last], stop)
+    try:
+        thread.join(0.7)
+        assert thread.is_alive(), "ended although the writer still holds part 1"
+        os.close(fd)  # the writer goes
+        fd = -1
+        thread.join(10)
+        assert not thread.is_alive() and "error" not in result, result
+    finally:
+        stop.set()
+        if fd >= 0:
+            os.close(fd)
+        thread.join(10)
+
+
+def test_a_part_that_appears_while_following_must_belong_to_the_same_session(
+    tmp_path: Path,
+) -> None:
+    base, _ = split_set(tmp_path, 40)
+    last = max(p for p in (part_path(base, n) for n in range(1, 20)) if p.exists())
+    number = int(last.name.split(".p")[1][:4]) if last != base else 1
+    fd = os.open(base, os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    stop = threading.Event()
+    thread, result = follow_in_thread([last], stop)
+    try:
+        time.sleep(0.3)
+        other = crafted(
+            good_blobs(), meta=meta_data(session="999999999999", part=number + 1), frames=2
+        )
+        part_path(base, number + 1).write_bytes(bytes(other.out))
+        thread.join(10)
+        assert not thread.is_alive()
+        error = result.get("error")
+        assert isinstance(error, IronbirdError) and error.code is Code.CLI_USAGE
+        assert "another recording session" in error.summary
+    finally:
+        stop.set()
+        os.close(fd)
+        thread.join(10)
 
 
 # -- the output a replay writes to never drops a line --

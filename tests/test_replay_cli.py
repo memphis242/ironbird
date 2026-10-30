@@ -117,8 +117,10 @@ def test_replay_prints_the_records_a_live_listen_printed(
 
     events = ledger_events(tmp_path)
     start = next(e for e in events if e["event"] == "replay.start" and e["where"] is None)
-    stop = next(e for e in events if e["event"] == "replay.stop")
-    assert start["files"] == [str(rec)] and stop["shown"] == 6 and stop["reason"] == "done"
+    # One ledger file per process, in no fixed order: the stops are looked at as a set.
+    stops = [e for e in events if e["event"] == "replay.stop"]
+    assert start["files"] == [str(rec)] and all(e["reason"] == "done" for e in stops)
+    assert sorted(e["shown"] for e in stops) == [3, 6, 6]
 
 
 def test_nothing_is_ever_sent_by_replay(tmp_path: Path, env: dict[str, str]) -> None:
@@ -228,6 +230,18 @@ def test_defs_config_decodes_with_the_current_configuration(
     assert refused.stdout == ""
 
 
+def test_defs_config_that_does_not_fit_the_recordings_cap_says_the_cap_is_the_recordings(
+    tmp_path: Path, env: dict[str, str]
+) -> None:
+    (tmp_path / "small.ibrec").write_bytes(
+        bytes(crafted(good_blobs(), max_packet=20, frames=0).out)
+    )
+    done = run_ib(tmp_path, ["replay", str(tmp_path / "small.ibrec"), "--defs", "config"], env)
+    assert done.returncode != 0 and "error IB-ENC-004" in done.stderr, done.stderr
+    assert "cap" in done.stderr and "recording" in done.stderr.split("IB-ENC-004", 1)[1]
+    assert "Traceback" not in done.stderr and done.stdout == ""
+
+
 def test_a_recording_made_without_definitions_says_what_to_do(
     tmp_path: Path, env: dict[str, str]
 ) -> None:
@@ -254,6 +268,11 @@ def test_a_recording_made_without_definitions_says_what_to_do(
         (["--from", "tomorrow"], "IB-CLI-001"),
         (["--from", "+90"], "IB-CLI-001"),
         (["--from", "2026-10-30T12:00:00Z", "--to", "2026-10-30T11:00:00Z"], "earlier than --to"),
+        (["--from", "+90s", "--to", "+10s"], "earlier than --to"),
+        (["--from", "+10s", "--to", "+10s"], "earlier than --to"),
+        (["--from", "+10s", "--to", "2020-01-01T00:00:00Z"], "earlier than --to"),
+        (["--from", "2099-01-01T00:00:00Z", "--to", "+1s"], "earlier than --to"),
+        (["--from", "yesterday"], "is not a time: use a UTC time"),
         (["--speed", "-1"], "IB-CLI-001"),
         (["--speed", "nan"], "IB-CLI-001"),
         (["--follow-idle", "5"], "needs --follow"),
@@ -349,6 +368,25 @@ def test_mid_file_damage_is_exit_5_with_the_output_before_it(
     assert counted.returncode == 0 and len(counted.stdout.splitlines()) == 5  # never reached it
 
 
+def test_an_offset_range_with_damage_before_the_first_frame_still_reads_and_exits_5(
+    tmp_path: Path, env: dict[str, str]
+) -> None:
+    write_recording(
+        tmp_path / "r.ibrec",
+        hk_frames(300),
+        options=RecorderOptions(min_free_bytes=0, chunk_bytes=900),
+    )
+    bad = damaged_copy(tmp_path / "r.ibrec", tmp_path / "bad.ibrec", 0)
+    for flag in ("--from", "--to"):
+        done = run_ib(tmp_path, ["replay", str(bad), flag, "+1s"], env)
+        assert done.returncode == 5, done.stderr
+        assert "IB-REC-006" in done.stderr and "1 damaged stretch" in done.stderr
+    resumed = run_ib(tmp_path, ["replay", str(bad), "--skip-damage", "--to", "+1s"], env)
+    assert resumed.returncode == 5 and len(resumed.stdout.splitlines()) == 100
+    from_ = run_ib(tmp_path, ["replay", str(bad), "--skip-damage", "--from", "+1s"], env)
+    assert len(from_.stdout.splitlines()) == 199  # the damaged chunk is outside the range
+
+
 def test_a_torn_tail_is_a_warning_and_exit_0(tmp_path: Path, env: dict[str, str]) -> None:
     write_recording(tmp_path / "r.ibrec", hk_frames(20))
     raw = (tmp_path / "r.ibrec").read_bytes()
@@ -402,6 +440,19 @@ def test_a_split_recording_plays_every_part_and_a_missing_one_is_exit_5(
     gap = run_ib(tmp_path, ["replay", str(base)], env)
     assert gap.returncode == 5 and "part 2" in gap.stderr and "IB-REC-006" in gap.stderr
     assert 0 < len(gap.stdout.splitlines()) < 60
+    # Later parts still play: more than part 1 alone holds.
+    first_part = RecordingReader(base)
+    try:
+        part_one_frames = sum(1 for _ in first_part.frames())
+    finally:
+        first_part.close()
+    assert len(gap.stdout.splitlines()) > part_one_frames
+    # --count reached first: the run did not get to the hole, so it is a normal end (0); a count
+    # that is not reached leaves the missing part standing (5).
+    counted = run_ib(tmp_path, ["replay", str(base), "--count", "5"], env)
+    assert counted.returncode == 0 and len(counted.stdout.splitlines()) == 5, counted.stderr
+    unreached = run_ib(tmp_path, ["replay", str(base), "--count", "59"], env)
+    assert unreached.returncode == 5, unreached.stderr
 
 
 # -- signals, a closed output, a slow reader --
@@ -605,7 +656,7 @@ def test_follow_ends_when_the_recorder_is_killed_and_says_the_file_was_not_close
             follower.kill()
     assert follower is not None
     assert code == 0, follower.stderr
-    assert "warning IB-REC-007" in follower.stderr
+    assert "warning IB-REC-007" in follower.stderr and "not closed cleanly" in follower.stderr
 
 
 def test_follow_idle_ends_a_quiet_follow(tmp_path: Path, env: dict[str, str]) -> None:
@@ -626,6 +677,7 @@ def test_follow_idle_ends_a_quiet_follow(tmp_path: Path, env: dict[str, str]) ->
     assert done.returncode == 0, done.stderr
     assert len(done.stdout.splitlines()) == 2 and took >= 1.0
     assert live.returncode == 0 and "still being written" in live.stderr
+    assert "not closed cleanly" not in done.stderr and "IB-REC-007" in done.stderr
 
 
 def test_replay_never_modifies_the_recording(tmp_path: Path, env: dict[str, str]) -> None:

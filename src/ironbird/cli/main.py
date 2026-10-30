@@ -52,6 +52,7 @@ from ironbird.recording.render import damage_summary, info_json, info_lines, siz
 from ironbird.recording.replay import (
     Pacer,
     Replay,
+    check_range,
     check_speed,
     parse_time_spec,
 )
@@ -1473,7 +1474,7 @@ def _replay_summary(
     if undecoded:
         parts.append(f"{undecoded} without definitions")
     if stats.chunks_skipped:
-        parts.append(f"{stats.chunks_skipped} chunk(s) skipped by the index")
+        parts.append(f"{stats.chunks_skipped} chunk(s) skipped by the index and not checked")
     if stats.gaps:
         parts.append(f"{stats.gaps} gap(s) ({stats.gap_frames} frame(s) lost)")
     if stats.damage:
@@ -1581,14 +1582,7 @@ def replay(
             check_speed(speed)
             start = parse_time_spec(from_, "--from") if from_ is not None else None
             end = parse_time_spec(to, "--to") if to is not None else None
-            if (
-                start is not None
-                and end is not None
-                and start.absolute_ns is not None
-                and end.absolute_ns is not None
-                and start.absolute_ns >= end.absolute_ns
-            ):
-                raise IronbirdError(Code.CLI_USAGE, "--from must be earlier than --to")
+            check_range(start, end)
             if follow_idle is not None and not follow:
                 raise IronbirdError(Code.CLI_USAGE, "--follow-idle needs --follow")
             ledger.record(
@@ -1651,13 +1645,19 @@ def replay(
                 stop=stdout_gone,
             )
             stats = replaying.stats
-            for missing in stats.missing_parts:
+            if stats.missing_parts:
+                numbers = stats.missing_parts
+                listed = ", ".join(str(n) for n in numbers[:8]) + (
+                    ", ..." if len(numbers) > 8 else ""
+                )
                 miss = IronbirdError(
                     Code.REC_DAMAGED,
-                    f"part {missing} of the split recording is missing; the frames in it are "
-                    "not in the output",
+                    f"{'part' if len(numbers) == 1 else 'parts'} {listed} of the split recording "
+                    f"{'is' if len(numbers) == 1 else 'are'} missing"
+                    f"{f' ({len(numbers)} in all)' if len(numbers) > 1 else ''}; "
+                    "the frames in them are not in the output",
                 )
-                ledger.record_error(miss, part=missing)
+                ledger.record_error(miss, parts=numbers[:64])
                 console.err(miss.user_line())
             needed = fmt is not OutputFormat.HEX or where is not None
             codecs, aliases, degraded = _replay_definitions(
@@ -1689,6 +1689,11 @@ def replay(
                     "warning", warn.code.value, summary=warn.summary, files=stats.unclosed
                 )
                 console.err(f"warning {warn.code.value}: {warn.summary}")
+            if replaying.follow_ended == "idle":
+                console.err(
+                    f"info {Code.REC_TORN.value}: --follow ended after {follow_idle:g} s without "
+                    "growth; the recorder may still be writing"
+                )
             if stats.live_end:
                 console.err(
                     f"info {Code.REC_TORN.value}: the recording is still being written; "
