@@ -41,7 +41,7 @@ from ironbird.transport.udp import UdpTransport
 EXIT_TIMEOUT = 3
 
 
-# -- helpers --------------------------------------------------------------------------------
+# -- helpers --
 
 
 @pytest.fixture
@@ -156,7 +156,7 @@ def read_ledger(ledger: Ledger) -> list[dict[str, Any]]:
     return [json.loads(line) for line in ledger.path.read_text().splitlines()]
 
 
-# -- B1: signals outside the listen loops -------------------------------------------------
+# -- B1: signals outside the listen loops --
 
 SLOW_OPEN = """
     from ironbird.transport.udp import UdpTransport
@@ -255,7 +255,7 @@ def test_ctrl_c_after_the_datagram_left_says_sent_and_ledgers_sent(
     assert tx["result"] == "sent" and tx["sent"] is True
 
 
-# -- B4: tx.command tells the truth -------------------------------------------------------
+# -- B4: tx.command tells the truth --
 
 
 def test_tx_command_result_is_not_sent_when_cancelled_or_failed_before_sendto(
@@ -302,7 +302,7 @@ def test_tx_command_result_is_sent_only_after_sendto(run_session: Any, mock_conf
     assert tx["result"] == "sent" and tx["sent"] is True
 
 
-# -- B2: blocked stdout never stops the loop ------------------------------------------------
+# -- B2: blocked stdout never stops the loop --
 
 
 def start_blocked_listen(config: Path, tmp_path: Path, *extra: str):
@@ -422,7 +422,7 @@ def test_closed_stdout_pipe_ends_listen_normally(
     assert endings and endings[-1]["reason"] == "pipe_closed"
 
 
-# -- B5: exit codes ---------------------------------------------------------------------------
+# -- B5: exit codes --
 
 
 @pytest.mark.parametrize(
@@ -469,7 +469,7 @@ def test_signal_ends_listen_with_128_plus_n(
     assert events_named(state_dir, "listen.ending")[-1]["reason"] == "signal"
 
 
-# -- option validation ------------------------------------------------------------------------
+# -- option validation --
 
 
 @pytest.mark.parametrize("delta", ["0", "65536", "-65536", "131072", "99999999999999999999"])
@@ -527,7 +527,7 @@ def test_mid_filter_accepts_known_mids_and_names(mock_config_path: Path) -> None
         assert result.exit_code == 0, (mid, result.output)
 
 
-# -- transport errors blame the right thing ---------------------------------------------------
+# -- transport errors blame the right thing --
 
 
 def test_unresolvable_reply_host_blames_the_reply_endpoint(
@@ -566,7 +566,7 @@ def test_decode_error_message_names_the_mid_once() -> None:
     assert "0x0803" in other.summary  # still named when the reason does not say it
 
 
-# -- XDG and the ledger directory -------------------------------------------------------------
+# -- XDG and the ledger directory --
 
 
 def test_relative_xdg_state_home_is_ignored() -> None:
@@ -615,7 +615,7 @@ def test_read_only_commands_still_run_without_a_ledger(
     assert result.exit_code == 0 and Code.LED_DIR.value in result.output
 
 
-# -- B3: kernel drops and the receive buffer -------------------------------------------------
+# -- B3: kernel drops and the receive buffer --
 
 
 def test_transport_counts_datagrams_the_kernel_dropped() -> None:
@@ -716,7 +716,7 @@ def test_effective_rcvbuf_is_ledgered_and_a_short_buffer_warns_once(
     assert opened[0]["rcvbuf_requested"] == 1 << 30
 
 
-# -- filtered listeners still account for what they skip -------------------------------------
+# -- filtered listeners still account for what they skip --
 
 
 def test_filtered_listener_reports_skipped_malformed_and_unknown_packets(
@@ -839,7 +839,7 @@ def test_render_sanitizes_packet_event_and_banner_strings(
         assert not re.search(NODE_NAME, rest), text
 
 
-# -- tools -------------------------------------------------------------------------------------
+# -- tools --
 
 TOOLS = REPO / "tools" / "cfs"
 

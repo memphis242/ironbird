@@ -130,12 +130,24 @@ class Link:
 
 
 @dataclass(frozen=True, slots=True)
+class RecordingConfig:
+    """The ``[recording]`` table: where recordings go and how they are written."""
+
+    dir: Path | None = None  # None: $IRONBIRD_RECORD_DIR, else the XDG data directory
+    fsync: str = "chunk"  # "chunk" | "always" | "never"
+    max_buffer_bytes: int = 256 * 1024 * 1024
+    min_free_bytes: int = 1024 * 1024 * 1024
+    embed_definitions: bool = True  # decision D1
+
+
+@dataclass(frozen=True, slots=True)
 class SystemConfig:
     path: Path
     acts_as: str
     max_packet_bytes: int
     nodes: Mapping[str, Node]
     links: tuple[Link, ...]
+    recording: RecordingConfig = RecordingConfig()
 
     def resolve(self, name_or_alias: str) -> Node:
         """Look a node up by name or alias."""
@@ -306,10 +318,60 @@ def _parse_node(ctx: _Ctx, name: str, raw: object) -> Node:
     )
 
 
+MIN_BUFFER_BYTES: Final = 1024 * 1024
+MAX_BUFFER_BYTES: Final = 64 * 1024 * 1024 * 1024
+MAX_FREE_BYTES: Final = 1 << 50
+FSYNC_POLICIES: Final = ("chunk", "always", "never")
+
+
+def _config_int(
+    ctx: _Ctx, table: Mapping[str, Any], key: str, path: str, low: int, high: int
+) -> int:
+    value = table[key]
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise ctx.fail(f"{path}.{key}", f"must be an integer in {low}..{high}")
+    return value
+
+
+def _parse_recording(ctx: _Ctx, raw: object) -> RecordingConfig:
+    if not isinstance(raw, dict):
+        raise ctx.fail("recording", "must be a table")
+    ctx.keys(
+        raw,
+        "recording",
+        {"dir", "fsync", "max_buffer_bytes", "min_free_bytes", "embed_definitions"},
+        set(),
+    )
+    defaults = RecordingConfig()
+    fsync = ctx.string(raw, "fsync", "recording", defaults.fsync)
+    if fsync not in FSYNC_POLICIES:
+        raise ctx.fail("recording.fsync", f"must be one of {', '.join(FSYNC_POLICIES)}")
+    embed = raw.get("embed_definitions", defaults.embed_definitions)
+    if not isinstance(embed, bool):
+        raise ctx.fail("recording.embed_definitions", "must be true or false")
+    return RecordingConfig(
+        dir=ctx.file(raw, "dir", "recording"),
+        fsync=fsync,
+        max_buffer_bytes=(
+            _config_int(
+                ctx, raw, "max_buffer_bytes", "recording", MIN_BUFFER_BYTES, MAX_BUFFER_BYTES
+            )
+            if "max_buffer_bytes" in raw
+            else defaults.max_buffer_bytes
+        ),
+        min_free_bytes=(
+            _config_int(ctx, raw, "min_free_bytes", "recording", 0, MAX_FREE_BYTES)
+            if "min_free_bytes" in raw
+            else defaults.min_free_bytes
+        ),
+        embed_definitions=embed,
+    )
+
+
 def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
     """Validate a parsed TOML mapping (paths resolve against ``path.parent``)."""
     ctx = _Ctx(path)
-    ctx.keys(data, "", {"ironbird", "nodes", "links"}, {"nodes"})
+    ctx.keys(data, "", {"ironbird", "nodes", "links", "recording"}, {"nodes"})
 
     settings = data.get("ironbird", {})
     if not isinstance(settings, dict):
@@ -419,6 +481,9 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
         max_packet_bytes=max_bytes,
         nodes=MappingProxyType(nodes),
         links=tuple(links),
+        recording=_parse_recording(ctx, data["recording"])
+        if "recording" in data
+        else RecordingConfig(),
     )
 
 

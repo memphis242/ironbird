@@ -15,7 +15,7 @@ from ironbird.ccdd.model import MessageKind
 from ironbird.config import find_config, load_config, parse_config
 from ironbird.errors import Code, IronbirdError
 
-# -- config ---------------------------------------------------------------------------
+# -- config --
 
 
 def _config() -> dict[str, Any]:
@@ -90,7 +90,7 @@ def test_find_config_order_and_error(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert find_config(None, {"IRONBIRD_CONFIG": "/etc/ib.toml"}) == Path("/etc/ib.toml")
 
 
-# -- CCDD -----------------------------------------------------------------------------
+# -- CCDD --
 
 
 def _ccdd() -> dict[str, Any]:

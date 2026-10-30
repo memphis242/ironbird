@@ -36,7 +36,7 @@ from ironbird.engine import (
 )
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
-from ironbird.frame import Decoded
+from ironbird.frame import Decoded, Stream
 from ironbird.header import load_profile
 from ironbird.ledger import Ledger
 from ironbird.notice import Level, Notice
@@ -485,6 +485,58 @@ class Session:
             ends, sinks=sinks, queue_frames=queue_frames, queue_bytes=queue_bytes
         )
 
+    def streams_for(self, routes: Sequence[Route]) -> tuple[Stream, ...]:
+        """The receive and send streams of ``routes``, in order (ids are fixed from here on), so a
+        recorder can declare them before the capture that feeds it opens."""
+        return self._engine.streams_for([(route.link, link_end(route.side)) for route in routes])
+
+    def record_routes(
+        self, nodes: Sequence[str] | None = None, *, link_name: str | None = None
+    ) -> list[Route]:
+        """Every link of the node ironbird acts as (or those to ``nodes`` / named ``link_name``),
+        each as the route a capture on this side of it receives from, for ``ib record``."""
+        me = self.node.name
+        wanted: set[str] | None = None
+        if nodes:
+            wanted = {self.config.resolve(name).name for name in nodes}
+        routes: list[Route] = []
+        for lk in self.config.links:
+            if me not in (lk.source, lk.destination):
+                continue
+            peer = lk.destination if lk.source == me else lk.source
+            if (wanted is not None and peer not in wanted) or (
+                link_name is not None and lk.name != link_name
+            ):
+                continue
+            side = Side.COMMANDER if lk.source == me else Side.RESPONDER
+            routes.append(
+                Route(lk, side, self.config.nodes[peer], self.config.nodes[lk.destination])
+            )
+        if not routes:
+            raise IronbirdError(
+                Code.CFG_LINK,
+                f"{me!r} has no link to record"
+                + (f" named {link_name!r}" if link_name else "")
+                + (f" to {', '.join(sorted(wanted))}" if wanted else ""),
+                details="links: " + ", ".join(link.name for link in self.config.links),
+            )
+        seen: dict[str, Route] = {}
+        for route in routes:
+            end = link_end(route.side)
+            rx = (
+                route.link.telemetry_endpoint
+                if end is LinkEnd.SOURCE
+                else route.link.command_endpoint
+            )
+            clash = seen.setdefault(str(rx), route)
+            if clash is not route:
+                raise IronbirdError(
+                    Code.CFG_LINK,
+                    f"links {clash.link.name!r} and {route.link.name!r} both receive on {rx}; "
+                    "select one with --link",
+                )
+        return routes
+
     def add_sink(self, sink: FrameSink) -> None:
         """Attach ``sink`` to every frame this session ingests or sends until it is removed.
 
@@ -577,6 +629,15 @@ class Session:
                 )
         return routes
 
+    def event_routes(self, nodes: Sequence[str] | None = None) -> list[Route]:
+        """The routes :meth:`events` captures: those of ``nodes`` (default: all) whose CCDD
+        defines event telemetry. Empty when none does (``events`` then explains)."""
+        return [
+            route
+            for route in self._event_routes(nodes)
+            if self.codec_for(route.server.name).model.event_messages()
+        ]
+
     async def events(
         self, nodes: Sequence[str] | None = None, *, min_severity: EventSeverity | None = None
     ) -> EventStream:
@@ -621,7 +682,9 @@ class Session:
 
     # -- responder ------------------------------------------------------------------
 
-    async def respond(self, *, peer: str | None = None, link: str | None = None) -> Responder:
+    def respond_route(self, *, peer: str | None = None, link: str | None = None) -> Route:
+        """The link :meth:`respond` answers on (``peer``/``link`` narrow it when several end at
+        this node)."""
         me = self.node.name
         candidates = [
             lk
@@ -643,8 +706,12 @@ class Session:
                 details="links: " + ", ".join(lk.name for lk in candidates),
             )
         chosen = candidates[0]
-        route = Route(chosen, Side.RESPONDER, self.config.nodes[chosen.source], self.node)
-        codec = self.codec_for(me)
+        return Route(chosen, Side.RESPONDER, self.config.nodes[chosen.source], self.node)
+
+    async def respond(self, *, peer: str | None = None, link: str | None = None) -> Responder:
+        route = self.respond_route(peer=peer, link=link)
+        chosen = route.link
+        codec = self.codec_for(self.node.name)
         rules = _validate_rules(self.node, codec, self.config)
         capture = await self.capture([route])
         self.ledger.record(

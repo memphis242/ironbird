@@ -27,7 +27,7 @@ from ironbird.notice import Level, Notice
 from ironbird.session import Session, TxAttempt
 from ironbird.transport.udp import UdpTransport
 
-# -- C1: record numbers ------------------------------------------------------------------
+# -- C1: record numbers --
 
 
 def _written(ledger: Ledger) -> list[dict[str, Any]]:
@@ -89,7 +89,7 @@ def test_essential_overflow_is_counted_not_silent(tmp_path: Path) -> None:
     assert dropped["count"] == 3 and dropped["essential"] == 3
 
 
-# -- C2: the coalescer keeps the last real pointer --------------------------------------
+# -- C2: the coalescer keeps the last real pointer --
 
 
 def test_coalesced_summary_keeps_the_last_non_none_ledger_pointer() -> None:
@@ -124,7 +124,7 @@ def _command_listener(config: Any) -> Generator[socket.socket]:
         sock.close()
 
 
-# -- C3: the transmit attempt is immutable ----------------------------------------------
+# -- C3: the transmit attempt is immutable --
 
 
 def test_tx_attempt_is_frozen_and_replaced_as_the_send_progresses(
@@ -172,7 +172,7 @@ def test_last_tx_after_a_send_reports_it_went_out(mock_config_path: Path, tmp_pa
     assert after is not None and after.went_out and after.command == "MOCK_NOOP"
 
 
-# -- F2: immutable mappings serialise as objects ----------------------------------------
+# -- F2: immutable mappings serialise as objects --
 
 
 def test_mapping_proxy_values_are_ledgered_as_json_objects(tmp_path: Path) -> None:

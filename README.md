@@ -70,17 +70,61 @@ but capture is not guaranteed when the queue is full. A `[ledger n=N]` pointer n
 queued for the latest occurrence; it is written unless the ledger fails (`IB-LED-001`) or the
 process is killed first.
 
-Planned (Stage 2e): recordings embed the CCDD and header profiles they were captured with, so a
-recording is exactly as sensitive as those definition files; share it accordingly.
+## Recording
+
+`ib record [NODE ...] [--link L] [-o PATH] [--duration S] [--count N] [--split 1GiB|1h] [--quiet]`
+captures every frame of all (or the selected) links of the acting node into an `.ibrec`
+recording, decoding nothing beyond the ingest check (a status line goes to stderr every 5 s).
+`--record PATH` on `listen`, `events` and `respond` records the same links while they run
+(`--record auto` picks the default location and name); `respond` also records the replies it sends.
+Commands sent by a separate `ib send` are in the ledger, not in the recording.
+
+```bash
+ib record -o /data/run1.ibrec --duration 600       # or: ib listen fc --record /data/run1.ibrec
+ib rec info /data/run1.ibrec [--format json]       # session, streams, per-MID counts, gaps, clean/torn
+ib rec check /data/run1.ibrec [--strict]           # every CRC and rule; exit 1 on damage
+ib rec repair /data/run1.ibrec /data/run1.fixed.ibrec [--force]
+```
+
+- **Where.** `-o PATH` (an existing directory gets the default name inside it), else
+  `[recording] dir`, `$IRONBIRD_RECORD_DIR`, `$XDG_DATA_HOME/ironbird/recordings`,
+  `~/.local/share/ironbird/recordings`; the name is `<UTC stamp>-<session>.ibrec`. The path is
+  printed and ledgered at start. A recording is created `O_EXCL` (mode 0600, directory 0700) and
+  never overwritten or deleted by ironbird (`IB-REC-001` if it exists).
+- **Durability.** The file survives a crash from the first frame on, `fdatasync` runs once per
+  chunk (1 MiB or 1 s): a power loss loses about a second, `kill -9` the last 250 ms, a clean stop
+  or a signal nothing. A write failure (`IB-REC-002`) stops the recorder and the capture goes on;
+  the command exits 1 at the end (`ib record` at once). If the disk is slower than the traffic,
+  buffered bytes are capped (`max_buffer_bytes`); frames past it are dropped, `IB-REC-003` says
+  so, and a GAP record in the file says which. Frames the kernel dropped are GAP records too.
+- **What is in it.** Raw frames of both directions (sequence, UTC ns time, stream, peer, MID,
+  flags, bytes), chunk summaries (time and MID counts), a META record (session, host, user,
+  command line, config hash) and, unless `embed_definitions = false`, the CCDD and header profiles
+  of the nodes it decodes with. **A recording is as sensitive as those definition files and the
+  traffic: share it accordingly.**
+- **Damage.** A recording that ends in an incomplete record (a crash) is a *torn tail*: warning
+  `IB-REC-007`, everything before it is readable. Damage followed by valid records is mid-file
+  damage (`IB-REC-006`). `ib rec repair IN OUT` writes the valid prefix plus a fresh index and
+  trailer to a new file and never modifies `IN`; it exits 5 if frames after mid-file damage were
+  left out. `ib rec info` reads the trailer, index and chunk summaries, not frames (a missing or
+  bad index falls back to a full read, `IB-REC-008`); `ib rec check` reads everything.
+- **Config.** `[recording]`: `dir`, `fsync = "chunk" | "always" | "never"`,
+  `max_buffer_bytes` (default 256 MiB), `min_free_bytes` (default 1 GiB: recording refuses to start
+  below it, `IB-REC-010`), `embed_definitions` (default true). `ib record` warns (`IB-REC-010`)
+  when the disk would fill within 10 minutes.
+- **Splitting.** `--split 1GiB` or `--split 1h` starts `NAME.p0002.ibrec`, ... each a complete file
+  naming the session, its part number and the previous part's last sequence number; part 1 stays
+  open and locked until the session ends.
 
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | Normal end: done, `--count` reached, `--timeout` elapsed without `--count`, or the reader of stdout went away (`\| head -1`) |
-| 1 | Runtime error (`error IB-...`), `find` with no match |
+| 1 | Runtime error (`error IB-...`), `find` with no match; `ib rec check` found damage; a recording failed to write (`IB-REC-002`) |
 | 2 | Usage, configuration, CCDD or header-profile error |
 | 3 | `listen`, `events` or `respond` had `--count N` and `--timeout` elapsed first |
+| 5 | `ib rec repair` produced its output, but the input was damaged mid-file and valid frames after the damage are in the original only |
 | 4 | The command otherwise succeeded but stdout lines were lost (`IB-OUT-002`): dropped while stdout was not draining, abandoned when a signal cut the final drain short, or stdout is closed (`>&-`). An error (1, 2), 3 or a signal (128+n) takes precedence. A `send` that exits 4 still went out |
 | 128+n | Ended by signal n: 130 (Ctrl-C), 129 (SIGHUP), 143 (SIGTERM). The ledger is flushed first; an interrupted `send` says whether the command went out |
 

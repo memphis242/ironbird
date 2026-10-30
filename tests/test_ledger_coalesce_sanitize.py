@@ -29,7 +29,7 @@ class FakeClock:
         return self.now
 
 
-# -- coalescer ------------------------------------------------------------------------
+# -- coalescer --
 
 
 def _report(co: Coalescer, key: str, summary: str, *, group: Code | None = None) -> None:
@@ -107,7 +107,7 @@ def test_notice_line_uses_its_level_and_rejects_inconsistent_values() -> None:
         warning.count = 5  # type: ignore[misc]
 
 
-# -- ledger ---------------------------------------------------------------------------
+# -- ledger --
 
 
 def test_ledger_record_is_deferred_and_flush_writes_valid_jsonl(tmp_path: Path) -> None:
@@ -207,7 +207,7 @@ def test_state_dir_resolution() -> None:
     assert format_ts(1_700_000_000_123_456_789) == "2023-11-14T22:13:20.123456Z"
 
 
-# -- terminal injection ---------------------------------------------------------------
+# -- terminal injection --
 
 HOSTILE = "\x1b[2J\x1b]0;pwn\x07" + chr(0x9B) + "31m" + chr(0x202E) + "[bold]x"
 
@@ -261,7 +261,7 @@ def test_find_output_sanitizes_ccdd_descriptions(tmp_path: Path) -> None:
     assert "\x1b" not in result.output and "\x07" not in result.output
 
 
-# -- ledger robustness (formatting never raises, bounded error flush, raw evidence) ---------
+# -- ledger robustness (formatting never raises, bounded error flush, raw evidence) --
 
 
 def _strict_loads(line: str) -> dict[str, object]:

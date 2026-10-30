@@ -40,9 +40,11 @@ from ironbird.frame import (
     FLAG_TRUNCATED,
     FLAGS_BY_BITS,
     KNOWN_FLAG_BITS,
+    MAX_STREAM_ID,
     Decoded,
     Direction,
     Frame,
+    GapReason,
     Stream,
 )
 from ironbird.ledger import Ledger
@@ -56,7 +58,7 @@ CONSUMER_QUEUE_BYTES: Final = 32 * 1024 * 1024
 FRAME_OVERHEAD_BYTES: Final = 320
 _RELEASE_EVERY: Final = 64  # offers between releases of the charges of frames a consumer popped
 READ_BATCH_FRAMES: Final = 512  # most frames one ``next_batch`` hands a consumer
-_MAX_STREAMS: Final = 0x10000
+_MAX_STREAMS: Final = MAX_STREAM_ID + 1
 OPEN_TIMEOUT_S: Final = 5.0  # longest a transport may take to open (name resolution, bind)
 
 Reporter = Callable[..., None]  # Session.report: (error, *, context, level, evidence)
@@ -67,6 +69,27 @@ class FrameSink(Protocol):
 
     def append(self, frame: Frame) -> None:
         """Must be cheap and must not raise; a sink that does is detached and reported once."""
+        ...
+
+
+class GapSink(Protocol):
+    """A sink that also wants to know about frames lost before they were given to it (frames the
+    kernel dropped never received a sequence number). Optional: the engine calls ``gap`` on a
+    sink that has it, at its once-a-second tick, and detaches a sink whose ``gap`` raises."""
+
+    def gap(
+        self,
+        stream: Stream,
+        reason: GapReason,
+        lost: int,
+        first_ns: int,
+        last_ns: int,
+        first_seq: int,
+        last_seq: int,
+    ) -> None:
+        """``lost`` frames of ``stream`` went missing between wall times ``first_ns`` and
+        ``last_ns``, while the engine's sequence ran from ``first_seq`` to ``last_seq`` (the
+        loss lies somewhere in that range of the capture)."""
         ...
 
 
@@ -275,6 +298,8 @@ class _SinkRef:
 @dataclass(slots=True)
 class _KernelWatch:
     seen: int = 0
+    last_ns: int = 0  # when the counter was last polled, for the GAP's time bounds
+    last_seq: int = 0  # the engine's last sequence number at that poll
 
 
 class _LinkIO:
@@ -531,21 +556,20 @@ class Engine:
     def _drop_from_ingest(self, sink: FrameSink) -> None:
         self._sinks = tuple(s for s in self._sinks if s is not sink)
 
-    def _sink_failed(self, sink: FrameSink, frame: Frame, exc: Exception) -> None:
-        """A sink raised: it is detached at once (it would fail on every later frame as well),
-        and the failure is reported and ledgered this one time."""
+    def _sink_failed(self, sink: FrameSink, seq: int, exc: Exception) -> None:
+        """A sink raised on the frame (or gap) at sequence ``seq``: it is detached at once (it
+        would fail on every later one as well), and the failure is reported and ledgered this one
+        time."""
         name = type(sink).__name__
         ref = self._sink_refs.get(id(sink))
         if ref is not None:
             ref.attached = False  # its holders still count, so a later holder cannot be undone
         self._drop_from_ingest(sink)
-        self._ledger.record(
-            "state", "sink.detached", sink=name, seq=frame.seq, error=type(exc).__name__
-        )
+        self._ledger.record("state", "sink.detached", sink=name, seq=seq, error=type(exc).__name__)
         self._report(
             IronbirdError(
                 Code.INTERNAL,
-                f"frame sink {name} failed on frame {frame.seq} and was detached: "
+                f"frame sink {name} failed on frame {seq} and was detached: "
                 f"{type(exc).__name__}: {exc}",
                 details="".join(traceback.format_exception(exc)),
                 cause=exc,
@@ -565,6 +589,16 @@ class Engine:
         )
 
     # -- link ends ---------------------------------------------------------------------
+
+    def streams_for(self, ends: Sequence[tuple[Link, LinkEnd]]) -> tuple[Stream, ...]:
+        """The receive and send stream of each of ``ends``, in order. Stream ids are assigned
+        the first time a link end is named, so a recorder can declare its streams before the
+        capture that feeds it opens."""
+        found: list[Stream] = []
+        for link, end in ends:
+            io = self._io(link, end)
+            found += (io.rx_stream, io.tx_stream)
+        return tuple(found)
 
     def _io(self, link: Link, end: LinkEnd) -> _LinkIO:
         existing = self._ios.get((link.name, end))
@@ -692,7 +726,7 @@ class Engine:
                     raise _capture_after_close() from None
                 previous, io.transport, io.receiving = io.transport, transport, True
                 io.description = transport.description
-                io.kernel = _KernelWatch()
+                io.kernel = _KernelWatch(0, time.time_ns(), self._seq)
                 facts: dict[str, Any] = dict(transport.facts())
                 self._ledger.record("state", f"{io.link.transport}.open", **facts)
                 io.subs.append(sub)
@@ -949,7 +983,7 @@ class Engine:
             try:
                 sink.append(frame)
             except Exception as exc:
-                self._sink_failed(sink, frame, exc)
+                self._sink_failed(sink, frame.seq, exc)
         if checked is not None:
             self._count(checked.message.mid, time_ns)
         else:
@@ -986,7 +1020,7 @@ class Engine:
             try:
                 sink.append(frame)
             except Exception as exc:
-                self._sink_failed(sink, frame, exc)
+                self._sink_failed(sink, frame.seq, exc)
 
     # -- periodic work and drop accounting -----------------------------------------------
 
@@ -1038,6 +1072,18 @@ class Engine:
             return
         label = io.description
         self._ledger.record("state", "rx.unread_at_close", label=label, datagrams=left)
+        # Datagrams the OS discards unread are lost before the transport read them, like a kernel
+        # drop: sinks that record gaps get one, bracketing the loss by the last poll and now.
+        watch, now_ns = io.kernel, time.time_ns()
+        self._notify_gap(
+            io.rx_stream,
+            GapReason.KERNEL_DROP,
+            left,
+            watch.last_ns,
+            now_ns,
+            watch.last_seq,
+            self._seq,
+        )
         if io.lossy or transport.stats().kernel_dropped:
             self._report(
                 IronbirdError(
@@ -1048,13 +1094,38 @@ class Engine:
                 context=f"close {label}",
             )
 
+    def _notify_gap(
+        self,
+        stream: Stream,
+        reason: GapReason,
+        lost: int,
+        first_ns: int,
+        last_ns: int,
+        first_seq: int,
+        last_seq: int,
+    ) -> None:
+        for sink in self._sinks:
+            gap = getattr(sink, "gap", None)
+            if gap is None:
+                continue
+            try:
+                gap(stream, reason, lost, first_ns, last_ns, first_seq, last_seq)
+            except Exception as exc:
+                self._sink_failed(sink, last_seq, exc)
+
     def _poll_kernel(self, io: _LinkIO, transport: Transport) -> None:
         """Report new kernel-side drops of ``transport`` since the last poll."""
         total = transport.stats().kernel_dropped
         watch = io.kernel
+        now_ns, seq = time.time_ns(), self._seq
+        first_ns, first_seq = watch.last_ns, watch.last_seq
+        watch.last_ns, watch.last_seq = now_ns, seq
         if total == watch.seen:
             return
         delta, watch.seen = total - watch.seen, total
+        self._notify_gap(
+            io.rx_stream, GapReason.KERNEL_DROP, delta, first_ns, now_ns, first_seq, seq
+        )
         label = io.description
         self._ledger.record("state", "rx.kernel_drops", label=label, delta=delta, total=total)
         self._report(
@@ -1077,5 +1148,6 @@ __all__ = [
     "Engine",
     "FrameDecoder",
     "FrameSink",
+    "GapSink",
     "MidStatSnapshot",
 ]

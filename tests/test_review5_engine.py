@@ -23,7 +23,7 @@ from test_review4_engine import ftok_key, run_clean
 
 state_dir = r2.state_dir
 
-# -- 1: the direct signal notice never blocks the exit ----------
+# -- 1: the direct signal notice never blocks the exit --
 
 # stderr is a pipe nobody reads. As the ledger closes, with everything else already written to
 # stderr (however much the host made the run print, e.g. an IB-TX-005 receive-buffer warning),
@@ -80,7 +80,7 @@ def test_signal_notice_on_a_full_stderr_pipe_does_not_hang_and_the_ledger_has_it
     assert event["signum"] == int(signal.SIGTERM)
 
 
-# -- 2: a signal after the shutdown still ends the process by that signal ----------
+# -- 2: a signal after the shutdown still ends the process by that signal --
 
 SIGNAL_AFTER_FINISH = """
     import os, signal
@@ -153,7 +153,7 @@ def test_slices_end_on_a_newline_when_the_slice_holds_one() -> None:
     assert slice_end(b"ab\n", 0) == 3  # the rest of the chunk fits
 
 
-# -- 4: clean.sh compares keys as canonical decimal strings ----------
+# -- 4: clean.sh compares keys as canonical decimal strings --
 
 
 def test_clean_sh_ignores_octal_looking_and_malformed_rows_explicitly(tmp_path: Path) -> None:
@@ -178,7 +178,7 @@ def test_clean_sh_ignores_octal_looking_and_malformed_rows_explicitly(tmp_path: 
     assert errors[0].count("ignoring malformed") == 3, errors[0]
 
 
-# -- 5: the working directory stays untouched ----------
+# -- 5: the working directory stays untouched --
 
 
 def test_cli_leaves_an_empty_working_directory_empty(

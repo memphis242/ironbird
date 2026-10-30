@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from enum import IntFlag, StrEnum
+from enum import IntEnum, IntFlag, StrEnum
 from typing import Any, Final, NamedTuple, Self
 
 from ironbird.ccdd.model import MessageKind
@@ -29,7 +29,7 @@ from ironbird.codec import DecodedPacket, Resolved
 
 IDENTITY_FIELDS: Final = 8  # the packet fields of a frame; ``checked`` follows them
 MAX_FRAME_BYTES: Final = 65535  # the largest max_packet_bytes the config accepts
-MAX_STREAM_ID: Final = 0xFFFF
+MAX_STREAM_ID: Final = 0xFFFE  # 0xFFFF means "no stream" in a recording's GAP records
 MAX_MID: Final = 0xFFFFFFFF  # MIDs are 32 bits (the CCDD and the header codec enforce it)
 SERIAL_TRANSPORT: Final = "serial"
 
@@ -52,6 +52,16 @@ class FrameFlag(IntFlag):
     TRUNCATED = FLAG_TRUNCATED
     GARBAGE = FLAG_GARBAGE
     STALE = FLAG_STALE
+
+
+class GapReason(IntEnum):
+    """Why frames that belong in a capture are missing from it (the value is the recording's)."""
+
+    KERNEL_DROP = 1  # the OS dropped datagrams before the transport read them
+    QUEUE_DROP = 2  # a transport-side queue overflowed
+    RECORDER_OVERRUN = 3  # the recorder's buffer was full; frames were not written
+    LINK_DOWN = 4  # the link was down (serial reconnect)
+    NOT_RECORDED = 5  # frames of a stream this recorder was not given
 
 
 KNOWN_FLAGS: Final = FrameFlag.HAS_MID | FrameFlag.TRUNCATED | FrameFlag.GARBAGE | FrameFlag.STALE
