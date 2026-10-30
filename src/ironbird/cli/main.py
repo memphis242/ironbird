@@ -38,10 +38,16 @@ from ironbird.cli.output import (
 from ironbird.config import SystemConfig, find_config, load_config
 from ironbird.errors import Code, IronbirdError
 from ironbird.ledger import Ledger, default_state_dir
-from ironbird.session import Session, Side
+from ironbird.recording import inspect as rec_inspect
+from ironbird.recording.render import damage_summary, info_json, info_lines, size_text
+from ironbird.recording.session import PendingRecording, RecordRequest, parse_split
+from ironbird.recording.writer import Recorder
+from ironbird.session import Route, Session, Side
 
 EXIT_TIMEOUT: Final = 3  # --count was given and not reached before --timeout
 EXIT_OUTPUT_LOST: Final = 4  # the command completed but stdout lines were lost
+EXIT_DAMAGED_INPUT: Final = 5  # output produced, but the input recording was damaged mid-file
+STATUS_INTERVAL_S: Final = 5.0  # ``ib record`` status line on stderr
 MAX_TIMEOUT_S: Final = 365 * 24 * 3600.0
 OUTPUT_POLL_S: Final = 0.5
 DRAIN_NOTICE_S: Final = 2.0  # waiting this long for the reader of stdout earns one notice
@@ -56,6 +62,14 @@ app = typer.Typer(
     add_completion=False,
     pretty_exceptions_enable=False,
 )
+rec_app = typer.Typer(
+    name="rec",
+    help="Inspect, check and repair recordings (.ibrec files).",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(rec_app, name="rec")
 
 
 class Format(StrEnum):
@@ -94,6 +108,16 @@ VerboseOption = Annotated[
     bool, typer.Option("--verbose", "-v", help="Show full error detail and packet hex.")
 ]
 LinkOption = Annotated[str | None, typer.Option("--link", help="Link name, if several match.")]
+RecordOption = Annotated[
+    str | None,
+    typer.Option(
+        "--record",
+        help=(
+            "Also record every frame of the captured links to this .ibrec file "
+            "('auto': the default location and name)."
+        ),
+    ),
+]
 CountOption = Annotated[int | None, typer.Option("--count", min=1, help="Stop after N packets.")]
 WhereOption = Annotated[
     str | None,
@@ -101,7 +125,8 @@ WhereOption = Annotated[
         "--where",
         help=(
             "Only frames matching this filter expression, e.g. "
-            "'msg == SAMPLE_APP_HK and CommandCounter > 0' (combines with --mid by and)."
+            "'msg == SAMPLE_APP_HK and CommandCounter > 0' (combines with --mid by and). "
+            "Limits only what is shown: --record still records every frame."
         ),
     ),
 ]
@@ -226,6 +251,7 @@ class _Run:
 
 
 Body = Callable[[Session, SystemConfig, "_Run"], Awaitable[int]]
+OfflineBody = Callable[[Ledger, Console, "_Run"], int]
 
 
 def _print_error(console: Console, exc: IronbirdError, verbose: bool) -> None:
@@ -513,14 +539,18 @@ def _run(
     ctx: typer.Context,
     as_node: str | None,
     verbose: bool,
-    body: Body,
+    body: Body | None,
     name: str,
     *,
     transmits: bool = False,
+    offline: OfflineBody | None = None,
 ) -> None:
     """Open the ledger, run ``body`` in an event loop, flush everything, exit with its code.
 
     ``transmits`` commands (they put packets on a link) refuse to run without a ledger.
+    ``offline`` runs instead of ``body``, synchronously and with no configuration or session: it
+    is for commands that only read or write files (``ib rec ...``); a signal still ends it
+    orderly.
     """
     base: Globals = ctx.obj
     glob = Globals(base.config, as_node or base.role, base.verbose or verbose)
@@ -547,8 +577,12 @@ def _run(
         main_coro: Coroutine[Any, Any, int] | None = None
         try:
             _check_descriptors()
-            main_coro = _main(glob, ledger, body, run)
-            code = asyncio.run(main_coro)
+            if offline is not None:
+                code = offline(ledger, console, run)
+            else:
+                assert body is not None
+                main_coro = _main(glob, ledger, body, run)
+                code = asyncio.run(main_coro)
         except (_Terminated, asyncio.CancelledError) as stop:
             if not _STATE.signum:
                 raise
@@ -632,6 +666,73 @@ def _parse_args(items: list[str] | None) -> dict[str, str]:
             raise IronbirdError(Code.CLI_USAGE, f"argument {key[:40]!r} given more than once")
         args[key] = value
     return args
+
+
+class _RecordingScope:
+    """``--record`` for one command: a recording that lives for the ``async with`` block.
+
+    Entering it stages the capture's frames; ``commit`` (called right after the capture has
+    opened, so a wrong argument or a busy port leaves no file) creates the recording and hands
+    the staged frames to it; leaving it closes the recording after the capture has closed, so
+    the closing records are written on every way out (normal end, ``--duration``, a signal).
+    Without a target it does nothing. ``exit_code`` folds a failed recorder into the command's
+    exit code (the capture goes on; the command exits 1 at the end).
+    """
+
+    def __init__(
+        self,
+        session: Session,
+        run: _Run,
+        target: str | None,
+        command: str,
+        *,
+        nodes: list[str],
+        routes: list[Route] | None = None,
+        split: tuple[int | None, float | None] = (None, None),
+    ) -> None:
+        self.recorder: Recorder | None = None
+        self._run = run
+        self._pending: PendingRecording | None = None
+        if target is not None and nodes:
+            request = RecordRequest(
+                None if target == "auto" else Path(target), split[0], split[1], command
+            )
+            self._pending = PendingRecording(session, request, nodes=nodes, routes=routes or [])
+
+    async def __aenter__(self) -> _RecordingScope:
+        if self._pending is not None:
+            self._pending.begin()
+        return self
+
+    async def commit(self) -> None:
+        """Create the recording now (call once the capture is open). A no-op without a target."""
+        if self._pending is None:
+            return
+        self.recorder = self._pending.commit()
+        self._run.console.err(f"recording to {term(str(self.recorder.path), 1000, err=True)}")
+
+    async def __aexit__(self, exc_type: object, exc: BaseException | None, tb: object) -> None:
+        pending = self._pending
+        if pending is None:
+            return
+        stats = await pending.finish(interrupted=isinstance(exc, asyncio.CancelledError))
+        recorder = self.recorder
+        if stats is None or recorder is None:
+            return
+        where = term(str(recorder.path), 1000, err=True)
+        size = size_text(stats.file_bytes)
+        if recorder.failed is not None:
+            self._run.console.err(
+                f"recording stopped after {stats.frames} frame(s), {stats.lost_frames} not "
+                f"recorded ({size}) in {where}"
+            )
+        else:
+            dropped = f", {stats.overrun_frames} dropped" if stats.overrun_frames else ""
+            self._run.console.err(f"recorded {stats.frames} frame(s) ({size}{dropped}) to {where}")
+
+    def exit_code(self, code: int) -> int:
+        failed = self.recorder is not None and self.recorder.failed is not None
+        return 1 if failed and code < 128 and code not in (1, 2) else code
 
 
 # -- commands -----------------------------------------------------------------------------
@@ -815,12 +916,28 @@ def listen(
     count: CountOption = None,
     timeout: TimeoutOption = None,
     link: LinkOption = None,
+    record: RecordOption = None,
     as_node: AsOption = None,
     verbose: VerboseOption = False,
 ) -> None:
     """Decode and print incoming packets (telemetry as ground; commands as a flight node)."""
 
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
+        route = session.route(node, link_name=link) if record is not None else None
+        async with _RecordingScope(
+            session,
+            run,
+            record,
+            "listen",
+            nodes=[route.server.name] if route is not None else [],
+            routes=[route] if route is not None else [],
+        ) as scope:
+            code = await listen_body(session, config, run, scope)
+        return scope.exit_code(code)
+
+    async def listen_body(
+        session: Session, config: SystemConfig, run: _Run, scope: _RecordingScope
+    ) -> int:
         io = run.console
         mids = _parse_mids(session, node, mid, link)
         listener = await session.listen(node, mids=mids, link=link, where=where)
@@ -843,6 +960,7 @@ def listen(
                     return
 
         try:
+            await scope.commit()
             reason = await _run_until(consume(), timeout, "listen", run)
         finally:
             await listener.close()
@@ -868,12 +986,28 @@ def events(
         int | None, typer.Option("--count", min=1, help="Stop after N events.")
     ] = None,
     timeout: TimeoutOption = None,
+    record: RecordOption = None,
     as_node: AsOption = None,
     verbose: VerboseOption = False,
 ) -> None:
     """Listen on every telemetry link of all (or selected) nodes and print only events."""
 
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
+        routes = session.event_routes(node) if record is not None else []
+        async with _RecordingScope(
+            session,
+            run,
+            record,
+            "events",
+            nodes=sorted({r.server.name for r in routes}),
+            routes=routes,
+        ) as scope:
+            code = await events_body(session, config, run, scope)
+        return scope.exit_code(code)
+
+    async def events_body(
+        session: Session, config: SystemConfig, run: _Run, scope: _RecordingScope
+    ) -> int:
         io = run.console
         stream = await session.events(
             node,
@@ -895,6 +1029,7 @@ def events(
                     return
 
         try:
+            await scope.commit()
             reason = await _run_until(consume(), timeout, "events", run)
         finally:
             await stream.close()
@@ -910,12 +1045,28 @@ def respond(
     count: CountOption = None,
     timeout: TimeoutOption = None,
     link: LinkOption = None,
+    record: RecordOption = None,
     as_node: AsOption = None,
     verbose: VerboseOption = False,
 ) -> None:
     """Act as a flight-side node: decode commands, answer with configured telemetry."""
 
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
+        route = session.respond_route(peer=peer, link=link) if record is not None else None
+        async with _RecordingScope(
+            session,
+            run,
+            record,
+            "respond",
+            nodes=[route.server.name] if route is not None else [],
+            routes=[route] if route is not None else [],
+        ) as scope:
+            code = await respond_body(session, config, run, scope)
+        return scope.exit_code(code)
+
+    async def respond_body(
+        session: Session, config: SystemConfig, run: _Run, scope: _RecordingScope
+    ) -> int:
         io = run.console
         responder = await session.respond(peer=peer, link=link)
         io.err(render.respond_banner(session.node.name, responder.local_address))
@@ -938,12 +1089,291 @@ def respond(
                     return
 
         try:
+            await scope.commit()
             reason = await _run_until(consume(), timeout, "respond", run)
         finally:
             await responder.close()
         return _exit_for(reason, count, handled)
 
     _run(ctx, as_node, verbose, body, "respond", transmits=True)
+
+
+# -- record and the recording tools -------------------------------------------------------------
+
+
+async def _status_loop(recorder: Recorder, console: Console) -> None:
+    """One status line on stderr every :data:`STATUS_INTERVAL_S` (frames, bytes, rate, drops)."""
+    last_time, last_frames = time.monotonic(), 0
+    while True:
+        await asyncio.sleep(STATUS_INTERVAL_S)
+        stats, now = recorder.stats(), time.monotonic()
+        rate = (stats.frames - last_frames) / max(now - last_time, 1e-9)
+        last_time, last_frames = now, stats.frames
+        dropped = stats.overrun_frames + stats.not_recorded_frames
+        console.err(
+            f"recording: {stats.frames} frames, {size_text(stats.file_bytes)}, "
+            f"{rate:.0f} frames/s, {dropped} dropped"
+        )
+
+
+async def _close_when_failed(recorder: Recorder, capture: Any) -> None:
+    """A recorder that stopped (a failed write) ends ``ib record`` at once."""
+    assert recorder.failed_event is not None
+    await recorder.failed_event.wait()
+    await capture.close()
+
+
+@app.command()
+def record(
+    ctx: typer.Context,
+    nodes: Annotated[
+        list[str] | None,
+        typer.Argument(help="Record only the links to these nodes (default: all links)."),
+    ] = None,
+    link: LinkOption = None,
+    output: Annotated[
+        Path | None,
+        typer.Option("-o", "--output", help="Recording file (default: the recording directory)."),
+    ] = None,
+    duration: Annotated[
+        float | None,
+        typer.Option(
+            "--duration",
+            callback=_check_timeout,
+            help="Stop after this many seconds (a normal end, exit 0).",
+        ),
+    ] = None,
+    count: Annotated[
+        int | None, typer.Option("--count", min=1, help="Stop after at least N frames.")
+    ] = None,
+    split: Annotated[
+        str | None,
+        typer.Option("--split", help="Start a new part at this size (1GiB) or age (1h)."),
+    ] = None,
+    quiet: Annotated[bool, typer.Option("--quiet", help="No status line every 5 seconds.")] = False,
+    as_node: AsOption = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """Capture all (or the selected) links of this node into a recording, decoding nothing."""
+
+    async def body(session: Session, config: SystemConfig, run: _Run) -> int:
+        io = run.console
+        parts = parse_split(split) if split is not None else (None, None)
+        routes = session.record_routes(nodes, link_name=link)
+        scope = _RecordingScope(
+            session,
+            run,
+            str(output) if output is not None else "auto",
+            "record",
+            nodes=sorted({r.server.name for r in routes}),
+            routes=routes,
+            split=parts,
+        )
+        async with scope:
+            capture = await session.capture(routes)
+            try:
+                await scope.commit()
+            except BaseException:
+                await capture.close()
+                raise
+            recorder = scope.recorder
+            assert recorder is not None
+            helpers = [asyncio.ensure_future(_close_when_failed(recorder, capture))]
+            if not quiet:
+                helpers.append(asyncio.ensure_future(_status_loop(recorder, io)))
+            try:
+                where = ", ".join(term(s.endpoint, 200, err=True) for s in capture.streams)
+                io.err(f"recording: listening on {where}")
+
+                async def consume() -> None:
+                    while True:
+                        if not await capture.next_batch():
+                            return
+                        if count is not None and recorder.frames >= count:
+                            return
+
+                await _run_until(consume(), duration, "record", run)
+            finally:
+                for helper in helpers:
+                    helper.cancel()
+                await asyncio.gather(*helpers, return_exceptions=True)
+                await capture.close()
+        return scope.exit_code(0)
+
+    _run(ctx, as_node, verbose, body, "record")
+
+
+def _rec_failure(ledger: Ledger, console: Console, run: _Run, exc: IronbirdError) -> int:
+    ledger.record_error(exc)
+    _print_error(console, exc, run.verbose)
+    return exc.exit_code
+
+
+def _damage_lines(report: rec_inspect.Report, *, verbose: bool = False) -> list[str]:
+    """The problems ``rec check`` reports: all the damage in one line (``verbose`` lists the
+    stretches kept; the ledger has the same detail), then findings and unexplained holes."""
+    lines: list[str] = []
+    if report.damage_total:
+        code = Code.REC_DAMAGED if report.mid_file_damage else Code.REC_TORN
+        severity = "error" if report.mid_file_damage else "warning"
+        lines.append(f"{severity} {code.value}: {damage_summary(report)}")
+        if verbose and report.damage_total > 1:
+            lines += [f"  {d.offset}+{d.span}: {d.reason}" for d in report.damage]
+    for finding in report.findings:
+        lines.append(f"error {Code.REC_DAMAGED.value}: {finding}")
+    if len(report.holes) == 1:
+        first, last = report.holes[0]
+        lines.append(
+            f"error {Code.REC_DAMAGED.value}: sequence {first}..{last} is missing and no GAP "
+            "record explains it"
+        )
+    elif report.holes:
+        first, last = report.holes[0]
+        lines.append(
+            f"error {Code.REC_DAMAGED.value}: {report.hole_frames} frame(s) are missing in "
+            f"sequence holes no GAP record explains, the first {first}..{last}"
+        )
+    if report.trailer is None and not report.damage:
+        lines.append(
+            f"warning {Code.REC_TORN.value}: the recording ends without a trailer (not closed "
+            "cleanly); every record before the end is readable"
+        )
+    return lines
+
+
+@rec_app.command("info")
+def rec_info(
+    ctx: typer.Context,
+    file: Annotated[Path, typer.Argument(help="The recording.")],
+    fmt: Annotated[Format, typer.Option("--format", help="Output format.")] = Format.LINE,
+    verbose: VerboseOption = False,
+) -> None:
+    """Summarise a recording: session, streams, per-MID counts, gaps, clean or torn."""
+
+    def work(ledger: Ledger, console: Console, run: _Run) -> int:
+        try:
+            report = rec_inspect.info(file)
+        except IronbirdError as exc:
+            return _rec_failure(ledger, console, run, exc)
+        ledger.record(
+            "action",
+            "rec.info",
+            file=file,
+            status=report.status,
+            frames=report.frames,
+            source=report.source,
+        )
+        if fmt is Format.JSON:
+            console.out(info_json(report))
+        else:
+            for line in info_lines(report):
+                console.out(line)
+        if report.source == "scan" and report.index != "ok":
+            note = term(report.index_note, 200, err=True)
+            console.err(
+                f"info {Code.REC_INDEX.value}: no usable index ({note}); "
+                "every record was read instead (ib rec repair writes a fresh index)"
+            )
+        return 0
+
+    _run(ctx, None, verbose, None, "rec.info", offline=work)
+
+
+@rec_app.command("check")
+def rec_check(
+    ctx: typer.Context,
+    file: Annotated[Path, typer.Argument(help="The recording.")],
+    strict: Annotated[
+        bool, typer.Option("--strict", help="A recording not closed cleanly also fails (exit 1).")
+    ] = False,
+    verbose: VerboseOption = False,
+) -> None:
+    """Read every record, check every CRC and rule; exit 1 if the file is damaged."""
+
+    def work(ledger: Ledger, console: Console, run: _Run) -> int:
+        try:
+            report = rec_inspect.scan(file)
+        except IronbirdError as exc:
+            return _rec_failure(ledger, console, run, exc)
+        unclosed = report.status in ("torn", "unclosed", "recording")
+        bad = bool(report.mid_file_damage or report.findings_total or report.hole_frames)
+        failed = bad or (strict and unclosed)
+        ledger.record(
+            "action",
+            "rec.check",
+            file=file,
+            status=report.status,
+            frames=report.frames,
+            damage_total=report.damage_total,
+            damage_bytes=report.damage_bytes,
+            damage=[f"{d.offset}+{d.span}: {d.reason}" for d in report.damage],
+            findings=report.findings_total,
+            holes=report.hole_frames,
+            ok=not failed,
+        )
+        console.out(
+            f"{term(str(file), 400)}: {report.status}, {report.frames} frame(s) in "
+            f"{report.chunks} chunk(s), {report.gap_total} gap record(s)"
+        )
+        for line in _damage_lines(report, verbose=run.verbose):
+            console.err(term(line, 1000, err=True))
+        if report.index != "ok" and report.trailer is not None:
+            note = term(report.index_note, 200, err=True)
+            console.err(f"info {Code.REC_INDEX.value}: the index is unusable ({note})")
+        return 1 if failed else 0
+
+    _run(ctx, None, verbose, None, "rec.check", offline=work)
+
+
+@rec_app.command("repair")
+def rec_repair(
+    ctx: typer.Context,
+    source: Annotated[Path, typer.Argument(metavar="IN", help="The damaged recording.")],
+    output: Annotated[Path, typer.Argument(metavar="OUT", help="The repaired copy to create.")],
+    force: Annotated[
+        bool, typer.Option("--force", help="Replace OUT if it exists (never IN itself).")
+    ] = False,
+    verbose: VerboseOption = False,
+) -> None:
+    """Copy the valid prefix of IN plus a fresh index and trailer to a new file OUT."""
+
+    def work(ledger: Ledger, console: Console, run: _Run) -> int:
+        ledger.record("action", "rec.repair.start", source=source, output=output, force=force)
+        try:
+            result = rec_inspect.repair(source, output, force=force)
+        except IronbirdError as exc:
+            return _rec_failure(ledger, console, run, exc)
+        ledger.record(
+            "action",
+            "rec.repair.done",
+            source=source,
+            output=output,
+            frames=result.frames,
+            bytes_kept=result.bytes_copied,
+            bytes_dropped=result.dropped_bytes,
+            damage=result.damage.reason if result.damage else None,
+            frames_beyond_damage=result.frames_beyond,
+        )
+        console.out(
+            f"repaired {term(str(source), 400)} -> {term(str(result.output), 400)}: "
+            f"{result.frames} frame(s), {size_text(result.size)}; the original is unchanged"
+        )
+        damage = result.damage
+        if damage is None:
+            return 0
+        error = damage.to_error()
+        console.err(
+            f"{'warning' if damage.torn else 'error'} {error.code.value}: "
+            f"{term(error.summary, 600, err=True)}; {result.dropped_bytes} byte(s) were not copied"
+        )
+        if result.frames_beyond:
+            console.err(
+                f"warning {Code.REC_DAMAGED.value}: {result.frames_beyond} valid frame(s) after "
+                "the damage are in the original only"
+            )
+        return 0 if damage.torn else EXIT_DAMAGED_INPUT
+
+    _run(ctx, None, verbose, None, "rec.repair", offline=work)
 
 
 # -- entry point ----------------------------------------------------------------------------

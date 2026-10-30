@@ -837,3 +837,67 @@ def test_evs_housekeeping_decodes_and_counts_its_noop(ground: Ground) -> None:
     sb = ground.fresh("SB_HK", "SB_SEND_HK")
     tbl = ground.fresh("TBL_HK", "TBL_SEND_HK")
     assert sb["MemInUse"] > 0 and tbl["NumTables"] >= 1
+
+
+# -- stage 2e: record a live session, then check and summarise the recording ------------------
+
+RECORD_SECONDS = 10.0
+ES_HK_PERIOD_S = 4.0  # SCH_LAB publishes ES housekeeping every 4.0 s (tools/cfs/NOTES.md)
+
+
+def test_a_live_session_records_to_a_clean_recording_with_the_periodic_housekeeping(
+    ground: Ground, tmp_path: Path
+) -> None:
+    config = tmp_path / "ironbird.toml"
+    examples = REPO / "examples"
+    text = CONFIG.read_text().replace('"ccdd/', f'"{examples}/ccdd/')
+    text = text.replace('"headers/', f'"{examples}/headers/')
+    config.write_text(text + "\n[recording]\nmin_free_bytes = 0\n")
+    out = tmp_path / "live.ibrec"
+    env = {**ground.env, "IRONBIRD_CONFIG": str(config)}
+    ib = [sys.executable, "-m", "ironbird.cli.main"]
+    err_path = tmp_path / "record.stderr"
+    with ground.listener_paused(), err_path.open("w") as err:  # one process owns UDP 2234
+        recorder = subprocess.Popen([*ib, "record", "-o", str(out), "--quiet"], stderr=err, env=env)
+        try:
+            deadline = time.monotonic() + 15
+            while "listening" not in err_path.read_text():
+                assert recorder.poll() is None, err_path.read_text()
+                assert time.monotonic() < deadline, "ib record never reported it was listening"
+                time.sleep(0.05)
+            started = time.monotonic()
+            for _ in range(3):
+                ground.send("SAMPLE_APP_NOOP")
+            time.sleep(max(0.0, RECORD_SECONDS - (time.monotonic() - started)))
+        finally:
+            recorder.send_signal(signal.SIGINT)
+            code = recorder.wait(timeout=20)
+    assert code == 128 + signal.SIGINT, err_path.read_text()
+
+    check = subprocess.run(
+        [*ib, "rec", "check", str(out)], capture_output=True, text=True, env=env, check=False
+    )
+    assert check.returncode == 0, check.stderr
+    info = subprocess.run(
+        [*ib, "rec", "info", str(out), "--format", "json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert info.returncode == 0, info.stderr
+    report = json.loads(info.stdout)
+    assert report["status"] == "closed" and report["frames"] > 0
+    assert report["gaps"]["total"] == 0 and report["missing_frames"] == 0  # seq contiguous
+    by_mid = {m["mid"]: m["count"] for m in report["mids"]}
+    span = report["duration_s"]
+    es_hk = by_mid[0x0800]
+    assert abs(es_hk - span / ES_HK_PERIOD_S) <= 2, (
+        es_hk,
+        span,
+    )  # one every 4.0 s, within a packet
+    assert [d["kind"] for d in report["definitions"]] == [
+        "ccdd",
+        "command_profile",
+        "telemetry_profile",
+    ]

@@ -96,7 +96,7 @@ async def until(predicate: Callable[[], bool], timeout: float = 5.0) -> None:
             await asyncio.sleep(0.01)
 
 
-# -- ingest order and sinks ---------------------------------------------------------------
+# -- ingest order and sinks --
 
 
 def test_sinks_see_every_frame_before_the_consumer_queue_even_when_it_is_full(
@@ -148,8 +148,8 @@ def test_a_consumer_that_falls_behind_is_reported_once_and_loses_nothing_from_th
         blast(addr, [hk] * 50)
         await until(lambda: len(sink.frames) == 50)
         await asyncio.sleep(0.2)
-        overflow = [n for n in notices if n.code is Code.TX_OVERRUN]
-        assert len(overflow) == 1 and "dropped from the consumer view" in overflow[0].summary
+        overflow = [n for n in notices if n.code is Code.ENG_LAG]
+        assert len(overflow) == 1 and "48" in overflow[0].summary
         await capture.close()
         assert len(sink.frames) == 50
 
@@ -203,7 +203,7 @@ def two_node_config_path(mock_config_path: Path) -> Path:
     return path
 
 
-# -- malformed and unknown frames reach the consumers -----------------------------------------
+# -- malformed and unknown frames reach the consumers --
 
 
 def test_malformed_unknown_and_oversize_frames_are_yielded_with_their_flags(
@@ -252,7 +252,7 @@ def test_malformed_unknown_and_oversize_frames_are_yielded_with_their_flags(
     run_ground_and_fc(config, tmp_path, scenario)
 
 
-# -- TX frames ------------------------------------------------------------------------------
+# -- TX frames --
 
 
 def test_sent_commands_and_replies_pass_through_ingest_as_tx_frames(
@@ -310,7 +310,7 @@ def test_a_sink_that_raises_is_reported_and_does_not_stop_ingest(
     run_ground_and_fc(config, tmp_path, scenario)
 
 
-# -- shared transports -----------------------------------------------------------------------
+# -- shared transports --
 
 
 def test_two_captures_of_one_link_end_share_the_transport_and_free_the_port_when_done(
@@ -397,7 +397,7 @@ def test_a_failed_open_leaves_no_capture_and_no_sink_behind(
     run_ground_and_fc(config, tmp_path, scenario)
 
 
-# -- the transport registry ------------------------------------------------------------------
+# -- the transport registry --
 
 
 def test_registry_has_a_factory_for_every_transport_the_config_accepts() -> None:
@@ -442,7 +442,7 @@ def test_a_serial_link_is_still_refused_by_the_config(
     assert info.value.code is Code.CFG_SCHEMA and "unsupported transport" in info.value.summary
 
 
-# -- Frame invariants -----------------------------------------------------------------------
+# -- Frame invariants --
 
 STREAM = Stream(1, "l", "fc", TLM, Direction.RX, "udp", "udp 0.0.0.0:1")
 SERIAL_STREAM = dataclasses.replace(STREAM, transport="serial", endpoint="serial /dev/x")
@@ -541,7 +541,7 @@ def test_frame_construction_from_arbitrary_values_asserts_or_is_consistent(
         assert frame.stream.transport == "serial"
 
 
-# -- ingest of arbitrary bytes ----------------------------------------------------------------
+# -- ingest of arbitrary bytes --
 
 
 class _Probe:

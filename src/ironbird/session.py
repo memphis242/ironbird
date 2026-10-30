@@ -44,7 +44,7 @@ from ironbird.engine import (
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
 from ironbird.filter import Filter, FilterError, Matcher, compile_filter
-from ironbird.frame import Decoded
+from ironbird.frame import Decoded, Stream
 from ironbird.header import load_profile
 from ironbird.ledger import Ledger
 from ironbird.notice import Level, Notice
@@ -116,6 +116,10 @@ def _is_decimal(text: str) -> bool:
     return text.isascii() and text.isdigit()
 
 
+def _notice_key(code: Code, mid: int | None, context: str) -> str:
+    return f"{code.value}:{mid}:{context}"
+
+
 class Session:
     def __init__(
         self,
@@ -133,7 +137,9 @@ class Session:
         self._codecs: dict[str, Codec] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._last_tx: TxAttempt | None = None
-        self._engine: Engine = Engine(config, ledger, self.report, self.codec_for)
+        self._engine: Engine = Engine(
+            config, ledger, self.report, self.codec_for, withdraw=self.withdraw_notices
+        )
 
     # -- read-only state -----------------------------------------------------------
 
@@ -233,6 +239,11 @@ class Session:
         """Emit every pending coalesced summary now (shutdown, or before reading the output)."""
         self._coalescer.flush()
 
+    def withdraw_notices(self, code: Code, context: str) -> None:
+        """Drop the pending coalesced summary of ``code`` reported with ``context``, because a
+        fatal error about the same thing is being raised to the user and ends it."""
+        self._coalescer.discard(_notice_key(code, None, context))
+
     def fatal(self, error: IronbirdError) -> None:
         """Ledger an error that is leaving the session (the caller prints it)."""
         self.ledger.record_error(error, role=self.node.name)
@@ -261,7 +272,7 @@ class Session:
         ledger_n = self.ledger.record_error(
             err, evidence=evidence, role=self.node.name, mid=raw_mid, offset=offset
         )
-        key = f"{err.code.value}:{raw_mid}:{context}"
+        key = _notice_key(err.code, raw_mid, context)
         self._coalescer.report(err.code, level, key, err.summary, ledger_n=ledger_n, group=err.code)
 
     # -- loading -------------------------------------------------------------------
@@ -469,15 +480,72 @@ class Session:
         *,
         sinks: Sequence[FrameSink] = (),
         queue_frames: int | None = None,
+        queue_bytes: int | None = None,
     ) -> Capture:
         """Start receiving on ``routes``: an async iterator of every frame they carry.
 
         ``sinks`` see each frame, synchronously, before any consumer queue (and also the frames
-        this session sends); a consumer that falls behind loses frames from its own queue only.
-        Close the capture when done.
+        this session sends); a consumer that falls behind loses frames from its own queue only
+        (``IB-ENG-001``). The queue is bounded by ``queue_frames`` and ``queue_bytes``. Iterating
+        a capture raises the ``IB-TX-003`` error that ends it if a link end can no longer
+        receive. Close the capture when done.
         """
         ends = [(route.link, link_end(route.side)) for route in routes]
-        return await self._engine.open_capture(ends, sinks=sinks, queue_frames=queue_frames)
+        return await self._engine.open_capture(
+            ends, sinks=sinks, queue_frames=queue_frames, queue_bytes=queue_bytes
+        )
+
+    def streams_for(self, routes: Sequence[Route]) -> tuple[Stream, ...]:
+        """The receive and send streams of ``routes``, in order (ids are fixed from here on), so a
+        recorder can declare them before the capture that feeds it opens."""
+        return self._engine.streams_for([(route.link, link_end(route.side)) for route in routes])
+
+    def record_routes(
+        self, nodes: Sequence[str] | None = None, *, link_name: str | None = None
+    ) -> list[Route]:
+        """Every link of the node ironbird acts as (or those to ``nodes`` / named ``link_name``),
+        each as the route a capture on this side of it receives from, for ``ib record``."""
+        me = self.node.name
+        wanted: set[str] | None = None
+        if nodes:
+            wanted = {self.config.resolve(name).name for name in nodes}
+        routes: list[Route] = []
+        for lk in self.config.links:
+            if me not in (lk.source, lk.destination):
+                continue
+            peer = lk.destination if lk.source == me else lk.source
+            if (wanted is not None and peer not in wanted) or (
+                link_name is not None and lk.name != link_name
+            ):
+                continue
+            side = Side.COMMANDER if lk.source == me else Side.RESPONDER
+            routes.append(
+                Route(lk, side, self.config.nodes[peer], self.config.nodes[lk.destination])
+            )
+        if not routes:
+            raise IronbirdError(
+                Code.CFG_LINK,
+                f"{me!r} has no link to record"
+                + (f" named {link_name!r}" if link_name else "")
+                + (f" to {', '.join(sorted(wanted))}" if wanted else ""),
+                details="links: " + ", ".join(link.name for link in self.config.links),
+            )
+        seen: dict[str, Route] = {}
+        for route in routes:
+            end = link_end(route.side)
+            rx = (
+                route.link.telemetry_endpoint
+                if end is LinkEnd.SOURCE
+                else route.link.command_endpoint
+            )
+            clash = seen.setdefault(str(rx), route)
+            if clash is not route:
+                raise IronbirdError(
+                    Code.CFG_LINK,
+                    f"links {clash.link.name!r} and {route.link.name!r} both receive on {rx}; "
+                    "select one with --link",
+                )
+        return routes
 
     def add_sink(self, sink: FrameSink) -> None:
         """Attach ``sink`` to every frame this session ingests or sends until it is removed.
@@ -626,6 +694,15 @@ class Session:
                 )
         return routes
 
+    def event_routes(self, nodes: Sequence[str] | None = None) -> list[Route]:
+        """The routes :meth:`events` captures: those of ``nodes`` (default: all) whose CCDD
+        defines event telemetry. Empty when none does (``events`` then explains)."""
+        return [
+            route
+            for route in self._event_routes(nodes)
+            if self.codec_for(route.server.name).model.event_messages()
+        ]
+
     async def events(
         self,
         nodes: Sequence[str] | None = None,
@@ -684,7 +761,9 @@ class Session:
 
     # -- responder ------------------------------------------------------------------
 
-    async def respond(self, *, peer: str | None = None, link: str | None = None) -> Responder:
+    def respond_route(self, *, peer: str | None = None, link: str | None = None) -> Route:
+        """The link :meth:`respond` answers on (``peer``/``link`` narrow it when several end at
+        this node)."""
         me = self.node.name
         candidates = [
             lk
@@ -706,8 +785,12 @@ class Session:
                 details="links: " + ", ".join(lk.name for lk in candidates),
             )
         chosen = candidates[0]
-        route = Route(chosen, Side.RESPONDER, self.config.nodes[chosen.source], self.node)
-        codec = self.codec_for(me)
+        return Route(chosen, Side.RESPONDER, self.config.nodes[chosen.source], self.node)
+
+    async def respond(self, *, peer: str | None = None, link: str | None = None) -> Responder:
+        route = self.respond_route(peer=peer, link=link)
+        chosen = route.link
+        codec = self.codec_for(self.node.name)
         rules = _validate_rules(self.node, codec, self.config)
         capture = await self.capture([route])
         self.ledger.record(
@@ -796,11 +879,13 @@ class Listener:
         self._session.ledger.record(
             "action", "listen.stop", peer=self._route.peer.name, unread=stats.unread, **undecodable
         )
-        if stats.unread and self._capture.overloaded:
-            # The user already has drop notices; say what the end adds to them.
+        if stats.unread and stats.not_shown:
+            # The queue refused frames, so the consumer was behind and what is still queued was
+            # never shown. Frames merely in flight when listening ended, or lost to the kernel
+            # (reported as IB-TX-004), are not a consumer lag.
             self._session.report(
                 IronbirdError(
-                    Code.TX_OVERRUN,
+                    Code.ENG_LAG,
                     f"listening ended with {stats.unread} frame(s) received but not shown",
                 )
             )

@@ -336,6 +336,10 @@ jobs:
           mkdir -p "$RUNNER_TEMP/fuzz-crashes"
           python tools/fuzz/fuzz_decode.py -max_total_time=900 \
             -artifact_prefix="$RUNNER_TEMP/fuzz-crashes/"
+      - name: Fuzz the recording reader
+        run: |
+          python tools/fuzz/fuzz_recording.py -max_total_time=600 \
+            -artifact_prefix="$RUNNER_TEMP/fuzz-crashes/"
       - name: Keep crash inputs
         if: failure()
         uses: actions/upload-artifact@v4

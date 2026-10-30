@@ -20,8 +20,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
-from conftest import EXAMPLES, free_udp_ports
+from conftest import EXAMPLES, REPO
 from filter_defs import make_frame
 from ironbird import render
 from ironbird.ccdd.loader import load_ccdd
@@ -37,6 +38,7 @@ from ironbird.ledger import Ledger
 from ironbird.notice import Level
 from ironbird.session import Session
 from ironbird.transport import LinkEnd
+from recutil import high_ports
 from test_engine import _Probe
 
 DECODE_CEILING_S = 100e-6
@@ -46,6 +48,17 @@ LISTEN_FILTER_OVERHEAD_RATIO = 1.8  # the same with a decode-level filter evalua
 FLOOR_PPS = 1_000  # the plan's hard floor, aggregate packets per second
 TARGET_PPS = 10_000  # the plan's design target
 PACKET_BYTES = 200  # the plan's average packet size
+
+# A guard whose threshold is a rate or a cost ratio measured on the host. Under xdist the other
+# workers keep every core busy, so such a measurement says more about the scheduler than about
+# the tool: a listener off-CPU for a few milliseconds overruns a socket buffer capped by a small
+# net.core.rmem_max (212992 on GitHub runners), and a timed loop shares its core with another
+# test. These run, and are enforced, in the serial run of this file (CI's "Benchmarks" step,
+# ``pytest tests/test_benchmarks.py -n0``), as pytest-benchmark's own ceilings are.
+needs_a_quiet_host = pytest.mark.skipif(
+    "PYTEST_XDIST_WORKER" in os.environ,
+    reason="host-timing guard: enforced by the serial run (pytest tests/test_benchmarks.py -n0)",
+)
 
 
 def _check_ceiling(benchmark: Any, ceiling: float) -> None:
@@ -200,6 +213,7 @@ PREDICATE_CASES = {
 }
 
 
+@needs_a_quiet_host
 @pytest.mark.parametrize("case", list(PREDICATE_CASES))
 def test_filter_cost_per_predicate(benchmark: Any, mock_codec: Codec, case: str) -> None:
     """The marginal cost of a predicate, by level: a chain of all-true predicates divided by its
@@ -241,6 +255,7 @@ COMPILE_ALTERNATIVES = 256
 FILTER_COMPILE_CEILING_S = 0.5  # a 256-way `or` over a 2048-message CCDD (0.03-0.11 s measured)
 
 
+@needs_a_quiet_host
 def test_filter_compile_time_does_not_grow_with_the_message_count(tmp_path: Path) -> None:
     """Fields of one type are judged once however many messages have them, so a wide `or` over a
     large CCDD compiles in milliseconds (it took seconds when each message was judged alone)."""
@@ -343,7 +358,7 @@ def _bench_config(tmp_path: Path) -> Path:
     )
     ccdd_path = tmp_path / "bench.json"
     ccdd_path.write_text(json.dumps(ccdd))
-    command_port, telemetry_port = free_udp_ports(2)
+    command_port, telemetry_port = high_ports(2)
     path = tmp_path / "bench.toml"
     path.write_text(
         f"""[ironbird]
@@ -360,6 +375,8 @@ to = "fc"
 transport = "udp"
 command_endpoint = "127.0.0.1:{command_port}"
 telemetry_endpoint = "127.0.0.1:{telemetry_port}"
+[recording]
+min_free_bytes = 0
 """
     )
     return path
@@ -423,6 +440,7 @@ def _loopback_run(tmp_path: Path, count: int, rate: int) -> tuple[int, int, floa
     return count, ingested, seconds
 
 
+@needs_a_quiet_host
 def test_ingest_only_saturation_rate_on_loopback(benchmark: Any, tmp_path: Path) -> None:
     """INGEST ONLY: the most packets/s one engine ingests (and a draining consumer discards)
     from an unpaced sender. Nothing is decoded or printed, so this is not the rate ``ib listen``
@@ -444,6 +462,7 @@ def test_ingest_only_saturation_rate_on_loopback(benchmark: Any, tmp_path: Path)
     assert best >= FLOOR_PPS
 
 
+@needs_a_quiet_host
 def test_ingest_only_at_the_target_rate_loses_nothing_on_loopback(tmp_path: Path) -> None:
     """INGEST ONLY: paced at the floor and, on a host with room, at the design target: nothing
     is lost between the socket and a draining consumer."""
@@ -457,6 +476,7 @@ def test_ingest_only_at_the_target_rate_loses_nothing_on_loopback(tmp_path: Path
 # -- the whole listen path --
 
 
+@needs_a_quiet_host
 @pytest.mark.parametrize("where", [None, 'msg == BENCH_TLM and blob contains "xx"'])
 def test_listen_path_costs_little_over_decode_and_render(tmp_path: Path, where: str | None) -> None:
     """The per-packet cost of receive + queue + decode + JSON render, against the cost of the
@@ -559,6 +579,7 @@ def _run_listen_cli(
     return count, len(out_path.read_bytes().splitlines()), err_path.read_text()
 
 
+@needs_a_quiet_host
 def test_listen_cli_at_the_target_rate_loses_no_output(tmp_path: Path) -> None:
     """END TO END: a separate ``ib listen --format json`` process writing to a file, fed by a
     separate sender at the design target rate. Output lines must not be dropped by the tool
@@ -567,9 +588,12 @@ def test_listen_cli_at_the_target_rate_loses_no_output(tmp_path: Path) -> None:
     sent, lines, errors = _run_listen_cli(tmp_path, LISTEN_PACKETS, LISTEN_RATE)
     print(f"\nib listen at {LISTEN_RATE:,} pkt/s: {lines}/{sent} lines written")
     assert "IB-OUT-" not in errors, errors
-    assert lines >= 0.95 * sent, f"{sent - lines} of {sent} packets did not reach the output"
+    assert lines >= 0.95 * sent, (
+        f"{sent - lines} of {sent} packets did not reach the output; stderr: {errors}"
+    )
 
 
+@needs_a_quiet_host
 def test_listen_cli_with_a_filter_at_the_target_rate_loses_no_output(tmp_path: Path) -> None:
     """END TO END with a typical filter: the same run as above with ``--where`` selecting every
     packet by a message name and a decoded field, so the filter is evaluated 30000 times and the
@@ -578,4 +602,184 @@ def test_listen_cli_with_a_filter_at_the_target_rate_loses_no_output(tmp_path: P
     sent, lines, errors = _run_listen_cli(tmp_path, LISTEN_PACKETS, LISTEN_RATE, ("--where", where))
     print(f"\nib listen --where at {LISTEN_RATE:,} pkt/s: {lines}/{sent} lines written")
     assert "IB-OUT-" not in errors, errors
-    assert lines >= 0.95 * sent, f"{sent - lines} of {sent} packets did not reach the output"
+    assert lines >= 0.95 * sent, (
+        f"{sent - lines} of {sent} packets did not reach the output; stderr: {errors}"
+    )
+
+
+# -- recording --
+
+
+def _record_frames(count: int) -> list[Frame]:
+    from recutil import RX, frame
+
+    data = bytes(PACKET_BYTES)
+    return [frame(i, stream=RX, data=data, mid=0x899) for i in range(1, count + 1)]
+
+
+def test_recorder_append_cost(benchmark: Any, tmp_path: Path) -> None:
+    """The per-frame cost of the recorder sink: encode one 200-byte frame (CRC, chunk summary).
+    Flushes to the writer thread are amortised in; the disk is the thread's problem."""
+    from ironbird.recording.writer import Recorder
+    from recutil import FAST, RX, frame, meta
+
+    recorder = Recorder.open(tmp_path / "b.ibrec", meta(), streams=[RX], options=FAST)
+    item = frame(1, data=bytes(PACKET_BYTES), mid=0x899)
+    benchmark(recorder.append, item)  # the recorder does not look at sequence order
+    asyncio.run(recorder.close())
+    benchmark.extra_info["frames_per_s"] = round(1 / benchmark.stats.stats.mean) if getattr(
+        benchmark, "stats", None) else None  # fmt: skip
+    _check_ceiling(benchmark, 100e-6)
+
+
+@needs_a_quiet_host
+def test_recorder_writer_throughput_and_reader_rate(tmp_path: Path) -> None:
+    """WRITER: frames/s and MB/s from append to a closed, fsynced file; READER: frames/s with
+    every CRC and rule checked."""
+    from ironbird.recording.reader import RecordingReader
+    from ironbird.recording.writer import Recorder
+    from recutil import FAST, RX, meta
+
+    total = 150_000
+    frames = _record_frames(total)
+    recorder = Recorder.open(tmp_path / "w.ibrec", meta(), streams=[RX], options=FAST)
+    start = time.perf_counter()
+    for item in frames:
+        recorder.append(item)
+    appended = time.perf_counter() - start
+    asyncio.run(recorder.close())
+    written = time.perf_counter() - start
+    size = (tmp_path / "w.ibrec").stat().st_size
+    start = time.perf_counter()
+    with RecordingReader(tmp_path / "w.ibrec") as reader:
+        read = sum(1 for _ in reader.frames())
+    reading = time.perf_counter() - start
+    assert read == total
+    print(
+        f"\nrecorder append {total / appended:,.0f} frames/s "
+        f"({appended / total * 1e6:.1f} us each); "
+        f"to a closed file {total / written:,.0f} frames/s, {size / written / 1e6:.0f} MB/s; "
+        f"reader {total / reading:,.0f} frames/s ({size / reading / 1e6:.0f} MB/s)"
+    )
+    assert total / appended >= TARGET_PPS * 3  # the sink alone leaves most of a core free
+    assert total / reading >= FLOOR_PPS * 10
+
+
+RECORD_PACKETS = 30_000
+
+
+def _run_record_cli(tmp_path: Path, count: int, rate: int) -> tuple[int, Any, str, float]:
+    """``ib record`` in its own process while another sends ``count`` packets at ``rate``/s.
+    Returns (sent, the recording's report, stderr, CPU seconds the recorder used)."""
+    import resource
+
+    from ironbird.recording import inspect as rec_inspect
+
+    config_path = _bench_config(tmp_path)
+    config = load_config(config_path)
+    codec = Session(
+        config, role="ground", ledger=Ledger(tmp_path / "l0", session_id="c"), notify=_ignore
+    ).codec_for("fc")
+    wire = codec.encode_telemetry("BENCH_TLM", {"blob": "x" * 20}).data
+    port = config.links[0].telemetry_endpoint.port
+    environment = {
+        **os.environ,
+        "IRONBIRD_CONFIG": str(config_path),
+        "IRONBIRD_STATE_DIR": str(tmp_path / "state"),
+    }
+    out_path, err_path = tmp_path / "bench.ibrec", tmp_path / "record.err"
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    with err_path.open("wb") as err:
+        recorder = subprocess.Popen(
+            [sys.executable, "-c", CLI_MAIN, "record", "-o", str(out_path), "--quiet"],
+            stdout=subprocess.DEVNULL,
+            stderr=err,
+            env=environment,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while b"istening" not in err_path.read_bytes():
+                assert recorder.poll() is None, err_path.read_text()
+                assert time.monotonic() < deadline, "the recorder never reported it was listening"
+                time.sleep(0.05)
+            subprocess.run(
+                [sys.executable, "-c", SENDER, str(port), str(count), str(rate), wire.hex()],
+                check=True,
+            )
+            time.sleep(0.7)
+        finally:
+            recorder.send_signal(signal.SIGTERM)
+            try:
+                recorder.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                recorder.kill()
+                recorder.wait()
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
+    return count, rec_inspect.scan(out_path), err_path.read_text(), cpu
+
+
+@needs_a_quiet_host
+def test_record_cli_at_the_target_rate_loses_no_frame(tmp_path: Path) -> None:
+    """END TO END: a separate ``ib record`` process, a separate sender at the design target rate.
+    Every datagram that reached the socket is in the recording: recorded frames plus the kernel's
+    own drops (GAP records) equal what was sent, nothing is dropped by the recorder, and the file
+    is closed cleanly."""
+    sent, report, errors, cpu = _run_record_cli(tmp_path, RECORD_PACKETS, TARGET_PPS)
+    kernel = report.lost_by_reason.get("kernel_drop", 0)
+    print(
+        f"\nib record at {TARGET_PPS:,} pkt/s: {report.frames}/{sent} recorded, {kernel} lost in "
+        f"the kernel, {cpu:.2f} s CPU ({cpu / max(report.frames, 1) * 1e6:.0f} us per frame)"
+    )
+    assert "IB-REC-" not in errors.replace("IB-REC-007", ""), errors
+    assert report.status == "closed" and not report.holes and not report.findings
+    assert report.frames + kernel == sent, f"{sent - report.frames - kernel} frames unaccounted for"
+    assert report.frames >= 0.95 * sent  # the host's own datagram loss is tolerated, not hidden
+    assert report.lost_by_reason.get("recorder_overrun", 0) == 0
+
+
+# -- the serial run that enforces the guards above --
+
+WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
+PARALLEL_RUN = "pytest -n auto"
+SERIAL_RUN = "pytest tests/test_benchmarks.py -n0"
+
+
+def _unenforced_jobs(workflow_text: str) -> list[str]:
+    """Jobs that run the suite under xdist (where the host-timing guards skip) without a later,
+    failure-reporting serial run of this file; empty if every such job enforces them."""
+    document = yaml.safe_load(workflow_text)
+    assert isinstance(document, dict) and isinstance(document.get("jobs"), dict)
+    problems: list[str] = []
+    for name, job in document["jobs"].items():
+        steps = job.get("steps", []) if isinstance(job, dict) else []
+        runs = [(str(step.get("run", "")), step) for step in steps if isinstance(step, dict)]
+        parallel = [i for i, (run, _) in enumerate(runs) if PARALLEL_RUN in run]
+        if not parallel:
+            continue
+        serial = [
+            i
+            for i, (run, step) in enumerate(runs)
+            if SERIAL_RUN in run and not step.get("continue-on-error")
+        ]
+        if not any(i > parallel[-1] for i in serial):
+            problems.append(f"{name}: runs '{PARALLEL_RUN}' but no later '{SERIAL_RUN}' step")
+    return problems
+
+
+def test_every_parallel_ci_job_enforces_the_host_timing_guards_serially() -> None:
+    assert _unenforced_jobs(WORKFLOW.read_text()) == []
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        (SERIAL_RUN, "pytest tests/test_benchmarks.py -n auto"),
+        (f"run: {SERIAL_RUN}\n", f"run: {SERIAL_RUN}\n        continue-on-error: true\n"),
+    ],
+    ids=["serial run made parallel", "serial run allowed to fail"],
+)
+def test_the_enforcement_check_catches_a_lost_serial_run(old: str, new: str) -> None:
+    text = WORKFLOW.read_text()
+    assert old in text, f"mutation anchor not found: {old!r}"
+    assert _unenforced_jobs(text.replace(old, new))

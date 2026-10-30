@@ -49,7 +49,7 @@ from test_review2_engine import (
 state_dir = r2.state_dir
 TOOLS = REPO / "tools" / "cfs"
 
-# -- 2: the drain notice is in the ledger before the wait begins ----------
+# -- 2: the drain notice is in the ledger before the wait begins --
 
 
 def test_drain_notice_is_ledgered_so_a_kill_during_the_wait_leaves_a_trace(
@@ -66,7 +66,7 @@ def test_drain_notice_is_ledgered_so_a_kill_during_the_wait_leaves_a_trace(
     assert waiting["kind"] == "warning" and "queued" in waiting["summary"]
 
 
-# -- 3, 4: a signal in the gaps still ends the command by signal, announced ----------
+# -- 3, 4: a signal in the gaps still ends the command by signal, announced --
 
 SIGNAL_AFTER_LOOP = """
     import os, signal
@@ -153,7 +153,7 @@ def test_open_error_is_the_bind_failure_not_a_later_socket_failure(
     assert "address famil" not in summary
 
 
-# -- 6: clean.sh compares numeric uids ----------
+# -- 6: clean.sh compares numeric uids --
 
 
 def ftok_key(path: Path) -> int:
@@ -238,7 +238,7 @@ def test_clean_sh_removes_a_real_segment_and_leaves_the_table_without_it(tmp_pat
         libc.shmctl(shmid, 0, None)  # IPC_RMID; harmless when already gone
 
 
-# -- 7: closed standard descriptors are refilled ----------
+# -- 7: closed standard descriptors are refilled --
 
 SHOW_FDS = """
     import os
@@ -274,7 +274,7 @@ def test_closed_standard_descriptors_are_refilled_before_any_file_is_opened(
     assert fdfile.read_text().split("\n") == [os.devnull] * 3
 
 
-# -- 10: IPv6 endpoints print with brackets ----------
+# -- 10: IPv6 endpoints print with brackets --
 
 
 def test_ipv6_endpoints_print_in_bracket_form() -> None:
@@ -284,7 +284,7 @@ def test_ipv6_endpoints_print_in_bracket_form() -> None:
     assert "[::1]:5" in render.events_banner([("fc", ("::1", 5))])
 
 
-# -- 10: the descriptor message states what is free and what is needed ----------
+# -- 10: the descriptor message states what is free and what is needed --
 
 
 def test_descriptor_shortage_message_states_free_and_needed(mock_config_path: Path) -> None:

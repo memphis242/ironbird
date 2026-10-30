@@ -63,7 +63,7 @@ def _well_formed(result: object) -> bool:
     return isinstance(result, DecodedPacket | DecodeError)
 
 
-# -- corpus ---------------------------------------------------------------------------
+# -- corpus --
 
 
 def _corpus(pattern: str) -> list[Path]:
@@ -112,7 +112,7 @@ def test_corpus_configs_are_rejected_with_coded_errors(path: Path) -> None:
     assert info.value.code.value.startswith("IB-CFG-")
 
 
-# -- packets: header.unpack / codec.decode ---------------------------------------------
+# -- packets: header.unpack / codec.decode --
 
 
 @FUZZ
@@ -261,7 +261,7 @@ def test_telemetry_round_trip(temp: float, volts: float, uptime: int) -> None:
     assert isinstance(decoded, DecodedPacket) and decoded.as_dict() == values
 
 
-# -- structured files: CCDD / header profile / config -----------------------------------
+# -- structured files: CCDD / header profile / config --
 
 JSON_VALUES = st.recursive(
     st.none() | st.booleans() | st.integers() | st.floats() | st.text(max_size=20),

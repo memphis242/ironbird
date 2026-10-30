@@ -550,7 +550,8 @@ per-MID counts without reading frames, and are the work units for a decode worke
   at 256 KiB or every 250 ms the buffer goes to a writer thread (`os.write`, releases the
   GIL, handles partial writes). `fdatasync` once per chunk by default
   (`recording.fsync = "chunk" | "always" | "never"`): a power loss loses at most about
-  1 s, a crash at most the unflushed 250 ms, a clean stop or signal nothing.
+  1 s, a crash at most what was not yet handed to the disk (the 250 ms flush interval plus up
+  to one timer tick, about 500 ms at the worst), a clean stop or signal nothing.
 - Back-pressure is bounded: in-memory plus queued bytes are capped
   (`recording.max_buffer_bytes`, default 256 MiB, about 2 minutes at the 10k pkt/s
   target). Above it, frames are dropped and counted, and a GAP record (reason
@@ -559,8 +560,8 @@ per-MID counts without reading frames, and are the work units for a decode worke
 - Transport drops (kernel, queue) never received a seq; the engine turns their counter
   deltas into GAP records on its 1 Hz tick, so a replay shows every loss and where.
 - Close: final CHUNK, INDEX, TRAILER, `fdatasync`, close. On SIGINT/SIGTERM/SIGHUP the
-  close runs in the cancellation path with a 5 s bound; a second signal abandons it,
-  leaving a readable file without a trailer.
+  close runs in the cancellation path; it ends when the writer makes no progress for 5 s
+  (a draining backlog is waited for), leaving a readable file without a trailer.
 - Write failure (ENOSPC, EIO): `IB-REC-002`, recorder stops, capture goes on;
   `ib record` exits 1 at once, other commands with `--record` finish and exit 1. Free
   space: refuse to start below `recording.min_free_bytes` (default 1 GiB), check every
@@ -892,6 +893,115 @@ memory bounded. Verification: E2E flood test with a paused stdout asserting a bo
 (measured from `/proc/self/status`) and exact drop accounting (`sent == recorded ==
 shown + not_shown`); unit test of the `MSG_TRUNC` path on loopback; corpus entry for an
 oversize datagram.
+
+As built (where the build differs from, or settles, the text above)
+- **Edge cap.** `UdpTransport` reads into a `bytearray(max_packet_bytes)` with
+  `recvmsg_into(..., MSG_TRUNC)`; on Linux the returned size is the datagram's true length even
+  when it is longer than the buffer, so the kernel copies at most `max_packet_bytes` and a longer
+  datagram becomes one `TRUNCATED` frame with `orig_len` = the wire size (`IB-DEC-002`). The
+  receiver is called with data already cut. The cut in `Engine._ingest` stays as a backstop for a
+  transport that does not cut (the serial transport of 2k will cut at its own framer); the
+  `MSG_TRUNC` size semantics are Linux's, the only supported platform. The connected send socket's
+  drain (`_on_tx_readable`) reads into a 1-byte buffer, so a peer that sends to the ephemeral port
+  of our send socket costs no copy. `open_transport(link, end, report, *, failed=None,
+  max_packet_bytes=DEFAULT_MAX_PACKET_BYTES)` and `TransportFactory` carry the cap and the failure
+  callback; `TransportStats.rx_errors` counts failed reads; `facts()` ledgers `max_packet_bytes`.
+- **Consumer queue.** Bounded by frames (`queue_frames`, default 16384) and bytes (`queue_bytes`,
+  `CONSUMER_QUEUE_BYTES` = 32 MiB, on `Engine.open_capture` and `Session.capture`). A frame is
+  charged `len(data) + FRAME_OVERHEAD_BYTES` (320: the `Frame` tuple, the bytes header, the check
+  token), so tiny frames cannot dodge the bound through overhead; `queue_bytes` must admit one
+  largest frame (`max_packet_bytes + 320`, asserted). A frame the consumer pops off the live deque
+  (`wait_frames`, iteration) stops counting when the queue next reconciles its charge list with
+  `items`: when the bound would be passed and every 64 offers, so the figure is never below the
+  truth and the hot path pays no per-pop work. `next_batch` charges its batch until the consumer
+  asks again (`wait`), so a consumer sitting on batches cannot exceed the bound. `CaptureStats`
+  gains `queued_bytes`, `peak_bytes` (an upper bound on what the queue ever held) and
+  `not_shown_bytes`. The queue is closed with an optional error: once drained, every read raises it.
+- **Worst-case memory per hop** (default `max_packet_bytes` 2048; at the 65535 maximum only the
+  per-frame figures change): UDP read buffer 1 x `max_packet_bytes`; one consumer queue
+  `queue_bytes` (32 MiB) plus one frame being handled; the ledger queue 64 MiB estimated
+  (48 MiB of it evidence), each record at most `max_raw_bytes` of raw bytes. A flood of 64 KiB
+  datagrams therefore costs at most 32 MiB x captures + 64 MiB + buffers, whatever the rate and
+  however stalled the consumer or the disk. Measured (flood test, `max_packet_bytes` 65535, 4000 x
+  60000 B, queue_bytes 4 MiB, consumer never reading): RSS grew 4.2 MiB; the same flood on `main`
+  grew it 235 MiB with every frame unread.
+- **IB-ENG-001 replaces IB-TX-004 for consumer lag**: the consumer-queue overflow notice and the
+  "listening ended with N frame(s) received but not shown" notice are now `IB-ENG-001`
+  ("consumer fell behind, N frame(s) not shown so far; K of them still reached a sink"; no
+  recorder exists before 2e, so the notice does not say "recorded"). `IB-TX-004` is left for the
+  kernel's drops and for datagrams unread in the socket at close. The ledger's `rx.queue_drops`
+  record gains `queue_dropped_bytes` and `queue_peak_bytes`.
+- **Ledger.** `Ledger.record` cuts every top-level bytes-like field to `max_raw_bytes` and turns
+  `bytearray`/`memoryview` into `bytes` when the record is created (a reused buffer cannot change
+  a queued record), adding `<field>_len` (`raw_len`) with the full length. The written text is
+  unchanged (`hex ...(+NB)`); `_Cut` carries the head and the omitted count so it survives to the
+  formatter. Each record is charged `ENTRY_OVERHEAD_BYTES` (512) plus its str and bytes-like field
+  sizes against `max_queue_bytes` (64 MiB) and, for evidence, `max_evidence_queue_bytes` (48 MiB);
+  a record over either bound is refused and counted like one over the count bounds (the count
+  bounds stay). `Ledger.pending_bytes` exposes the figure. Only top-level fields are scanned
+  (nested containers are not; no caller nests bytes), and strings are charged, not cut. The
+  `rx.malformed` record gains `wire_len` (the size on the wire, which differs from `raw_len` only
+  past the cap).
+- **IB-TX-003.** A failed `recvmsg` on the receive socket (anything but EAGAIN/EINTR) was held in
+  the transport's pending send error; it is now counted (`rx_errors`) and reported through the
+  transport's `report` callback, coalesced per link end like any notice, with the running count in
+  the text. It is permanent, and ends the transport (reader removed, nothing spins), when the errno
+  is EBADF, ENOTSOCK or EINVAL, or when reads have been failing with no good read in between for
+  `RECV_FAIL_WINDOW_S` (5 s, by the transport's monotonic clock) or for `RECV_FAIL_BACKSTOP`
+  (100000) reads, whichever comes first. The clock decides, so a burst of any number of failures
+  inside the window never ends a capture; the count is only a backstop, because a failing read
+  leaves its datagram queued and the loop retries at once (the dev host managed about 69000
+  failed reads in the 5 s with the ledger on, so there the window ends it; a host failing faster
+  than 20000 reads/s reaches the backstop first). A good
+  read ends the failing episode, and two failures a window or more apart are separate episodes
+  (nothing arrived in between to prove either way, and an error that clears itself must not
+  accumulate toward a fatal one). A permanent failure calls the engine's `failed` callback, which ledgers
+  `rx.failed`, flushes the drop accounting and closes the queues of every capture fed from that
+  link end with the error: each consumer reads what was received before the failure, then its
+  read raises the `IB-TX-003` error, which the CLI prints and exits 1 on like any coded error. No
+  separate notice is shown for a permanent failure (the raised error is the report, so the user is
+  not told twice), and the coalescer window still open for the failures that led up to it is
+  dropped (`Coalescer.discard`, reached through `Session.withdraw_notices`), so no
+  "(xN in T s)" summary of them can print after the fatal line; the count is in the fatal error
+  and every occurrence is in the ledger. A capture opened on a failed link end is refused with the same error until the
+  last capture of the end closes and the transport is replaced. A closed queue is offered
+  nothing, so a link end that failed does not make its siblings count lag.
+- **The closing notice** ("listening ended with N frame(s) received but not shown") is given only
+  when the consumer queue itself refused frames (`CaptureStats.not_shown`), so what is left
+  unread was behind because of lag. Frames merely in flight at SIGTERM, or lost to the kernel
+  (`IB-TX-004` says so), no longer produce an `IB-ENG-001` they do not deserve.
+- **Not done.** Reader ownership by task (2b's deferral) stays deferred: no real case appeared.
+  The ledger still writes a malformed 64 KiB packet as ~190 KB of JSON (hex plus separators);
+  bounding what a flood writes is the evidence sampling of 2d.
+- **Deferred (PR #6 review).**
+  - A link end whose receive failed keeps its socket open (reader removed) until every capture
+    on the end has closed, because the transport is replaced only then. A CLI run ends at once,
+    so it is harmless; the TUI and library (a long-lived session) should close the socket at the
+    failure so the port is free and no kernel buffer fills behind a dead reader. Stage 3 (TUI),
+    with the first long-lived consumer.
+  - Nested bytes in the `args` or `tamper` of a ledger record (and of any record with a
+    container-valued field) are not cut, charged or copied at creation: only top-level fields are
+    scanned. No caller nests bytes today; 2d's ledger bounds revisit this when evidence sampling
+    lands (a recursive walk would cost the hot path, so it needs a schema for which fields can
+    carry bytes).
+  - Ingest-only saturation knee: about 4% lower at 25k packets/s than on `main` (the per-frame
+    byte charge in the consumer queue), within the host's run-to-run noise; the 1.5x guard and
+    the 30000-of-30000-lines check at 10k packets/s hold. Revisit if a profile of 2d shows it.
+- **Tests.** `tests/test_bounded_memory.py`: the edge for sizes 0..65507 and the whole corpus
+  (Hypothesis over sizes and caps, buffer reuse), receive errors (transient, each fatal errno,
+  the failing window, the count backstop, episode reset on a good read or a long gap, the fatal
+  line being the last word, through `Listener` and `EventStream`), the queue (model-based Hypothesis
+  over put/pop/take, held batch, closed with error), the ledger (cut at creation, buffer
+  isolation, wide and strided memoryviews, byte bounds, Hypothesis over record sizes) and the
+  flood end to end with exact accounting (`sent == received + kernel_dropped`, `offered == shown +
+  not_shown`). Corpus: `packet-tlm-oversize-by-one.bin` (cap + 1 bytes, replayed through the UDP
+  edge and the decoder).
+- **Cost** (4-core dev host, best of several runs). `_FrameQueue.put` 160 -> 380 ns per frame;
+  `Ledger.record` of a 200-byte raw packet record 0.95 -> 1.65 us, of a one-field state record
+  0.83 -> 1.05 us. The ingest-only, `listen` path and end-to-end guards are unchanged within the
+  host's run-to-run noise (the ingest-only saturation rate is about 70k packets/s, the listen
+  path about 1.1-1.3x the bare decode and render against a 1.5x guard, 30000 of 30000 lines at
+  10k packets/s).
 
 ### 2d - Ledger under floods, disk full, retention
 
@@ -1820,6 +1930,129 @@ Verification
   SCH_LAB period (`tools/cfs/NOTES.md`: ES 4.0 s, EVS 4.2 s, ...) within one packet, seq
   contiguous, no gaps, clean close.
 
+As built (where the build differs from, or settles, the text above)
+- Modules: `recording/format.py` (layouts, limits, pure record codecs), `reader.py`, `writer.py`,
+  `inspect.py` (`scan` for `check`, `info`, `repair`), `render.py` (info text and JSON),
+  `session.py` (location, embedded definitions, META, `recording_for`); `atomicfile.py` holds the
+  non-replacing temporary commit (see below). The reader's checks live in `RecordingReader`;
+  `recutil`/`rec_corpus` build crafted files for the tests, `tools/fuzz/fuzz_recording.py` is the
+  `atheris` target (added to the nightly fuzz job; atheris is not installed on the dev host, so
+  the target has not been run here).
+- Layout details the plan left open. Chunk 0 starts at offset 24, so META, BLOBs and the declared
+  STREAMs are the head of the first chunk. Non-frame records (STREAM, SOURCE, GAP, MARK) only appear
+  at the start of a chunk: one needed while a chunk holds frames closes the chunk first, which is
+  what lets `info` list gaps, marks and streams from chunk heads without reading frames. STREAM and
+  SOURCE definitions are repeated every 60 s at a chunk start, so one damaged definition cannot make
+  the rest of a stream unreadable (the reader requires every frame's stream and source to be
+  defined, and a redefinition must be identical). Bodies: STREAM `u16 id, u8 kind (1 command,
+  2 telemetry), u8 direction (1 rx, 2 tx)`, then u8-prefixed link, node and transport and a
+  u16-prefixed endpoint; link and node follow the config name pattern, BLOB node and adapter the
+  config identifier pattern (anything else is damage); BLOB `u8 kind, u8-prefixed node, u8-prefixed
+  adapter, 32-byte SHA-256, content`; SOURCE `u16 id (below 4096) + UTF-8`, frames use 0xFFFF for
+  "(other)"; GAP is a fixed 48-byte body `u16 stream, u8 reason, 0, u32 0, u64 lost, first_ns,
+  last_ns, first_seq, last_seq`; MARK `u64 time_ns, u8 kind, 3 zero bytes, text`; CHUNK `bytes` is
+  the file bytes of the chunk's FRAME records. TRAILER `index_offset` 0 means no index (more than
+  2 M chunks); the trailer is the last record and bytes after it are damage (`trailing`).
+- Stricter than the text: a TRUNCATED frame needs `orig_len` above both `len(data)` and META
+  `max_packet_bytes` (the codec's `oversize_error` assertion), an unknown GAP reason or MARK
+  reserved byte is damage, and the envelope `flags`/reserved bytes are checked before the CRC.
+- Resync scans for the envelope shape with a regex over 1 MiB windows, at 8-byte aligned offsets,
+  and validates a candidate plus its successor with the state (streams, sources, sequence) a
+  real read would have. One work budget per pass (4 MiB plus 4 times the file size, charged for
+  bytes read and CRC-checked and 64 per candidate looked at, never reset by a new damaged stretch)
+  bounds hostile files; a record whose declared length runs past the end of the file is refused
+  without reading it (a torn tail), and a scan that exhausts the budget ends the file as mid-file
+  damage "the scan gave up", not as a torn tail.
+  A reader takes `LOCK_SH | LOCK_NB` on the file; a writer's `LOCK_EX` shows as `writer_active`
+  (`info` reports "recording" rather than torn).
+- GAP reasons emitted: `kernel_drop` (the engine bracket: `first_seq`/`last_seq` are the engine's
+  sequence numbers at the previous and the current 1 Hz poll, since a dropped datagram never had
+  one; delivered to sinks that have a `gap` method, the new optional `GapSink` protocol),
+  `recorder_overrun` and `not_recorded` (seq ranges of the frames not written, per stream).
+  `queue_drop` and `link_down` are defined for 2k; a consumer queue overflow is not a recording gap
+  because the sinks already have the frame.
+- Writer: `Recorder.open` writes preamble, META, BLOBs and the declared streams synchronously and
+  syncs file and directory before returning; the 250 ms flush, the 1 s chunk close, the end of an
+  overrun (hysteresis at half the cap), the 10 s free-space projection (`IB-REC-010` warning under
+  10 minutes) and the rate samples run on a loop timer; `fdatasync` and the 60 s heartbeat
+  (`os.utime` of the active file) run on the writer thread, which holds the shutdown signals
+  blocked. The close always syncs, even with `fsync = "never"`. A wall-clock step of 250 ms or more
+  against the monotonic clock is a MARK. `Recorder.rate_bytes_per_s()` (bytes encoded over the last
+  minute) is the hook for 2d's `IB-RET-002` projection; nothing consumes it yet. A split keeps part
+  1 open and locked, and every part repeats META, BLOBs and definitions. A second signal does not
+  abandon the close (the CLI ignores repeated signals); the close gives up only when the writer makes no
+  progress for 5 s, writes the GAP for dropped frames and the trailer first when the disk is
+  merely slow, and says how many frames were not written when it does give up.
+- Commands: `ib record` (exit 0 on `--duration`, `--count` or a signal's 128+n; `--count` stops at
+  the first batch past N, so it records at least N), `--record PATH|auto` on `listen`, `events`
+  and `respond`, `ib rec info [--format line|json]`, `ib rec check [--strict]` (exit 1 on mid-file
+  damage, a summary that disagrees with its records or an unexplained sequence hole; a torn tail
+  is a warning unless `--strict`), `ib rec repair IN OUT [--force]` (exit 5 when valid frames
+  after mid-file damage were left out; the synthesised closing chunk has no monotonic times; a clean
+  recording repairs to identical bytes). `info` answers from the index and chunk summaries, so it
+  does not notice a damaged frame; `check` does. The CLI gained an `offline` runner (no config,
+  no session) for the `rec` commands, and `Session.record_routes`, `event_routes`, `respond_route`
+  and `streams_for`.
+- Config `[recording]`: `dir`, `fsync`, `max_buffer_bytes` (1 MiB to 64 GiB), `min_free_bytes`,
+  `embed_definitions`; definition files above 8 MiB (64 KiB for profiles) refuse the recording
+  with a hint to turn embedding off. META names every node's definition digests either way.
+- `atomicfile.py` implements what 2d's plan assigns to 2d for the temporary commit, because
+  `rec repair` needs it now: `TempOutput` (`.<name>.<16 hex>.tmp` created `O_EXCL`, removed on
+  failure only after `fstatat` matches its descriptor) and `rename_noreplace` (`renameat2`
+  `RENAME_NOREPLACE`, then `link` with the NFSv3 retransmission case, then a placeholder rename;
+  directory sync after the commit; regular files only, the directory placeholder of the 2h export
+  is not built). 2d should extend or adopt it rather than write a second one.
+- Not done here: replay and `--follow` (2g), retention and prune (2d: the recording name matches
+  its patterns, the heartbeat and lock exist, the rate hook is unwired), `IB-LED-009` for a file
+  system without locks (the recorder runs unlocked and ledgers nothing), `IB-REC-009` (2g).
+- PR #7 review fixes (reader and tools). The reader does no unbounded work on a hostile file: one work
+  budget per pass (above), and a body that runs past the end of the file is never read. `Damage`
+  objects kept are capped (1000; the count and byte total cover all), `rec check` and the ledger
+  report damage as one coalesced line (`--verbose` lists the kept stretches). The reader no longer
+  retains BLOB contents; `info` lists distinct definitions (set) with a capped output. Holes in the
+  sequence are explained by a bounded merged set of GAP intervals over every GAP (so neither a
+  false failure nor a false pass past the listing cap) and `lost_by_reason` sums all gaps. `rec
+  repair` and `check` treat bytes after the valid prefix as damage: a stale INDEX, a TRAILER in
+  mid-file, or a concatenated file; `repair` exits 5 and names how many bytes and valid frames
+  were left only in the original. Stricter rules the mutation run showed untested are now pinned:
+  nonzero padding, envelope flags, an INDEX that is not increasing or does not end at the trailer,
+  a GAP naming an undefined stream, chunk time bounds and MID order, the trailer's last sequence, a
+  MARK reserved byte, CHUNK `chunk_start` bounds. STREAM id 0xFFFF is reserved (it means "no stream"
+  in a GAP). META nesting is capped at 16 levels (iterative check) and `info --format json` is
+  strict JSON (no NaN or Infinity; nested META values pass through the same sanitizer). A complete
+  final record that fails its CRC is reported as a damaged record, not an incomplete one. An empty
+  split part (a recorder killed just after creating it) reports "the file is empty" with a hint that
+  the earlier parts are complete; every non-first part's head is written and synced before the part
+  takes frames, so the only residue of a crash is that empty or head-less last part.
+- PR #7 review fixes (writer and commands). Statistics count frames when the write completed
+  (`RecorderStats.frames`, `file_bytes`); the rest are `unwritten_frames` (encoded, never written),
+  `after_stop_frames` and `overrun_frames`, and `lost_frames` sums them. A write failure says
+  "recording stopped after N frame(s), M not recorded" in the notice, the CLI summary and the
+  ledger, and words whether the capture goes on (`ib record` ends, `--record` commands continue).
+  Close: no overall limit but "no writer progress for 5 s"; the overrun hysteresis does not fire
+  during a close, so there is no second `IB-REC-003`. `Recorder.append`, `gap` and `mark` never
+  raise: a failure stops the recorder through the internal-failure path (`IB-INT-001`). `--record`
+  creates its file only after the arguments validated and the transport opened (frames are staged,
+  bounded at 65536 events then counted as a `recorder_overrun` GAP, and handed over in one loop
+  turn); a start that fails after the `O_EXCL` create removes its own partial file, or names it
+  when it cannot. Datagrams unread at close become a `kernel_drop` GAP. A directory that cannot be
+  synced (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`) is tolerated with one `IB-REC-011` warning.
+- Deferred (documented, not fixed): an `atheris` run of the recording target (not installed on
+  the dev host); `IB-LED-009`; a crash in the microseconds between creating a non-first split part
+  and writing its head can still leave that one part empty (reported with a hint, not repaired).
+- Verification numbers (4-core dev host): `Recorder.append` of a 200-byte frame about 3-4 us; the
+  writer sustains about 210-270k frames/s (52-66 MB/s) to a closed, synced file; the reader reads
+  about 105-130k frames/s with every CRC and rule checked; `ib record` at 10k pkt/s of 200-byte
+  packets for 3 s records 30000 of 30000 with no kernel drop, about 56 us of CPU per frame for the
+  whole process, and the `ib listen` guards are unchanged. Tests: `test_recording.py` (writer,
+  reader, engine sink), `test_recording_malformed.py` (truncation at every offset, every third
+  bit flip, Hypothesis corruption and arbitrary records with valid CRCs, crafted frames, forged
+  records, bounded resync, the 69-file corpus `tests/corpus/malformed/rec-*.ibrec` (each with an expected outcome asserted in
+  `tests/rec_corpus.py`)),
+  `test_recording_tools.py` (commit paths, repair), `test_recording_cli.py` (record, `--record`,
+  SIGTERM and `kill -9`, `rec` tools, config) and benchmarks; `tests/cfs/test_acceptance.py` has
+  a live-session recording case for CI (not run on the dev host: it needs the fixed cFS ports).
+
 ### 2f - Filter language and live `--where`
 
 Deliverables: `filter/` (lexer, recursive-descent parser with a depth counter, compiler,
@@ -1919,6 +2152,10 @@ As built (where the build differs from, or settles, the text above)
   `listen.start` and `events.start` record the expression (`where`) only when there is one;
   `listen.start` adds the candidate count (`where_mid_count`) and the first 32 MIDs (`where_mids`),
   and `listen.stop` adds `where_undecodable` only for a filtered listener.
+- With `--record` (2e) the filter only limits what is shown: the recorder is a sink that sees every
+  frame of the link before any consumer queue, so a filtered `listen`/`events` still records every
+  frame (malformed and filtered-out ones included). A bad `--where` is `IB-FLT-*` (exit 2) raised
+  before the capture opens, so no recording file is created.
 - `IB-FLT-*` is usage (exit 2). One-line message with column and (for names and literals) the best
   suggestion; `--verbose` and the ledger get the expression window, a caret line and up to three
   close names. Non-printable and right-to-left or bidi characters in the shown expression are `?`,
@@ -2237,6 +2474,7 @@ Verification
 | `IB-REC-008` | `REC_INDEX` | index missing or invalid; rebuilt by scanning | 2e |
 | `IB-REC-009` | `REC_DEFS` | embedded definitions differ from config, or cannot be loaded | 2g |
 | `IB-REC-010` | `REC_SPACE` | low disk space for the recording | 2e |
+| `IB-REC-011` | `REC_DIRSYNC` | the recording's directory cannot be synced; its name may not survive a power loss (warning) | 2e |
 | `IB-FLT-001` | `FLT_SYNTAX` | filter syntax error (column, excerpt) | 2f |
 | `IB-FLT-002` | `FLT_NAME` | unknown name in a filter, or a reserved name misused | 2f |
 | `IB-FLT-003` | `FLT_TYPE` | literal does not fit the name's type, or the filter can never match | 2f |

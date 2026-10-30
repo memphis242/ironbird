@@ -27,7 +27,7 @@ import pytest
 from typer.testing import CliRunner
 
 import test_review2_engine as r2
-from conftest import REPO
+from conftest import REPO, udp_rx_queued_bytes
 from ironbird.cli.main import app
 from ironbird.cli.output import BoundedWriter
 from ironbird.config import Endpoint
@@ -58,17 +58,42 @@ EXIT_OUTPUT_LOST = 4
 TOOLS = REPO / "tools" / "cfs"
 
 
+BURST_CHUNK = 100  # datagrams per chunk: far below any socket buffer (100 x ~1 KiB truesize)
+BURST_DRAIN_S = 15.0  # longest a listener may take to read one chunk off its socket
+
+
 def send_burst(config: Path, count: int, label: str = "x") -> None:
+    """Send ``count`` HK packets to the telemetry port in chunks, each sent only once the
+    listener has read everything before it off its socket.
+
+    The tests that use this count every line, so a datagram the kernel drops would fail them for
+    a reason that is the host's, not the tool's: with a small ``net.core.rmem_max`` (GitHub
+    runners: 212992) the socket holds about 500 of these packets, which a listener starved of
+    CPU by other test processes overruns in a few milliseconds. Waiting for the socket to drain
+    makes the burst lossless by construction on a host of any speed or load.
+    """
     _, telemetry = endpoints(config)
     wire = hk_wire(config, label)
     raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        for i in range(count):
-            raw.sendto(wire, (telemetry.host, telemetry.port))
-            if i % 100 == 99:
-                time.sleep(0.005)
+        for start in range(0, count, BURST_CHUNK):
+            _wait_until_read(telemetry.port)
+            for _ in range(min(BURST_CHUNK, count - start)):
+                raw.sendto(wire, (telemetry.host, telemetry.port))
     finally:
         raw.close()
+
+
+def _wait_until_read(port: int) -> None:
+    deadline = time.monotonic() + BURST_DRAIN_S
+    while (queued := udp_rx_queued_bytes(port)) != 0:
+        if queued is None:  # no /proc/net/udp: fall back to a pause per chunk
+            time.sleep(0.005)
+            return
+        assert time.monotonic() < deadline, (
+            f"the listener left {queued} bytes unread on its socket for {BURST_DRAIN_S} s"
+        )
+        time.sleep(0.001)
 
 
 # -- 1: normal end drains with no deadline; losses are reported ----------------------------------
@@ -104,7 +129,7 @@ def test_slow_reader_receives_every_line_when_listen_ends_normally(
         proc.wait(timeout=15)
     finally:
         kill_quietly(proc)
-    assert out.count(b"\n") == count
+    assert out.count(b"\n") == count, errfile.read_text()
     assert proc.returncode == 0, errfile.read_text()
     assert "IB-OUT" not in errfile.read_text().replace("IB-OUT-003", "")
 
@@ -181,7 +206,7 @@ def test_reader_exiting_during_the_final_drain_is_a_normal_end_without_a_traceba
     assert "Traceback" not in err and "RuntimeError" not in err and "IB-INT-001" not in err
 
 
-# -- 2: the writer threads hold the shutdown signals ----------------------------------------------
+# -- 2: the writer threads hold the shutdown signals --
 
 
 def blocked_signals(tid: int) -> set[int]:
@@ -242,7 +267,7 @@ def test_a_signal_during_the_ledger_close_does_not_interrupt_it(
     assert proc.returncode == 143
 
 
-# -- 3: clean.sh as root --------------------------------------------------------------------------
+# -- 3: clean.sh as root --
 
 
 def test_clean_sh_run_as_root_cleans_the_segments_of_the_cfs_run_uid(tmp_path: Path) -> None:
@@ -283,7 +308,7 @@ def test_clean_sh_run_as_root_cleans_the_segments_of_the_cfs_run_uid(tmp_path: P
     assert log.read_text().split() == ["-m", "101"]
 
 
-# -- 4: closed standard streams -------------------------------------------------------------------
+# -- 4: closed standard streams --
 
 
 @pytest.mark.parametrize(
@@ -323,7 +348,7 @@ def test_closed_standard_streams_do_not_crash_and_send_still_goes_out(
             assert err.count(Code.OUT_LOST.value) == 1 and "was sent" in err
 
 
-# -- 5: socket creation and the event loop under resource limits ----------------------------------
+# -- 5: socket creation and the event loop under resource limits --
 
 
 def fake_socket_module(error: int) -> types.SimpleNamespace:
@@ -396,7 +421,7 @@ def test_too_few_file_descriptors_for_the_event_loop_is_a_coded_error(
     assert "error IB-SYS-001" in done.stderr and "ulimit" in done.stderr
 
 
-# -- 6: /proc/net/udp is scanned off the loop, and not needlessly ---------------------------------
+# -- 6: /proc/net/udp is scanned off the loop, and not needlessly --
 
 
 class ScanProbe:
@@ -510,7 +535,7 @@ def test_proc_scan_without_the_kernel_counter_runs_off_the_loop_once_per_tick(
     assert max(gaps) < 0.1, f"the loop stalled for {max(gaps):.3f} s"
 
 
-# -- 7: relative IRONBIRD_STATE_DIR ---------------------------------------------------------------
+# -- 7: relative IRONBIRD_STATE_DIR --
 
 
 def test_relative_state_dir_override_is_refused_with_a_remedy() -> None:
@@ -539,7 +564,7 @@ def test_send_with_a_relative_state_dir_sends_nothing(
         receiver.close()
 
 
-# -- 8: drops counted while closing are reported --------------------------------------------------
+# -- 8: drops counted while closing are reported --
 
 
 def test_frames_a_consumer_queue_refused_are_reported_and_counted(
@@ -565,7 +590,7 @@ def test_frames_a_consumer_queue_refused_are_reported_and_counted(
     assert drops and drops[-1]["total"] == final[0] == 6
 
 
-# -- 9: a signal during session teardown still ends the command by signal -------------------------
+# -- 9: a signal during session teardown still ends the command by signal --
 
 SLOW_TASK_STOP = """
     import ironbird.ledger as _l
