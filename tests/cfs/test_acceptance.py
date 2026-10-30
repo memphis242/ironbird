@@ -901,3 +901,80 @@ def test_a_live_session_records_to_a_clean_recording_with_the_periodic_housekeep
         "command_profile",
         "telemetry_profile",
     ]
+
+
+# -- stage 2g: replay a recording of a live session -----------------------------------------
+
+REPLAY_NOOPS = 3
+
+
+def test_replaying_a_live_recording_selects_exactly_what_was_sent(
+    ground: Ground, tmp_path: Path
+) -> None:
+    """Record a session in which SAMPLE_APP is reset and sent K NOOPs, then replay it: the filter
+    ``event.app == "SAMPLE_APP" and event.id == 3`` yields exactly K events (the NOOP's
+    information event), the last SAMPLE_APP housekeeping carries the K NOOPs in its counter, and
+    the replay of everything shows as many frames as the recording holds."""
+    config = tmp_path / "ironbird.toml"
+    examples = REPO / "examples"
+    text = CONFIG.read_text().replace('"ccdd/', f'"{examples}/ccdd/')
+    text = text.replace('"headers/', f'"{examples}/headers/')
+    config.write_text(text + "\n[recording]\nmin_free_bytes = 0\n")
+    out = tmp_path / "replay-live.ibrec"
+    env = {**ground.env, "IRONBIRD_CONFIG": str(config), "IRONBIRD_STATE_DIR": str(tmp_path / "s")}
+    ib = [sys.executable, "-m", "ironbird.cli.main"]
+    err_path = tmp_path / "record.stderr"
+    with ground.listener_paused(), err_path.open("w") as err:  # one process owns UDP 2234
+        recorder = subprocess.Popen([*ib, "record", "-o", str(out), "--quiet"], stderr=err, env=env)
+        try:
+            deadline = time.monotonic() + 15
+            while "listening" not in err_path.read_text():
+                assert recorder.poll() is None, err_path.read_text()
+                assert time.monotonic() < deadline, "ib record never reported it was listening"
+                time.sleep(0.05)
+            ground.send("SAMPLE_APP_RESET_COUNTERS")
+            for _ in range(REPLAY_NOOPS):
+                ground.send("SAMPLE_APP_NOOP")
+                time.sleep(0.5)
+            ground.send("SAMPLE_APP_SEND_HK")
+            time.sleep(2.0)
+        finally:
+            recorder.send_signal(signal.SIGINT)
+            code = recorder.wait(timeout=20)
+    assert code == 128 + signal.SIGINT, err_path.read_text()
+
+    def replay(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [*ib, "replay", str(out), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+            timeout=60,
+        )
+
+    events = replay("--format", "json", "--where", 'event.app == "SAMPLE_APP" and event.id == 3')
+    assert events.returncode == 0, events.stderr
+    event_records = [json.loads(line) for line in events.stdout.splitlines()]
+    assert len(event_records) == REPLAY_NOOPS, events.stdout
+    assert all(r["category"] == "event" for r in event_records)
+
+    housekeeping = replay("--format", "json", "--where", "msg == SAMPLE_APP_HK")
+    assert housekeeping.returncode == 0, housekeeping.stderr
+    counters = [
+        json.loads(line)["fields"]["CommandCounter"] for line in housekeeping.stdout.splitlines()
+    ]
+    assert counters and counters[-1] == REPLAY_NOOPS, counters
+
+    everything = replay("--format", "hex")
+    info = subprocess.run(
+        [*ib, "rec", "info", str(out), "--format", "json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert everything.returncode == 0 and info.returncode == 0, everything.stderr
+    assert len(everything.stdout.splitlines()) == json.loads(info.stdout)["frames"] > 0
+    undecoded = replay("--where", "status != ok")  # what a live listen would have hidden
+    assert undecoded.returncode == 0, undecoded.stderr

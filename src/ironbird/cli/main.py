@@ -35,11 +35,27 @@ from ironbird.cli.output import (
     Console,
     signals_held,
 )
+from ironbird.codec import Codec
 from ironbird.config import SystemConfig, find_config, load_config
 from ironbird.errors import Code, IronbirdError
+from ironbird.filter import Filter
 from ironbird.ledger import Ledger, default_state_dir
 from ironbird.recording import inspect as rec_inspect
+from ironbird.recording.defs import (
+    config_codecs,
+    differences_from_config,
+    embedded_codecs,
+)
+from ironbird.recording.player import Ending, OutputFormat, compile_where, play
+from ironbird.recording.reader import Damage
 from ironbird.recording.render import damage_summary, info_json, info_lines, size_text
+from ironbird.recording.replay import (
+    Pacer,
+    Replay,
+    check_range,
+    check_speed,
+    parse_time_spec,
+)
 from ironbird.recording.session import PendingRecording, RecordRequest, parse_split
 from ironbird.recording.writer import Recorder
 from ironbird.session import Route, Session, Side
@@ -75,6 +91,11 @@ app.add_typer(rec_app, name="rec")
 class Format(StrEnum):
     LINE = "line"
     JSON = "json"
+
+
+class DefsSource(StrEnum):
+    RECORDING = "recording"
+    CONFIG = "config"
 
 
 class MinType(StrEnum):
@@ -1374,6 +1395,356 @@ def rec_repair(
         return 0 if damage.torn else EXIT_DAMAGED_INPUT
 
     _run(ctx, None, verbose, None, "rec.repair", offline=work)
+
+
+# -- replay -------------------------------------------------------------------------------------
+
+MAX_DAMAGE_SHOWN: Final = 3  # damage lines printed by one replay; the summary counts the rest
+MAX_DAMAGE_LEDGERED: Final = 100
+REPLAY_OUTPUT_POLL_S: Final = 0.05
+
+
+def _config_for_defs(glob: Globals) -> SystemConfig:
+    return load_config(find_config(glob.config))
+
+
+def _replay_definitions(
+    glob: Globals,
+    replay: Replay,
+    defs: DefsSource,
+    needed: bool,
+    lenient: bool,
+    ledger: Ledger,
+    console: Console,
+) -> tuple[dict[str, Codec], dict[str, str] | None, IronbirdError | None]:
+    """The codecs frames are decoded with, the node aliases a filter may use, and why there are
+    no codecs when ``lenient`` let that pass.
+
+    ``--defs recording`` (the default) builds them from the definitions the recording embeds
+    (``IB-REC-009`` when they cannot be used) and says once, as information, when the current
+    configuration's files differ; ``--defs config`` uses the configuration's files with the
+    recording's packet cap. Nothing is built when ``needed`` is false (hex output, no filter);
+    ``lenient`` (hex output) carries on without codecs when they cannot be had."""
+    if not needed:
+        return {}, None, None
+    try:
+        if defs is DefsSource.CONFIG:
+            config = _config_for_defs(glob)
+            codecs = config_codecs(config, replay.nodes, replay.max_packet_bytes)
+            return codecs, {n.alias: n.name for n in config.nodes.values()}, None
+        codecs = embedded_codecs(
+            replay.parts[0], replay.head, replay.nodes, replay.meta.data, replay.max_packet_bytes
+        )
+    except IronbirdError as exc:
+        if not lenient:
+            raise
+        ledger.record("state", "replay.no_definitions", code=exc.code.value, summary=exc.summary)
+        return {}, None, exc
+    try:
+        current = load_config(find_config(glob.config))
+    except IronbirdError as exc:
+        # No configuration to compare with is the normal case on a machine that only reads
+        # recordings; it is in the ledger, not the user's way.
+        ledger.record("state", "replay.defs_compare_skipped", code=exc.code.value)
+        return codecs, None, None
+    differing = differences_from_config(replay.head, current)
+    if differing:
+        shown = ", ".join(differing[:6]) + (", ..." if len(differing) > 6 else "")
+        console.err(
+            f"info {Code.REC_DEFS.value}: the recording's definitions differ from the current "
+            f"configuration ({term(shown, 300, err=True)}); decoding with the recording's "
+            "(--defs config uses the current ones)"
+        )
+        ledger.record("state", "replay.defs_differ", differing=differing[:64])
+    return codecs, None, None
+
+
+def _replay_summary(
+    replay: Replay, shown: int, malformed: int, unknown: int, garbage: int, undecoded: int
+) -> str:
+    stats = replay.stats
+    parts = [
+        f"replay: read {stats.frames_read} frame(s) of {stats.parts} file(s)",
+        f"{stats.frames_in_range} in range" if stats.frames_in_range != stats.frames_read else "",
+        f"{shown} shown",
+    ]
+    for count, what in ((malformed, "malformed"), (unknown, "unknown"), (garbage, "garbage")):
+        if count:
+            parts.append(f"{count} {what}")
+    if undecoded:
+        parts.append(f"{undecoded} without definitions")
+    if stats.chunks_skipped:
+        parts.append(f"{stats.chunks_skipped} chunk(s) skipped by the index and not checked")
+    if stats.gaps:
+        parts.append(f"{stats.gaps} gap(s) ({stats.gap_frames} frame(s) lost)")
+    if stats.damage:
+        parts.append(f"{stats.damage} damaged stretch(es), {stats.damage_bytes} byte(s)")
+    return ", ".join(part for part in parts if part)
+
+
+@app.command()
+def replay(
+    ctx: typer.Context,
+    files: Annotated[
+        list[Path],
+        typer.Argument(
+            metavar="FILE...",
+            help=(
+                "The recording. Part 1 of a split recording plays all its parts; several files "
+                "play as given, in part order."
+            ),
+        ),
+    ],
+    where: Annotated[
+        str | None,
+        typer.Option(
+            "--where",
+            help=(
+                "Only frames matching this filter expression, compiled against the recording's "
+                "definitions, e.g. 'msg == SAMPLE_APP_HK and CommandCounter > 0' or "
+                "'status != ok'."
+            ),
+        ),
+    ] = None,
+    from_: Annotated[
+        str | None,
+        typer.Option(
+            "--from",
+            help=(
+                "Start here: ISO 8601 UTC (2026-10-30T12:00:00Z) or +90s, +1m30s from the "
+                "first frame."
+            ),
+        ),
+    ] = None,
+    to: Annotated[
+        str | None,
+        typer.Option("--to", help="Stop before this time (same forms as --from)."),
+    ] = None,
+    speed: Annotated[
+        float,
+        typer.Option(
+            "--speed",
+            help="0 = as fast as possible (default); 1 = the recorded pace; 2 = twice as fast.",
+        ),
+    ] = 0.0,
+    follow: Annotated[
+        bool,
+        typer.Option("--follow", help="Keep reading a recording that is being written."),
+    ] = False,
+    follow_idle: Annotated[
+        float | None,
+        typer.Option(
+            "--follow-idle",
+            callback=_check_timeout,
+            help=(
+                "With --follow: end after this many seconds without growth (for file systems "
+                "without usable locks, where a dead recorder cannot be told from a quiet one)."
+            ),
+        ),
+    ] = None,
+    fmt: Annotated[
+        OutputFormat, typer.Option("--format", help="line, json, or hex (undecoded bytes).")
+    ] = OutputFormat.LINE,
+    defs: Annotated[
+        DefsSource,
+        typer.Option(
+            "--defs",
+            help=(
+                "Decode with the definitions the recording embeds (default), or the current "
+                "configuration's."
+            ),
+        ),
+    ] = DefsSource.RECORDING,
+    skip_damage: Annotated[
+        bool,
+        typer.Option(
+            "--skip-damage", help="Resume at the next valid record after mid-file damage."
+        ),
+    ] = False,
+    count: Annotated[
+        int | None, typer.Option("--count", min=1, help="Stop after N frames are shown.")
+    ] = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """Replay a recording: decoded like `listen`, plus the frames `listen` hides.
+
+    Nothing is sent anywhere. Malformed, unknown and garbage frames are shown flagged, with
+    their bytes in hex. Exit 5: the recording is damaged mid-file (a part is missing, or replay
+    stopped at the damage, or with --skip-damage went past it).
+    """
+    base: Globals = ctx.obj
+
+    def work(ledger: Ledger, console: Console, run: _Run) -> int:
+        replaying: Replay | None = None
+        ending = "interrupted"
+        shown = 0
+        try:
+            check_speed(speed)
+            start = parse_time_spec(from_, "--from") if from_ is not None else None
+            end = parse_time_spec(to, "--to") if to is not None else None
+            check_range(start, end)
+            if follow_idle is not None and not follow:
+                raise IronbirdError(Code.CLI_USAGE, "--follow-idle needs --follow")
+            ledger.record(
+                "action",
+                "replay.start",
+                files=[str(f) for f in files],
+                where=where,
+                time_from=from_,
+                time_to=to,
+                speed=speed,
+                follow=follow,
+                follow_idle=follow_idle,
+                format=fmt.value,
+                defs=defs.value,
+                skip_damage=skip_damage,
+                count=count,
+            )
+            damage_shown = 0
+
+            def stdout_gone() -> bool:
+                return console.stdout.reader_gone or console.stdout.unavailable
+
+            def on_damage(damage: Damage, path: Path) -> None:
+                nonlocal damage_shown
+                error = damage.to_error()
+                where_ = f"{term(path.name, 200, err=True)}: "
+                damage_shown += 1
+                if damage_shown <= MAX_DAMAGE_LEDGERED:  # the stop record carries the total
+                    if damage.torn:
+                        ledger.record("warning", error.code.value, summary=error.summary, file=path)
+                    else:
+                        ledger.record_error(error, file=path)
+                if damage_shown <= MAX_DAMAGE_SHOWN:
+                    kind = "warning" if damage.torn else "error"
+                    hint = (
+                        ""
+                        if damage.torn or skip_damage
+                        else "; replay stopped there (--skip-damage resumes after it)"
+                    )
+                    console.err(
+                        f"{kind} {error.code.value}: {where_}"
+                        f"{term(error.summary, 600, err=True)}{hint}"
+                    )
+                elif damage_shown == MAX_DAMAGE_SHOWN + 1:
+                    console.err("further damage is counted in the summary and the ledger")
+
+            def on_note(code: Code, text: str) -> None:
+                console.err(f"info {code.value}: {term(text, 400, err=True)}")
+                ledger.record("state", "replay.note", code=code.value, text=text)
+
+            replaying = Replay(
+                files,
+                skip_damage=skip_damage,
+                follow=follow,
+                follow_idle_s=follow_idle,
+                start=start,
+                end=end,
+                on_damage=on_damage,
+                on_note=on_note,
+                stop=stdout_gone,
+            )
+            stats = replaying.stats
+            if stats.missing_parts:
+                numbers = stats.missing_parts
+                listed = ", ".join(str(n) for n in numbers[:8]) + (
+                    ", ..." if len(numbers) > 8 else ""
+                )
+                miss = IronbirdError(
+                    Code.REC_DAMAGED,
+                    f"{'part' if len(numbers) == 1 else 'parts'} {listed} of the split recording "
+                    f"{'is' if len(numbers) == 1 else 'are'} missing"
+                    f"{f' ({len(numbers)} in all)' if len(numbers) > 1 else ''}; "
+                    "the frames in them are not in the output",
+                )
+                ledger.record_error(miss, parts=numbers[:64])
+                console.err(miss.user_line())
+            needed = fmt is not OutputFormat.HEX or where is not None
+            codecs, aliases, degraded = _replay_definitions(
+                base, replaying, defs, needed, fmt is OutputFormat.HEX, ledger, console
+            )
+            flt: Filter | None = None
+            if where is not None:
+                flt = compile_where(replaying, where, codecs, aliases=aliases, degraded=degraded)
+            pacer = Pacer(speed) if speed > 0 else None
+            result = play(
+                replaying,
+                codecs,
+                out=console.stdout.write_wait,
+                fmt=fmt,
+                where=flt,
+                pacer=pacer,
+                count=count,
+                stop=stdout_gone,
+            )
+            shown = result.shown
+            ending = result.ending.value
+            if stats.unclosed:
+                warn = IronbirdError(
+                    Code.REC_TORN,
+                    "the recording ends without a trailer (not closed cleanly); every record "
+                    "before the end was replayed",
+                )
+                ledger.record(
+                    "warning", warn.code.value, summary=warn.summary, files=stats.unclosed
+                )
+                console.err(f"warning {warn.code.value}: {warn.summary}")
+            if replaying.follow_ended == "idle":
+                console.err(
+                    f"info {Code.REC_TORN.value}: --follow ended after {follow_idle:g} s without "
+                    "growth; the recorder may still be writing"
+                )
+            if stats.live_end:
+                console.err(
+                    f"info {Code.REC_TORN.value}: the recording is still being written; "
+                    "--follow keeps reading as it grows"
+                )
+            console.err(
+                _replay_summary(
+                    replaying,
+                    result.shown,
+                    result.malformed,
+                    result.unknown,
+                    result.garbage,
+                    result.undecoded,
+                )
+            )
+            if result.skipped_no_definitions:
+                console.err(
+                    f"warning {Code.REC_DEFS.value}: {result.skipped_no_definitions} frame(s) "
+                    "of a node with no definitions were not tested by the filter"
+                )
+            ledger.record(
+                "state",
+                "replay.stop",
+                reason=ending,
+                shown=result.shown,
+                read=stats.frames_read,
+                in_range=stats.frames_in_range,
+                malformed=result.malformed,
+                unknown=result.unknown,
+                garbage=result.garbage,
+                undecoded=result.undecoded,
+                gaps=stats.gaps,
+                gap_frames=stats.gap_frames,
+                damage=stats.damage,
+                damage_bytes=stats.damage_bytes,
+                chunks_skipped=stats.chunks_skipped,
+                rejected=dict(result.rejected),
+            )
+            counted = result.ending is Ending.COUNT
+            damaged = stats.mid_file_damage or (bool(stats.missing_parts) and not counted)
+            return EXIT_DAMAGED_INPUT if damaged else 0
+        except IronbirdError as exc:
+            ending = "error"
+            return _rec_failure(ledger, console, run, exc)
+        finally:
+            if replaying is not None:
+                replaying.close()
+            if ending in ("interrupted", "error"):
+                ledger.record("state", "replay.stop", reason=ending, shown=shown)
+
+    _run(ctx, None, verbose, None, "replay", offline=work)
 
 
 # -- entry point ----------------------------------------------------------------------------

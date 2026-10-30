@@ -71,6 +71,7 @@ _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 _NS: Final = 1_000_000_000
 _ESCAPABLE: Final = frozenset({"\\", '"', "'"})
 
+MAX_TIME_CHARS: Final = 64
 TIME_FORMAT_HINT: Final = "use YYYY-MM-DDTHH:MM:SS[.fff]Z or an offset such as +02:00"
 
 
@@ -217,6 +218,21 @@ def _time(text: str, i: int) -> Token:
     fraction = (match.group("f") or "").ljust(9, "0")
     seconds = delta.days * 86_400 + delta.seconds
     return Token(Tok.TIME, seconds * _NS + int(fraction), i, end)
+
+
+def parse_time(text: str) -> int:
+    """Nanoseconds since the Unix epoch of ``text``, an ISO 8601 time with a zone (``Z`` or an
+    offset) and seconds, as a filter's time literal is. Raises :class:`FilterError` for anything
+    else; the caller names the option it came from."""
+    if len(text) > MAX_TIME_CHARS or _TIME_START_RE.match(text) is None:
+        raise FilterError(
+            Code.FLT_SYNTAX, text[:MAX_TIME_CHARS], 0, f"not a time; {TIME_FORMAT_HINT}"
+        )
+    token = _time(text, 0)
+    if token.end != len(text):
+        raise FilterError(Code.FLT_SYNTAX, text, token.end, "unexpected text after the time")
+    seconds: int = token.value
+    return seconds
 
 
 def _zone_offset(zone: str) -> timedelta:

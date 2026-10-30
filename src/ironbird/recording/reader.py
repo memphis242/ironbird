@@ -33,7 +33,7 @@ import re
 import stat
 import zlib
 from collections import ChainMap
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, NamedTuple
@@ -564,12 +564,51 @@ class RecordingReader:
         if len(self.damage) < MAX_DAMAGE_KEPT:
             self.damage.append(damage)
 
-    def items(self) -> Iterator[Item | Damage]:
+    def skip_chunk(self, start: int, stop: int) -> list[fmt.Gap]:
+        """Account for a chunk the caller jumps over: its stream and source definitions are
+        learned from its head (they may be the only place a later chunk's frames find theirs), and
+        the sequence check starts afresh, since the frames in between are not seen. The GAP
+        records of the chunk (they sit at its head, before any frame) are returned.
+
+        A definition that disagrees with one already known is ignored; a frame that needs it is
+        then damage, as it would be in a straight read. Nothing in the chunk is validated further.
+        """
+        state = self._state
+        gaps: list[fmt.Gap] = []
+        for item in self.head_records(start, stop):
+            if item.rtype == RecordType.STREAM:
+                state.streams.setdefault(item.value.id, item.value)
+            elif item.rtype == RecordType.SOURCE:
+                state.sources.setdefault(item.value[0], item.value[1])
+            elif item.rtype == RecordType.GAP:
+                gaps.append(item.value)
+        state.last_seq = 0
+        return gaps
+
+    def items(
+        self,
+        *,
+        skip: Callable[[int], int | None] | None = None,
+        wait: Callable[[], bool] | None = None,
+    ) -> Iterator[Item | Damage]:
         """Every valid record after META in file order, and a :class:`Damage` where the file is
-        not valid records. Stops at damage unless ``skip_damage``; a torn tail always ends it."""
+        not valid records. Stops at damage unless ``skip_damage``; a torn tail always ends it.
+
+        ``skip(offset)`` is asked before each record: an offset it returns is where reading goes
+        on instead (a chunk the caller has no use for; it calls :meth:`skip_chunk`).
+
+        ``wait`` is for a file that is still being written: where the file ends at a record
+        boundary or inside a record, or a bad record has no valid chain after it yet, ``wait()``
+        is called, and ``True`` means "the file may have grown, look again". Only when it returns
+        ``False`` is the end of the file the end of the data: a torn tail, as without ``wait``.
+        """
         state = self._state
         offset = self._start
         while True:
+            if skip is not None and (jump := skip(offset)) is not None:
+                assert jump > offset, "a skip moves forward"
+                offset = jump
+                continue
             raw = self._read_raw(offset)
             reason: str | None = None
             incomplete = False
@@ -577,9 +616,13 @@ class RecordingReader:
             effect: _Effect = None
             if isinstance(raw, _Fail):
                 if raw.eof:
+                    if wait is not None and wait():
+                        continue
                     return
                 if raw.unsupported:
                     raise _unsupported(self.path, raw.reason)
+                if raw.incomplete and wait is not None and wait():
+                    continue
                 reason, incomplete = raw.reason, raw.incomplete
             else:
                 try:
@@ -590,6 +633,8 @@ class RecordingReader:
                     reason = str(bad)
             if reason is not None:
                 found, gave_up = self._resync(offset)
+                if found is None and not gave_up and wait is not None and wait():
+                    continue  # more of the file may make a valid chain; look again
                 size = max(self.size(), offset)
                 if found is None:
                     gave = " (the scan for a valid record gave up)" if gave_up else ""
