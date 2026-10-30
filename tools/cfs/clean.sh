@@ -70,7 +70,12 @@ for name in .cdskeyfile .resetkeyfile .reservedkeyfile; do
     keyfile="$RUN_DIR/$name"
     [[ -e "$keyfile" ]] || continue
     # glibc ftok(path, 'R'): 'R' << 24 | (st_dev & 0xff) << 16 | (st_ino & 0xffff)
-    read -r dev ino < <(stat -c '%d %i' "$keyfile")
+    # Not `read ... < <(stat ...)`: a process substitution hides stat's exit status.
+    if ! stat_out="$(stat -c '%d %i' "$keyfile")"; then
+        echo "clean.sh: cannot stat $keyfile; leaving the segments keyed from it alone" >&2
+        continue
+    fi
+    read -r dev ino <<< "$stat_out"
     key=$(( (0x52 << 24) | ((dev & 0xff) << 16) | (ino & 0xffff) ))
     while read -r seg_key shmid nattch owner; do
         [[ "$seg_key" == "$key" ]] || continue

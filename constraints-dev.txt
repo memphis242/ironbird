@@ -11,3 +11,9 @@ hypothesis==6.170.13
 ruff==0.17.3
 pyright==1.1.414
 atheris==3.0.0
+# The Node.js runtime pyright runs on (pyright[nodejs]); a manylinux_2_28 wheel, so the same
+# Node 24 LTS runs on Ubuntu and on EL8 (glibc 2.28).
+nodejs-wheel-binaries==24.19.0
+# Test dependency: tests/test_ci_el8.py parses the workflow.
+pyyaml==6.0.3
+types-pyyaml==6.0.12.20261030
