@@ -59,7 +59,7 @@ def test_explicit_evidence_tier_overrides_the_kind_default(
     assert ledger.record("action", "a") is not None  # essential room is untouched
 
 
-# -- _format survives mappings that raise while being serialised -------------------------
+# -- _format survives mappings that raise while being serialised --
 
 
 class _RaisingGetitem(Mapping[str, Any]):

@@ -25,7 +25,7 @@ from ironbird.ledger import Ledger
 from ironbird.notice import Level, Notice
 from ironbird.session import MidStatSnapshot, Session
 
-# -- notices from a live session -------------------------------------------------------
+# -- notices from a live session --
 
 
 def test_session_notices_point_at_their_ledger_records(
@@ -112,7 +112,7 @@ def test_cli_verbose_notice_names_its_ledger_record(
     assert ("[ledger n=" in line) is verbose
 
 
-# -- shared data is immutable ---------------------------------------------------------
+# -- shared data is immutable --
 
 
 def test_unpacked_header_values_reject_mutation() -> None:

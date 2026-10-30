@@ -71,7 +71,7 @@ def send_burst(config: Path, count: int, label: str = "x") -> None:
         raw.close()
 
 
-# -- 1: normal end drains with no deadline; losses are reported ----------------------------------
+# -- 1: normal end drains with no deadline; losses are reported --
 
 
 def test_slow_reader_receives_every_line_when_listen_ends_normally(
@@ -181,7 +181,7 @@ def test_reader_exiting_during_the_final_drain_is_a_normal_end_without_a_traceba
     assert "Traceback" not in err and "RuntimeError" not in err and "IB-INT-001" not in err
 
 
-# -- 2: the writer threads hold the shutdown signals ----------------------------------------------
+# -- 2: the writer threads hold the shutdown signals --
 
 
 def blocked_signals(tid: int) -> set[int]:
@@ -242,7 +242,7 @@ def test_a_signal_during_the_ledger_close_does_not_interrupt_it(
     assert proc.returncode == 143
 
 
-# -- 3: clean.sh as root --------------------------------------------------------------------------
+# -- 3: clean.sh as root --
 
 
 def test_clean_sh_run_as_root_cleans_the_segments_of_the_cfs_run_uid(tmp_path: Path) -> None:
@@ -283,7 +283,7 @@ def test_clean_sh_run_as_root_cleans_the_segments_of_the_cfs_run_uid(tmp_path: P
     assert log.read_text().split() == ["-m", "101"]
 
 
-# -- 4: closed standard streams -------------------------------------------------------------------
+# -- 4: closed standard streams --
 
 
 @pytest.mark.parametrize(
@@ -323,7 +323,7 @@ def test_closed_standard_streams_do_not_crash_and_send_still_goes_out(
             assert err.count(Code.OUT_LOST.value) == 1 and "was sent" in err
 
 
-# -- 5: socket creation and the event loop under resource limits ----------------------------------
+# -- 5: socket creation and the event loop under resource limits --
 
 
 def fake_socket_module(error: int) -> types.SimpleNamespace:
@@ -396,7 +396,7 @@ def test_too_few_file_descriptors_for_the_event_loop_is_a_coded_error(
     assert "error IB-SYS-001" in done.stderr and "ulimit" in done.stderr
 
 
-# -- 6: /proc/net/udp is scanned off the loop, and not needlessly ---------------------------------
+# -- 6: /proc/net/udp is scanned off the loop, and not needlessly --
 
 
 class ScanProbe:
@@ -510,7 +510,7 @@ def test_proc_scan_without_the_kernel_counter_runs_off_the_loop_once_per_tick(
     assert max(gaps) < 0.1, f"the loop stalled for {max(gaps):.3f} s"
 
 
-# -- 7: relative IRONBIRD_STATE_DIR ---------------------------------------------------------------
+# -- 7: relative IRONBIRD_STATE_DIR --
 
 
 def test_relative_state_dir_override_is_refused_with_a_remedy() -> None:
@@ -539,7 +539,7 @@ def test_send_with_a_relative_state_dir_sends_nothing(
         receiver.close()
 
 
-# -- 8: drops counted while closing are reported --------------------------------------------------
+# -- 8: drops counted while closing are reported --
 
 
 def test_frames_a_consumer_queue_refused_are_reported_and_counted(
@@ -565,7 +565,7 @@ def test_frames_a_consumer_queue_refused_are_reported_and_counted(
     assert drops and drops[-1]["total"] == final[0] == 6
 
 
-# -- 9: a signal during session teardown still ends the command by signal -------------------------
+# -- 9: a signal during session teardown still ends the command by signal --
 
 SLOW_TASK_STOP = """
     import ironbird.ledger as _l

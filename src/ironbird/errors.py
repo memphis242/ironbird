@@ -59,6 +59,16 @@ class Code(StrEnum):
     OUT_DROPPED = "IB-OUT-001"  # output lines dropped because stdout/stderr is not draining
     OUT_LOST = "IB-OUT-002"  # final tally: output lines dropped, abandoned or never deliverable
     OUT_WAITING = "IB-OUT-003"  # ending, but still waiting for the reader of stdout to take lines
+    # Recordings
+    REC_CREATE = "IB-REC-001"  # cannot create the recording or a repaired copy
+    REC_WRITE = "IB-REC-002"  # a recording write or sync failed; recording stopped
+    REC_OVERRUN = "IB-REC-003"  # recorder buffer full; frames dropped (GAP recorded)
+    REC_FORMAT = "IB-REC-004"  # not an ironbird recording (or unreadable)
+    REC_VERSION = "IB-REC-005"  # unsupported version or unknown critical record type
+    REC_DAMAGED = "IB-REC-006"  # damaged record mid-file
+    REC_TORN = "IB-REC-007"  # recording ends in an incomplete record (not closed cleanly)
+    REC_INDEX = "IB-REC-008"  # index missing or invalid; rebuilt by scanning
+    REC_SPACE = "IB-REC-010"  # low disk space for the recording
     # System resources
     SYS_RESOURCE = "IB-SYS-001"  # the OS refused a resource needed to start (file descriptors)
     # CLI / internal

@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from conftest import EXAMPLES, free_udp_ports
+from conftest import EXAMPLES
 from ironbird import render
 from ironbird.ccdd.model import MessageKind
 from ironbird.coalesce import Coalescer
@@ -33,6 +33,7 @@ from ironbird.ledger import Ledger
 from ironbird.notice import Level
 from ironbird.session import Session
 from ironbird.transport import LinkEnd
+from recutil import high_ports
 from test_engine import _Probe
 
 DECODE_CEILING_S = 100e-6
@@ -157,7 +158,7 @@ def _bench_config(tmp_path: Path) -> Path:
     )
     ccdd_path = tmp_path / "bench.json"
     ccdd_path.write_text(json.dumps(ccdd))
-    command_port, telemetry_port = free_udp_ports(2)
+    command_port, telemetry_port = high_ports(2)
     path = tmp_path / "bench.toml"
     path.write_text(
         f"""[ironbird]
@@ -174,6 +175,8 @@ to = "fc"
 transport = "udp"
 command_endpoint = "127.0.0.1:{command_port}"
 telemetry_endpoint = "127.0.0.1:{telemetry_port}"
+[recording]
+min_free_bytes = 0
 """
     )
     return path
@@ -376,3 +379,132 @@ def test_listen_cli_at_the_target_rate_loses_no_output(tmp_path: Path) -> None:
     print(f"\nib listen at {LISTEN_RATE:,} pkt/s: {lines}/{sent} lines written")
     assert "IB-OUT-" not in errors, errors
     assert lines >= 0.95 * sent, f"{sent - lines} of {sent} packets did not reach the output"
+
+
+# -- recording --
+
+
+def _record_frames(count: int) -> list[Frame]:
+    from recutil import RX, frame
+
+    data = bytes(PACKET_BYTES)
+    return [frame(i, stream=RX, data=data, mid=0x899) for i in range(1, count + 1)]
+
+
+def test_recorder_append_cost(benchmark: Any, tmp_path: Path) -> None:
+    """The per-frame cost of the recorder sink: encode one 200-byte frame (CRC, chunk summary).
+    Flushes to the writer thread are amortised in; the disk is the thread's problem."""
+    from ironbird.recording.writer import Recorder
+    from recutil import FAST, RX, frame, meta
+
+    recorder = Recorder.open(tmp_path / "b.ibrec", meta(), streams=[RX], options=FAST)
+    item = frame(1, data=bytes(PACKET_BYTES), mid=0x899)
+    benchmark(recorder.append, item)  # the recorder does not look at sequence order
+    asyncio.run(recorder.close())
+    benchmark.extra_info["frames_per_s"] = round(1 / benchmark.stats.stats.mean) if getattr(
+        benchmark, "stats", None) else None  # fmt: skip
+    _check_ceiling(benchmark, 100e-6)
+
+
+def test_recorder_writer_throughput_and_reader_rate(tmp_path: Path) -> None:
+    """WRITER: frames/s and MB/s from append to a closed, fsynced file; READER: frames/s with
+    every CRC and rule checked."""
+    from ironbird.recording.reader import RecordingReader
+    from ironbird.recording.writer import Recorder
+    from recutil import FAST, RX, meta
+
+    total = 150_000
+    frames = _record_frames(total)
+    recorder = Recorder.open(tmp_path / "w.ibrec", meta(), streams=[RX], options=FAST)
+    start = time.perf_counter()
+    for item in frames:
+        recorder.append(item)
+    appended = time.perf_counter() - start
+    asyncio.run(recorder.close())
+    written = time.perf_counter() - start
+    size = (tmp_path / "w.ibrec").stat().st_size
+    start = time.perf_counter()
+    with RecordingReader(tmp_path / "w.ibrec") as reader:
+        read = sum(1 for _ in reader.frames())
+    reading = time.perf_counter() - start
+    assert read == total
+    print(
+        f"\nrecorder append {total / appended:,.0f} frames/s "
+        f"({appended / total * 1e6:.1f} us each); "
+        f"to a closed file {total / written:,.0f} frames/s, {size / written / 1e6:.0f} MB/s; "
+        f"reader {total / reading:,.0f} frames/s ({size / reading / 1e6:.0f} MB/s)"
+    )
+    assert total / appended >= TARGET_PPS * 3  # the sink alone leaves most of a core free
+    assert total / reading >= FLOOR_PPS * 10
+
+
+RECORD_PACKETS = 30_000
+
+
+def _run_record_cli(tmp_path: Path, count: int, rate: int) -> tuple[int, Any, str, float]:
+    """``ib record`` in its own process while another sends ``count`` packets at ``rate``/s.
+    Returns (sent, the recording's report, stderr, CPU seconds the recorder used)."""
+    import resource
+
+    from ironbird.recording import inspect as rec_inspect
+
+    config_path = _bench_config(tmp_path)
+    config = load_config(config_path)
+    codec = Session(
+        config, role="ground", ledger=Ledger(tmp_path / "l0", session_id="c"), notify=_ignore
+    ).codec_for("fc")
+    wire = codec.encode_telemetry("BENCH_TLM", {"blob": "x" * 20}).data
+    port = config.links[0].telemetry_endpoint.port
+    environment = {
+        **os.environ,
+        "IRONBIRD_CONFIG": str(config_path),
+        "IRONBIRD_STATE_DIR": str(tmp_path / "state"),
+    }
+    out_path, err_path = tmp_path / "bench.ibrec", tmp_path / "record.err"
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    with err_path.open("wb") as err:
+        recorder = subprocess.Popen(
+            [sys.executable, "-c", CLI_MAIN, "record", "-o", str(out_path), "--quiet"],
+            stdout=subprocess.DEVNULL,
+            stderr=err,
+            env=environment,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while b"istening" not in err_path.read_bytes():
+                assert recorder.poll() is None, err_path.read_text()
+                assert time.monotonic() < deadline, "the recorder never reported it was listening"
+                time.sleep(0.05)
+            subprocess.run(
+                [sys.executable, "-c", SENDER, str(port), str(count), str(rate), wire.hex()],
+                check=True,
+            )
+            time.sleep(0.7)
+        finally:
+            recorder.send_signal(signal.SIGTERM)
+            try:
+                recorder.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                recorder.kill()
+                recorder.wait()
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
+    return count, rec_inspect.scan(out_path), err_path.read_text(), cpu
+
+
+def test_record_cli_at_the_target_rate_loses_no_frame(tmp_path: Path) -> None:
+    """END TO END: a separate ``ib record`` process, a separate sender at the design target rate.
+    Every datagram that reached the socket is in the recording: recorded frames plus the kernel's
+    own drops (GAP records) equal what was sent, nothing is dropped by the recorder, and the file
+    is closed cleanly."""
+    sent, report, errors, cpu = _run_record_cli(tmp_path, RECORD_PACKETS, TARGET_PPS)
+    kernel = report.lost_by_reason.get("kernel_drop", 0)
+    print(
+        f"\nib record at {TARGET_PPS:,} pkt/s: {report.frames}/{sent} recorded, {kernel} lost in "
+        f"the kernel, {cpu:.2f} s CPU ({cpu / max(report.frames, 1) * 1e6:.0f} us per frame)"
+    )
+    assert "IB-REC-" not in errors.replace("IB-REC-007", ""), errors
+    assert report.status == "closed" and not report.holes and not report.findings
+    assert report.frames + kernel == sent, f"{sent - report.frames - kernel} frames unaccounted for"
+    assert report.frames >= 0.95 * sent  # the host's own datagram loss is tolerated, not hidden
+    assert report.lost_by_reason.get("recorder_overrun", 0) == 0

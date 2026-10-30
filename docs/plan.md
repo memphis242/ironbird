@@ -1802,6 +1802,88 @@ Verification
   SCH_LAB period (`tools/cfs/NOTES.md`: ES 4.0 s, EVS 4.2 s, ...) within one packet, seq
   contiguous, no gaps, clean close.
 
+As built (where the build differs from, or settles, the text above)
+- Modules: `recording/format.py` (layouts, limits, pure record codecs), `reader.py`, `writer.py`,
+  `inspect.py` (`scan` for `check`, `info`, `repair`), `render.py` (info text and JSON),
+  `session.py` (location, embedded definitions, META, `recording_for`); `atomicfile.py` holds the
+  non-replacing temporary commit (see below). The reader's checks live in `RecordingReader`;
+  `recutil`/`rec_corpus` build crafted files for the tests, `tools/fuzz/fuzz_recording.py` is the
+  `atheris` target (added to the nightly fuzz job; atheris is not installed on the dev host, so
+  the target has not been run here).
+- Layout details the plan left open. Chunk 0 starts at offset 24, so META, BLOBs and the declared
+  STREAMs are the head of the first chunk. Non-frame records (STREAM, SOURCE, GAP, MARK) only appear
+  at the start of a chunk: one needed while a chunk holds frames closes the chunk first, which is
+  what lets `info` list gaps, marks and streams from chunk heads without reading frames. STREAM and
+  SOURCE definitions are repeated every 60 s at a chunk start, so one damaged definition cannot make
+  the rest of a stream unreadable (the reader requires every frame's stream and source to be
+  defined, and a redefinition must be identical). Bodies: STREAM `u16 id, u8 kind (1 command,
+  2 telemetry), u8 direction (1 rx, 2 tx)`, then u8-prefixed link, node and transport and a
+  u16-prefixed endpoint; link and node follow the config name pattern, BLOB node and adapter the
+  config identifier pattern (anything else is damage); BLOB `u8 kind, u8-prefixed node, u8-prefixed
+  adapter, 32-byte SHA-256, content`; SOURCE `u16 id (below 4096) + UTF-8`, frames use 0xFFFF for
+  "(other)"; GAP is a fixed 48-byte body `u16 stream, u8 reason, 0, u32 0, u64 lost, first_ns,
+  last_ns, first_seq, last_seq`; MARK `u64 time_ns, u8 kind, 3 zero bytes, text`; CHUNK `bytes` is
+  the file bytes of the chunk's FRAME records. TRAILER `index_offset` 0 means no index (more than
+  2 M chunks); the trailer is the last record and bytes after it are damage (`trailing`).
+- Stricter than the text: a TRUNCATED frame needs `orig_len` above both `len(data)` and META
+  `max_packet_bytes` (the codec's `oversize_error` assertion), an unknown GAP reason or MARK
+  reserved byte is damage, and the envelope `flags`/reserved bytes are checked before the CRC.
+- Resync scans for the envelope shape with a regex over 1 MiB windows, at 8-byte aligned offsets,
+  and validates a candidate plus its successor with the state (streams, sources, sequence) a
+  real read would have. A CRC budget (16 MiB plus 4 bytes per byte scanned) bounds hostile files; a
+  scan that exhausts it ends the file as mid-file damage "the scan gave up", not as a torn tail.
+  A reader takes `LOCK_SH | LOCK_NB` on the file; a writer's `LOCK_EX` shows as `writer_active`
+  (`info` reports "recording" rather than torn).
+- GAP reasons emitted: `kernel_drop` (the engine bracket: `first_seq`/`last_seq` are the engine's
+  sequence numbers at the previous and the current 1 Hz poll, since a dropped datagram never had
+  one; delivered to sinks that have a `gap` method, the new optional `GapSink` protocol),
+  `recorder_overrun` and `not_recorded` (seq ranges of the frames not written, per stream).
+  `queue_drop` and `link_down` are defined for 2k; a consumer queue overflow is not a recording gap
+  because the sinks already have the frame.
+- Writer: `Recorder.open` writes preamble, META, BLOBs and the declared streams synchronously and
+  syncs file and directory before returning; the 250 ms flush, the 1 s chunk close, the end of an
+  overrun (hysteresis at half the cap), the 10 s free-space projection (`IB-REC-010` warning under
+  10 minutes) and the rate samples run on a loop timer; `fdatasync` and the 60 s heartbeat
+  (`os.utime` of the active file) run on the writer thread, which holds the shutdown signals
+  blocked. The close always syncs, even with `fsync = "never"`. A wall-clock step of 250 ms or more
+  against the monotonic clock is a MARK. `Recorder.rate_bytes_per_s()` (bytes encoded over the last
+  minute) is the hook for 2d's `IB-RET-002` projection; nothing consumes it yet. A split keeps part
+  1 open and locked, and every part repeats META, BLOBs and definitions. A second signal does not
+  abandon the close (the CLI ignores repeated signals); the close is bounded to 5 s.
+- Commands: `ib record` (exit 0 on `--duration`, `--count` or a signal's 128+n; `--count` stops at
+  the first batch past N, so it records at least N), `--record PATH|auto` on `listen`, `events`
+  and `respond`, `ib rec info [--format line|json]`, `ib rec check [--strict]` (exit 1 on mid-file
+  damage, a summary that disagrees with its records or an unexplained sequence hole; a torn tail
+  is a warning unless `--strict`), `ib rec repair IN OUT [--force]` (exit 5 when valid frames
+  after mid-file damage were left out; the synthesised closing chunk has no monotonic times; a clean
+  recording repairs to identical bytes). `info` answers from the index and chunk summaries, so it
+  does not notice a damaged frame; `check` does. The CLI gained an `offline` runner (no config,
+  no session) for the `rec` commands, and `Session.record_routes`, `event_routes`, `respond_route`
+  and `streams_for`.
+- Config `[recording]`: `dir`, `fsync`, `max_buffer_bytes` (1 MiB to 64 GiB), `min_free_bytes`,
+  `embed_definitions`; definition files above 8 MiB (64 KiB for profiles) refuse the recording
+  with a hint to turn embedding off. META names every node's definition digests either way.
+- `atomicfile.py` implements what 2d's plan assigns to 2d for the temporary commit, because
+  `rec repair` needs it now: `TempOutput` (`.<name>.<16 hex>.tmp` created `O_EXCL`, removed on
+  failure only after `fstatat` matches its descriptor) and `rename_noreplace` (`renameat2`
+  `RENAME_NOREPLACE`, then `link` with the NFSv3 retransmission case, then a placeholder rename;
+  directory sync after the commit; regular files only, the directory placeholder of the 2h export
+  is not built). 2d should extend or adopt it rather than write a second one.
+- Not done here: replay and `--follow` (2g), retention and prune (2d: the recording name matches
+  its patterns, the heartbeat and lock exist, the rate hook is unwired), `IB-LED-009` for a file
+  system without locks (the recorder runs unlocked and ledgers nothing), `IB-REC-009` (2g).
+- Verification numbers (4-core dev host): `Recorder.append` of a 200-byte frame about 3-4 us; the
+  writer sustains about 210-270k frames/s (52-66 MB/s) to a closed, synced file; the reader reads
+  about 105-130k frames/s with every CRC and rule checked; `ib record` at 10k pkt/s of 200-byte
+  packets for 3 s records 30000 of 30000 with no kernel drop, about 56 us of CPU per frame for the
+  whole process, and the `ib listen` guards are unchanged. Tests: `test_recording.py` (writer,
+  reader, engine sink), `test_recording_malformed.py` (truncation at every offset, every third
+  bit flip, Hypothesis corruption and arbitrary records with valid CRCs, crafted frames, forged
+  records, bounded resync, the 53-file corpus `tests/corpus/malformed/rec-*.ibrec`),
+  `test_recording_tools.py` (commit paths, repair), `test_recording_cli.py` (record, `--record`,
+  SIGTERM and `kill -9`, `rec` tools, config) and benchmarks; `tests/cfs/test_acceptance.py` has
+  a live-session recording case for CI (not run on the dev host: it needs the fixed cFS ports).
+
 ### 2f - Filter language and live `--where`
 
 Deliverables: `filter/` (lexer, recursive-descent parser with a depth counter, compiler,

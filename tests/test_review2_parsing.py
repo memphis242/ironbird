@@ -36,7 +36,7 @@ def _load_error(path: Path, text: str) -> IronbirdError:
     return info.value
 
 
-# -- 1. fullmatch: a trailing newline is not part of a name -------------------------------
+# -- 1. fullmatch: a trailing newline is not part of a name --
 
 
 @pytest.mark.parametrize(
@@ -103,7 +103,7 @@ def test_valid_example_config_still_loads() -> None:
     assert parse_config(MOCK_TOML, EXAMPLES / "mock.toml").links
 
 
-# -- 2. TOML loaders: huge ints and deep nesting are coded errors ---------------------------
+# -- 2. TOML loaders: huge ints and deep nesting are coded errors --
 
 
 def test_config_huge_int_port_is_a_coded_schema_error() -> None:
@@ -128,7 +128,7 @@ def test_profile_toml_resource_limits_are_file_errors(name: str) -> None:
     assert name in info.value.user_line()
 
 
-# -- 4. duplicate JSON keys -----------------------------------------------------------------
+# -- 4. duplicate JSON keys --
 
 
 def test_duplicate_json_keys_are_rejected_not_last_wins(tmp_path: Path) -> None:
@@ -155,7 +155,7 @@ def test_duplicate_toml_keys_are_already_rejected(tmp_path: Path) -> None:
     assert info.value.code is Code.HDR_FILE
 
 
-# -- 5. enums: reverse map and cap ---------------------------------------------------------
+# -- 5. enums: reverse map and cap --
 
 
 def test_enum_label_is_a_dict_lookup_and_agrees_with_the_forward_map() -> None:
@@ -195,7 +195,7 @@ def test_enum_error_hint_stays_short(mock_codec: Codec) -> None:
     assert info.value.code is Code.ENC_ARG
 
 
-# -- 6. floats -------------------------------------------------------------------------------
+# -- 6. floats --
 
 
 def _float_field(type_text: str) -> FieldDef:
@@ -266,7 +266,7 @@ def test_message_too_long_for_the_length_field_fails_at_codec_load() -> None:
         Codec(edge, cmd, narrow)
 
 
-# -- 8. the cheap half of the decode boundary ------------------------------------------------------
+# -- 8. the cheap half of the decode boundary --
 
 
 def test_check_separates_known_unknown_and_malformed(mock_codec: Codec) -> None:
@@ -289,7 +289,7 @@ def test_check_separates_known_unknown_and_malformed(mock_codec: Codec) -> None:
     assert mock_codec.check(TLM, bytes(unknown) + b"\0").code is Code.DEC_UNKNOWN  # type: ignore[union-attr]
 
 
-# -- 3. sanitize ----------------------------------------------------------------------------------
+# -- 3. sanitize --
 
 
 def test_clean_escapes_the_replacement_character() -> None:

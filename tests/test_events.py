@@ -53,7 +53,7 @@ def _decode(codec: Codec, data: bytes) -> DecodedPacket:
     return result
 
 
-# -- category model ----------------------------------------------------------------------
+# -- category model --
 
 
 def test_category_priority_is_the_documented_order() -> None:
@@ -172,7 +172,7 @@ def test_event_type_labels_are_matched_case_insensitively() -> None:
     }
 
 
-# -- extraction and rendering ---------------------------------------------------------------
+# -- extraction and rendering --
 
 
 def _long_event_bytes(app: bytes, event_id: int, event_type: int, text: bytes) -> bytes:
@@ -263,7 +263,7 @@ def test_any_event_payload_extracts_without_raising_and_renders_inert(payload: b
     assert event.severity is None or event.type_label != ""
 
 
-# -- ib events over loopback UDP: two nodes ---------------------------------------------------
+# -- ib events over loopback UDP: two nodes --
 
 
 @pytest.fixture
@@ -468,7 +468,7 @@ def test_node_without_event_definitions_is_an_error(mock_config_path: Path, tmp_
     asyncio.run(main())
 
 
-# -- the CLI ----------------------------------------------------------------------------------
+# -- the CLI --
 
 
 def test_cli_events_usage_errors(mock_config_path: Path) -> None:
