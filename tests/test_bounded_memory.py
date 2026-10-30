@@ -30,6 +30,7 @@ from conftest import CORPUS
 from ironbird.ccdd.model import MessageKind
 from ironbird.config import Endpoint, load_config
 from ironbird.engine import (
+    _RELEASE_EVERY,
     CONSUMER_QUEUE_BYTES,
     FRAME_OVERHEAD_BYTES,
     Capture,
@@ -40,8 +41,8 @@ from ironbird.frame import MAX_FRAME_BYTES, Direction, Frame, FrameFlag, Stream
 from ironbird.ledger import ENTRY_OVERHEAD_BYTES, Ledger
 from ironbird.notice import Notice
 from ironbird.session import Session
-from ironbird.transport import LinkEnd, UdpTransport
-from ironbird.transport.udp import RECV_ERROR_STREAK
+from ironbird.transport import LinkEnd, UdpTransport, udp
+from ironbird.transport.udp import RECV_FAIL_WINDOW_S
 
 T = TypeVar("T")
 TRUNCATED_BIT = int(FrameFlag.TRUNCATED)
@@ -276,46 +277,145 @@ def test_an_unusable_socket_fails_the_transport_at_once(number: int) -> None:
     assert "restart" in failures[0].summary
 
 
-def test_reads_that_keep_failing_end_the_transport_after_a_streak() -> None:
+class ReceiveClock:
+    """A clock the receive path reads once per failed read: each failure sees ``times`` in turn
+    (the last one repeats), so a test fixes exactly when each failure happens."""
+
+    def __init__(self, times: list[float]) -> None:
+        self._times = times
+        self.reads = 0
+
+    def __call__(self) -> float:
+        value = self._times[min(self.reads, len(self._times) - 1)]
+        self.reads += 1
+        return value
+
+
+async def _failing_transport(
+    clock: ReceiveClock,
+    reports: list[IronbirdError],
+    failures: list[IronbirdError],
+    got: list[Received],
+) -> tuple[UdpTransport, tuple[str, int]]:
+    transport = UdpTransport(
+        local=Endpoint("127.0.0.1", 0),
+        report=reports.append,
+        failed=failures.append,
+        clock=clock,
+    )
+    await transport.open(lambda data, _t, _s, orig, flags: got.append((data, orig, flags)))
+    address = transport.local_address
+    assert address is not None
+    return transport, address
+
+
+def test_reads_still_failing_after_the_window_end_the_transport() -> None:
     reports: list[IronbirdError] = []
     failures: list[IronbirdError] = []
+    step = 0.2
+    last = round(RECV_FAIL_WINDOW_S / step)  # the failure that finds the window elapsed
+    clock = ReceiveClock([step * n for n in range(2 * last)])
 
     async def main() -> None:
-        transport = UdpTransport(
-            local=Endpoint("127.0.0.1", 0), report=reports.append, failed=failures.append
-        )
-        await transport.open(lambda *_: None)
-        address = transport.local_address
-        assert address is not None
-        _flaky(transport, [OSError(errno.EIO, "I/O error")] * (RECV_ERROR_STREAK + 50))
+        transport, address = await _failing_transport(clock, reports, failures, [])
+        _flaky(transport, [OSError(errno.EIO, "I/O error")] * (3 * last))
         try:
             _send(address, b"x")
             await _until(lambda: bool(failures))
-            assert transport.stats().rx_errors == RECV_ERROR_STREAK
+            assert transport.stats().rx_errors == last + 1
         finally:
             await transport.close()
 
     _run(main())
-    assert len(reports) == RECV_ERROR_STREAK - 1 and len(failures) == 1
+    assert len(reports) == last and len(failures) == 1
+    assert "restart" in failures[0].summary
 
 
-def test_a_successful_read_resets_the_failure_streak() -> None:
+def test_a_burst_of_failures_inside_the_window_never_ends_the_transport() -> None:
+    reports: list[IronbirdError] = []
     failures: list[IronbirdError] = []
+    burst = 3000  # far more than any count-only rule would tolerate, all within 3 s
+    clock = ReceiveClock([n * 0.001 for n in range(burst)])
 
     async def main() -> None:
         got: list[Received] = []
-        transport = UdpTransport(
-            local=Endpoint("127.0.0.1", 0),
-            report=lambda _: None,
-            failed=failures.append,
-        )
-        await transport.open(lambda data, _t, _s, orig, flags: got.append((data, orig, flags)))
-        address = transport.local_address
-        assert address is not None
+        transport, address = await _failing_transport(clock, reports, failures, got)
+        _flaky(transport, [OSError(errno.EIO, "I/O error")] * burst)
+        try:
+            _send(address, b"after")
+            await _until(lambda: len(got) == 1)
+            assert transport.stats().rx_errors == burst
+        finally:
+            await transport.close()
+
+    _run(main())
+    assert len(reports) == burst and failures == []
+
+
+def test_a_flood_of_failures_ends_the_transport_at_the_count_backstop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backstop = 500
+    monkeypatch.setattr(udp, "RECV_FAIL_BACKSTOP", backstop)
+    reports: list[IronbirdError] = []
+    failures: list[IronbirdError] = []
+    clock = ReceiveClock([0.0])  # the clock never moves: only the count can end it
+
+    async def main() -> None:
+        transport, address = await _failing_transport(clock, reports, failures, [])
+        _flaky(transport, [OSError(errno.EIO, "I/O error")] * (2 * backstop))
+        try:
+            _send(address, b"x")
+            await _until(lambda: bool(failures))
+            assert transport.stats().rx_errors == backstop
+        finally:
+            await transport.close()
+
+    _run(main())
+    assert len(reports) == backstop - 1 and len(failures) == 1
+
+
+def test_a_successful_read_resets_the_failing_window() -> None:
+    failures: list[IronbirdError] = []
+    window = RECV_FAIL_WINDOW_S
+    # Each round fails at its start and 0.8 of a window later, then a good read arrives. Rounds
+    # begin 0.9 of a window apart, so without the reset the third round would be 2+ windows old.
+    times: list[float] = []
+    for round_ in range(4):
+        base = round_ * 0.9 * window
+        times += [base, base + 0.8 * window]
+    clock = ReceiveClock(times)
+
+    async def main() -> None:
+        got: list[Received] = []
+        transport, address = await _failing_transport(clock, [], failures, got)
         flaky = _flaky(transport, [])
         try:
-            for round_ in range(3):  # 3 x (streak - 1) failures in all: never a streak
-                flaky.errors.extend([OSError(errno.EIO, "I/O error")] * (RECV_ERROR_STREAK - 1))
+            for round_ in range(4):
+                flaky.errors.extend([OSError(errno.EIO, "I/O error")] * 2)
+                _send(address, b"ok")
+                await _until(lambda expected=round_ + 1: len(got) == expected)
+        finally:
+            await transport.close()
+
+    _run(main())
+    assert failures == [] and clock.reads == len(times)
+
+
+def test_a_successful_read_resets_the_failure_count_toward_the_backstop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(udp, "RECV_FAIL_BACKSTOP", 10)
+    failures: list[IronbirdError] = []
+    clock = ReceiveClock([0.0])
+
+    async def main() -> None:
+        got: list[Received] = []
+        transport, address = await _failing_transport(clock, [], failures, got)
+        flaky = _flaky(transport, [])
+        try:
+            for round_ in range(4):  # 4 x 6 failures in all, but never 10 in a row
+                flaky.errors.extend([OSError(errno.EIO, "I/O error")] * 6)
                 _send(address, b"ok")
                 await _until(lambda expected=round_ + 1: len(got) == expected)
         finally:
@@ -323,6 +423,24 @@ def test_a_successful_read_resets_the_failure_streak() -> None:
 
     _run(main())
     assert failures == []
+
+
+def test_failures_further_apart_than_the_window_are_separate_episodes() -> None:
+    failures: list[IronbirdError] = []
+    # Nothing is read in between (so no good read resets anything), but each failure comes more
+    # than a window after the one before: the condition cleared in the meantime.
+    clock = ReceiveClock([n * 1.5 * RECV_FAIL_WINDOW_S for n in range(6)])
+
+    async def main() -> None:
+        transport, _address = await _failing_transport(clock, [], failures, [])
+        try:
+            for _ in range(6):
+                transport._receive_failed(OSError(errno.EIO, "I/O error"))
+        finally:
+            await transport.close()
+
+    _run(main())
+    assert failures == [] and clock.reads == 6
 
 
 # -- through the engine: sessions on the mock config ------------------------------------------
@@ -412,6 +530,92 @@ def test_a_dead_socket_ends_the_capture_with_the_error_after_what_it_received(
             assert "rx.failed" in events
 
     _run(main())
+
+
+def test_a_fatal_failure_is_the_last_word_no_stale_coalesced_summary_follows_it(
+    mock_config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failures_before_fatal = 150
+    monkeypatch.setattr(udp, "RECV_FAIL_BACKSTOP", failures_before_fatal)
+    notices: list[Notice] = []
+
+    async def main() -> None:
+        async with _ground(mock_config_path, tmp_path, notices) as ground:
+            listener = await ground.listen("fc")
+            address = listener.local_address
+            assert address is not None
+            errors = [OSError(errno.ENOMEM, "no memory")] * failures_before_fatal
+            _flaky(_source_io(ground).transport, errors)
+            _send(address, b"x")
+            with pytest.raises(IronbirdError) as info:
+                async for _rx in listener:
+                    pass
+            assert info.value.code is Code.TX_RECV
+            await listener.close()
+            ground.flush_notices()  # what shutdown does after the error is printed
+
+    _run(main())
+    recv = [n for n in notices if n.code is Code.TX_RECV]
+    # The first occurrence was shown; the fatal error (raised, not noticed) is the only thing
+    # after it, so no "(x149 in ...)" summary of the failures it ends may follow.
+    assert len(recv) == 1 and recv[0].count == 1, recv
+
+
+def test_frames_a_failed_captures_other_link_end_still_receives_are_not_counted_as_lag(
+    mock_config_path: Path, tmp_path: Path
+) -> None:
+    notices: list[Notice] = []
+
+    async def main() -> None:
+        async with _ground(mock_config_path, tmp_path, notices) as ground:
+            engine = ground._engine
+            link = ground.route("fc").link
+            capture = await engine.open_capture(
+                [(link, LinkEnd.SOURCE), (link, LinkEnd.DESTINATION)]
+            )
+            source = engine._ios[(link.name, LinkEnd.SOURCE)]
+            other = engine._ios[(link.name, LinkEnd.DESTINATION)]
+            assert isinstance(source.transport, UdpTransport)
+            assert isinstance(other.transport, UdpTransport)
+            source_address = source.transport.local_address
+            other_address = other.transport.local_address
+            assert source_address is not None and other_address is not None
+            _flaky(source.transport, [OSError(errno.EBADF, "Bad file descriptor")])
+            _send(source_address, b"x")
+            await _until(lambda: source.failure is not None)
+            assert capture._queue.closed  # one queue serves both link ends: it ended with the first
+            before = engine.last_seq
+            _send(other_address, b"y", b"z")  # the other end keeps receiving into the closed queue
+            await _until(lambda: engine.last_seq == before + 2)
+            await engine.tick()
+            ground.flush_notices()
+            assert capture.stats().not_shown == 0 and not other.lossy
+            assert all(sub.dropped == 0 for sub in other.subs)
+            await capture.close()
+
+    _run(main())
+    assert not [n for n in notices if n.code is Code.ENG_LAG], notices
+
+
+def test_frames_left_unread_at_close_are_not_a_consumer_lag_when_only_the_kernel_dropped(
+    mock_config_path: Path, tmp_path: Path
+) -> None:
+    notices: list[Notice] = []
+
+    async def main() -> None:
+        async with _ground(mock_config_path, tmp_path, notices) as ground:
+            hk = ground.codec_for("fc").encode_telemetry("MOCK_HK").data
+            listener = await ground.listen("fc")
+            address = listener.local_address
+            assert address is not None
+            _send(address, hk, hk, hk)
+            await _until(lambda: listener.capture.stats().frames == 3)
+            _source_io(ground).kernel.seen = 5  # the kernel dropped datagrams; the queue did not
+            await listener.close()
+            assert listener.capture.stats().unread == 3 and listener.capture.stats().not_shown == 0
+
+    _run(main())
+    assert not [n for n in notices if n.code is Code.ENG_LAG], notices
 
 
 def test_the_events_stream_surfaces_a_failed_link_end(
@@ -517,6 +721,31 @@ def test_frames_the_consumer_pops_free_their_bytes_for_the_next_put() -> None:
     queue.items.popleft()
     assert queue.queued_bytes == 2 * _charge(100)
     assert queue.put(_frame(100)) and queue.put(_frame(100)) and not queue.put(_frame(100))
+
+
+def test_a_put_at_the_byte_bound_releases_popped_frames_without_anyone_asking_the_size() -> None:
+    # Nothing reads ``queued_bytes`` here: the put itself must find the room the consumer freed.
+    queue = _FrameQueue(1000, 4 * _charge(100))
+    for seq in range(1, 5):
+        assert queue.put(_frame(100, seq))
+    assert not queue.put(_frame(100))
+    queue.items.popleft()
+    assert queue.put(_frame(100)), "the freed room must be found by the put that needs it"
+    assert not queue.put(_frame(100))
+    assert queue.dropped == 2
+
+
+def test_a_consumer_that_pops_never_makes_the_charge_list_outgrow_the_queue() -> None:
+    # The byte and count bounds are never reached, so only the periodic release trims the list
+    # of charges; it must stay a few dozen entries long however long the consumer keeps popping.
+    queue = _FrameQueue(1 << 30, 1 << 40)
+    longest = 0
+    for seq in range(1, 20 * _RELEASE_EVERY + 1):
+        assert queue.put(_frame(10, seq))
+        queue.items.popleft()
+        longest = max(longest, len(queue._charges))
+    assert longest <= _RELEASE_EVERY, longest
+    assert queue._bytes <= _RELEASE_EVERY * _charge(10)  # never below the truth, but not runaway
 
 
 def test_a_batch_the_consumer_holds_stays_charged_until_it_asks_for_more() -> None:

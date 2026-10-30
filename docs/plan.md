@@ -927,21 +927,51 @@ As built (where the build differs from, or settles, the text above)
   the transport's pending send error; it is now counted (`rx_errors`) and reported through the
   transport's `report` callback, coalesced per link end like any notice, with the running count in
   the text. It is permanent, and ends the transport (reader removed, nothing spins), when the errno
-  is EBADF, ENOTSOCK or EINVAL, or when `RECV_ERROR_STREAK` (100) reads in a row failed; a good
-  read resets the streak. A permanent failure calls the engine's `failed` callback, which ledgers
+  is EBADF, ENOTSOCK or EINVAL, or when reads have been failing with no good read in between for
+  `RECV_FAIL_WINDOW_S` (5 s, by the transport's monotonic clock) or for `RECV_FAIL_BACKSTOP`
+  (100000) reads, whichever comes first. The clock decides, so a burst of any number of failures
+  inside the window never ends a capture; the count is only a backstop, because a failing read
+  leaves its datagram queued and the loop retries at once (the dev host managed about 69000
+  failed reads in the 5 s with the ledger on, so there the window ends it; a host failing faster
+  than 20000 reads/s reaches the backstop first). A good
+  read ends the failing episode, and two failures a window or more apart are separate episodes
+  (nothing arrived in between to prove either way, and an error that clears itself must not
+  accumulate toward a fatal one). A permanent failure calls the engine's `failed` callback, which ledgers
   `rx.failed`, flushes the drop accounting and closes the queues of every capture fed from that
   link end with the error: each consumer reads what was received before the failure, then its
   read raises the `IB-TX-003` error, which the CLI prints and exits 1 on like any coded error. No
   separate notice is shown for a permanent failure (the raised error is the report, so the user is
-  not told twice). A capture opened on a failed link end is refused with the same error until the
+  not told twice), and the coalescer window still open for the failures that led up to it is
+  dropped (`Coalescer.discard`, reached through `Session.withdraw_notices`), so no
+  "(xN in T s)" summary of them can print after the fatal line; the count is in the fatal error
+  and every occurrence is in the ledger. A capture opened on a failed link end is refused with the same error until the
   last capture of the end closes and the transport is replaced. A closed queue is offered
   nothing, so a link end that failed does not make its siblings count lag.
+- **The closing notice** ("listening ended with N frame(s) received but not shown") is given only
+  when the consumer queue itself refused frames (`CaptureStats.not_shown`), so what is left
+  unread was behind because of lag. Frames merely in flight at SIGTERM, or lost to the kernel
+  (`IB-TX-004` says so), no longer produce an `IB-ENG-001` they do not deserve.
 - **Not done.** Reader ownership by task (2b's deferral) stays deferred: no real case appeared.
   The ledger still writes a malformed 64 KiB packet as ~190 KB of JSON (hex plus separators);
   bounding what a flood writes is the evidence sampling of 2d.
+- **Deferred (PR #6 review).**
+  - A link end whose receive failed keeps its socket open (reader removed) until every capture
+    on the end has closed, because the transport is replaced only then. A CLI run ends at once,
+    so it is harmless; the TUI and library (a long-lived session) should close the socket at the
+    failure so the port is free and no kernel buffer fills behind a dead reader. Stage 3 (TUI),
+    with the first long-lived consumer.
+  - Nested bytes in the `args` or `tamper` of a ledger record (and of any record with a
+    container-valued field) are not cut, charged or copied at creation: only top-level fields are
+    scanned. No caller nests bytes today; 2d's ledger bounds revisit this when evidence sampling
+    lands (a recursive walk would cost the hot path, so it needs a schema for which fields can
+    carry bytes).
+  - Ingest-only saturation knee: about 4% lower at 25k packets/s than on `main` (the per-frame
+    byte charge in the consumer queue), within the host's run-to-run noise; the 1.5x guard and
+    the 30000-of-30000-lines check at 10k packets/s hold. Revisit if a profile of 2d shows it.
 - **Tests.** `tests/test_bounded_memory.py`: the edge for sizes 0..65507 and the whole corpus
   (Hypothesis over sizes and caps, buffer reuse), receive errors (transient, each fatal errno,
-  streak, streak reset, through `Listener` and `EventStream`), the queue (model-based Hypothesis
+  the failing window, the count backstop, episode reset on a good read or a long gap, the fatal
+  line being the last word, through `Listener` and `EventStream`), the queue (model-based Hypothesis
   over put/pop/take, held batch, closed with error), the ledger (cut at creation, buffer
   isolation, wide and strided memoryviews, byte bounds, Hypothesis over record sizes) and the
   flood end to end with exact accounting (`sent == received + kernel_dropped`, `offered == shown +

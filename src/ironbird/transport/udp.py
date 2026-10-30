@@ -53,7 +53,14 @@ CONFIRM_WAIT_S: Final = 0.05
 BATCH: Final = 256  # datagrams read per wakeup before yielding to the loop
 SOURCE_CACHE_SIZE: Final = 64  # peers whose text form is remembered (bounded: peers are untrusted)
 MAX_DATAGRAM: Final = 65536
-RECV_ERROR_STREAK: Final = 100  # reads in a row that fail before the failure counts as permanent
+# A read error that is not one of the fatal errnos is treated as transient until reads have been
+# failing, with no good read in between, for RECV_FAIL_WINDOW_S (the clock decides, so a short
+# burst of errors never ends a capture, however many reads it takes; two failures further apart
+# than the window are separate episodes) or for RECV_FAIL_BACKSTOP reads (a failing read leaves
+# the datagram queued, so the loop retries at once; the count ends the capture long before a
+# host that fails this fast would have spun for the whole window).
+RECV_FAIL_WINDOW_S: Final = 5.0
+RECV_FAIL_BACKSTOP: Final = 100_000
 # A read failing with one of these cannot succeed later: the socket itself is gone or unusable.
 _FATAL_RECV_ERRNOS: Final = frozenset({errno.EBADF, errno.ENOTSOCK, errno.EINVAL})
 _DISCARD_BYTES: Final = 1  # a read of the send socket keeps nothing, so it needs no room
@@ -136,6 +143,7 @@ class UdpTransport:
         report: Callable[[IronbirdError], None] | None = None,
         failed: FailureHandler | None = None,
         max_packet_bytes: int = DEFAULT_MAX_PACKET_BYTES,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         assert local is not None or remote is not None, "need a local or remote endpoint"
         assert remote is None or reply_to is None, "connected sockets cannot also reply_to"
@@ -146,6 +154,7 @@ class UdpTransport:
         self._report = report
         self._failed = failed
         self._cap = max_packet_bytes
+        self._clock = clock
         self._receiver: Receiver | None = None
         self._rx: socket.socket | None = None
         self._tx: socket.socket | None = None
@@ -162,7 +171,9 @@ class UdpTransport:
         self._rx_total = 0  # datagrams read from the socket
         self._rx_bytes = 0  # bytes on the wire, including what was cut
         self._rx_errors = 0
-        self._rx_error_streak = 0
+        self._rx_error_streak = 0  # reads that failed since the last good one
+        self._rx_failing_since: float | None = None  # clock reading of the first of them
+        self._rx_last_failure: float | None = None  # ... and of the latest
         self._rx_dead = False  # a read failed for good; nothing more is delivered
         self._rx_seen = 0  # ``_rx_total`` at the previous :meth:`kernel_scan_due`
         self._tx_total = 0
@@ -302,7 +313,7 @@ class UdpTransport:
             except OSError as exc:
                 self._receive_failed(exc)
                 return
-            self._rx_error_streak = 0
+            self._rx_failing_since = None  # a good read ends the failing episode
             stamp = time.time_ns()
             self._rx_total += 1
             self._rx_bytes += size
@@ -322,15 +333,27 @@ class UdpTransport:
         """A read of the receive socket failed (anything but "nothing to read" or a signal).
 
         Counted and reported as ``IB-TX-003`` (the report is coalesced downstream). One that
-        cannot clear, because the socket itself is unusable or ``RECV_ERROR_STREAK`` reads in a
-        row failed, stops the transport receiving and tells the engine, which ends the captures
-        fed from it with that error.
+        cannot clear, because the socket itself is unusable or reads have been failing, with no
+        good one between, for ``RECV_FAIL_WINDOW_S`` (or ``RECV_FAIL_BACKSTOP`` reads), stops the
+        transport receiving and tells the engine, which ends the captures fed from it with that
+        error.
         """
+        now = self._clock()
         self._rx_errors += 1
+        last = self._rx_last_failure
+        quiet_s = 0.0 if last is None else now - last
+        if self._rx_failing_since is None or quiet_s >= RECV_FAIL_WINDOW_S:
+            self._rx_failing_since, self._rx_error_streak = now, 0  # a new episode
         self._rx_error_streak += 1
+        self._rx_last_failure = now
+        failing_s = now - self._rx_failing_since
         name = errno.errorcode.get(exc.errno or 0, "unknown errno")
         reason = f"{exc.strerror or exc} ({name})"
-        fatal = exc.errno in _FATAL_RECV_ERRNOS or self._rx_error_streak >= RECV_ERROR_STREAK
+        fatal = (
+            exc.errno in _FATAL_RECV_ERRNOS
+            or failing_s >= RECV_FAIL_WINDOW_S
+            or self._rx_error_streak >= RECV_FAIL_BACKSTOP
+        )
         if not fatal:
             if self._report is not None:
                 self._report(

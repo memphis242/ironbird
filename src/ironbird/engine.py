@@ -390,12 +390,6 @@ class Capture:
         await self._queue.wait()
         return self._queue.take(READ_BATCH_FRAMES)
 
-    @property
-    def overloaded(self) -> bool:
-        """Whether this capture has lost frames: its queue refused some, or the kernel dropped
-        datagrams of a link end it receives from."""
-        return self._queue.dropped > 0 or any(sub.io.kernel.seen for sub in self._subs)
-
     def stats(self) -> CaptureStats:
         queue = self._queue
         return CaptureStats(
@@ -469,8 +463,11 @@ class Engine:
         ledger: Ledger,
         report: Reporter,
         codec_for: Callable[[str], Codec],
+        *,
+        withdraw: Callable[[Code, str], None] | None = None,
     ) -> None:
         self._config = config
+        self._withdraw = withdraw
         self._max_packet_bytes = config.max_packet_bytes
         self._ledger = ledger
         self._report = report
@@ -630,6 +627,8 @@ class Engine:
         if io.failure is not None:
             return
         io.failure = error
+        if self._withdraw is not None:  # the raised error is the last word on this failure
+            self._withdraw(error.code, io.label)
         self._ledger.record(
             "state",
             "rx.failed",
