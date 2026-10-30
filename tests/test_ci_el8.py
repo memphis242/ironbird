@@ -71,6 +71,32 @@ def test_el8_setup_installs_distro_python_311_and_pip() -> None:
     assert {"python3.11", "python3.11-pip"} <= packages
 
 
+def test_el8_setup_installs_libatomic_for_the_pyright_node() -> None:
+    """pyright runs on the Node.js that nodeenv downloads; the official Node binaries link
+    libatomic.so.1, which EL8 base images lack (the loader exits 127 before pyright starts)."""
+    assert "libatomic" in _setup_packages()
+
+
+# A pipeline stage that stops reading early (head, grep -q/-m, sed q) closes the pipe while the
+# writer may still be writing; the writer dies of SIGPIPE and, under pipefail, the pipeline (and
+# the `set -e` script) exits 141. Whether it happens depends on scheduling, so it is a flaky
+# failure: `ldd --version | head -n 1` failed the EL8 setup step this way.
+_EARLY_EXIT_READER = re.compile(r"\|\s*(head\b|grep\s+-\w*[qm]|sed\s+(-n\s+)?['\"]?\d+q)")
+
+
+@pytest.mark.parametrize("script", [SETUP, *CFS_SCRIPTS], ids=lambda p: p.name)
+def test_pipefail_scripts_do_not_pipe_into_early_exit_readers(script: Path) -> None:
+    text = script.read_text()
+    if "pipefail" not in text:
+        pytest.skip("script does not set pipefail")
+    offending = [
+        f"{number}: {line.strip()}"
+        for number, line in enumerate(text.splitlines(), start=1)
+        if not line.lstrip().startswith("#") and _EARLY_EXIT_READER.search(line)
+    ]
+    assert not offending, f"{script.name}: SIGPIPE-prone pipelines under pipefail: {offending}"
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
 @pytest.mark.parametrize("script", [SETUP, *CFS_SCRIPTS], ids=lambda p: p.name)
 def test_shell_scripts_parse(script: Path) -> None:

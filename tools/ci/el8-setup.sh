@@ -37,9 +37,19 @@ readonly PACKAGES=(
     which             # which
     ca-certificates   # TLS for git clone and pip
     glibc-langpack-en # en_US.UTF-8, the locale users normally have
+    libatomic         # libatomic.so.1 for the official Node.js binary pyright runs on
 )
 
 die() { echo "el8-setup.sh: error: $*" >&2; exit 1; }
+
+# First line of a command's output, read in full by the command substitution. Piping into
+# `head -n 1` instead lets head exit while the command is still writing (ldd --version writes
+# line by line): the command dies of SIGPIPE and, under pipefail, the script exits 141.
+first_line() {
+    local output
+    output="$("$@")" || die "'$*' failed (exit $?)"
+    printf '%s\n' "${output%%$'\n'*}"
+}
 
 [[ "$(id -u)" -eq 0 ]] || die "must run as root (it installs packages and creates the CI user)"
 [[ "$CI_UID" =~ ^[1-9][0-9]*$ ]] || die "CI_UID must be a positive number, got '$CI_UID'"
@@ -50,7 +60,25 @@ source /etc/os-release
 [[ "${VERSION_ID%%.*}" == "8" ]] || die "expected Enterprise Linux 8, found $PRETTY_NAME"
 echo "el8-setup.sh: $PRETTY_NAME"
 
-dnf -y --setopt=install_weak_deps=False --nodocs install "${PACKAGES[@]}"
+# Name every package the enabled repositories cannot supply, rather than leaving it to dnf's
+# transaction error. An installed package counts as present: base images carry packages their
+# repositories may not.
+not_installed=()
+for package in "${PACKAGES[@]}"; do
+    rpm -q --quiet "$package" || not_installed+=("$package")
+done
+if (( ${#not_installed[@]} > 0 )); then
+    available="$(dnf -q repoquery --qf '%{name}' "${not_installed[@]}")" \
+        || die "cannot query the dnf repositories (network, proxy or repository configuration?)"
+    missing=()
+    for package in "${not_installed[@]}"; do
+        grep -qxF -- "$package" <<<"$available" || missing+=("$package")
+    done
+    (( ${#missing[@]} == 0 )) \
+        || die "not available from the enabled dnf repositories: ${missing[*]} (see 'dnf repolist')"
+    dnf -y --setopt=install_weak_deps=False --nodocs install "${not_installed[@]}" \
+        || die "dnf install failed for: ${not_installed[*]} (see the dnf output above)"
+fi
 dnf clean all
 
 if ! id "$CI_USER" >/dev/null 2>&1; then
@@ -60,13 +88,13 @@ fi
 
 # What the build actually runs on, recorded in the job log.
 python3.11 --version
-gcc --version | head -n 1
-cmake --version | head -n 1
+first_line gcc --version
+first_line cmake --version
 git --version
-ldd --version | head -n 1
+first_line ldd --version
 flock --version
 setpriv --version
-bash --version | head -n 1
+first_line bash --version
 [[ "$(python3.11 -c 'import sys; print(sys.version_info[:2] == (3, 11))')" == "True" ]] \
     || die "python3.11 is not Python 3.11"
 echo "el8-setup.sh: OK - CI user '$CI_USER' (uid $(id -u "$CI_USER"))"

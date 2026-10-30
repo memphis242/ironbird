@@ -120,6 +120,9 @@ ruff check . && ruff format --check .
 pyright
 ```
 
+With no `node` on PATH, pyright downloads the official Node.js build, which needs
+`libatomic.so.1`: on RHEL 8 / Oracle Linux 8 run `dnf install libatomic` first.
+
 Real-cFS acceptance tests (opt-in, serial, need `tools/cfs/build.sh` first):
 
 ```bash
