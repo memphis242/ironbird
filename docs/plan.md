@@ -760,6 +760,43 @@ Verification: Stage 1 suite unchanged in behaviour; new unit tests of ingest ord
 links, malformed frames yielded with flags; ingest benchmark (frames/s on loopback) as a
 baseline for the 10k gate; cFS acceptance unchanged.
 
+As built (where the build differs from, or settles, the text above)
+- `engine.py` holds `Engine` (ingest, sinks, per-link-end transports), `Capture`, `FrameDecoder`;
+  `Session` wraps it (`capture()`, `decoder()`, `add_sink()`) and keeps `listen()`, `events()`,
+  `respond()`, whose `Listener`, `EventStream` and `Responder` are capture consumers. `Received`
+  is replaced by `frame.Decoded(frame, packet)`.
+- A transport is one *link end* (`LinkEnd.SOURCE` receives telemetry and sends commands,
+  `DESTINATION` the reverse), shared by that end's sends and receives; `open_transport(link,
+  end, report)` builds it unopened (no `framing` argument until 2k). The UDP transport owns up to
+  two sockets (a bound receive socket, a connected send socket opened by the first send so a
+  listener does not need the command host to resolve). Beyond S2, the protocol has
+  `local_address`, `facts()` (ledgered once after open, e.g. the receive buffer granted),
+  `poll()` (1 Hz, off-loop counter refresh) and `send(..., handed_off=)`: the callback runs the
+  moment the bytes leave the process, which `ib send` needs to tell "sent" from "not sent" while
+  `confirm` still waits for an ICMP refusal. `Receiver` is a plain `Callable` alias.
+- Sinks are session-wide: they see every frame the session ingests or sends from the capture's
+  open to its close. Consumers receive RX frames only; TX frames (`send_command`, responder
+  replies) reach sinks, so a recorder sees both directions.
+- `Frame` cannot know `max_packet_bytes`, so it asserts the global 65535 cap; ingest enforces the
+  configured cap by cutting longer data and setting TRUNCATED (the copy of the whole datagram
+  before the cut is what 2c removes). A truncated frame is reported as `IB-DEC-002` at ingest.
+- Consumer queues are bounded by frame count in 2b (`queue_frames`, default 16384, newest
+  dropped); 2c adds the byte bound and `IB-ENG-001`. Until then an overflow keeps Stage 1's code
+  `IB-TX-004`, worded as frames "not shown" (they are still captured).
+- `Codec.classify`/`DatagramClass` are gone: `Codec.check` does their job and the rest of the
+  boundary. Errors come in a fixed order: over the cap, shorter than the header, MID not in the
+  CCDD, length field, fixed fields (`HeaderProfile.fixed_mask`/`fixed_value`, one compare),
+  checksum, function code, payload size. `decode` accepts exactly what `check` accepts and
+  returns the same error otherwise. `FrameDecoder(report_checked=False)` never re-reports a
+  failure `check` already reported at ingest; 2j must report the errors only its decode can
+  produce (variable-length counts) in both modes.
+- The profile-load check that MIDs fit 32 bits is in `Codec` (`IB-HDR-002`, corpus
+  `codec-hdr-mid-wider-than-32.toml`). `SerialLinkSpec` exists as a placeholder dataclass; the
+  config still refuses `transport = "serial"` until 2k parses it.
+- Ingest benchmark (`tests/test_benchmarks.py`, 200-byte valid telemetry from a separate sender
+  process into a capture with a draining consumer, 4-core dev host): one frame through ingest
+  about 10 us; 41-53k packets/s saturated; 10k packets/s paced with zero loss.
+
 ### 2c - Byte-bounded memory and receive-side errors
 
 Deliverables

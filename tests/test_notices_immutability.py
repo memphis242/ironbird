@@ -170,9 +170,9 @@ def test_session_state_is_read_only_and_stats_are_snapshots(
                 with pytest.raises(AttributeError):
                     setattr(ground, name, None)
             assert not hasattr(ground, "coalescer") and not hasattr(ground, "stats")
-            ground._count(0x0881, 5)
+            ground._engine._count(0x0881, 5)
             before = ground.stats_snapshot()
-            ground._count(0x0881, 9)
+            ground._engine._count(0x0881, 9)
             assert before[0x0881] == MidStatSnapshot(1, 5)  # a snapshot does not follow
             assert ground.stats_snapshot()[0x0881] == MidStatSnapshot(2, 9)
             with pytest.raises(TypeError):

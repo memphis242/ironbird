@@ -1,0 +1,13 @@
+# Loads as a profile, but a frame carries the MID as a u32: the codec refuses a 40-bit one.
+name = "p"
+kind = "telemetry"
+mid_fields = ["id"]
+[[fields]]
+name = "id"
+bits = 40
+computed = "from_mid"
+[[fields]]
+name = "length"
+bits = 16
+computed = "length"
+bias = 0

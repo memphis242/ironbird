@@ -17,8 +17,9 @@ from typer.testing import CliRunner
 from ironbird.cli.main import app
 from ironbird.config import SystemConfig, load_config
 from ironbird.errors import Code, IronbirdError
+from ironbird.frame import Decoded
 from ironbird.ledger import Ledger
-from ironbird.session import Handled, Received, Session
+from ironbird.session import Handled, Session
 
 
 def _ledger(tmp_path: Path, name: str) -> Ledger:
@@ -74,7 +75,7 @@ def test_command_telemetry_loop_with_decoded_fields(mock_config_path: Path, tmp_
             await ground.send_command("fc", "MOCK_NOOP")
             event: Handled = await _next(handled)
             assert event.command is not None and event.command.message.name == "MOCK_NOOP"
-            hk: Received = await _next(received)
+            hk: Decoded = await _next(received)
             assert hk.packet.message.name == "MOCK_HK"
             assert hk.packet.as_dict()["cmd_counter"] == 1
 
@@ -171,7 +172,7 @@ def test_responder_survives_a_flood_of_malformed_commands_and_coalesces(
             await ground.send_command("fc", "MOCK_NOOP")  # still alive and capturing
             event = await _next(handled)
             assert event.command is not None
-            hk: Received = await _next(received)
+            hk: Decoded = await _next(received)
             assert hk.packet.as_dict()["err_counter"] == flood % 256
             assert responder.rejected == flood and responder.accepted == 1
         finally:
@@ -217,7 +218,7 @@ def test_ground_survives_malformed_telemetry_and_reports_unknown_mid_once(
                 if i % 10 == 9:
                     await asyncio.sleep(0.002)
             raw.sendto(good_tlm, addr)
-            rx: Received = await _next(received)
+            rx: Decoded = await _next(received)
             assert rx.packet.message.name == "MOCK_HK"
         finally:
             raw.close()

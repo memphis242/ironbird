@@ -144,7 +144,7 @@ def test_open_error_is_the_bind_failure_not_a_later_socket_failure(
     monkeypatch.setattr(udp, "socket", fake)
     try:
         with pytest.raises(IronbirdError) as info:
-            asyncio.run(UdpTransport(local=Endpoint("dual.test", port)).open())
+            asyncio.run(UdpTransport(local=Endpoint("dual.test", port)).open(lambda *_: None))
     finally:
         hog.close()
     assert info.value.code is Code.TX_OPEN
