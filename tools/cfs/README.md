@@ -25,6 +25,10 @@ belong to the invoking user, derive from the run directory's key files, and have
 | `CFS_APPS` | `sch_lab ci_lab to_lab sample_app` (`ALL` = stock startup script) | run |
 | `CFS_RUN_UID` | `65534` (only used when started as root) | run |
 
+EL8: CI also builds and runs this on `oraclelinux:8` (gcc 8.5, cmake and git from the EL8
+AppStream, bash 4.4, util-linux 2.32) as a non-root user; `tools/ci/el8-setup.sh` is the package
+list those hosts need (`flock`, `setpriv` and `ipcrm` come from util-linux).
+
 Behind the agent proxy a failed clone is a proxy problem, see `/root/.ccr/README.md`.
 
 `run.sh` copies `build-native_std/exe/cpu1` to `$CFS_BUILD_DIR/run/cpu1` on every start

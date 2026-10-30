@@ -11,6 +11,27 @@ pyenv activate ironbird
 pip install -e '.[dev]'
 ```
 
+## Supported platforms
+
+Target servers run RHEL 8 / Oracle Linux 8 (x86-64), as an ordinary unprivileged user.
+ironbird needs the EL8 AppStream `python3.11` (`dnf install python3.11 python3.11-pip`, then
+`python3.11 -m venv`); building the real-cFS target also needs `gcc make cmake git` and the
+util-linux tools (`flock`, `setpriv`, `ipcrm`). No root, RT priorities or sysctl changes.
+
+CI (`.github/workflows/ci.yml`) runs the lint, type check, tests and the real-cFS acceptance
+tests twice: on Ubuntu (fast feedback, newest toolchain) and inside `oraclelinux:8`
+containers (`redhat/ubi8` best effort) as a non-root user, using `tools/ci/el8-setup.sh`
+to install the toolchain. What the EL8 containers match: glibc 2.28 (manylinux wheel
+compatibility), gcc 8 under cFS's `-Werror`, the EL8 cmake and bash 4.4, the distro Python 3.11
+and its pip/venv packaging, util-linux and coreutils versions, no SELinux enforcement in the
+container, and running without privileges.
+
+What they do not match: containers share the runner's Ubuntu kernel, so kernel-level behaviour
+is not EL8's. That covers `net.core.rmem_max` and the UDP receive buffer the kernel grants,
+`/proc/net/udp` columns, `SO_RXQ_OVFL` drop counts, `flock` and SysV IPC/mqueue limits, and
+serial hardware. SELinux policy, `firewalld`, systemd and site-specific sysctls are absent. Run
+the opt-in acceptance tests on a real EL8 host before relying on kernel-dependent behaviour.
+
 ## Try it without hardware (ironbird as both ends)
 
 ```bash

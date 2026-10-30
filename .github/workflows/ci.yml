@@ -1,5 +1,18 @@
 name: ci
 
+# Two families of jobs, on purpose:
+#   checks / cfs          Ubuntu runner, setup-python: fast feedback (cached, ~minutes) on the
+#                         newest toolchain, and the home of the coverage that needs a real VM.
+#   el8-checks / el8-cfs  the same lint/types/tests and real-cFS acceptance inside Oracle Linux 8
+#                         (and, best effort, UBI 8) containers, as an unprivileged user: the
+#                         user's target servers are RHEL 8 / Oracle Linux 8 (glibc 2.28, gcc 8,
+#                         EL8 AppStream python3.11 and cmake). They catch what Ubuntu hides:
+#                         old-toolchain warnings under cFS -Werror, missing util-linux tools,
+#                         wheel/glibc compatibility, pip/venv packaging of the distro Python.
+# Containers share the runner's Ubuntu kernel, so kernel-level behaviour (net.core.rmem_max,
+# /proc/net/udp, SO_RXQ_OVFL, flock, SysV IPC limits) is NOT EL8's; see README "Supported
+# platforms".
+
 on:
   push:
   pull_request:
@@ -87,6 +100,143 @@ jobs:
           name: cfs-logs
           path: ${{ runner.temp }}/pytest
           if-no-files-found: ignore
+
+  # EL8 jobs. Steps run as the unprivileged user `ci` (the default shell below drops privileges
+  # with setpriv); only the bootstrap, package-install, ownership and cache steps run as root,
+  # and say so with `shell: bash`. The Python venv lives in the user's home, outside the
+  # workspace, and is first on PATH for every unprivileged step.
+  el8-checks:
+    name: EL8 ${{ matrix.name }} - lint, types, tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # UBI 8 is best effort: its repositories carry a subset of the packages, and a gap there
+    # is not an ironbird regression. Oracle Linux 8 is the gate.
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: oraclelinux8, image: "oraclelinux:8", experimental: false }
+          - { name: ubi8, image: "redhat/ubi8", experimental: true }
+    container:
+      image: ${{ matrix.image }}
+    env:
+      LANG: en_US.UTF-8
+    defaults:
+      run:
+        shell: >-
+          setpriv --reuid=ci --regid=ci --init-groups
+          env HOME=/home/ci USER=ci LOGNAME=ci
+          PATH=/home/ci/venv/bin:/usr/local/bin:/usr/bin:/bin
+          bash --noprofile --norc -eo pipefail {0}
+    steps:
+      - name: Bootstrap for checkout (root)
+        shell: bash
+        run: dnf -y --setopt=install_weak_deps=False --nodocs install git tar gzip
+      - uses: actions/checkout@v4
+      - name: Install EL8 toolchain and create the CI user (root)
+        shell: bash
+        run: |
+          tools/ci/el8-setup.sh
+          chown -R ci:ci "$GITHUB_WORKSPACE"
+      - name: Create venv (EL8 python3.11)
+        run: python3.11 -m venv "$HOME/venv"
+      - name: Install
+        run: python -m pip install -c constraints-dev.txt -e '.[dev]'
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Type check
+        run: pyright
+      - name: Tests as a non-root user (real-cFS tests are opt-in and skipped here)
+        run: |
+          test "$(id -u)" -ne 0
+          pytest -n auto
+      - name: Benchmarks (serial, so the performance ceilings are enforced)
+        run: pytest tests/test_benchmarks.py -n0
+      - name: Hand the workspace back to root (root)
+        if: always()
+        shell: bash
+        run: chown -R root:root "$GITHUB_WORKSPACE"
+
+  el8-cfs:
+    name: EL8 ${{ matrix.name }} - real cFS acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: oraclelinux8, image: "oraclelinux:8", experimental: false }
+          - { name: ubi8, image: "redhat/ubi8", experimental: true }
+    container:
+      image: ${{ matrix.image }}
+    env:
+      LANG: en_US.UTF-8
+      # Inside the user's home so the cached tree has one stable absolute path.
+      CFS_BUILD_DIR: /home/ci/cfs-build
+      IRONBIRD_CFS: "1"
+    defaults:
+      run:
+        shell: >-
+          setpriv --reuid=ci --regid=ci --init-groups
+          env HOME=/home/ci USER=ci LOGNAME=ci
+          PATH=/home/ci/venv/bin:/usr/local/bin:/usr/bin:/bin
+          bash --noprofile --norc -eo pipefail {0}
+    steps:
+      - name: Bootstrap for checkout (root)
+        shell: bash
+        run: dnf -y --setopt=install_weak_deps=False --nodocs install git tar gzip
+      - uses: actions/checkout@v4
+      - name: Install EL8 toolchain and create the CI user (root)
+        shell: bash
+        run: |
+          tools/ci/el8-setup.sh
+          chown -R ci:ci "$GITHUB_WORKSPACE"
+      - name: Read pinned cFS commit (root)
+        id: pin
+        shell: bash
+        run: |
+          commit="$(sed -n 's/^readonly DEFAULT_COMMIT="\(.*\)"$/\1/p' tools/cfs/build.sh)"
+          test -n "$commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Cache cFS checkout and build
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: /home/ci/cfs-build
+          key: cfs-el8-${{ matrix.name }}-${{ steps.pin.outputs.commit }}-${{ hashFiles('tools/cfs/build.sh', 'tools/ci/el8-setup.sh') }}
+      - name: Hand the restored cache to the CI user (root)
+        shell: bash
+        run: |
+          mkdir -p /home/ci/cfs-build
+          chown -R ci:ci /home/ci/cfs-build
+      - name: Build cFS (gcc 8, as the CI user)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: tools/cfs/build.sh
+      - name: Create venv (EL8 python3.11)
+        run: python3.11 -m venv "$HOME/venv"
+      - name: Install ironbird
+        run: python -m pip install -c constraints-dev.txt -e '.[dev]'
+      - name: Real-cFS acceptance tests as a non-root user
+        # One cFS instance owns fixed UDP ports and /dev/shm/osal:RAM (the container's own
+        # network and shm namespaces): run serially.
+        run: |
+          test "$(id -u)" -ne 0
+          pytest tests/cfs -m cfs -n0 -v --basetemp="$HOME/pytest-cfs"
+      - name: Keep cFS console logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfs-logs-el8-${{ matrix.name }}
+          path: /home/ci/pytest-cfs
+          if-no-files-found: ignore
+      - name: Hand the workspace back to root (root)
+        if: always()
+        shell: bash
+        run: chown -R root:root "$GITHUB_WORKSPACE"
 
   fuzz:
     name: fuzz decode boundary
