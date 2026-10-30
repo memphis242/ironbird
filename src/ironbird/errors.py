@@ -45,8 +45,8 @@ class Code(StrEnum):
     # Transport
     TX_OPEN = "IB-TX-001"  # cannot open / bind
     TX_SEND = "IB-TX-002"  # send failed or refused
-    TX_RECV = "IB-TX-003"  # receive failed
-    TX_OVERRUN = "IB-TX-004"  # datagrams dropped: receive queue overflow or kernel socket buffer
+    TX_RECV = "IB-TX-003"  # receive failed: a socket read errored (may end the capture)
+    TX_OVERRUN = "IB-TX-004"  # datagrams dropped by the kernel socket buffer (or left unread)
     TX_RCVBUF = "IB-TX-005"  # kernel granted a smaller receive buffer than requested
     # Events
     EVT_NONE = "IB-EVT-001"  # no event telemetry is defined for the selected node(s)
@@ -59,6 +59,8 @@ class Code(StrEnum):
     OUT_DROPPED = "IB-OUT-001"  # output lines dropped because stdout/stderr is not draining
     OUT_LOST = "IB-OUT-002"  # final tally: output lines dropped, abandoned or never deliverable
     OUT_WAITING = "IB-OUT-003"  # ending, but still waiting for the reader of stdout to take lines
+    # Engine
+    ENG_LAG = "IB-ENG-001"  # a consumer fell behind: frames not shown to it (sinks still saw them)
     # System resources
     SYS_RESOURCE = "IB-SYS-001"  # the OS refused a resource needed to start (file descriptors)
     # CLI / internal

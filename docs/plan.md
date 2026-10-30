@@ -875,6 +875,115 @@ memory bounded. Verification: E2E flood test with a paused stdout asserting a bo
 shown + not_shown`); unit test of the `MSG_TRUNC` path on loopback; corpus entry for an
 oversize datagram.
 
+As built (where the build differs from, or settles, the text above)
+- **Edge cap.** `UdpTransport` reads into a `bytearray(max_packet_bytes)` with
+  `recvmsg_into(..., MSG_TRUNC)`; on Linux the returned size is the datagram's true length even
+  when it is longer than the buffer, so the kernel copies at most `max_packet_bytes` and a longer
+  datagram becomes one `TRUNCATED` frame with `orig_len` = the wire size (`IB-DEC-002`). The
+  receiver is called with data already cut. The cut in `Engine._ingest` stays as a backstop for a
+  transport that does not cut (the serial transport of 2k will cut at its own framer); the
+  `MSG_TRUNC` size semantics are Linux's, the only supported platform. The connected send socket's
+  drain (`_on_tx_readable`) reads into a 1-byte buffer, so a peer that sends to the ephemeral port
+  of our send socket costs no copy. `open_transport(link, end, report, *, failed=None,
+  max_packet_bytes=DEFAULT_MAX_PACKET_BYTES)` and `TransportFactory` carry the cap and the failure
+  callback; `TransportStats.rx_errors` counts failed reads; `facts()` ledgers `max_packet_bytes`.
+- **Consumer queue.** Bounded by frames (`queue_frames`, default 16384) and bytes (`queue_bytes`,
+  `CONSUMER_QUEUE_BYTES` = 32 MiB, on `Engine.open_capture` and `Session.capture`). A frame is
+  charged `len(data) + FRAME_OVERHEAD_BYTES` (320: the `Frame` tuple, the bytes header, the check
+  token), so tiny frames cannot dodge the bound through overhead; `queue_bytes` must admit one
+  largest frame (`max_packet_bytes + 320`, asserted). A frame the consumer pops off the live deque
+  (`wait_frames`, iteration) stops counting when the queue next reconciles its charge list with
+  `items`: when the bound would be passed and every 64 offers, so the figure is never below the
+  truth and the hot path pays no per-pop work. `next_batch` charges its batch until the consumer
+  asks again (`wait`), so a consumer sitting on batches cannot exceed the bound. `CaptureStats`
+  gains `queued_bytes`, `peak_bytes` (an upper bound on what the queue ever held) and
+  `not_shown_bytes`. The queue is closed with an optional error: once drained, every read raises it.
+- **Worst-case memory per hop** (default `max_packet_bytes` 2048; at the 65535 maximum only the
+  per-frame figures change): UDP read buffer 1 x `max_packet_bytes`; one consumer queue
+  `queue_bytes` (32 MiB) plus one frame being handled; the ledger queue 64 MiB estimated
+  (48 MiB of it evidence), each record at most `max_raw_bytes` of raw bytes. A flood of 64 KiB
+  datagrams therefore costs at most 32 MiB x captures + 64 MiB + buffers, whatever the rate and
+  however stalled the consumer or the disk. Measured (flood test, `max_packet_bytes` 65535, 4000 x
+  60000 B, queue_bytes 4 MiB, consumer never reading): RSS grew 4.2 MiB; the same flood on `main`
+  grew it 235 MiB with every frame unread.
+- **IB-ENG-001 replaces IB-TX-004 for consumer lag**: the consumer-queue overflow notice and the
+  "listening ended with N frame(s) received but not shown" notice are now `IB-ENG-001`
+  ("consumer fell behind, N frame(s) not shown so far; K of them still reached a sink"; no
+  recorder exists before 2e, so the notice does not say "recorded"). `IB-TX-004` is left for the
+  kernel's drops and for datagrams unread in the socket at close. The ledger's `rx.queue_drops`
+  record gains `queue_dropped_bytes` and `queue_peak_bytes`.
+- **Ledger.** `Ledger.record` cuts every top-level bytes-like field to `max_raw_bytes` and turns
+  `bytearray`/`memoryview` into `bytes` when the record is created (a reused buffer cannot change
+  a queued record), adding `<field>_len` (`raw_len`) with the full length. The written text is
+  unchanged (`hex ...(+NB)`); `_Cut` carries the head and the omitted count so it survives to the
+  formatter. Each record is charged `ENTRY_OVERHEAD_BYTES` (512) plus its str and bytes-like field
+  sizes against `max_queue_bytes` (64 MiB) and, for evidence, `max_evidence_queue_bytes` (48 MiB);
+  a record over either bound is refused and counted like one over the count bounds (the count
+  bounds stay). `Ledger.pending_bytes` exposes the figure. Only top-level fields are scanned
+  (nested containers are not; no caller nests bytes), and strings are charged, not cut. The
+  `rx.malformed` record gains `wire_len` (the size on the wire, which differs from `raw_len` only
+  past the cap).
+- **IB-TX-003.** A failed `recvmsg` on the receive socket (anything but EAGAIN/EINTR) was held in
+  the transport's pending send error; it is now counted (`rx_errors`) and reported through the
+  transport's `report` callback, coalesced per link end like any notice, with the running count in
+  the text. It is permanent, and ends the transport (reader removed, nothing spins), when the errno
+  is EBADF, ENOTSOCK or EINVAL, or when reads have been failing with no good read in between for
+  `RECV_FAIL_WINDOW_S` (5 s, by the transport's monotonic clock) or for `RECV_FAIL_BACKSTOP`
+  (100000) reads, whichever comes first. The clock decides, so a burst of any number of failures
+  inside the window never ends a capture; the count is only a backstop, because a failing read
+  leaves its datagram queued and the loop retries at once (the dev host managed about 69000
+  failed reads in the 5 s with the ledger on, so there the window ends it; a host failing faster
+  than 20000 reads/s reaches the backstop first). A good
+  read ends the failing episode, and two failures a window or more apart are separate episodes
+  (nothing arrived in between to prove either way, and an error that clears itself must not
+  accumulate toward a fatal one). A permanent failure calls the engine's `failed` callback, which ledgers
+  `rx.failed`, flushes the drop accounting and closes the queues of every capture fed from that
+  link end with the error: each consumer reads what was received before the failure, then its
+  read raises the `IB-TX-003` error, which the CLI prints and exits 1 on like any coded error. No
+  separate notice is shown for a permanent failure (the raised error is the report, so the user is
+  not told twice), and the coalescer window still open for the failures that led up to it is
+  dropped (`Coalescer.discard`, reached through `Session.withdraw_notices`), so no
+  "(xN in T s)" summary of them can print after the fatal line; the count is in the fatal error
+  and every occurrence is in the ledger. A capture opened on a failed link end is refused with the same error until the
+  last capture of the end closes and the transport is replaced. A closed queue is offered
+  nothing, so a link end that failed does not make its siblings count lag.
+- **The closing notice** ("listening ended with N frame(s) received but not shown") is given only
+  when the consumer queue itself refused frames (`CaptureStats.not_shown`), so what is left
+  unread was behind because of lag. Frames merely in flight at SIGTERM, or lost to the kernel
+  (`IB-TX-004` says so), no longer produce an `IB-ENG-001` they do not deserve.
+- **Not done.** Reader ownership by task (2b's deferral) stays deferred: no real case appeared.
+  The ledger still writes a malformed 64 KiB packet as ~190 KB of JSON (hex plus separators);
+  bounding what a flood writes is the evidence sampling of 2d.
+- **Deferred (PR #6 review).**
+  - A link end whose receive failed keeps its socket open (reader removed) until every capture
+    on the end has closed, because the transport is replaced only then. A CLI run ends at once,
+    so it is harmless; the TUI and library (a long-lived session) should close the socket at the
+    failure so the port is free and no kernel buffer fills behind a dead reader. Stage 3 (TUI),
+    with the first long-lived consumer.
+  - Nested bytes in the `args` or `tamper` of a ledger record (and of any record with a
+    container-valued field) are not cut, charged or copied at creation: only top-level fields are
+    scanned. No caller nests bytes today; 2d's ledger bounds revisit this when evidence sampling
+    lands (a recursive walk would cost the hot path, so it needs a schema for which fields can
+    carry bytes).
+  - Ingest-only saturation knee: about 4% lower at 25k packets/s than on `main` (the per-frame
+    byte charge in the consumer queue), within the host's run-to-run noise; the 1.5x guard and
+    the 30000-of-30000-lines check at 10k packets/s hold. Revisit if a profile of 2d shows it.
+- **Tests.** `tests/test_bounded_memory.py`: the edge for sizes 0..65507 and the whole corpus
+  (Hypothesis over sizes and caps, buffer reuse), receive errors (transient, each fatal errno,
+  the failing window, the count backstop, episode reset on a good read or a long gap, the fatal
+  line being the last word, through `Listener` and `EventStream`), the queue (model-based Hypothesis
+  over put/pop/take, held batch, closed with error), the ledger (cut at creation, buffer
+  isolation, wide and strided memoryviews, byte bounds, Hypothesis over record sizes) and the
+  flood end to end with exact accounting (`sent == received + kernel_dropped`, `offered == shown +
+  not_shown`). Corpus: `packet-tlm-oversize-by-one.bin` (cap + 1 bytes, replayed through the UDP
+  edge and the decoder).
+- **Cost** (4-core dev host, best of several runs). `_FrameQueue.put` 160 -> 380 ns per frame;
+  `Ledger.record` of a 200-byte raw packet record 0.95 -> 1.65 us, of a one-field state record
+  0.83 -> 1.05 us. The ingest-only, `listen` path and end-to-end guards are unchanged within the
+  host's run-to-run noise (the ingest-only saturation rate is about 70k packets/s, the listen
+  path about 1.1-1.3x the bare decode and render against a 1.5x guard, 30000 of 30000 lines at
+  10k packets/s).
+
 ### 2d - Ledger under floods, disk full, retention
 
 Deliverables

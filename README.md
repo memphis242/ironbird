@@ -61,8 +61,10 @@ ib -c examples/mock.toml send fc MOCK_RAISE_EVENT app=DEMO event_id=7 event_type
 to every notice that has a ledger record, `N` being the record number (field `n`) in that file
 holding the full detail. Every action and error is recorded as JSON Lines in
 `$XDG_STATE_HOME/ironbird/` (override with `IRONBIRD_STATE_DIR`). When the ledger queue is full
-(a flood faster than the disk) a new record is refused and counted, and queued records are never
-evicted; one `ledger.dropped` record in the ledger says how many. Packet and wire-error records
+(by count, or by a 64 MiB estimate of its size; a flood faster than the disk) a new record is
+refused and counted, and queued records are never evicted; one `ledger.dropped` record in the
+ledger says how many. A packet's `raw` bytes are cut to `max_packet_bytes` when the record is
+created and the full length is kept as `raw_len`. Packet and wire-error records
 have a capped share of the queue so a flood of them is unlikely to crowd out actions and commands,
 but capture is not guaranteed when the queue is full. A `[ledger n=N]` pointer names the record
 queued for the latest occurrence; it is written unless the ledger fails (`IB-LED-001`) or the
@@ -91,7 +93,11 @@ draining after it. `ib listen --count N | slow-consumer` is lossless only while 
 the 512 KiB output queue; beyond that the overflow is dropped while stdout is not draining, and
 the command exits 4 with the counts in the `IB-OUT-002` line. Whatever was lost is
 summed up in one `IB-OUT-002` line, in the ledger, and in exit code 4. Datagrams the kernel drops because the socket buffer is full are reported as
-`IB-TX-004`; if the kernel grants a smaller receive buffer than requested, `IB-TX-005` says to
+`IB-TX-004`. Memory is bounded under a flood: a datagram longer than `max_packet_bytes` is cut by
+the kernel's own copy (`IB-DEC-002` reports its size on the wire), and a front-end that cannot keep
+up holds at most 32 MiB of received frames; those it was not shown are reported as `IB-ENG-001`
+(a recorder sees them regardless). A socket read that fails is reported as `IB-TX-003`; one that
+cannot recover ends the command with that error. If the kernel grants a smaller receive buffer than requested, `IB-TX-005` says to
 raise `net.core.rmem_max` (`sysctl -w net.core.rmem_max=...`).
 
 The ledger directory is an absolute `$IRONBIRD_STATE_DIR` (a relative one is refused), else an absolute `$XDG_STATE_HOME/ironbird`,

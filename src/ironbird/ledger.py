@@ -6,7 +6,13 @@ task that runs only while the loop has been idle, in small slices, with a bounde
 (forced drain at ``FORCE_AGE_S`` age or ``FORCE_COUNT`` entries). :meth:`Ledger.flush` is
 the synchronous path used on error, shutdown and signals.
 
-When the queue is full the *new* record is refused and counted (its call returns ``None``);
+Memory is bounded by bytes as well as by count: a bytes-like field (a packet's ``raw``) is cut to
+``max_raw_bytes`` and copied out of any mutable buffer when the record is *created* (the full
+length rides along as ``<field>_len``), and every queued record is charged an estimate of its
+size against ``max_queue_bytes``, so a flood of large records cannot grow the queue past it.
+
+When the queue is full (by count or by bytes) the *new* record is refused and counted (its call
+returns ``None``);
 a queued record is never evicted, so a record number handed out is queued to be written (it
 is, unless the ledger fails or the process is killed first). Evidence-tier records (packets,
 events, and errors that untrusted wire input produces) are capped below the queue size, so a
@@ -27,6 +33,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
@@ -40,6 +47,11 @@ POLL_S: Final = 0.01
 SLICE: Final = 256
 MAX_QUEUE: Final = 200_000
 MAX_EVIDENCE_QUEUE: Final = 150_000  # of MAX_QUEUE; the rest is reserved for essential records
+MAX_QUEUE_BYTES: Final = 64 * 1024 * 1024  # estimated size of everything queued
+MAX_EVIDENCE_QUEUE_BYTES: Final = 48 * 1024 * 1024  # of MAX_QUEUE_BYTES; the rest is essential
+# What a queued record costs besides its variable-length fields: the entry tuple, the field
+# mapping and its small values. An estimate, deliberately on the high side.
+ENTRY_OVERHEAD_BYTES: Final = 512
 ERROR_FLUSH_MIN_INTERVAL_S: Final = 0.25
 MAX_DEPTH: Final = 16
 MAX_FALLBACK_REPR: Final = 2000
@@ -49,8 +61,31 @@ _KINDS: Final = frozenset({"action", "command", "state", "packet", "event", "war
 # Kinds a flood can produce; they share a capped slice of the queue. Everything else is essential.
 _EVIDENCE_KINDS: Final = frozenset({"packet", "event"})
 assert _EVIDENCE_KINDS <= _KINDS and MAX_EVIDENCE_QUEUE < MAX_QUEUE
+assert MAX_EVIDENCE_QUEUE_BYTES < MAX_QUEUE_BYTES
 
-_Entry = tuple[int, int, str, str, Mapping[str, Any], bool]  # last: counts as evidence
+# (time_ns, number, kind, event, fields, counts as evidence, bytes charged against the queue)
+_Entry = tuple[int, int, str, str, Mapping[str, Any], bool, int]
+_BYTES_LIKE: Final = frozenset({bytes, bytearray, memoryview})
+
+
+_LENGTH_KEYS: Final[dict[str, str]] = {}
+MAX_LENGTH_KEYS: Final = 64  # field names are code literals; the cache is bounded regardless
+
+
+def _length_key(name: str) -> str:
+    """The field that carries the full length of the bytes-like field ``name``."""
+    key = f"{name}_len"
+    if len(_LENGTH_KEYS) < MAX_LENGTH_KEYS:
+        _LENGTH_KEYS[name] = key
+    return key
+
+
+@dataclass(frozen=True, slots=True)
+class _Cut:
+    """A bytes-like field cut at record creation: the kept head and how much was left out."""
+
+    head: bytes
+    omitted: int
 
 
 def default_state_dir(environ: Mapping[str, str] | None = None) -> Path:
@@ -99,6 +134,8 @@ def _make_default(max_raw_bytes: int) -> Callable[[object], object]:
     """JSON fallback for non-JSON values; raw bytes are kept up to ``max_raw_bytes``."""
 
     def default(value: object) -> object:
+        if isinstance(value, _Cut):
+            return f"{value.head.hex(' ')} ...(+{value.omitted}B)"
         if isinstance(value, bytes | bytearray | memoryview):
             raw = bytes(value)
             text = raw[:max_raw_bytes].hex(" ")
@@ -157,19 +194,27 @@ class Ledger:
         max_raw_bytes: int = DEFAULT_MAX_PACKET_BYTES,
         max_queue: int = MAX_QUEUE,
         max_evidence_queue: int = MAX_EVIDENCE_QUEUE,
+        max_queue_bytes: int = MAX_QUEUE_BYTES,
+        max_evidence_queue_bytes: int = MAX_EVIDENCE_QUEUE_BYTES,
     ) -> None:
         assert max_raw_bytes > 0
         assert 0 < max_evidence_queue < max_queue, "essential records need reserved room"
+        assert 0 < max_evidence_queue_bytes < max_queue_bytes, "essential records need room"
         self._directory: Path = directory
         self._session_id: str = session_id or uuid.uuid4().hex[:12]
         self._on_failure = on_failure
         self._enabled = enabled
+        self._max_raw_bytes = max_raw_bytes
         self._default = _make_default(max_raw_bytes)
         self._urgent = False
         self._max_queue = max_queue
         self._max_evidence_queue = max_evidence_queue
+        self._max_queue_bytes = max_queue_bytes
+        self._max_evidence_queue_bytes = max_evidence_queue_bytes
         self._queue: deque[_Entry] = deque()
         self._evidence_queued = 0  # entries of ``_EVIDENCE_KINDS`` in ``_queue``
+        self._queued_bytes = 0  # sum of the charges of ``_queue``
+        self._evidence_bytes = 0  # of which the evidence entries'
         self._seq = 0
         # Records refused because the queue was full, by tier, until the next marker is written.
         self._dropped_evidence = 0
@@ -205,6 +250,11 @@ class Ledger:
         return len(self._queue)
 
     @property
+    def pending_bytes(self) -> int:
+        """Estimated size of the queued records, the figure the byte bound applies to."""
+        return self._queued_bytes
+
+    @property
     def dropped(self) -> int:
         """Records refused (and not yet summarised in the ledger) because the queue was full."""
         return self._dropped_evidence + self._dropped_essential
@@ -212,7 +262,35 @@ class Ledger:
     def set_max_raw_bytes(self, max_raw_bytes: int) -> None:
         """Keep raw packet evidence up to this many bytes per field (the packet size cap)."""
         assert max_raw_bytes > 0
+        self._max_raw_bytes = max_raw_bytes
         self._default = _make_default(max_raw_bytes)
+
+    def _cut(self, fields: dict[str, Any], names: list[str]) -> int:
+        """Cut the bytes-like values ``names`` of ``fields`` to ``max_raw_bytes``; returns their
+        charge.
+
+        Each ends up an immutable ``bytes`` of at most ``max_raw_bytes`` (a buffer the producer
+        reuses cannot change a queued record), and its full length is added as ``<name>_len``.
+        ``fields`` is the caller's own keyword dictionary.
+        """
+        limit = self._max_raw_bytes
+        charge = 0
+        for name in names:
+            value = fields[name]
+            kind = type(value)
+            if kind is memoryview:  # measured and cut in bytes, whatever its item size
+                value = value.cast("B") if value.contiguous else memoryview(value.tobytes())
+            size = len(value)
+            if size > limit:
+                fields[name] = _Cut(bytes(value[:limit]), size - limit)
+                charge += limit
+            else:
+                fields[name] = value if kind is bytes else bytes(value)
+                charge += size
+            length_key = _LENGTH_KEYS.get(name) or _length_key(name)
+            assert length_key not in fields, f"field {length_key} collides with a length key"
+            fields[length_key] = size
+        return charge
 
     def mark_busy(self) -> None:
         """Called by hot paths; the drain task waits for ``IDLE_S`` of quiet after this."""
@@ -240,8 +318,30 @@ class Ledger:
         queue = self._queue
         if evidence is None:
             evidence = kind in _EVIDENCE_KINDS
-        if len(queue) >= self._max_queue or (
-            evidence and self._evidence_queued >= self._max_evidence_queue
+        charge = ENTRY_OVERHEAD_BYTES
+        names: list[str] | None = None
+        for name, value in fields.items():
+            value_type = type(value)
+            if value_type is str:
+                charge += len(value)
+            elif value_type in _BYTES_LIKE:
+                if names is None:
+                    names = [name]
+                else:
+                    names.append(name)
+        if names is not None:
+            charge += self._cut(fields, names)
+        queued_bytes = self._queued_bytes + charge
+        if (
+            len(queue) >= self._max_queue
+            or queued_bytes > self._max_queue_bytes
+            or (
+                evidence
+                and (
+                    self._evidence_queued >= self._max_evidence_queue
+                    or self._evidence_bytes + charge > self._max_evidence_queue_bytes
+                )
+            )
         ):
             if evidence:
                 self._dropped_evidence += 1
@@ -252,8 +352,10 @@ class Ledger:
             self._oldest_mono = time.monotonic()
         if evidence:
             self._evidence_queued += 1
+            self._evidence_bytes += charge
+        self._queued_bytes = queued_bytes
         self._seq += 1
-        queue.append((time.time_ns(), self._seq, kind, event, fields, evidence))
+        queue.append((time.time_ns(), self._seq, kind, event, fields, evidence, charge))
         return self._seq
 
     def record_error(
@@ -285,7 +387,7 @@ class Ledger:
 
     def _format(self, entry: _Entry) -> str:
         """One JSON line for ``entry``. Never raises: bad fields degrade to a repr fallback."""
-        time_ns, seq, kind, event, fields, _ = entry
+        time_ns, seq, kind, event, fields, _evidence, _charge = entry
         record: dict[str, Any] = {
             "ts": format_ts(time_ns),
             "session": self._session_id,
@@ -350,6 +452,7 @@ class Ledger:
         self._failed = True
         self._queue.clear()
         self._evidence_queued = 0
+        self._evidence_bytes = self._queued_bytes = 0
 
     def _write_lines(self, lines: list[str]) -> bool:
         if self._failed:
@@ -374,7 +477,7 @@ class Ledger:
         self._seq += 1
         fields = {"count": evidence + essential, "evidence": evidence, "essential": essential}
         self._write_lines(
-            [self._format((time.time_ns(), self._seq, "state", "ledger.dropped", fields, False))]
+            [self._format((time.time_ns(), self._seq, "state", "ledger.dropped", fields, False, 0))]
         )
 
     def _drain(self, limit: int) -> int:
@@ -383,7 +486,9 @@ class Ledger:
             return 0
         entries = [self._queue.popleft() for _ in range(count)]
         self._evidence_queued -= sum(1 for entry in entries if entry[5])
-        assert self._evidence_queued >= 0
+        self._evidence_bytes -= sum(entry[6] for entry in entries if entry[5])
+        self._queued_bytes -= sum(entry[6] for entry in entries)
+        assert self._evidence_queued >= 0 and 0 <= self._evidence_bytes <= self._queued_bytes
         self._write_lines([self._format(entry) for entry in entries])
         if not self._queue:
             self._write_dropped_marker()

@@ -552,6 +552,7 @@ def test_closing_an_overloaded_listener_reports_what_it_left_unread(
             await listener.close()
 
     _run(main())
+    lag = [n.summary for n in notices if n.code is Code.ENG_LAG]
+    assert any("received but not shown" in line and "4 frame" in line for line in lag), lag
     lines = [n.summary for n in notices if n.code is Code.TX_OVERRUN]
-    assert any("received but not shown" in line and "4 frame" in line for line in lines), lines
     assert any("7 more datagram" in line and "socket buffer" in line for line in lines), lines
