@@ -677,7 +677,7 @@ class Notice:
     summary: str  # sanitized, one line, no count suffix
     count: int = 1  # occurrences this notice stands for (1 = first)
     window_s: float = 0.0  # span the count covers (0.0 for the first)
-    ledger_n: int | None = None  # record number of the latest WRITTEN record, if any
+    ledger_n: int | None = None  # record number queued for the latest occurrence, if any
 
     def line(self, *, verbose: bool = False) -> str:
         """'error IB-DEC-005: ... (x37 in 10 s)'; verbose appends ' [ledger n=1234]'."""
@@ -687,10 +687,12 @@ The coalescer emits `Notice` values instead of strings; front-ends render them.
 `Ledger.record` returns the record number so a notice can point at its full record
 (`--verbose` appends `[ledger n=1234]` to every notice that has one and prints the ledger
 file path once at start; the TUI details pane opens that record).
-- `ledger_n` is the number of the latest occurrence that was **written**, never of one that
-  was not: `record` returns `None` when the ledger is disabled or failed, the queue was
-  full and the record was dropped (counted by `ledger.dropped`), or evidence sampling (2d)
-  skipped that occurrence. The coalescer keeps the last non-`None` pointer of a window.
+- `ledger_n` is the record number **queued** for the latest occurrence that had one. It is
+  written unless the ledger fails (reported as `IB-LED-001`) or the process is killed
+  before the queue drains. `record` returns `None`, and the occurrence has no pointer,
+  when the ledger is disabled or failed, the queue was full and the record was refused
+  (counted by `ledger.dropped`), or evidence sampling (2d) skipped that occurrence. The
+  coalescer keeps the last non-`None` pointer of a window.
 - After rotation (2d) `n` stays session-wide, but finding it would mean scanning parts, so
   the pointer then names the part too: `Notice` gains `ledger_part: int = 1` and the
   verbose suffix becomes `[ledger n=1234 file=<stamp>-<session>.p0003]` (no `file=` for
@@ -715,9 +717,10 @@ Deliverables
 - `notice.py` (S5); `Coalescer` emits `Notice`; CLI renders `Notice.line()`, output text
   unchanged from Stage 1 at default verbosity.
 - `Ledger.record` returns its record number, or `None` when no record was queued
-  (disabled, failed, or queue full: the new record is dropped and counted, never an older
-  one; evidence kinds have a capped slice of the queue so a flood cannot crowd out
-  essential records). `record_error` also returns `None` when its prompt flush failed.
+  (disabled, failed, or queue full: the new record is refused and counted, never an older
+  one evicted; evidence-tier records, including wire-origin errors, have a capped slice of
+  the queue so a flood is unlikely to crowd out essential records, but capture of an
+  essential record is not guaranteed when the queue is full). `record_error` also returns `None` when its prompt flush failed.
 - Immutability: `Header.values`, `checksum.REGISTRY`, codec profile and layout tables
   as `MappingProxyType`; `Session.stats` becomes private with
   `stats_snapshot() -> Mapping[int, MidStatSnapshot]` (frozen); public collections
@@ -803,7 +806,10 @@ Deliverables
   either way.
 - **Queue.** The in-memory queue follows the same rule: when full, the new record is dropped
   (`Ledger.record` returns `None`, counted and summarised by `ledger.dropped`), evidence
-  kinds are capped below the queue size, and essential records are never evicted.
+  kinds (and wire-origin errors, via the explicit `evidence` tier parameter of `record` and
+  `record_error`) are capped below the queue size, and a queued essential record is never
+  evicted. When the queue is full a new record is refused and counted, essential or not:
+  this bounds memory, it is not a guarantee that every essential record is captured.
 - **Rotation**: at `max_file_bytes` the ledger continues in `<stamp>-<session>.pNNNN.jsonl`,
   each part opening with a `ledger.part` record naming the previous one.
 - **Retention** at session start, in a worker thread: delete ledger files (our name

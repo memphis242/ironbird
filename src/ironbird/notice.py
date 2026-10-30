@@ -41,7 +41,9 @@ class Notice:
     summary: str  # sanitized, one line, no count suffix
     count: int = 1  # occurrences this notice stands for (1 = first)
     window_s: float = 0.0  # span the count covers (0.0 for the first)
-    ledger_n: int | None = None  # ledger record number of the latest occurrence
+    ledger_n: int | None = (
+        None  # record number queued for the latest occurrence (written unless the ledger fails)
+    )
 
     def __post_init__(self) -> None:
         assert self.count >= 1

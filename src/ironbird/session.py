@@ -254,8 +254,13 @@ class Session:
         *,
         context: str = "",
         level: Level = Level.ERROR,
+        evidence: bool = False,
     ) -> None:
-        """Ledger in full, notify the user coalesced (one notice per key per window)."""
+        """Ledger in full, notify the user coalesced (one notice per key per window).
+
+        ``evidence`` marks an error that untrusted wire input can produce at will; its ledger
+        record then shares the capped evidence tier instead of the essential one.
+        """
         if isinstance(error, DecodeError):
             raw_mid = error.mid
             err = error.to_error(context)
@@ -264,7 +269,9 @@ class Session:
             raw_mid = None
             err = error
             offset = None
-        ledger_n = self.ledger.record_error(err, role=self.node.name, mid=raw_mid, offset=offset)
+        ledger_n = self.ledger.record_error(
+            err, evidence=evidence, role=self.node.name, mid=raw_mid, offset=offset
+        )
         key = f"{err.code.value}:{raw_mid}:{context}"
         self._coalescer.report(err.code, level, key, err.summary, ledger_n=ledger_n, group=err.code)
 
@@ -480,7 +487,7 @@ class Session:
     def _reject(self, error: DecodeError, datagram: Datagram, source_label: str) -> DecodeError:
         self._malformed_total += 1
         self.ledger.record("packet", "rx.malformed", raw=datagram.data, source=datagram.source)
-        self.report(error, context=f"from {source_label}")
+        self.report(error, context=f"from {source_label}", evidence=True)
         return error
 
     def _ingest(

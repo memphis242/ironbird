@@ -6,15 +6,19 @@ task that runs only while the loop has been idle, in small slices, with a bounde
 (forced drain at ``FORCE_AGE_S`` age or ``FORCE_COUNT`` entries). :meth:`Ledger.flush` is
 the synchronous path used on error, shutdown and signals.
 
-When the queue is full the *new* record is dropped and counted (its call returns ``None``),
-never an older one: a record number handed out is a record that gets written. Evidence kinds
-(packets, events) are capped below the queue size, so a flood of them cannot crowd out the
-essential records (actions, commands, state changes, errors).
+When the queue is full the *new* record is refused and counted (its call returns ``None``);
+a queued record is never evicted, so a record number handed out is queued to be written (it
+is, unless the ledger fails or the process is killed first). Evidence-tier records (packets,
+events, and errors that untrusted wire input produces) are capped below the queue size, so a
+flood of them is unlikely to crowd out the essential records (actions, commands, state
+changes, other errors); essential records are still refused and counted if the queue itself
+fills, so capture of every essential record is not guaranteed.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -46,7 +50,7 @@ _KINDS: Final = frozenset({"action", "command", "state", "packet", "event", "war
 _EVIDENCE_KINDS: Final = frozenset({"packet", "event"})
 assert _EVIDENCE_KINDS <= _KINDS and MAX_EVIDENCE_QUEUE < MAX_QUEUE
 
-_Entry = tuple[int, int, str, str, Mapping[str, Any]]
+_Entry = tuple[int, int, str, str, Mapping[str, Any], bool]  # last: counts as evidence
 
 
 def default_state_dir(environ: Mapping[str, str] | None = None) -> Path:
@@ -214,19 +218,28 @@ class Ledger:
         """Called by hot paths; the drain task waits for ``IDLE_S`` of quiet after this."""
         self._last_busy = time.monotonic()
 
-    def record(self, kind: str, event: str, **fields: Any) -> int | None:
+    def record(
+        self, kind: str, event: str, *, evidence: bool | None = None, **fields: Any
+    ) -> int | None:
         """Queue one record and return its record number (the ``n`` it is written with).
 
         Cheap by design: no formatting, no I/O. ``None`` means there is no record for a notice
         to point at: the ledger is disabled or has failed, or the queue was full and this
         record was dropped (counted, and summarised by one ``ledger.dropped`` record).
+
+        ``evidence`` selects the tier: ``True`` shares the capped evidence slice of the queue,
+        ``False`` is essential. The default follows ``kind`` (packets and events are evidence).
+        A caller whose record is produced by untrusted wire input, such as the error for a
+        malformed packet, passes ``True`` so a flood of such input cannot fill the essential
+        slice.
         """
         assert kind in _KINDS, f"unknown ledger kind {kind!r}"
         assert not (fields.keys() & _RESERVED), "field name collides with a ledger envelope key"
         if not self._enabled or self._failed:
             return None
         queue = self._queue
-        evidence = kind in _EVIDENCE_KINDS
+        if evidence is None:
+            evidence = kind in _EVIDENCE_KINDS
         if len(queue) >= self._max_queue or (
             evidence and self._evidence_queued >= self._max_evidence_queue
         ):
@@ -240,18 +253,22 @@ class Ledger:
         if evidence:
             self._evidence_queued += 1
         self._seq += 1
-        queue.append((time.time_ns(), self._seq, kind, event, fields))
+        queue.append((time.time_ns(), self._seq, kind, event, fields, evidence))
         return self._seq
 
-    def record_error(self, error: IronbirdError, **fields: Any) -> int | None:
+    def record_error(
+        self, error: IronbirdError, *, evidence: bool = False, **fields: Any
+    ) -> int | None:
         """Record an error in full and flush promptly (rate-limited under floods).
 
         Returns the record number as :meth:`record` does; ``None`` also when the prompt flush
-        found the ledger unwritable, since then the record was never written.
+        found the ledger unwritable, since then the record was never written. ``evidence=True``
+        puts errors that untrusted wire input can produce in the capped evidence tier.
         """
         number = self.record(
             "error",
             error.code.value,
+            evidence=evidence,
             summary=error.summary,
             details=error.detail_text(),
             **fields,
@@ -268,7 +285,7 @@ class Ledger:
 
     def _format(self, entry: _Entry) -> str:
         """One JSON line for ``entry``. Never raises: bad fields degrade to a repr fallback."""
-        time_ns, seq, kind, event, fields = entry
+        time_ns, seq, kind, event, fields, _ = entry
         record: dict[str, Any] = {
             "ts": format_ts(time_ns),
             "session": self._session_id,
@@ -279,10 +296,8 @@ class Ledger:
         record.update(fields)
         # ensure_ascii escapes control and non-ASCII characters, so the file is inert
         # when viewed in a terminal.
-        try:
+        with contextlib.suppress(Exception):  # a hostile Mapping can raise anything
             return json.dumps(record, default=self._default, separators=(",", ":"), allow_nan=False)
-        except (TypeError, ValueError, RecursionError):
-            pass
         try:
             record.update({k: _plain(v, frozenset(), 0) for k, v in fields.items()})
             return json.dumps(record, default=self._default, separators=(",", ":"), allow_nan=False)
@@ -359,7 +374,7 @@ class Ledger:
         self._seq += 1
         fields = {"count": evidence + essential, "evidence": evidence, "essential": essential}
         self._write_lines(
-            [self._format((time.time_ns(), self._seq, "state", "ledger.dropped", fields))]
+            [self._format((time.time_ns(), self._seq, "state", "ledger.dropped", fields, False))]
         )
 
     def _drain(self, limit: int) -> int:
@@ -367,7 +382,7 @@ class Ledger:
         if count == 0:
             return 0
         entries = [self._queue.popleft() for _ in range(count)]
-        self._evidence_queued -= sum(1 for entry in entries if entry[2] in _EVIDENCE_KINDS)
+        self._evidence_queued -= sum(1 for entry in entries if entry[5])
         assert self._evidence_queued >= 0
         self._write_lines([self._format(entry) for entry in entries])
         if not self._queue:
