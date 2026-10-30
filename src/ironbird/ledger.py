@@ -142,8 +142,8 @@ class Ledger:
         max_raw_bytes: int = DEFAULT_MAX_PACKET_BYTES,
     ) -> None:
         assert max_raw_bytes > 0
-        self.directory: Path = directory
-        self.session_id: str = session_id or uuid.uuid4().hex[:12]
+        self._directory: Path = directory
+        self._session_id: str = session_id or uuid.uuid4().hex[:12]
         self._on_failure = on_failure
         self._enabled = enabled
         self._default = _make_default(max_raw_bytes)
@@ -162,11 +162,19 @@ class Ledger:
     # -- producer side -------------------------------------------------------------------
 
     @property
+    def directory(self) -> Path:
+        return self._directory
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    @property
     def path(self) -> Path:
         """Location of this session's ledger file (created on first write)."""
         if self._path is None:
             stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self._start_ns // 1_000_000_000))
-            self._path = self.directory / f"{stamp}-{self.session_id}.jsonl"
+            self._path = self._directory / f"{stamp}-{self._session_id}.jsonl"
         return self._path
 
     @property
@@ -186,12 +194,16 @@ class Ledger:
         """Called by hot paths; the drain task waits for ``IDLE_S`` of quiet after this."""
         self._last_busy = time.monotonic()
 
-    def record(self, kind: str, event: str, **fields: Any) -> None:
-        """Queue one record. Cheap by design: no formatting, no I/O."""
+    def record(self, kind: str, event: str, **fields: Any) -> int | None:
+        """Queue one record and return its record number (the ``n`` it is written with).
+
+        Cheap by design: no formatting, no I/O. ``None`` means the ledger is disabled or has
+        failed, so there is no record for a notice to point at.
+        """
         assert kind in _KINDS, f"unknown ledger kind {kind!r}"
         assert not (fields.keys() & _RESERVED), "field name collides with a ledger envelope key"
         if not self._enabled or self._failed:
-            return
+            return None
         queue = self._queue
         if len(queue) == MAX_QUEUE:
             self._dropped += 1
@@ -199,10 +211,14 @@ class Ledger:
             self._oldest_mono = time.monotonic()
         self._seq += 1
         queue.append((time.time_ns(), self._seq, kind, event, fields))
+        return self._seq
 
-    def record_error(self, error: IronbirdError, **fields: Any) -> None:
-        """Record an error in full and flush promptly (rate-limited under floods)."""
-        self.record(
+    def record_error(self, error: IronbirdError, **fields: Any) -> int | None:
+        """Record an error in full and flush promptly (rate-limited under floods).
+
+        Returns the record number, as :meth:`record` does.
+        """
+        number = self.record(
             "error",
             error.code.value,
             summary=error.summary,
@@ -215,6 +231,7 @@ class Ledger:
             self._drain(SLICE)
             self._last_flush = time.monotonic()
             self._urgent = bool(self._queue)
+        return number
 
     # -- writer side ---------------------------------------------------------------------
 
@@ -223,7 +240,7 @@ class Ledger:
         time_ns, seq, kind, event, fields = entry
         record: dict[str, Any] = {
             "ts": format_ts(time_ns),
-            "session": self.session_id,
+            "session": self._session_id,
             "n": seq,
             "kind": kind,
             "event": event,
@@ -252,7 +269,7 @@ class Ledger:
             Code.LED_WRITE,
             f"cannot write ledger {self.path}: {exc.strerror or exc}; ledger disabled "
             "(set IRONBIRD_STATE_DIR to a writable directory)",
-            details=f"directory {self.directory}",
+            details=f"directory {self._directory}",
             cause=exc,
         )
         if self._on_failure is not None:
@@ -260,7 +277,7 @@ class Ledger:
 
     def _open_file(self) -> None:
         if self._file is None:
-            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             self._file = os.fdopen(fd, "a", encoding="utf-8")
 
@@ -277,7 +294,7 @@ class Ledger:
         except OSError as exc:
             raise IronbirdError(
                 Code.LED_DIR,
-                f"cannot use ledger directory {self.directory}: {exc.strerror or exc}; "
+                f"cannot use ledger directory {self._directory}: {exc.strerror or exc}; "
                 "set IRONBIRD_STATE_DIR to a writable directory",
                 cause=exc,
             ) from exc

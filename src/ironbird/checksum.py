@@ -7,10 +7,11 @@ algorithm needs only ``compute``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import reduce
 from operator import xor
+from types import MappingProxyType
 from typing import Final
 
 
@@ -51,17 +52,19 @@ def _crc16_ccitt(data: bytes | memoryview) -> int:
     return crc
 
 
-REGISTRY: Final[dict[str, ChecksumAlgorithm]] = {
-    algo.name: algo
-    for algo in (
-        ChecksumAlgorithm(
-            "xor8_cfs", 8, "8-bit XOR of the whole packet equals 0xFF (cFE commands)", _xor8_cfs
-        ),
-        ChecksumAlgorithm(
-            "crc16_ccitt", 16, "CRC-16/CCITT-FALSE over the whole packet", _crc16_ccitt
-        ),
-    )
-}
+REGISTRY: Final[Mapping[str, ChecksumAlgorithm]] = MappingProxyType(
+    {
+        algo.name: algo
+        for algo in (
+            ChecksumAlgorithm(
+                "xor8_cfs", 8, "8-bit XOR of the whole packet equals 0xFF (cFE commands)", _xor8_cfs
+            ),
+            ChecksumAlgorithm(
+                "crc16_ccitt", 16, "CRC-16/CCITT-FALSE over the whole packet", _crc16_ccitt
+            ),
+        )
+    }
+)
 
 assert _crc16_ccitt(b"123456789") == 0x29B1  # standard check value
 assert _xor8_cfs(b"") == 0xFF

@@ -609,7 +609,7 @@ def unpack(
             )
     sf = profile.sequence_field
     return Header(
-        values=values,
+        values=MappingProxyType(values),
         mid=mid,
         size=size,
         sequence=values[sf.name] if sf is not None else None,

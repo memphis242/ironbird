@@ -37,8 +37,15 @@ def _run(
 
     async def main() -> None:
         async with (
-            Session(config, role="ground", ledger=ground_ledger, notify=ground_notes.append) as g,
-            Session(config, role="fc", ledger=fc_ledger, notify=fc_notes.append) as f,
+            Session(
+                config,
+                role="ground",
+                ledger=ground_ledger,
+                notify=lambda n: ground_notes.append(n.line()),
+            ) as g,
+            Session(
+                config, role="fc", ledger=fc_ledger, notify=lambda n: fc_notes.append(n.line())
+            ) as f,
         ):
             await asyncio.wait_for(scenario(g, f, ground_notes, fc_notes), timeout=20)
 
@@ -171,7 +178,7 @@ def test_responder_survives_a_flood_of_malformed_commands_and_coalesces(
             raw.close()
             await responder.close()
             await listener.close()
-        fc.coalescer.flush()
+        fc.flush_notices()
         shown = [n for n in fc_notes if "IB-DEC-005" in n]
         assert 1 <= len(shown) <= 3, shown  # one announcement plus at most one summary
         assert any(f"x{flood}" in n for n in shown)
@@ -216,7 +223,7 @@ def test_ground_survives_malformed_telemetry_and_reports_unknown_mid_once(
             raw.close()
             await responder.close()
             await listener.close()
-        ground.coalescer.flush()
+        ground.flush_notices()
         unknown_lines = [n for n in ground_notes if "IB-DEC-006" in n and "0x08EE" in n]
         assert 1 <= len(unknown_lines) <= 2, ground_notes
         assert len(ground_notes) < 12  # alert-fatigue guard: nowhere near 600 lines
@@ -349,7 +356,9 @@ def test_session_exit_flushes_and_reports_when_a_background_task_died(
     monkeypatch.setattr(Ledger, "drain_task", broken_drain)
 
     async def main() -> None:
-        async with Session(config, role="ground", ledger=ledger, notify=notes.append) as ground:
+        async with Session(
+            config, role="ground", ledger=ledger, notify=lambda n: notes.append(n.line())
+        ) as ground:
             ground.ledger.record("action", "marker")
             await asyncio.sleep(0.1)
 

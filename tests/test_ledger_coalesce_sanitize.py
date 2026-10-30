@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import os
 import stat
@@ -16,6 +17,7 @@ from ironbird.coalesce import MAX_NEW_PER_GROUP, Coalescer
 from ironbird.codec import Codec, DecodedPacket
 from ironbird.errors import Code, IronbirdError
 from ironbird.ledger import Ledger, default_state_dir, format_ts
+from ironbird.notice import Level, Notice
 from ironbird.sanitize import clean
 
 
@@ -30,43 +32,79 @@ class FakeClock:
 # -- coalescer ------------------------------------------------------------------------
 
 
+def _report(co: Coalescer, key: str, summary: str, *, group: Code | None = None) -> None:
+    co.report(Code.DEC_CHECKSUM, Level.ERROR, key, summary, group=group)
+
+
 def test_coalescer_shows_first_then_one_summary() -> None:
-    lines: list[str] = []
+    notices: list[Notice] = []
     clock = FakeClock()
-    co = Coalescer(lines.append, window_s=10.0, clock=clock)
+    co = Coalescer(notices.append, window_s=10.0, clock=clock)
     for _ in range(37):
-        co.report("k", "error IB-DEC-005: bad")
-    assert lines == ["error IB-DEC-005: bad"]
+        _report(co, "k", "bad")
+    assert [n.line() for n in notices] == ["error IB-DEC-005: bad"]
+    assert notices[0].count == 1 and notices[0].window_s == 0.0
     clock.now += 10.5
     co.tick()
-    assert lines[-1] == "error IB-DEC-005: bad (x37 in 10 s)" or lines[-1].startswith(
-        "error IB-DEC-005: bad (x37 in"
-    )
-    assert len(lines) == 2
-    co.report("k", "error IB-DEC-005: bad")  # new window announces again
-    assert len(lines) == 3
+    assert len(notices) == 2
+    assert notices[1].count == 37 and notices[1].window_s == 10.5
+    assert notices[1].line() == "error IB-DEC-005: bad (x37 in 10 s)"
+    _report(co, "k", "bad")  # new window announces again
+    assert len(notices) == 3 and notices[2].count == 1
 
 
 def test_coalescer_flush_and_distinct_keys() -> None:
-    lines: list[str] = []
-    co = Coalescer(lines.append, clock=FakeClock())
-    co.report("a", "A")
-    co.report("b", "B")
-    co.report("a", "A")
+    notices: list[Notice] = []
+    co = Coalescer(notices.append, clock=FakeClock())
+    _report(co, "a", "A")
+    _report(co, "b", "B")
+    _report(co, "a", "A")
     co.flush()
-    assert lines == ["A", "B", "A (x2 in 1 s)"]
+    assert [n.line() for n in notices] == [
+        "error IB-DEC-005: A",
+        "error IB-DEC-005: B",
+        "error IB-DEC-005: A (x2 in 1 s)",
+    ]
+
+
+def test_coalescer_summary_carries_the_latest_ledger_record() -> None:
+    notices: list[Notice] = []
+    co = Coalescer(notices.append, clock=FakeClock())
+    for n in (10, 11, 12):
+        co.report(Code.DEC_CHECKSUM, Level.ERROR, "k", "bad", ledger_n=n)
+    co.flush()
+    assert [n.ledger_n for n in notices] == [10, 12]
+    assert notices[1].line(verbose=True).endswith("(x3 in 1 s) [ledger n=12]")
+    assert "ledger" not in notices[1].line()
 
 
 def test_coalescer_rate_limits_distinct_keys_per_group_and_bounds_memory() -> None:
-    lines: list[str] = []
-    co = Coalescer(lines.append, max_keys=8, clock=FakeClock())
+    notices: list[Notice] = []
+    co = Coalescer(notices.append, max_keys=8, clock=FakeClock())
     for i in range(1000):
-        co.report(f"mid{i}", f"error IB-DEC-006: unknown {i}", group="IB-DEC-006")
-    shown = [ln for ln in lines if "unknown" in ln]
+        co.report(Code.DEC_UNKNOWN, Level.ERROR, f"mid{i}", f"unknown {i}", group=Code.DEC_UNKNOWN)
+    shown = [n for n in notices if "unknown" in n.summary]
     assert len(shown) == MAX_NEW_PER_GROUP
     assert len(co._entries) <= 8
     co.flush()
-    assert any("more distinct occurrences" in ln and "x995" in ln for ln in lines)
+    folded = [n for n in notices if n.summary == "more distinct occurrences"]
+    assert [n.count for n in folded] == [1, 995]  # announced once, then summarised
+    assert all(n.code is Code.DEC_UNKNOWN for n in folded)
+    assert folded[1].line().startswith("error IB-DEC-006: more distinct occurrences (x995")
+
+
+def test_notice_line_uses_its_level_and_rejects_inconsistent_values() -> None:
+    warning = Notice(Code.TX_RCVBUF, Level.WARNING, "k", "small buffer")
+    assert warning.line() == "warning IB-TX-005: small buffer"
+    assert Level.INFO.label == "info"
+    with pytest.raises(AssertionError):
+        Notice(Code.TX_RCVBUF, Level.WARNING, "k", "two\nlines")
+    with pytest.raises(AssertionError):
+        Notice(Code.TX_RCVBUF, Level.WARNING, "k", "x", count=0)
+    with pytest.raises(AssertionError):
+        Notice(Code.TX_RCVBUF, Level.WARNING, "k", "x", count=1, window_s=2.0)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        warning.count = 5  # type: ignore[misc]
 
 
 # -- ledger ---------------------------------------------------------------------------
@@ -88,6 +126,24 @@ def test_ledger_record_is_deferred_and_flush_writes_valid_jsonl(tmp_path: Path) 
     )
     assert stat.S_IMODE(os.stat(ledger.path).st_mode) == 0o600
     assert stat.S_IMODE(os.stat(ledger.directory).st_mode) == 0o700
+
+
+def test_ledger_record_returns_the_number_it_is_written_with(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "state")
+    first = ledger.record("action", "a")
+    err = ledger.record_error(IronbirdError(Code.DEC_CHECKSUM, "bad"))
+    ledger.flush()
+    ledger.close()
+    written = [json.loads(line) for line in ledger.path.read_text().splitlines()]
+    assert (first, err) == (1, 2)
+    assert [r["n"] for r in written] == [1, 2]
+    assert written[1]["event"] == Code.DEC_CHECKSUM.value
+
+
+def test_disabled_ledger_has_no_record_number(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "state", enabled=False)
+    assert ledger.record("action", "a") is None
+    assert ledger.record_error(IronbirdError(Code.DEC_CHECKSUM, "bad")) is None
 
 
 def test_ledger_error_record_has_code_summary_and_details(tmp_path: Path) -> None:

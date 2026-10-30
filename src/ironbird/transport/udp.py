@@ -25,7 +25,8 @@ import socket
 import struct
 import sys
 import time
-from collections.abc import AsyncIterator, Collection, Iterable
+from collections.abc import AsyncIterator, Collection, Iterable, Mapping
+from types import MappingProxyType
 from typing import Any, Final
 
 from ironbird.config import Endpoint, format_hostport
@@ -44,22 +45,24 @@ PROC_MIN_COLUMNS: Final = 13  # the last one is "drops"
 SO_RXQ_OVFL: Final = getattr(socket, "SO_RXQ_OVFL", 40)
 _U32: Final = 0xFFFFFFFF
 
-_OPEN_REMEDY: Final = {
-    errno.EAFNOSUPPORT: (
-        "this host does not support that address family (is IPv6 disabled?) - use an "
-        "address of another family in the config"
-    ),
-    errno.EMFILE: "too many open files - raise the limit with 'ulimit -n' or close other files",
-    errno.ENFILE: "the system is out of file descriptors - close other programs, then retry",
-    errno.ENOBUFS: "the system is out of socket buffer memory - free memory, then retry",
-    errno.ENOMEM: "the system is out of memory - free memory, then retry",
-    errno.EADDRINUSE: (
-        "another listener (ib listen/respond, cFS) may own the port - stop it or change "
-        "the port in the config"
-    ),
-    errno.EADDRNOTAVAIL: "that address is not on this host - fix the host in the config",
-    errno.EACCES: "ports below 1024 need privileges - use a higher port in the config",
-}
+_OPEN_REMEDY: Final[Mapping[int, str]] = MappingProxyType(
+    {
+        errno.EAFNOSUPPORT: (
+            "this host does not support that address family (is IPv6 disabled?) - use an "
+            "address of another family in the config"
+        ),
+        errno.EMFILE: "too many open files - raise the limit with 'ulimit -n' or close other files",
+        errno.ENFILE: "the system is out of file descriptors - close other programs, then retry",
+        errno.ENOBUFS: "the system is out of socket buffer memory - free memory, then retry",
+        errno.ENOMEM: "the system is out of memory - free memory, then retry",
+        errno.EADDRINUSE: (
+            "another listener (ib listen/respond, cFS) may own the port - stop it or change "
+            "the port in the config"
+        ),
+        errno.EADDRNOTAVAIL: "that address is not on this host - fix the host in the config",
+        errno.EACCES: "ports below 1024 need privileges - use a higher port in the config",
+    }
+)
 
 
 def read_proc_drops(inodes: Iterable[int]) -> dict[int, int]:

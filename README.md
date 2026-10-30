@@ -31,8 +31,9 @@ ib -c examples/mock.toml send fc MOCK_RAISE_EVENT app=DEMO event_id=7 event_type
 
 `ib` is a short alias of `ironbird`. Global options: `--config/-c PATH` (or `$IRONBIRD_CONFIG`),
 `--as NODE`, `--verbose/-v`. Errors are one line, `error IB-XXX-NNN: summary`, on stderr; add
-`--verbose` for detail. Every action and error is recorded as JSON Lines in
-`$XDG_STATE_HOME/ironbird/` (override with `IRONBIRD_STATE_DIR`).
+`--verbose` for detail, including `[ledger n=N]` on repeated-error notices, the number of the
+ledger record (field `n`) holding the full detail. Every action and error is recorded as JSON
+Lines in `$XDG_STATE_HOME/ironbird/` (override with `IRONBIRD_STATE_DIR`).
 
 ## Exit codes
 

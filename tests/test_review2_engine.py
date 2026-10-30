@@ -135,8 +135,12 @@ def run_session(mock_config_path: Path, tmp_path: Path) -> Iterator[Any]:
 
         async def main() -> None:
             async with (
-                Session(config, role="ground", ledger=gl, notify=gnotes.append) as g,
-                Session(config, role="fc", ledger=fl, notify=fnotes.append) as f,
+                Session(
+                    config, role="ground", ledger=gl, notify=lambda n: gnotes.append(n.line())
+                ) as g,
+                Session(
+                    config, role="fc", ledger=fl, notify=lambda n: fnotes.append(n.line())
+                ) as f,
             ):
                 await asyncio.wait_for(scenario(g, f, gnotes, fnotes), timeout=30)
 
@@ -736,11 +740,11 @@ def test_filtered_listener_reports_skipped_malformed_and_unknown_packets(
         finally:
             raw.close()
             await listener.close()
-        ground.coalescer.flush()
+        ground.flush_notices()
         assert any(Code.DEC_UNKNOWN.value in n for n in gnotes), gnotes
         assert any(re.search(r"IB-DEC-00[1357]", n) for n in gnotes), gnotes
         assert len(gnotes) < 20  # coalesced, not one line per packet
-        assert len(ground.stats) < 8, "garbage MIDs must not fill the per-MID table"
+        assert len(ground.stats_snapshot()) < 8, "garbage MIDs must not fill the per-MID table"
         assert ground.malformed_total >= 1500
 
     ledger, _, _ = run_session(scenario)

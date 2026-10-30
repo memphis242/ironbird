@@ -278,7 +278,9 @@ async def _main_body(glob: Globals, ledger: Ledger, body: Body, run: _Run) -> in
             config,
             role=glob.role,
             ledger=ledger,
-            notify=lambda line: console.err(term(line, 1000, err=True)),
+            notify=lambda notice: console.err(
+                term(notice.line(verbose=run.verbose), 1000, err=True)
+            ),
         ) as session:
             run.session = session
             watcher = asyncio.ensure_future(_watch_output(session, console))

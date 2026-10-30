@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Final
 
 from ironbird import header as hdr
@@ -28,10 +29,12 @@ from ironbird.ccdd.model import (
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.header import Header, HeaderProfile, ProfileKind
 
-_KIND_TO_PROFILE: Final[Mapping[MessageKind, ProfileKind]] = {
-    MessageKind.COMMAND: ProfileKind.COMMAND,
-    MessageKind.TELEMETRY: ProfileKind.TELEMETRY,
-}
+_KIND_TO_PROFILE: Final[Mapping[MessageKind, ProfileKind]] = MappingProxyType(
+    {
+        MessageKind.COMMAND: ProfileKind.COMMAND,
+        MessageKind.TELEMETRY: ProfileKind.TELEMETRY,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,17 +252,19 @@ class Codec:
         self.model: CcddModel = model
         self.max_packet_bytes: int = max_packet_bytes
         self._clock = clock
-        self._profiles: Mapping[MessageKind, HeaderProfile] = {
-            MessageKind.COMMAND: command_profile,
-            MessageKind.TELEMETRY: telemetry_profile,
-        }
+        self._profiles: Mapping[MessageKind, HeaderProfile] = MappingProxyType(
+            {
+                MessageKind.COMMAND: command_profile,
+                MessageKind.TELEMETRY: telemetry_profile,
+            }
+        )
         self._sequence: dict[int, int] = {}
         self._command_mids: frozenset[int] = frozenset(m for m, _ in model.commands_by_key)
         layouts: dict[str, _Layout] = {}
         for msg in model.messages:
             self._validate_fit(msg)
             layouts[msg.name] = _compile_layout(msg)
-        self._layouts: Mapping[str, _Layout] = layouts
+        self._layouts: Mapping[str, _Layout] = MappingProxyType(layouts)
 
     @staticmethod
     def _validate_profile(profile: HeaderProfile) -> None:
