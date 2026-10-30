@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -68,10 +68,10 @@ class HeaderField:
     algorithm: str | None = None
     check: bool = True
     description: str = ""
+    mask: int = field(init=False, repr=False, compare=False)  # (1 << bits) - 1, set once
 
-    @property
-    def mask(self) -> int:
-        return (1 << self.bits) - 1
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mask", (1 << self.bits) - 1)
 
 
 @dataclass(frozen=True, slots=True)

@@ -11,10 +11,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Final, Protocol
 
-from ironbird.errors import IronbirdError
-from ironbird.frame import FrameFlag
+from ironbird.errors import Code, IronbirdError
 
 
 class LinkEnd(StrEnum):
@@ -25,8 +24,22 @@ class LinkEnd(StrEnum):
 
 
 # Called on the event-loop thread for each received frame as (data, time_ns, source, orig_len,
-# flags); it must be cheap and must never raise.
-Receiver = Callable[[bytes, int, str, int, FrameFlag], None]
+# flags), where ``flags`` is the transport's ``FrameFlag`` bits as a plain int (0 for none); it
+# must be cheap and must never raise.
+Receiver = Callable[[bytes, int, str, int, int], None]
+
+NO_FLAGS: Final = 0
+
+
+class TransportClosed(IronbirdError):
+    """A send reached a transport that was closed before the bytes left the process.
+
+    Nothing was sent. The engine sends again on the transport that replaces it; this is not a
+    failure of the link.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(Code.TX_SEND, "send on a closed transport")
 
 
 @dataclass(frozen=True, slots=True)

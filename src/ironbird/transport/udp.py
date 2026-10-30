@@ -34,8 +34,7 @@ from typing import Any, Final
 
 from ironbird.config import Endpoint, format_hostport
 from ironbird.errors import Code, IronbirdError
-from ironbird.frame import FrameFlag
-from ironbird.transport.base import Receiver, TransportStats
+from ironbird.transport.base import NO_FLAGS, Receiver, TransportClosed, TransportStats
 
 RCVBUF_BYTES: Final = 4 * 1024 * 1024
 CONFIRM_WAIT_S: Final = 0.05
@@ -279,7 +278,7 @@ class UdpTransport:
                     counter = struct.unpack_from("=I", data)[0]
                     self._ovfl_total += (counter - self._ovfl_last) & _U32
                     self._ovfl_last = counter
-            receiver(bytes(view[:size]), stamp, self._source_text(addr), size, FrameFlag.NONE)
+            receiver(bytes(view[:size]), stamp, self._source_text(addr), size, NO_FLAGS)
 
     def _on_tx_readable(self) -> None:
         """The connected send socket is never read for data; reading it surfaces ICMP errors."""
@@ -417,7 +416,7 @@ class UdpTransport:
             with contextlib.suppress(ValueError, OSError):
                 loop.remove_reader(tx.fileno())
             tx.close()
-            raise IronbirdError(Code.TX_SEND, "send on a closed transport")
+            raise TransportClosed
         self._tx = tx
 
     def _tune_listener(self, sock: socket.socket) -> None:
@@ -436,7 +435,7 @@ class UdpTransport:
         """Hand one datagram to the kernel. Raises a coded error if that fails."""
         sock = self._tx
         if sock is None or self._closed:
-            raise IronbirdError(Code.TX_SEND, "send on a closed transport")
+            raise TransportClosed
         target = self._remote or self._reply_to
         assert target is not None, "transport has no destination"
         self._pending_error = None

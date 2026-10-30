@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Final
+from typing import Final, NamedTuple
 
 from ironbird import header as hdr
 from ironbird.ccdd.model import (
@@ -56,6 +56,16 @@ class _Layout:
     segments: tuple[_Segment, ...]
     text_indices: tuple[int, ...]  # char[N] fields needing bytes -> str
     identity: bool  # single segment already in definition order, no char fields
+
+
+class Resolved(NamedTuple):
+    """What :meth:`Codec.resolve` established about a packet that passed the check: the message
+    it is and the header word. :meth:`Codec.decode_resolved` unpacks the fields from it without
+    repeating the check; it is only valid for the bytes (``size`` of them) it was made from."""
+
+    message: Message
+    word: int
+    size: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,9 +440,9 @@ class Codec:
         assert orig_len > self.max_packet_bytes
         return hdr.oversize_error(self._profiles[kind], data, orig_len, self.max_packet_bytes)
 
-    def _resolve(
+    def resolve(
         self, kind: MessageKind, data: bytes | bytearray | memoryview
-    ) -> tuple[Message, int] | DecodeError:
+    ) -> Resolved | DecodeError:
         """Everything short of unpacking fields: the message and the header word, or the error.
 
         Errors come in a fixed order: size above the cap or below the header, MID not in the
@@ -477,7 +487,7 @@ class Codec:
                 f"CCDD says {msg.payload_size}",
                 mid,
             )
-        return msg, word
+        return Resolved(msg, word, size)
 
     def check(self, kind: MessageKind, data: bytes | bytearray | memoryview) -> DecodeError | None:
         """Validate one whole packet without unpacking its fields; ``None`` means well formed.
@@ -485,20 +495,31 @@ class Codec:
         Safe on the receive path: it reads the header word, never the payload fields, and never
         raises. ``decode`` accepts exactly the packets ``check`` accepts.
         """
-        result = self._resolve(kind, data)
+        result = self.resolve(kind, data)
         return result if isinstance(result, DecodeError) else None
 
     def decode(
         self, kind: MessageKind, data: bytes | bytearray | memoryview
     ) -> DecodedPacket | DecodeError:
-        """Parse one whole packet: ``check`` first, then the fields. Never raises."""
-        resolved = self._resolve(kind, data)
+        """Parse one whole packet: ``resolve`` first, then the fields. Never raises."""
+        resolved = self.resolve(kind, data)
         if isinstance(resolved, DecodeError):
             return resolved
-        msg, word = resolved
+        return self.decode_resolved(kind, resolved, data)
+
+    def decode_resolved(
+        self, kind: MessageKind, resolved: Resolved, data: bytes | bytearray | memoryview
+    ) -> DecodedPacket | DecodeError:
+        """Unpack the fields of ``data``, which :meth:`resolve` already accepted as ``resolved``.
+
+        This is the second half of :meth:`decode`, for a caller that kept the first half's
+        result (the engine's ingest ran it on every frame). It does not validate the packet
+        again, so ``resolved`` must come from ``resolve(kind, data)`` for these very bytes.
+        """
+        msg, word, size = resolved
+        assert len(data) == size, "resolved token used with other bytes"
         profile = self._profiles[kind]
         parsed = hdr.parse_word(profile, word, msg.mid)
-        size = len(data)
         layout = self._layouts[msg.name]
         base = parsed.size
         try:

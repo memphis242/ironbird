@@ -149,7 +149,7 @@ def test_a_consumer_that_falls_behind_is_reported_once_and_loses_nothing_from_th
         await until(lambda: len(sink.frames) == 50)
         await asyncio.sleep(0.2)
         overflow = [n for n in notices if n.code is Code.TX_OVERRUN]
-        assert len(overflow) == 1 and "not shown" in overflow[0].summary
+        assert len(overflow) == 1 and "dropped from the consumer view" in overflow[0].summary
         await capture.close()
         assert len(sink.frames) == 50
 
@@ -465,7 +465,7 @@ def make_frame(**changes: Any) -> Frame:
 
 def test_frame_is_immutable_and_accepts_a_consistent_description() -> None:
     frame = make_frame()
-    with pytest.raises(dataclasses.FrozenInstanceError):
+    with pytest.raises(AttributeError):
         frame.seq = 2  # type: ignore[misc]
     assert make_frame(mid=None, flags=FrameFlag.NONE).mid is None
     cut = make_frame(flags=FrameFlag.HAS_MID | FrameFlag.TRUNCATED, orig_len=70000)

@@ -26,6 +26,7 @@ import errno
 import os
 import select
 import signal
+import stat
 import threading
 from collections import deque
 from collections.abc import Callable, Generator
@@ -34,10 +35,13 @@ from typing import Final, TextIO
 MAX_QUEUED_BYTES: Final = 512 * 1024
 CHUNK_BYTES: Final = 64 * 1024
 CLOSE_WAIT_S: Final = 1.0
-# One ``write`` call carries at most this many bytes. A blocking write of up to ``PIPE_BUF``
-# bytes to a pipe is atomic (all of it or none), so the bytes that reached a pipe are known
-# to within the one slice that may be in flight when the output is abandoned (see
-# :meth:`BoundedWriter.abandon`).
+# One ``write`` call to a pipe (or any descriptor that is not a file or a terminal) carries at
+# most this many bytes. A blocking write of up to ``PIPE_BUF`` bytes to a pipe is atomic (all of
+# it or none), so the bytes that reached a pipe are known to within the one slice that may be in
+# flight when the output is abandoned (see :meth:`BoundedWriter.abandon`). A regular file or a
+# terminal has no such atomicity to keep, and a write per slice only costs the writer thread
+# (and the event loop it competes with for the interpreter lock) more wake-ups, so those take
+# a whole chunk per write.
 WRITE_SLICE: Final = getattr(select, "PIPE_BUF", 512)
 _GONE: Final = frozenset({errno.EPIPE, errno.ECONNRESET, errno.EBADF})
 HANDLED_SIGNALS: Final = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
@@ -60,15 +64,25 @@ def signals_held() -> Generator[None]:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
-def slice_end(chunk: bytes, offset: int) -> int:
-    """End of the next slice of ``chunk`` from ``offset``: at most :data:`WRITE_SLICE` bytes.
+def write_slice_for(fd: int) -> int:
+    """Most bytes one ``write`` to ``fd`` carries: a whole chunk for a regular file or a
+    terminal, :data:`WRITE_SLICE` for a pipe, a socket or anything unknown."""
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError:
+        return WRITE_SLICE
+    return CHUNK_BYTES if stat.S_ISREG(mode) or stat.S_ISCHR(mode) else WRITE_SLICE
+
+
+def slice_end(chunk: bytes, offset: int, limit: int = WRITE_SLICE) -> int:
+    """End of the next slice of ``chunk`` from ``offset``: at most ``limit`` bytes.
 
     A slice that does not reach the end of the chunk is cut after the last newline it holds, so
-    a line no longer than the slice limit is never split across two writes (and so never
+    a line no longer than the limit is never split across two writes (and so never
     interleaved with another writer's output on a shared pipe); a longer line is cut at the limit.
     """
     assert 0 <= offset < len(chunk)
-    end = min(offset + WRITE_SLICE, len(chunk))
+    end = min(offset + limit, len(chunk))
     if end < len(chunk):
         newline = chunk.rfind(b"\n", offset, end)
         if newline >= 0:
@@ -109,6 +123,7 @@ class BoundedWriter:
         self.unavailable = stream is None  # e.g. standard output closed with ``>&-``
         self.error: OSError | None = None
         self._fd: int | None = None
+        self._slice = WRITE_SLICE
         self._thread: threading.Thread | None = None
         fd: int | None = None
         if stream is not None:
@@ -120,6 +135,7 @@ class BoundedWriter:
             with contextlib.suppress(OSError, ValueError):
                 stream.flush()  # earlier buffered text goes out first
             self._fd = fd
+            self._slice = write_slice_for(fd)
             self._thread = threading.Thread(target=self._pump, name="ib-output", daemon=True)
             with signals_held():  # the thread starts with the shutdown signals blocked
                 self._thread.start()
@@ -193,9 +209,10 @@ class BoundedWriter:
 
         Lines that reached the descriptor are not counted. The thread writes nothing more once it
         sees the flag, which it checks before every write. The count is exact except for at most
-        one in-flight slice (:data:`WRITE_SLICE` bytes): a ``write`` already blocked on a full
-        pipe when this runs can still complete once the reader catches up, so those lines reach
-        the reader although they were counted as abandoned. The report can exceed the true loss
+        one in-flight slice (:data:`WRITE_SLICE` bytes for a pipe; a chunk for a file or terminal):
+        a ``write`` already blocked on a full pipe when this runs can still complete once the
+        reader catches up, so those lines reach the reader although they were counted as
+        abandoned. The report can exceed the true loss
         by that slice and never falls short of it.
         """
         with self._cond:
@@ -286,7 +303,7 @@ class BoundedWriter:
         self._mark_gone()
 
     def _pump(self) -> None:
-        fd = self._fd
+        fd, limit = self._fd, self._slice
         assert fd is not None
         if hasattr(signal, "pthread_sigmask"):  # also when started some other way
             signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
@@ -300,7 +317,7 @@ class BoundedWriter:
                     if self._abandoned:
                         return
                     try:
-                        written = os.write(fd, view[offset : slice_end(chunk, offset)])
+                        written = os.write(fd, view[offset : slice_end(chunk, offset, limit)])
                     except BlockingIOError:
                         select.select([], [fd], [], 1.0)
                         continue

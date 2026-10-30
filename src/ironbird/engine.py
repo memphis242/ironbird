@@ -8,9 +8,10 @@ Data flow (one process, one event loop)::
                                     +-> each consumer's bounded queue -> filter -> decode -> render
 
 Ingest is cheap and never decodes fields. A frame that fails ``Codec.check`` is still a frame:
-it reaches the sinks and every consumer, so nothing a link carried is hidden. A consumer that
-falls behind loses frames from its own queue only (counted and reported); the sinks have
-already seen them.
+it reaches the sinks and every consumer, so nothing a link carried is hidden. A frame that
+passes carries the check's result, which a live consumer's decode reuses. A consumer that falls
+behind loses frames from its own queue only (counted and reported); the sinks have already seen
+them.
 
 The engine owns the transports a session has open, one per link end, shared by that end's
 sends and receives.
@@ -28,15 +29,25 @@ from dataclasses import dataclass
 from typing import Any, Final, Protocol
 
 from ironbird.ccdd.model import MessageKind
-from ironbird.codec import Codec
+from ironbird.codec import Codec, Resolved
 from ironbird.config import Link, SystemConfig
 from ironbird.errors import Code, DecodeError, IronbirdError
-from ironbird.frame import Decoded, Direction, Frame, FrameFlag, Stream
+from ironbird.frame import (
+    FLAG_HAS_MID,
+    FLAG_TRUNCATED,
+    FLAGS_BY_BITS,
+    KNOWN_FLAG_BITS,
+    Decoded,
+    Direction,
+    Frame,
+    Stream,
+)
 from ironbird.ledger import Ledger
-from ironbird.transport import LinkEnd, Transport, open_transport
+from ironbird.transport import LinkEnd, Transport, TransportClosed, open_transport
 
 MAX_TRACKED_MIDS: Final = 1024
 CONSUMER_QUEUE_FRAMES: Final = 16384
+READ_BATCH_FRAMES: Final = 512  # most frames one ``next_batch`` hands a consumer
 _MAX_STREAMS: Final = 0x10000
 
 Reporter = Callable[..., None]  # Session.report: (error, *, context, level, evidence)
@@ -46,7 +57,7 @@ class FrameSink(Protocol):
     """Receives every frame, synchronously, before any consumer queue."""
 
     def append(self, frame: Frame) -> None:
-        """Must be cheap and must not raise; a sink that does is reported as an internal error."""
+        """Must be cheap and must not raise; a sink that does is detached and reported once."""
         ...
 
 
@@ -69,7 +80,7 @@ class CaptureStats:
     """A frozen snapshot of what one capture was offered and what it could not hold."""
 
     frames: int  # offered to this capture's queue
-    not_shown: int  # refused because the queue was full (still seen by every sink)
+    not_shown: int  # refused because the queue was full (sinks saw them either way)
 
 
 class _FrameQueue:
@@ -109,24 +120,34 @@ class _FrameQueue:
         if waiter is not None and not waiter.done():
             waiter.set_result(None)
 
-    async def wait(self) -> None:
-        """Return when a frame is queued or the queue is closed."""
-        if self.items or self._closed:
-            return
-        self._waiter = asyncio.get_running_loop().create_future()
-        try:
-            await self._waiter
-        finally:
-            self._waiter = None
+    async def next_batch(self) -> list[Frame]:
+        """Up to :data:`READ_BATCH_FRAMES` queued frames, waiting for the first; ``[]`` once the
+        queue is closed and drained. One reader at a time: a queue has a single wake-up slot, so
+        a second reader would be starved or would split the stream, and is refused."""
+        if self._waiter is not None:
+            raise IronbirdError(
+                Code.INTERNAL,
+                "a capture has one reader; a second consumer is reading it at the same time",
+            )
+        items = self.items
+        if not items and not self._closed:
+            self._waiter = asyncio.get_running_loop().create_future()
+            try:
+                await self._waiter
+            finally:
+                self._waiter = None
+        popleft = items.popleft
+        return [popleft() for _ in range(min(len(items), READ_BATCH_FRAMES))]
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class _Subscription:
     """One consumer queue attached to one link end's receive stream."""
 
     queue: _FrameQueue
     io: _LinkIO
-    dropped: int = 0
+    dropped: int = 0  # frames the queue refused
+    dropped_to_sinks: int = 0  # of those, frames a sink had already received
     reported: int = 0
 
 
@@ -164,9 +185,7 @@ class _LinkIO:
         self.subs: list[_Subscription] = []
         self.kernel = _KernelWatch()
 
-    def on_data(
-        self, data: bytes, time_ns: int, source: str, orig_len: int, flags: FrameFlag
-    ) -> None:
+    def on_data(self, data: bytes, time_ns: int, source: str, orig_len: int, flags: int) -> None:
         """The transport's receiver. A bug in ingest is reported, never raised into the loop."""
         try:
             self.engine._ingest(self, data, time_ns, source, orig_len, flags)
@@ -208,14 +227,19 @@ class Capture:
         return self._iterate()
 
     async def _iterate(self) -> AsyncIterator[Frame]:
-        queue = self._queue
-        items = queue.items
-        while True:
-            while items:
-                yield items.popleft()
-            if queue.closed:
-                return
-            await queue.wait()
+        while batch := await self._queue.next_batch():
+            for frame in batch:
+                yield frame
+
+    async def next_batch(self) -> list[Frame]:
+        """The frames that arrived since the last call, oldest first, waiting for at least one;
+        empty once the capture is closed (or its engine shut down) and everything was read.
+
+        A consumer that decodes per frame loops over the batch itself, which is cheaper than
+        iterating the capture. A capture has one reader: a second concurrent call raises
+        ``IB-INT-001``.
+        """
+        return await self._queue.next_batch()
 
     def stats(self) -> CaptureStats:
         return CaptureStats(self._queue.offered, self._queue.dropped)
@@ -238,21 +262,37 @@ class FrameDecoder:
     ``report_checked`` says whether a frame that fails ``Codec.check`` is reported here: a live
     consumer passes ``False`` because ingest already reported it, a consumer with no ingest
     (replay) passes ``True``. Either way the error is returned.
+
+    A frame that live ingest accepted carries what its check established, so its fields are
+    unpacked without checking the packet a second time; every other frame goes through the whole
+    of ``Codec.decode``.
     """
 
     def __init__(self, engine: Engine, *, report_checked: bool) -> None:
         self._engine = engine
         self._report_checked = report_checked
+        self._codecs: dict[str, Codec] = {}
 
     def decode(self, frame: Frame) -> Decoded | DecodeError:
-        codec = self._engine._codec_for(frame.stream.node)
-        kind = frame.stream.kind
-        if FrameFlag.TRUNCATED in frame.flags:
-            result: Decoded | DecodeError = codec.oversize_error(kind, frame.data, frame.orig_len)
+        stream = frame.stream
+        codec = self._codecs.get(stream.node)
+        if codec is None:
+            codec = self._codecs[stream.node] = self._engine._codec_for(stream.node)
+        checked = frame.checked
+        result: Decoded | DecodeError
+        if checked is not None:
+            decoded = codec.decode_resolved(stream.kind, checked, frame.data)
+            if not isinstance(decoded, DecodeError):
+                return Decoded(frame, decoded)
+            result = decoded
+        elif frame.flags & FLAG_TRUNCATED:
+            result = codec.oversize_error(stream.kind, frame.data, frame.orig_len)
         else:
-            decoded = codec.decode(kind, frame.data)
-            result = decoded if isinstance(decoded, DecodeError) else Decoded(frame, decoded)
-        if isinstance(result, DecodeError) and self._report_checked:
+            decoded = codec.decode(stream.kind, frame.data)
+            if not isinstance(decoded, DecodeError):
+                return Decoded(frame, decoded)
+            result = decoded
+        if self._report_checked:
             self._engine.reject(frame, result)
         return result
 
@@ -273,7 +313,9 @@ class Engine:
         self._report = report
         self._codec_for = codec_for
         self._seq = 0
+        self._closed = False
         self._sinks: tuple[FrameSink, ...] = ()
+        self._sink_refs: dict[int, tuple[FrameSink, int]] = {}  # id(sink) -> (sink, holders)
         self._ios: dict[tuple[str, LinkEnd], _LinkIO] = {}
         self._labels: dict[int, str] = {}
         self._stats: dict[int, _MidStat] = {}
@@ -303,23 +345,46 @@ class Engine:
     # -- sinks -----------------------------------------------------------------------
 
     def add_sink(self, sink: FrameSink) -> None:
-        self._sinks = (*self._sinks, sink)
+        """Attach ``sink``. A sink is attached once however many holders ask (a session-level
+        attach and several captures, say) and stays until the last holder removes it, so it sees
+        each frame once."""
+        held = self._sink_refs.get(id(sink))
+        self._sink_refs[id(sink)] = (sink, 1 if held is None else held[1] + 1)
+        if held is None:
+            self._sinks = (*self._sinks, sink)
 
     def remove_sink(self, sink: FrameSink) -> None:
-        remaining = list(self._sinks)
-        if sink in remaining:
-            remaining.remove(sink)
-        self._sinks = tuple(remaining)
+        """Release one holder of ``sink``; it detaches when the last holder lets go. A sink that
+        is not attached (never added, or detached after it failed) is ignored."""
+        held = self._sink_refs.get(id(sink))
+        if held is None:
+            return
+        if held[1] > 1:
+            self._sink_refs[id(sink)] = (sink, held[1] - 1)
+            return
+        self._detach_sink(sink)
 
-    def _sink_failed(self, sink: FrameSink, exc: Exception) -> None:
+    def _detach_sink(self, sink: FrameSink) -> None:
+        self._sink_refs.pop(id(sink), None)
+        self._sinks = tuple(s for s in self._sinks if s is not sink)
+
+    def _sink_failed(self, sink: FrameSink, frame: Frame, exc: Exception) -> None:
+        """A sink raised: it is detached at once (it would fail on every later frame as well),
+        and the failure is reported and ledgered this one time."""
+        name = type(sink).__name__
+        self._detach_sink(sink)
+        self._ledger.record(
+            "state", "sink.detached", sink=name, seq=frame.seq, error=type(exc).__name__
+        )
         self._report(
             IronbirdError(
                 Code.INTERNAL,
-                f"frame sink {type(sink).__name__} failed: {type(exc).__name__}: {exc}",
+                f"frame sink {name} failed on frame {frame.seq} and was detached: "
+                f"{type(exc).__name__}: {exc}",
                 details="".join(traceback.format_exception(exc)),
                 cause=exc,
             ),
-            context=f"sink {type(sink).__name__}",
+            context=f"sink {name}",
         )
 
     def _ingest_failed(self, exc: Exception) -> None:
@@ -379,28 +444,43 @@ class Engine:
     def _new_transport(self, io: _LinkIO) -> Transport:
         return open_transport(io.link, io.end, lambda err: self._transport_report(err, io.label))
 
-    async def _start_receiving(self, io: _LinkIO) -> None:
-        async with io.lock:
-            if io.receiving:
-                return
-            transport = self._new_transport(io)
-            await transport.open(io.on_data)
-            previous, io.transport, io.receiving = io.transport, transport, True
-            io.description = transport.description
-            io.kernel = _KernelWatch()
-            facts: dict[str, Any] = dict(transport.facts())
-            self._ledger.record("state", f"{io.link.transport}.open", **facts)
-            if previous is not None:  # a send-only transport the receiving one replaces
-                await previous.close()
+    async def _attach(self, io: _LinkIO, sub: _Subscription) -> None:
+        """Subscribe ``sub`` to ``io``, opening its receiving transport if none is open.
 
-    async def _stop_receiving(self, io: _LinkIO) -> None:
-        transport, io.transport, io.receiving = io.transport, None, False
-        if transport is None:
-            return
-        try:
-            await transport.close()
-        finally:  # drops counted while closing are part of the final report
-            self._poll_kernel(io, transport)
+        The subscription is added under the link end's lock, so a close that is deciding whether
+        the transport is still needed sees it.
+        """
+        async with io.lock:
+            if not io.receiving:
+                transport = self._new_transport(io)
+                await transport.open(io.on_data)
+                previous, io.transport, io.receiving = io.transport, transport, True
+                io.description = transport.description
+                io.kernel = _KernelWatch()
+                facts: dict[str, Any] = dict(transport.facts())
+                self._ledger.record("state", f"{io.link.transport}.open", **facts)
+                io.subs.append(sub)
+                if previous is not None:  # a send-only transport the receiving one replaces
+                    await previous.close()
+            else:
+                io.subs.append(sub)
+
+    async def _stop_if_idle(self, io: _LinkIO) -> None:
+        """Close the receiving transport of ``io`` unless a capture subscribed in the meantime.
+
+        The decision and the close happen under the link end's lock, and the end's state changes
+        only once the transport is closed, so an open of the same end waits for the port to be
+        free instead of racing the close for it.
+        """
+        async with io.lock:
+            transport = io.transport
+            if io.subs or not io.receiving or transport is None:
+                return
+            try:
+                await transport.close()
+            finally:  # drops counted while closing are part of the final report
+                self._poll_kernel(io, transport)
+                io.transport, io.receiving = None, False
 
     async def open_capture(
         self,
@@ -412,6 +492,8 @@ class Engine:
         """Start receiving on ``ends``; every frame they receive reaches ``sinks`` and the
         returned capture. ``sinks`` stay attached to the whole engine until the capture closes."""
         assert len({(link.name, end) for link, end in ends}) == len(ends), "duplicate link end"
+        if self._closed:
+            raise IronbirdError(Code.INTERNAL, "the session is closed; it cannot capture again")
         queue = _FrameQueue(CONSUMER_QUEUE_FRAMES if queue_frames is None else queue_frames)
         capture = Capture(self, queue, sinks)
         for sink in sinks:
@@ -419,27 +501,33 @@ class Engine:
         try:
             for link, end in ends:
                 io = self._io(link, end)
-                await self._start_receiving(io)
                 sub = _Subscription(queue, io)
-                io.subs.append(sub)
                 capture._subs.append(sub)
+                await self._attach(io, sub)
         except BaseException:
             await capture.close()
             raise
         return capture
 
     async def _release_capture(self, capture: Capture) -> None:
+        failure: BaseException | None = None
         try:
+            ios: dict[int, _LinkIO] = {}
             for sub in capture._subs:
                 self._poll_sub(sub)
                 if sub in sub.io.subs:
                     sub.io.subs.remove(sub)
-            for io in {sub.io for sub in capture._subs}:
-                if not io.subs and io.receiving:
-                    await self._stop_receiving(io)
+                ios[id(sub.io)] = sub.io
+            for io in ios.values():
+                try:
+                    await self._stop_if_idle(io)
+                except BaseException as exc:  # the other link ends are still released
+                    failure = failure or exc
         finally:
             for sink in capture._sinks:
                 self.remove_sink(sink)
+        if failure is not None:
+            raise failure
 
     async def send(
         self,
@@ -451,32 +539,76 @@ class Engine:
         handed_off: Callable[[], None] | None = None,
     ) -> None:
         """Send ``data`` out of ``end`` of ``link``. The TX frame enters ingest the moment the
-        bytes leave the process (``handed_off`` runs right after), so sinks see what was sent."""
+        bytes leave the process (``handed_off`` runs right after), so sinks see what was sent.
+
+        The transport is shared with the end's captures, so closing the last one can close it
+        under a send that has not yet left the process. That send is made again on the transport
+        that replaces it; a send is never reported as a link failure for that.
+        """
         io = self._io(link, end)
-        async with io.lock:
-            if io.transport is None:
-                transport = self._new_transport(io)
-                await transport.open(None)
-                io.transport = transport
-            transport = io.transport
+        went_out = False
 
         def out() -> None:
+            nonlocal went_out
+            went_out = True
             self._ingest_tx(io, data)
             if handed_off is not None:
                 handed_off()
 
-        await transport.send(data, confirm=confirm, handed_off=out)
+        closed: TransportClosed | None = None
+        for _ in range(2):
+            async with io.lock:
+                if self._closed:
+                    raise IronbirdError(
+                        Code.TX_SEND, "not sent: the session is closing (not a link failure)"
+                    )
+                if io.transport is None:
+                    transport = self._new_transport(io)
+                    await transport.open(None)
+                    io.transport = transport
+                transport = io.transport
+            try:
+                await transport.send(data, confirm=confirm, handed_off=out)
+            except TransportClosed as exc:
+                if went_out:
+                    raise
+                closed = exc
+                continue
+            return
+        raise IronbirdError(
+            Code.TX_SEND,
+            f"not sent: {io.description} was closed while sending "
+            "(the session is closing; this is not a link failure)",
+            cause=closed,
+        )
 
     async def close(self) -> None:
-        """Close every transport still open (a capture its owner never closed, a send-only one)."""
-        for io in list(self._ios.values()):
+        """Close every transport still open (a capture its owner never closed, a send-only one)
+        and end every capture's iteration, so a consumer still waiting does not wait forever."""
+        self._closed = True
+        failure: BaseException | None = None
+        ios = list(self._ios.values())
+        for io in ios:
+            for sub in io.subs:
+                self._poll_sub(sub)
+                sub.queue.close()
             io.subs.clear()
-            if io.transport is not None:
-                if io.receiving:
-                    await self._stop_receiving(io)
-                else:
-                    transport, io.transport = io.transport, None
-                    await transport.close()
+        for io in ios:
+            try:
+                async with io.lock:
+                    transport = io.transport
+                    if transport is None:
+                        continue
+                    try:
+                        await transport.close()
+                    finally:
+                        if io.receiving:
+                            self._poll_kernel(io, transport)
+                        io.transport, io.receiving = None, False
+            except BaseException as exc:  # the other link ends are still closed
+                failure = failure or exc
+        if failure is not None:
+            raise failure
 
     # -- ingest (event-loop thread, per frame) -----------------------------------------------
 
@@ -505,53 +637,83 @@ class Engine:
         time_ns: int,
         source: str,
         orig_len: int,
-        flags: FrameFlag,
+        flags: int,
     ) -> None:
         self._ledger.mark_busy()
         size = len(data)
         assert orig_len >= size, "a transport reports the size on the wire, never less"
+        bits = int(flags)
+        assert not bits & ~KNOWN_FLAG_BITS, f"a transport passed unknown frame flag bits {bits:#x}"
         if size > self._max_packet_bytes:
             data = data[: self._max_packet_bytes]
-            flags |= FrameFlag.TRUNCATED
+            bits |= FLAG_TRUNCATED
         stream, codec = io.rx_stream, io.codec
         kind = stream.kind
-        mid = codec.peek_mid(kind, data)
-        if mid is not None:
-            flags |= FrameFlag.HAS_MID
-        self._seq += 1
-        frame = Frame(self._seq, time_ns, stream, sys.intern(source), mid, flags, orig_len, data)
-        for sink in self._sinks:
-            try:
-                sink.append(frame)
-            except Exception as exc:
-                self._sink_failed(sink, exc)
-        if FrameFlag.TRUNCATED in flags:
+        checked: Resolved | None = None
+        error: DecodeError | None
+        if bits & FLAG_TRUNCATED:
             error = codec.oversize_error(kind, data, orig_len)
+            mid = codec.peek_mid(kind, data)
         else:
-            if mid is not None and codec.is_known_mid(kind, mid):
-                self._count(mid, time_ns)
-            error = codec.check(kind, data)
-        if error is not None:
-            self.reject(frame, error)
-        for sub in io.subs:
-            if not sub.queue.put(frame):
-                sub.dropped += 1
-
-    def _ingest_tx(self, io: _LinkIO, data: bytes) -> None:
-        """A frame this process sent. Sinks see it; consumers of received frames do not."""
-        stream = io.tx_stream
-        mid = io.codec.peek_mid(stream.kind, data)
-        flags = FrameFlag.HAS_MID if mid is not None else FrameFlag.NONE
-        assert len(data) <= self._max_packet_bytes, "the codec keeps encoded packets under the cap"
+            verdict = codec.resolve(kind, data)
+            if isinstance(verdict, DecodeError):
+                error = verdict
+                mid = codec.peek_mid(kind, data)
+            else:
+                error, checked = None, verdict
+                mid = verdict.message.mid  # a packet that passed the check names a CCDD message
+        if mid is not None:
+            bits |= FLAG_HAS_MID
         self._seq += 1
         frame = Frame(
-            self._seq, time.time_ns(), stream, sys.intern(io.tx_peer), mid, flags, len(data), data
+            self._seq,
+            time_ns,
+            stream,
+            sys.intern(source),
+            mid,
+            FLAGS_BY_BITS[bits],
+            orig_len,
+            data,
+            checked,
         )
         for sink in self._sinks:
             try:
                 sink.append(frame)
             except Exception as exc:
-                self._sink_failed(sink, exc)
+                self._sink_failed(sink, frame, exc)
+        if checked is not None:
+            self._count(checked.message.mid, time_ns)
+        else:
+            assert error is not None
+            self.reject(frame, error)
+        for sub in io.subs:
+            if not sub.queue.put(frame):
+                sub.dropped += 1
+                if self._sinks:
+                    sub.dropped_to_sinks += 1
+
+    def _ingest_tx(self, io: _LinkIO, data: bytes) -> None:
+        """A frame this process sent. Sinks see it; consumers of received frames do not."""
+        stream = io.tx_stream
+        mid = io.codec.peek_mid(stream.kind, data)
+        bits = FLAG_HAS_MID if mid is not None else 0
+        assert len(data) <= self._max_packet_bytes, "the codec keeps encoded packets under the cap"
+        self._seq += 1
+        frame = Frame(
+            self._seq,
+            time.time_ns(),
+            stream,
+            sys.intern(io.tx_peer),
+            mid,
+            FLAGS_BY_BITS[bits],
+            len(data),
+            data,
+        )
+        for sink in self._sinks:
+            try:
+                sink.append(frame)
+            except Exception as exc:
+                self._sink_failed(sink, frame, exc)
 
     # -- periodic work and drop accounting -----------------------------------------------
 
@@ -561,7 +723,8 @@ class Engine:
         transports = [(io, io.transport) for io in receiving if io.transport is not None]
         await asyncio.gather(*(transport.poll() for _, transport in transports))
         for io, transport in transports:
-            self._poll_kernel(io, transport)
+            if io.transport is transport:  # a replaced transport was accounted for as it closed
+                self._poll_kernel(io, transport)
             for sub in io.subs:
                 self._poll_sub(sub)
 
@@ -572,12 +735,16 @@ class Engine:
             return
         delta, sub.reported = total - sub.reported, total
         label = sub.io.description
-        self._ledger.record("state", "rx.queue_drops", label=label, delta=delta, total=total)
+        kept = sub.dropped_to_sinks
+        self._ledger.record(
+            "state", "rx.queue_drops", label=label, delta=delta, total=total, seen_by_sinks=kept
+        )
+        tail = f"; {kept} of them still reached a sink" if kept else ""
         self._report(
             IronbirdError(
                 Code.TX_OVERRUN,
-                f"{label}: consumer queue overflow, {total} frame(s) not shown so far "
-                "(still captured)",
+                f"{label}: consumer queue overflow, {total} frame(s) dropped from the "
+                f"consumer view so far{tail}",
             ),
             context=f"queue {label}",
         )

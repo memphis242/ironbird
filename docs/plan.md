@@ -757,7 +757,7 @@ Decisions
 
 Verification: Stage 1 suite unchanged in behaviour; new unit tests of ingest ordering
 (sinks see every frame even when a consumer queue is full), seq monotonicity across two
-links, malformed frames yielded with flags; ingest benchmark (frames/s on loopback) as a
+links, malformed frames yielded with flags; ingest-only benchmark (frames/s on loopback) as a
 baseline for the 10k gate; cFS acceptance unchanged.
 
 As built (where the build differs from, or settles, the text above)
@@ -782,7 +782,10 @@ As built (where the build differs from, or settles, the text above)
   before the cut is what 2c removes). A truncated frame is reported as `IB-DEC-002` at ingest.
 - Consumer queues are bounded by frame count in 2b (`queue_frames`, default 16384, newest
   dropped); 2c adds the byte bound and `IB-ENG-001`. Until then an overflow keeps Stage 1's code
-  `IB-TX-004`, worded as frames "not shown" (they are still captured).
+  `IB-TX-004`, worded as frames dropped from the consumer view. No recorder exists in 2b, so
+  the notice says "still reached a sink" only for the frames a sink had received when they were
+  dropped (counted per subscription), never "captured" unconditionally. A capture has one
+  reader: a second concurrent `next_batch()`/iteration raises `IB-INT-001`.
 - `Codec.classify`/`DatagramClass` are gone: `Codec.check` does their job and the rest of the
   boundary. Errors come in a fixed order: over the cap, shorter than the header, MID not in the
   CCDD, length field, fixed fields (`HeaderProfile.fixed_mask`/`fixed_value`, one compare),
@@ -793,9 +796,40 @@ As built (where the build differs from, or settles, the text above)
 - The profile-load check that MIDs fit 32 bits is in `Codec` (`IB-HDR-002`, corpus
   `codec-hdr-mid-wider-than-32.toml`). `SerialLinkSpec` exists as a placeholder dataclass; the
   config still refuses `transport = "serial"` until 2k parses it.
-- Ingest benchmark (`tests/test_benchmarks.py`, 200-byte valid telemetry from a separate sender
-  process into a capture with a draining consumer, 4-core dev host): one frame through ingest
-  about 10 us; 41-53k packets/s saturated; 10k packets/s paced with zero loss.
+- `Frame` and `Decoded` are `NamedTuple`s (`Frame` subclasses one to add the invariant asserts
+  in a `__new__` that exists only when `__debug__`), `FrameFlag` stays an `IntFlag` for
+  consumers while ingest works on plain-int `FLAG_*` constants and picks the `FrameFlag` from
+  `FLAGS_BY_BITS`. A frame has a ninth field, `checked`: the `Codec.Resolved` token (message, header
+  word, size) of a frame that passed `Codec.check` at live ingest, `None` for a failed check and
+  for any frame not built by live ingest. `FrameDecoder.decode` uses it to call
+  `Codec.decode_resolved` (the second half of `decode`) instead of checking the packet again;
+  a frame without it takes the whole `Codec.decode`. `Codec.resolve` is the one place the check
+  runs, so the decode boundary stays single.
+- Consumers read a capture in batches (`Capture.next_batch()`, at most 512 frames); `Listener`
+  does so, so the receive-to-print path is one async generator, not a chain of them.
+  `BoundedWriter` writes whole chunks to a regular file or a terminal and `PIPE_BUF` slices only
+  to pipes and sockets, where atomicity matters.
+- Sinks are attached once however many holders ask (reference counted by identity), so one sink
+  on two captures sees each frame once. A sink that raises is detached on its first failure and
+  reported and ledgered once (`sink.detached`), never once per frame.
+- Per-MID statistics count only frames that pass `Codec.check`.
+- A link end's transport is opened, joined and closed under the end's lock: a capture subscribes
+  inside the lock, the closer re-checks the subscribers inside it, and the end's state changes
+  only after the close completes, so a close and an open of the same end cannot race for the
+  port. A send that finds its transport closed under it is made again on the one that replaces
+  it (`TransportClosed`, never reported as a link failure); a send after `Engine.close` is an
+  `IB-TX-002` "not sent: the session is closing". `Engine.close` ends every capture's iteration.
+- Ingest-only benchmarks (`tests/test_benchmarks.py`, names `*ingest_only*`): they time the
+  receive side alone (a 200-byte valid telemetry packet from a separate sender process into a
+  capture with a draining consumer that discards, 4-core dev host): one frame through ingest
+  about 4 us; 73k packets/s saturated; 10k packets/s paced with zero loss. They say nothing
+  about what a front-end sustains. The end-to-end guards are the `listen` ones:
+  `test_listen_cli_at_the_target_rate_loses_no_output` (a separate `ib listen --format json`
+  writing to a file, a separate sender at 10k packets/s of the large `MOCK_HK` packet: 30000 of
+  30000 lines, no `IB-OUT-*`; the guard allows 5% host-side datagram loss) and
+  `test_listen_path_costs_little_over_decode_and_render` (receive, queue, decode and JSON
+  render at about 21 us per packet against 17.5 us for the bare decode and render; the guard is
+  a 1.5x ratio so it holds on any host).
 
 ### 2c - Byte-bounded memory and receive-side errors
 
@@ -1714,7 +1748,15 @@ Deliverables
   the whole session as live. The recorder takes its lock before the first write and
   heartbeats its active file every 60 s while idle (2d liveness).
 
-Untrusted input: the reader is a decode boundary of its own and gets the full treatment:
+Untrusted input: the reader is a decode boundary of its own and gets the full treatment.
+It validates before it builds a `Frame`, because `Frame` asserts its invariants rather than
+checking them: `orig_len >= len(data)` and `TRUNCATED` iff `orig_len > len(data)`, and
+`len(data)` against the `max_packet_bytes` the recording declares (the `oversize_error`
+assertion in the codec fires on a lying `orig_len`), the flag-combination rules, and every
+stream id against the stream table (`Engine._labels[frame.stream.id]` is indexed by it when
+a frame is rejected). A record that fails any of these is damage (`IB-REC-*`), never a
+`Frame`. Its frames carry no `checked` token (the field is `None`), so replay decodes through
+the whole `Codec.decode`; the reader never copies a token from anywhere. Tests:
 Hypothesis round trip (arbitrary frame sequences written then read are equal),
 truncation at every offset (yields a prefix, reports torn tail at a record boundary,
 never raises), bit flips (never yields a frame that was not written), lying `body_len`
@@ -1757,6 +1799,12 @@ NOOP prints only that HK, and `ib events --where 'event.type >= error'` matches
 ### 2g - Replay
 
 Deliverables
+- Frames come from the 2e reader, which validates `orig_len`, the data length against the
+  recording's `max_packet_bytes`, the flag rules and the stream ids before it builds one (see
+  2e), so nothing replayed can trip `Frame`'s asserts, `oversize_error`'s assert or the
+  `Engine._labels` index. Replay decodes through `FrameDecoder(report_checked=True)` and
+  `Codec.decode` (no `checked` token), and its own reject path needs the stream table of the
+  recording rather than the engine's `_labels`.
 - `ib replay FILE [--where EXPR] [--from T] [--to T] [--speed X] [--follow]
   [--format line|json|hex] [--defs recording|config] [--skip-damage] [--count N]`.
   `T` is ISO 8601 UTC or `+offset` from the first frame (`+90s`, `+1m30s`). `--speed 0`

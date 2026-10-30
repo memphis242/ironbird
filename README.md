@@ -144,4 +144,5 @@ immutable `Frame`s, numbers them, runs the cheap `Codec.check`, hands each frame
 (a recorder, later) and then to each consumer's own bounded queue, so a slow consumer never costs
 a captured frame. Malformed and unknown frames are consumers' frames too; they are reported once,
 coalesced, at ingest. `Session.capture()` gives the raw frames, `Session.decoder()` decodes them.
-Throughput guards: `pytest tests/test_benchmarks.py -n0 -s` prints the loopback ingest rate.
+Throughput guards: `pytest tests/test_benchmarks.py -n0 -s` prints the loopback ingest-only rate
+(receive side alone) and the end-to-end `ib listen` result at 10k packets/s.

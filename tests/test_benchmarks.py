@@ -1,10 +1,19 @@
 """Performance guards (pytest-benchmark). Floors are loose: the plan's design target is
-10k packets/s aggregate, so decode must stay far below 100 us per packet."""
+10k packets/s aggregate, so decode must stay far below 100 us per packet.
+
+Two kinds of guard are kept apart on purpose. The ``ingest`` ones time only the receive side
+(a frame through ingest, or datagrams into a draining capture), which is a fraction of what a
+front-end spends per packet. The ``listen`` ones run the whole path a user sees: receive,
+decode, render and write.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -13,6 +22,7 @@ from typing import Any
 import pytest
 
 from conftest import EXAMPLES, free_udp_ports
+from ironbird import render
 from ironbird.ccdd.model import MessageKind
 from ironbird.coalesce import Coalescer
 from ironbird.codec import Codec, DecodedPacket
@@ -27,6 +37,7 @@ from test_engine import _Probe
 
 DECODE_CEILING_S = 100e-6
 INGEST_CEILING_S = 100e-6
+LISTEN_OVERHEAD_RATIO = 1.5  # listen path vs. the bare decode + render it must wrap
 FLOOR_PPS = 1_000  # the plan's hard floor, aggregate packets per second
 TARGET_PPS = 10_000  # the plan's design target
 PACKET_BYTES = 200  # the plan's average packet size
@@ -87,8 +98,9 @@ def test_check_rejects_garbage_cheaply(benchmark: Any, mock_codec: Codec) -> Non
     _check_ceiling(benchmark, DECODE_CEILING_S)
 
 
-def test_ingest_per_frame_cost(benchmark: Any, tmp_path: Path) -> None:
-    """One valid frame through ingest: seq, Frame, peek, check, count, one sink. No transport."""
+def test_ingest_only_per_frame_cost(benchmark: Any, tmp_path: Path) -> None:
+    """INGEST ONLY: one valid frame through ingest (seq, Frame, peek, check, count, one sink).
+    No transport, no consumer, no decode, no output: not the cost of a packet a user sees."""
     probe = _Probe(tmp_path)
     seen: list[Frame] = []
 
@@ -105,7 +117,7 @@ def test_ingest_per_frame_cost(benchmark: Any, tmp_path: Path) -> None:
     _check_ceiling(benchmark, INGEST_CEILING_S)
 
 
-# -- engine ingest on loopback ---------------------------------------------------------------
+# -- engine ingest on loopback (ingest only: a sender and a draining consumer, no decode) --
 
 SENDER = """
 import socket, sys, time
@@ -225,8 +237,10 @@ def _loopback_run(tmp_path: Path, count: int, rate: int) -> tuple[int, int, floa
     return count, ingested, seconds
 
 
-def test_ingest_saturation_rate_on_loopback(benchmark: Any, tmp_path: Path) -> None:
-    """The most packets/s one engine ingests (and a consumer drains) from an unpaced sender.
+def test_ingest_only_saturation_rate_on_loopback(benchmark: Any, tmp_path: Path) -> None:
+    """INGEST ONLY: the most packets/s one engine ingests (and a draining consumer discards)
+    from an unpaced sender. Nothing is decoded or printed, so this is not the rate ``ib listen``
+    sustains; see :func:`test_listen_cli_at_the_target_rate_loses_no_output`.
 
     The sender outruns the receiver, so the kernel drops the excess; the rate is what got in.
     """
@@ -244,10 +258,121 @@ def test_ingest_saturation_rate_on_loopback(benchmark: Any, tmp_path: Path) -> N
     assert best >= FLOOR_PPS
 
 
-def test_ingest_at_the_target_rate_loses_nothing_on_loopback(tmp_path: Path) -> None:
-    """Paced at the floor and, on a host with room, at the design target: nothing is lost."""
+def test_ingest_only_at_the_target_rate_loses_nothing_on_loopback(tmp_path: Path) -> None:
+    """INGEST ONLY: paced at the floor and, on a host with room, at the design target: nothing
+    is lost between the socket and a draining consumer."""
     sent, ingested, seconds = _loopback_run(tmp_path, FLOOR_PPS * 2, FLOOR_PPS)
     assert ingested == sent, f"floor rate lost {sent - ingested} of {sent}"
     sent, ingested, seconds = _loopback_run(tmp_path, TARGET_PPS * 2, TARGET_PPS)
     print(f"\npaced {TARGET_PPS:,} pkt/s: {ingested}/{sent} ingested over {seconds:.2f} s")
     assert ingested >= 0.9 * sent  # a loaded CI runner may drop some; the target is tracked
+
+
+# -- the whole listen path --
+
+
+def test_listen_path_costs_little_over_decode_and_render(tmp_path: Path) -> None:
+    """The per-packet cost of receive + queue + decode + JSON render, against the cost of the
+    bare decode + render it wraps, measured in the same process so the ratio holds on any host.
+
+    Frames arrive in bursts as they do off a socket (50 per reader wake-up); what is timed is
+    the engine and the listener around the decoder, which must stay a small fraction of it.
+    """
+    config = load_config(_bench_config(tmp_path))
+    burst, total = 50, 20_000
+
+    async def main() -> tuple[float, float]:
+        ledger = Ledger(tmp_path / "ledger", session_id="cost")
+        async with Session(config, role="ground", ledger=ledger, notify=_ignore) as ground:
+            codec = ground.codec_for("fc")
+            wire = codec.encode_telemetry("BENCH_TLM", {"blob": "x" * 20}).data
+            listener = await ground.listen("fc")
+            link = ground.route("fc").link
+            io = ground._engine._ios[(link.name, LinkEnd.SOURCE)]
+            frames = aiter(listener)
+            best_listen = best_floor = float("inf")
+            for _ in range(3):
+                start = time.perf_counter()
+                for _ in range(total // burst):
+                    for _ in range(burst):
+                        io.on_data(wire, 1, "127.0.0.1:1", len(wire), FrameFlag.NONE)
+                    for _ in range(burst):
+                        rx = await anext(frames)
+                        json.dumps(render.record("fc", rx.frame.time_ns, rx.packet))
+                best_listen = min(best_listen, (time.perf_counter() - start) / total)
+                start = time.perf_counter()
+                for _ in range(total):
+                    packet = codec.decode(MessageKind.TELEMETRY, wire)
+                    assert isinstance(packet, DecodedPacket)
+                    json.dumps(render.record("fc", 1, packet))
+                best_floor = min(best_floor, (time.perf_counter() - start) / total)
+            await listener.close()
+            return best_listen, best_floor
+
+    listen_s, floor_s = asyncio.run(main())
+    print(
+        f"\nlisten path {listen_s * 1e6:.1f} us/packet, bare decode+render {floor_s * 1e6:.1f} us"
+    )
+    assert listen_s < LISTEN_OVERHEAD_RATIO * floor_s, (
+        f"listen path {listen_s * 1e6:.1f} us/packet vs {floor_s * 1e6:.1f} us for decode+render"
+    )
+
+
+LISTEN_PACKETS = 30_000
+LISTEN_RATE = TARGET_PPS
+CLI_MAIN = "import sys; from ironbird.cli.main import main; sys.exit(main())"
+
+
+def _run_listen_cli(tmp_path: Path, count: int, rate: int) -> tuple[int, int, str]:
+    """``ib listen --format json`` to a file while another process sends ``count`` packets at
+    ``rate``/s. Returns (sent, lines written, standard error text)."""
+    config_path = _bench_config(tmp_path)
+    config = load_config(config_path)
+    codec = Session(
+        config, role="ground", ledger=Ledger(tmp_path / "l0", session_id="c"), notify=_ignore
+    ).codec_for("fc")
+    wire = codec.encode_telemetry("MOCK_HK").data  # many fields: the costly line to print
+    port = config.links[0].telemetry_endpoint.port
+    environment = {
+        **os.environ,
+        "IRONBIRD_CONFIG": str(config_path),
+        "IRONBIRD_STATE_DIR": str(tmp_path / "state"),
+    }
+    out_path, err_path = tmp_path / "listen.out", tmp_path / "listen.err"
+    with out_path.open("wb") as out, err_path.open("wb") as err:
+        listener = subprocess.Popen(
+            [sys.executable, "-c", CLI_MAIN, "listen", "fc", "--format", "json"],
+            stdout=out,
+            stderr=err,
+            env=environment,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while b"istening" not in err_path.read_bytes():
+                assert listener.poll() is None, err_path.read_text()
+                assert time.monotonic() < deadline, "the listener never reported it was listening"
+                time.sleep(0.05)
+            subprocess.run(
+                [sys.executable, "-c", SENDER, str(port), str(count), str(rate), wire.hex()],
+                check=True,
+            )
+            time.sleep(0.5)  # the last datagrams are read and written
+        finally:
+            listener.send_signal(signal.SIGTERM)
+            try:
+                listener.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                listener.kill()
+                listener.wait()
+    return count, len(out_path.read_bytes().splitlines()), err_path.read_text()
+
+
+def test_listen_cli_at_the_target_rate_loses_no_output(tmp_path: Path) -> None:
+    """END TO END: a separate ``ib listen --format json`` process writing to a file, fed by a
+    separate sender at the design target rate. Output lines must not be dropped by the tool
+    (``IB-OUT-*`` on standard error); only the host's own datagram loss is tolerated.
+    """
+    sent, lines, errors = _run_listen_cli(tmp_path, LISTEN_PACKETS, LISTEN_RATE)
+    print(f"\nib listen at {LISTEN_RATE:,} pkt/s: {lines}/{sent} lines written")
+    assert "IB-OUT-" not in errors, errors
+    assert lines >= 0.95 * sent, f"{sent - lines} of {sent} packets did not reach the output"

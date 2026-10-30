@@ -470,10 +470,15 @@ class Session:
         return await self._engine.open_capture(ends, sinks=sinks, queue_frames=queue_frames)
 
     def add_sink(self, sink: FrameSink) -> None:
-        """Attach ``sink`` to every frame this session ingests or sends until it is removed."""
+        """Attach ``sink`` to every frame this session ingests or sends until it is removed.
+
+        A sink attached by several holders (this call, captures naming it) sees each frame once
+        and stays until each has removed it; one that raises is detached and reported once.
+        """
         self._engine.add_sink(sink)
 
     def remove_sink(self, sink: FrameSink) -> None:
+        """Release one ``add_sink`` of ``sink``."""
         self._engine.remove_sink(sink)
 
     def decoder(self, *, report_checked: bool) -> FrameDecoder:
@@ -670,13 +675,14 @@ class Listener:
         return self._iterate()
 
     async def _iterate(self) -> AsyncIterator[Decoded]:
-        mids = self._mids
-        async for frame in self._capture:
-            if mids is not None and frame.mid not in mids:
-                continue  # a MID filter hides valid packets only; ingest reported the rest
-            result = self._decoder.decode(frame)
-            if not isinstance(result, DecodeError):
-                yield result
+        mids, decode, next_batch = self._mids, self._decoder.decode, self._capture.next_batch
+        while batch := await next_batch():
+            for frame in batch:
+                if mids is not None and frame.mid not in mids:
+                    continue  # a MID filter hides valid packets only; ingest reported the rest
+                result = decode(frame)
+                if not isinstance(result, DecodeError):
+                    yield result
 
     async def close(self) -> None:
         await self._capture.close()

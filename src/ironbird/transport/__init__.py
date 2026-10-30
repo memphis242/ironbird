@@ -17,6 +17,7 @@ from ironbird.transport.base import (
     LinkEnd,
     Receiver,
     Transport,
+    TransportClosed,
     TransportStats,
 )
 from ironbird.transport.udp import UdpTransport
@@ -65,6 +66,7 @@ __all__ = [
     "LinkEnd",
     "Receiver",
     "Transport",
+    "TransportClosed",
     "TransportFactory",
     "TransportStats",
     "UdpTransport",
