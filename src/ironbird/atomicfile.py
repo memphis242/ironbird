@@ -1,30 +1,37 @@
-"""Writing a file under a temporary name and committing it without replacing anything.
+"""Renaming and writing files without replacing or deleting anything that is not ours.
 
-An output file (a repaired recording, later an export) is first written to
-``.<final name>.<16 hex>.tmp`` in the final name's directory, created ``O_EXCL``, then synced and
-committed by :func:`rename_noreplace`, so a final name that appeared meanwhile is never
-overwritten. The only replacement is an explicit ``force`` over an existing regular file owned
-by the caller. A failure removes the temporary file, and only that: by directory descriptor and
-name, after checking that the name still denotes the descriptor this process holds open.
+:func:`rename_noreplace` is the one rename of the ledger (a retired reserve), of reserve
+recovery and of the temporary commit below: an existing file is never replaced. An output file
+(a repaired recording, later an export) is first written to ``.<final name>.<16 hex>.tmp`` in
+the final name's directory, created ``O_EXCL``, then synced and committed by
+:func:`rename_noreplace`, so a final name that appeared meanwhile is never overwritten. The only
+replacement is an explicit ``force`` over an existing regular file owned by the caller. A failure
+removes the temporary file, and only that: by directory descriptor and name, after checking that
+the name still denotes the descriptor this process holds open.
 
-Nothing here deletes a file this process did not create in the same call.
+Nothing here deletes a file this process did not create in the same call. Every system call goes
+through a :class:`~ironbird.fsops.FileSystem`, so tests can fail any step.
 """
 
 from __future__ import annotations
 
 import contextlib
-import ctypes
 import errno
 import os
 import stat
 from pathlib import Path
 from typing import Final
 
-_AT_FDCWD: Final = -100
-_RENAME_NOREPLACE: Final = 1
-_UNAVAILABLE: Final = frozenset({errno.ENOSYS, errno.EOPNOTSUPP, errno.EINVAL})
+from ironbird.fsops import (
+    REAL_FS,
+    FileSystem,
+    close_quietly,
+    same_file,
+    try_stat_at,
+)
+
 _NO_HARD_LINKS: Final = frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV})
-_OPEN_DIR: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+_NAME_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 class Collision(OSError):
@@ -34,118 +41,92 @@ class Collision(OSError):
         super().__init__(errno.EEXIST, "file exists", name)
 
 
-def _renameat2() -> object | None:
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        return libc.renameat2
-    except (AttributeError, OSError):
-        return None
+class SyncAfterCommit(OSError):
+    """The rename was committed but syncing the directory failed: the new name may not survive
+    a power loss. The rename is not undone."""
 
 
-_RENAMEAT2: Final = _renameat2()
-
-
-def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
-    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
-
-
-def _stat_at(dir_fd: int, name: str) -> os.stat_result | None:
-    try:
-        return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-    except OSError:
-        return None
-
-
-def _try_renameat2(dir_fd: int, old: str, new: str) -> bool | None:
-    """``True`` renamed, ``None`` the call is unavailable here; a collision raises."""
-    func = _RENAMEAT2
-    if func is None:
-        return None
-    result = func(  # type: ignore[operator]
-        ctypes.c_int(dir_fd),
-        os.fsencode(old),
-        ctypes.c_int(dir_fd),
-        os.fsencode(new),
-        ctypes.c_uint(_RENAME_NOREPLACE),
-    )
-    if result == 0:
-        return True
-    err = ctypes.get_errno()
-    if err == errno.EEXIST:
-        raise Collision(new)
-    if err in _UNAVAILABLE:
-        return None
-    raise OSError(err, os.strerror(err), new)
-
-
-def rename_noreplace(dir_fd: int, old: str, new: str, fd: int) -> None:
+def rename_noreplace(dir_fd: int, old: str, new: str, fd: int, *, fs: FileSystem = REAL_FS) -> None:
     """Rename ``old`` to ``new`` (both names in the directory ``dir_fd``) unless ``new`` exists.
 
-    ``fd`` is the open descriptor of the file: ``old`` must still denote it. Raises
-    :class:`Collision` when ``new`` exists and ``OSError`` for any other failure; after a
-    committed rename the directory is synced (a failure of that sync is raised, but does not
-    undo the rename).
+    ``fd`` is the open descriptor of the file (or directory) and ``old`` must still denote it.
+    Raises :class:`Collision` when ``new`` exists, :class:`SyncAfterCommit` when only the
+    directory sync after a committed rename failed, and ``OSError`` for any other failure, in
+    which case nothing was changed (a placeholder this call made is removed again).
     """
-    held, named = os.fstat(fd), _stat_at(dir_fd, old)
-    if named is None or not _same_file(held, named):
-        raise OSError(errno.ENOENT, "the temporary file's name no longer denotes the file", old)
-    if _try_renameat2(dir_fd, old, new) is None:
-        _link_or_placeholder(dir_fd, old, new, fd, held)
-    os.fsync(dir_fd)
+    held, named = fs.fstat(fd), try_stat_at(fs, dir_fd, old)
+    if named is None or not same_file(held, named):
+        raise OSError(errno.ENOENT, "the name no longer denotes the file", old)
+    try:
+        renamed = fs.renameat2_noreplace(dir_fd, old, new)
+    except FileExistsError:
+        raise Collision(new) from None
+    # renameat2 unavailable here: a hard link for a regular file, else the placeholder rename
+    if renamed is None and not (stat.S_ISREG(held.st_mode) and _link(fs, dir_fd, old, new, held)):
+        _placeholder_rename(fs, dir_fd, old, new, held)
+    try:
+        fs.fsync(dir_fd)
+    except OSError as exc:
+        raise SyncAfterCommit(exc.errno, exc.strerror or "directory sync failed", new) from exc
 
 
-def _link_or_placeholder(dir_fd: int, old: str, new: str, fd: int, held: os.stat_result) -> None:
-    """The fallbacks when ``renameat2`` cannot be used: a hard link, then a placeholder."""
-    if stat.S_ISREG(held.st_mode) and _link(dir_fd, old, new, held):
-        return
-    _placeholder_rename(dir_fd, old, new)
-
-
-def _link(dir_fd: int, old: str, new: str, held: os.stat_result) -> bool:
-    """Commit by hard link and unlink of the old name. ``False``: hard links are unavailable
+def _link(fs: FileSystem, dir_fd: int, old: str, new: str, held: os.stat_result) -> bool:
+    """Commit by hard link, then unlink of the old name. ``False``: hard links are unavailable
     here. A name that is taken raises :class:`Collision`."""
     try:
-        os.link(old, new, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+        fs.link_at(dir_fd, old, new)
     except FileExistsError:
-        current = _stat_at(dir_fd, new)
-        if current is None or not _same_file(held, current):
+        current = try_stat_at(fs, dir_fd, new)
+        if current is None or not same_file(held, current):
             raise Collision(new) from None
         # An earlier link went through and its reply was lost (NFSv3): the name is ours.
     except OSError as exc:
         if exc.errno in _NO_HARD_LINKS:
             return False
         raise
-    _unlink_pair(dir_fd, old, new, held)
+    now_new, now_old = try_stat_at(fs, dir_fd, new), try_stat_at(fs, dir_fd, old)
+    if now_new is None or not same_file(held, now_new):
+        raise OSError(errno.EIO, "the committed name does not denote the file", new)
+    if now_old is not None and same_file(held, now_old):
+        fs.unlink_at(dir_fd, old)  # the second step of the link rename: our own old name
     return True
 
 
-def _unlink_pair(dir_fd: int, old: str, new: str, held: os.stat_result) -> None:
-    now_new, now_old = _stat_at(dir_fd, new), _stat_at(dir_fd, old)
-    if now_new is None or not _same_file(held, now_new):
-        raise OSError(errno.EIO, "the committed name does not denote the file", new)
-    if now_old is not None and _same_file(held, now_old):
-        os.unlink(old, dir_fd=dir_fd)
+def _placeholder_rename(
+    fs: FileSystem, dir_fd: int, old: str, new: str, held: os.stat_result
+) -> None:
+    """Create the final name exclusively (an empty file, or a directory), then rename over it.
 
-
-def _placeholder_rename(dir_fd: int, old: str, new: str) -> None:
-    """Create the final name exclusively, then rename over it (an empty regular file)."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    A crash between the two steps leaves the empty placeholder at the final name, which a later
+    run refuses as an existing name; any failure after the placeholder exists removes the
+    placeholder this call created.
+    """
+    is_dir = stat.S_ISDIR(held.st_mode)
+    placeholder_fd = -1
     try:
-        placeholder = os.open(new, flags, 0o600, dir_fd=dir_fd)
+        if is_dir:
+            fs.mkdir_at(dir_fd, new, 0o700)
+        else:
+            placeholder_fd = fs.open_at(dir_fd, new, _NAME_FLAGS, 0o600)
     except FileExistsError:
         raise Collision(new) from None
     try:
-        made = os.fstat(placeholder)
+        made = fs.fstat(placeholder_fd) if placeholder_fd >= 0 else try_stat_at(fs, dir_fd, new)
         try:
-            os.rename(old, new, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-        except OSError:
-            current = _stat_at(dir_fd, new)
-            if current is not None and _same_file(made, current):
+            fs.rename_at(dir_fd, old, new)
+        except OSError as exc:
+            current = try_stat_at(fs, dir_fd, new)
+            if made is not None and current is not None and same_file(made, current):
                 with contextlib.suppress(OSError):
-                    os.unlink(new, dir_fd=dir_fd)
+                    if is_dir:
+                        fs.rmdir_at(dir_fd, new)  # the placeholder directory we made
+                    else:
+                        fs.unlink_at(dir_fd, new)  # the placeholder file we made
+            if is_dir and exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                raise Collision(new) from exc
             raise
     finally:
-        os.close(placeholder)
+        close_quietly(fs, placeholder_fd)
 
 
 class TempOutput:
@@ -155,34 +136,31 @@ class TempOutput:
     ``out.commit()``. Leaving the block without a commit removes the temporary file.
     """
 
-    def __init__(self, final: Path, *, force: bool = False) -> None:
+    def __init__(self, final: Path, *, force: bool = False, fs: FileSystem = REAL_FS) -> None:
         self.final = final
         self.force = force
         self.fd = -1
         self.name = ""
+        self._fs = fs
         self._dir_fd = -1
         self._committed = False
 
     def __enter__(self) -> TempOutput:
+        fs = self._fs
         directory = self.final.parent
-        self._dir_fd = os.open(directory, _OPEN_DIR)
+        self._dir_fd = fs.open_dir(directory)
         try:
             for _ in range(8):
                 name = f".{self.final.name}.{os.urandom(8).hex()}.tmp"
                 try:
-                    self.fd = os.open(
-                        name,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                        0o600,
-                        dir_fd=self._dir_fd,
-                    )
+                    self.fd = fs.open_at(self._dir_fd, name, _NAME_FLAGS, 0o600)
                 except FileExistsError:
                     continue
                 self.name = name
                 return self
             raise OSError(errno.EEXIST, "no free temporary name", str(directory))
         except BaseException:
-            os.close(self._dir_fd)
+            close_quietly(fs, self._dir_fd)
             raise
 
     @property
@@ -192,36 +170,40 @@ class TempOutput:
     def write(self, data: bytes | bytearray | memoryview) -> None:
         view = memoryview(data)
         while view:
-            written = os.write(self.fd, view)
+            written = self._fs.write(self.fd, view)
             if written <= 0:
                 raise OSError(errno.EIO, "write made no progress", self.name)
             view = view[written:]
 
     def commit(self) -> None:
         """Sync the file and give it its final name. An existing name is refused
-        (:class:`Collision`) unless ``force`` and it is an existing regular file, which is
-        replaced."""
-        os.fdatasync(self.fd)
+        (:class:`Collision`) unless ``force`` and it is an existing regular file owned by this
+        user, which is replaced."""
+        fs = self._fs
+        fs.fdatasync(self.fd)
         final = self.final.name
         if self.force:
-            existing = _stat_at(self._dir_fd, final)
-            if existing is not None and stat.S_ISREG(existing.st_mode):
-                os.rename(self.name, final, src_dir_fd=self._dir_fd, dst_dir_fd=self._dir_fd)
+            existing = try_stat_at(fs, self._dir_fd, final)
+            if (
+                existing is not None
+                and stat.S_ISREG(existing.st_mode)
+                and existing.st_uid == os.getuid()
+            ):
+                fs.rename_at(self._dir_fd, self.name, final)  # --force: the one replacement
                 self._committed = True
-                os.fsync(self._dir_fd)
+                fs.fsync(self._dir_fd)
                 return
-        rename_noreplace(self._dir_fd, self.name, final, self.fd)
+        rename_noreplace(self._dir_fd, self.name, final, self.fd, fs=fs)
         self._committed = True
 
     def __exit__(self, *exc_info: object) -> None:
+        fs = self._fs
         try:
             if not self._committed and self.name:
-                held, named = os.fstat(self.fd), _stat_at(self._dir_fd, self.name)
-                if named is not None and _same_file(held, named):
+                held, named = fs.fstat(self.fd), try_stat_at(fs, self._dir_fd, self.name)
+                if named is not None and same_file(held, named):
                     with contextlib.suppress(OSError):
-                        os.unlink(self.name, dir_fd=self._dir_fd)
+                        fs.unlink_at(self._dir_fd, self.name)  # our own uncommitted temporary
         finally:
-            with contextlib.suppress(OSError):
-                os.close(self.fd)
-            with contextlib.suppress(OSError):
-                os.close(self._dir_fd)
+            close_quietly(fs, self.fd)
+            close_quietly(fs, self._dir_fd)

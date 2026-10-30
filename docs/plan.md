@@ -1858,6 +1858,93 @@ Deferred from the 2d plan review (each revisited at the step named)
 - Exit-code precedence of 3 over 6: kept (Stage 1 orders 3 above 4, and 6 shares 4's
   tier); the `IB-LED-004` line is printed either way. Revisit if scripts need 6 to win.
 
+As built (where the build differs from, or settles, the text above)
+- **Modules.** `fsops.py` (the seam: `FileSystem`, one system call per method, `REAL_FS`; `fstatfs`
+  and `renameat2` via `ctypes` live only here), `atomicfile.py` (2e's helper, extended: every step
+  through the seam, a directory placeholder, `SyncAfterCommit` for a failed directory sync after a
+  committed rename), `ledgertiers.py` (`Tier`, `TierBudget`, `EvidenceSampler`, `TokenBucket`; pure,
+  injected clock), `ledgerstore.py` (`LedgerStore`: the on-disk state machine, and `LedgerWriter`, the
+  writer thread; the thread blocks the shutdown signals), `ledger.py` (the producer side: queue,
+  tiers, transmissions, `ExitReport`), `units.py` (the size and duration grammars), `retention.py`
+  (scan, liveness, protection, reserve recovery), `retnotices.py` (the notices file), `retservice.py`
+  (scheduling and the `IB-RET-*` warnings), `prune.py` and `cli/prunecmd.py` (the only deletion).
+- **Test seam.** `Ledger(..., fs=, clock=, ...)` and `Notices`/`Retention` take the `FileSystem` and
+  clock; the CLI reads `ironbird.cli.main.LEDGER_OPTIONS` (empty in production), which
+  `tests/support/faulty_main.py` fills before calling `main()`. `src/` reads no environment variable
+  or file to enable faults. `tests/support/faultfs.py` scripts errno failures, partial writes and
+  blocked calls.
+- **Record zero, numbering, ownership.** `ledger.open` is record `n=0`; records the writer thread
+  makes (`ledger.part`, `ledger.reserve`, `ledger.resumed`, `ledger.name_taken`) take numbers from the
+  same counter, so `n` is unique but not strictly increasing in file order across them.
+  `Ledger.record` returns the number of a record that was queued; while the ledger is stalled it
+  keeps returning numbers. `record_tx` is the one entry for a transmission (a command or a reply);
+  `Session.send_command` checks `on_full` before sending (`check_transmit`), the responder asks
+  `withhold_reply` and records replies through `record_reply` (10/s, burst 600, counted into
+  `respond.replies` per 10 s beyond it).
+- **Tier table.** `ledger.RECORD_TIERS` lists every record name `src/` writes; a test parses `src/`
+  and fails on a name that is missing. Errors take their tier from the code (`IB-DEC-*`,
+  `IB-RSP-*`, `IB-TX-003/004`, `IB-ENG-001` are evidence). `rx.unread_at_close` and `rx.failed` are
+  essential (once per close or failure); `rx.first`, `rx.queue_drops`, `rx.kernel_drops` are
+  evidence. The queue slices are 100 000 evidence and 50 000 event records (32 and 16 MiB) of
+  200 000 (64 MiB).
+- **Sampling keys.** `rx.malformed` records and their error records sample under separate keys
+  (`CODE:MID:stream` and the same with `|error`), the responder's received commands under
+  `rx.command:NAME`; the 1025th key of a window folds into one `other|<record name>` entry (one per
+  record name, so a summary never mixes two kinds). `Session.__aexit__` calls `Ledger.settle()` so the
+  open window's summary is written even when the process is not closing the ledger.
+- **Allowance accounting.** The tier's "bytes on disk" are the bytes the writer confirmed, so the
+  figure lags the producer by what is queued (at most about a second; the allowance is re-judged at
+  the end of every drain, every 256th record of a capped tier and every tick). `ledger.tier_over` is
+  written when an episode starts and `ledger.tier_gap` when it ends. A tier over its allowance, or a
+  ledger stalled or writing into its reserve, counts records and raw-field bytes per tier.
+- **Writer and stall.** The retry interval, the 5 s hang threshold and the 1 s sync read the
+  injected clock; a call that runs more than 5 s makes `Ledger.stalled` true on the loop side
+  (watchdog in `tick`) while the thread stays in the call, and when it returns its result is handled
+  like any other. `finish()` is the last write attempt plus a sync and the account, `close()` the
+  final close (an unused reserve takes the closing records and retires as the last part, never left
+  behind); records made after `close()` (a signal announced while it ran) are appended best effort to
+  the file the session ended in. `ib` calls `finish()` before the last stderr drain, so the exit
+  lines print, and `close()` after. A short command that was refused (`IB-LED-004` error) prints no
+  extra `IB-LED-001` exit line (the error line already names the stall).
+- **Reserve.** Allocation checks `f_type` (ext2/3/4, XFS, tmpfs), creates `rNNNN.reserve`
+  (`O_RDWR|O_CREAT|O_EXCL`, never `O_APPEND`), locks it, `pwrite`s the header, `posix_fallocate`s and
+  verifies `st_blocks`; a failed allocation is cut back to the header and retried each minute. A
+  reserve takes its part number when it becomes the active file, so the number in its records is the
+  one it will retire under. Only ENOSPC or EDQUOT on a write switches to the reserve; a deferred
+  error at `fdatasync` is "possibly lost" and stalls.
+- **Retention.** The scan runs in a worker thread; liveness is the lock probe, a newest mtime within
+  10 minutes or in the future, and "no part 1"; the checker's own session is live and never probed.
+  Classes are read from part 1's head newest first and only as far as the keep rules need. "Its
+  recording is present and not itself proposed" is read as: the recording exists and is protected or
+  not old enough to be selected under the same age; a recording that `ib rec prune` would propose does
+  not hold its ledger back. The notices file keeps at most 32 entries.
+- **Interpretations to review.** (1) The `keep_recent` order is the session start stamp. (2) The
+  age used for a ledger's "recording not proposed" test is the prune's own `--older-than`/`max_age`.
+  (3) `IB-RET-002` suggests the prune target as the directory's bytes minus the excess over the cap
+  (minus 5 % of the cap for a projection). (4) A notice pointer's part is the part current when the
+  record was queued, so across a rotation the record may be in the next part.
+- **Deviations.** `ib record` and the other recorders still run unlocked without saying so when the
+  file system has no locks (`IB-LED-009` covers the ledger only; the recorder's silent fallback is
+  2e's deferred item and remains). The recorder's `_discard_partial` (a failed start removes the
+  partial recording it just created with `O_EXCL`) is on the static guard's allowlist as the one
+  other removal of a file the process itself created; it is not a temporary-name file. The guard
+  checks references as well as calls, so a function passed as a value (`self._call(fs.ftruncate,
+  ...)`) is seen.
+- **Verification.** `test_ledger_tiers.py` (allowance arithmetic over 12 simulated hours, the 1:64
+  real-ledger run, sampler, sizing guard measured through the real formatter: 819/935/1656 B against
+  the documented 856/947/1670 B), `test_ledger_store.py` (open boundary per errno and step, locks,
+  stall and resume, exit lines and exit 6, deferred sync errors, hung writer, rotation and names
+  taken, reserve allocation, verification, use, retirement and close), `test_ledger_cli.py`,
+  `test_ledger_floods.py`, `test_retention*.py`, `test_ledger_recovery.py` (every recovery rule plus
+  the `led-reserve-*` corpus and a real `kill -9`), `test_retention_untrusted.py` (config grammar,
+  notices file, ledger heads, hostile names; corpus `cfg-ledger-*`, `cfg-retention-*`,
+  `ret-notices-*`, `led-head-*`, `led-reserve-*`), `test_no_automatic_deletion.py` (the static guard
+  and its mutation cases).
+- **Deferred.** The 1000-run `ib send` loops against a no-lock file system are covered by the
+  in-process 1000-caller test of the notices file and the per-process warnings, not by 1000
+  subprocesses. The `IB-RET-002` projection is tested with an injected clock and rate source, not
+  against a real recorder. A 100 000-entry directory is tested at a lowered bound.
+
 ### 2e - Recording format and writer
 
 Deliverables

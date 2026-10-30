@@ -123,6 +123,7 @@ def _isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.chdir(tmp_path)
     state = tmp_path / "state"
     monkeypatch.setenv("IRONBIRD_STATE_DIR", str(state))
+    monkeypatch.setenv("IRONBIRD_RECORD_DIR", str(tmp_path / "recordings"))  # never the user's
     monkeypatch.delenv("IRONBIRD_CONFIG", raising=False)
     return state
 

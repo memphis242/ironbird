@@ -751,8 +751,12 @@ def test_filtered_listener_reports_skipped_malformed_and_unknown_packets(
         assert ground.malformed_total >= 1500
 
     ledger, _, _ = run_session(scenario)
-    malformed = [e for e in read_ledger(ledger) if e["event"] == "rx.malformed"]
-    assert len(malformed) >= 1500
+    rows = read_ledger(ledger)
+    kept = [e for e in rows if e["event"] == "rx.malformed"]
+    # Evidence sampling keeps the first of each key in full; the window summaries stand for the
+    # rest (1024 keys, then everything folds into "other"), so every packet is accounted for.
+    summarised = sum(e["skipped"] for e in rows if e["event"] == "rx.malformed.summary")
+    assert len(kept) + summarised >= 1500
 
 
 # -- config/CCDD-sourced strings go through the one terminal-text helper -----------------------

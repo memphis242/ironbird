@@ -191,7 +191,13 @@ def test_responder_survives_a_flood_of_malformed_commands_and_coalesces(
         e for e in _events(fc_ledger) if e["kind"] == "error" and e["event"] != Code.TX_RCVBUF.value
     ]
     assert {e["event"] for e in errors} == {Code.DEC_CHECKSUM.value}, errors[:5]
-    assert len(errors) == flood  # the ledger keeps every one in full
+    # Evidence sampling: the first eight in full (then one a second), the window summary stands
+    # for the rest, so every occurrence is accounted for.
+    summaries = [
+        e for e in _events(fc_ledger) if e["event"] == f"{Code.DEC_CHECKSUM.value}.summary"
+    ]
+    assert 8 <= len(errors) < flood
+    assert len(errors) + sum(s["skipped"] for s in summaries) == flood
 
 
 def test_ground_survives_malformed_telemetry_and_reports_unknown_mid_once(

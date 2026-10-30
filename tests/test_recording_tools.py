@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from ironbird import atomicfile
+from ironbird import atomicfile, fsops
 from ironbird.errors import Code, IronbirdError
 from ironbird.recording import format as fmt
 from ironbird.recording import inspect as rec_inspect
@@ -85,24 +85,31 @@ def test_a_renamed_temporary_is_not_unlinked_by_name(tmp_path: Path) -> None:
     assert len(leftovers) == 1 and leftovers[0].read_bytes() == b"someone else's file"
 
 
+class _NoRenameat2(fsops.FileSystem):
+    def renameat2_noreplace(self, dir_fd: int, old: str, new: str) -> bool | None:
+        return None
+
+
+class _NoLinks(_NoRenameat2):
+    def link_at(self, dir_fd: int, old: str, new: str) -> None:
+        raise OSError(errno.EPERM, "no hard links here")
+
+
 @pytest.mark.parametrize("path_taken", ["renameat2", "link", "placeholder"])
 def test_every_commit_path_refuses_a_collision_and_commits_otherwise(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path_taken: str
+    tmp_path: Path, path_taken: str
 ) -> None:
-    if path_taken != "renameat2":
-        monkeypatch.setattr(atomicfile, "_RENAMEAT2", None)
-    if path_taken == "placeholder":
-
-        def no_links(*_: object, **__: object) -> None:
-            raise OSError(errno.EPERM, "no hard links here")
-
-        monkeypatch.setattr(os, "link", no_links)
+    fs = {
+        "renameat2": fsops.REAL_FS,
+        "link": _NoRenameat2(),
+        "placeholder": _NoLinks(),
+    }[path_taken]
     final = tmp_path / "out.bin"
-    with atomicfile.TempOutput(final) as out:
+    with atomicfile.TempOutput(final, fs=fs) as out:
         out.write(b"first")
         out.commit()
     assert final.read_bytes() == b"first"
-    with pytest.raises(atomicfile.Collision), atomicfile.TempOutput(final) as out:
+    with pytest.raises(atomicfile.Collision), atomicfile.TempOutput(final, fs=fs) as out:
         out.write(b"second")
         out.commit()
     assert final.read_bytes() == b"first" and not list(tmp_path.glob(".*"))
