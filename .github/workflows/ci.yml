@@ -47,7 +47,9 @@ jobs:
           ruff check .
           ruff format --check .
       - name: Type check
-        run: pyright
+        run: |
+          PYRIGHT_PYTHON_DEBUG=1 pyright --version  # logs which Node pyright runs on
+          pyright
       - name: Tests (real-cFS tests are opt-in and skipped here)
         run: pytest -n auto
       # pytest-benchmark disables itself under xdist, so the ceilings above are only enforced
@@ -73,19 +75,24 @@ jobs:
             constraints-dev.txt
       - name: Read pinned cFS commit
         id: pin
-        run: |
-          commit="$(sed -n 's/^readonly DEFAULT_COMMIT="\(.*\)"$/\1/p' tools/cfs/build.sh)"
-          test -n "$commit"
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-      - name: Cache cFS checkout and build
+        run: tools/ci/cache-key.sh >> "$GITHUB_OUTPUT"
+      # Restore and save are separate steps: the tree is saved right after the build, before
+      # the tests write their own state (cFS run directories, logs) into it.
+      - name: Restore cFS checkout and build
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.CFS_BUILD_DIR }}
           key: cfs-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ hashFiles('tools/cfs/build.sh') }}
       - name: Build cFS
         if: steps.cache.outputs.cache-hit != 'true'
         run: tools/cfs/build.sh
+      - name: Save cFS checkout and build
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CFS_BUILD_DIR }}
+          key: ${{ steps.cache.outputs.cache-primary-key }}
       - name: Install ironbird
         run: python -m pip install -c constraints-dev.txt -e '.[dev]'
       - name: Real-cFS acceptance tests
@@ -102,16 +109,22 @@ jobs:
           if-no-files-found: ignore
 
   # EL8 jobs. Steps run as the unprivileged user `ci` (the default shell below drops privileges
-  # with setpriv); only the bootstrap, package-install, ownership and cache steps run as root,
-  # and say so with `shell: bash`. The Python venv lives in the user's home, outside the
-  # workspace, and is first on PATH for every unprivileged step.
+  # with setpriv and sets no_new_privs, so nothing the tests run can regain them); only the
+  # bootstrap, package-install, ownership and cache-key steps run as root, and say so with
+  # `shell: bash`. Anything that must write a GITHUB_* file ($GITHUB_OUTPUT, $GITHUB_ENV,
+  # $GITHUB_PATH, $GITHUB_STEP_SUMMARY) is a root step: those files belong to the runner, not
+  # to `ci`. Every unprivileged `run` step starts with the id check below, and
+  # tests/test_ci_el8.py enforces both that and the shell default. The Python venv lives in
+  # the user's home, outside the workspace, and is first on PATH for every unprivileged step.
+  #
+  # UBI 8 is best effort only for one thing: a package its repositories lack (el8-setup.sh
+  # exit 3) skips the rest of its job with a warning. Any other failure on it, a test
+  # included, fails the job. The image digest is printed by "Initialize containers"; inside
+  # the container the setup step prints the release package and toolchain versions.
   el8-checks:
     name: EL8 ${{ matrix.name }} - lint, types, tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    # UBI 8 is best effort: its repositories carry a subset of the packages, and a gap there
-    # is not an ironbird regression. Oracle Linux 8 is the gate.
-    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
@@ -120,12 +133,14 @@ jobs:
           - { name: ubi8, image: "redhat/ubi8", experimental: true }
     container:
       image: ${{ matrix.image }}
+      # EL8 logins get a soft nofile limit of 1024 (PAM); Docker's default is far higher.
+      options: --ulimit nofile=1024:524288
     env:
       LANG: en_US.UTF-8
     defaults:
       run:
         shell: >-
-          setpriv --reuid=ci --regid=ci --init-groups
+          setpriv --reuid=ci --regid=ci --init-groups --no-new-privs
           env HOME=/home/ci USER=ci LOGNAME=ci
           PATH=/home/ci/venv/bin:/usr/local/bin:/usr/bin:/bin
           bash --noprofile --norc -eo pipefail {0}
@@ -135,26 +150,54 @@ jobs:
         run: dnf -y --setopt=install_weak_deps=False --nodocs install git tar gzip
       - uses: actions/checkout@v4
       - name: Install EL8 toolchain and create the CI user (root)
+        id: setup
         shell: bash
+        env:
+          BEST_EFFORT: ${{ matrix.experimental }}
         run: |
-          tools/ci/el8-setup.sh
-          chown -R ci:ci "$GITHUB_WORKSPACE"
+          status=0
+          tools/ci/el8-setup.sh || status=$?
+          if [ "$status" -eq 0 ]; then
+            chown -R ci:ci "$GITHUB_WORKSPACE"
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          elif [ "$status" -eq 3 ] && [ "$BEST_EFFORT" = "true" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=EL8 packages unavailable::el8-setup.sh found packages this best-effort image cannot supply; the rest of the job is skipped"
+          else
+            exit "$status"
+          fi
       - name: Create venv (EL8 python3.11)
-        run: python3.11 -m venv "$HOME/venv"
-      - name: Install
-        run: python -m pip install -c constraints-dev.txt -e '.[dev]'
-      - name: Lint
+        if: steps.setup.outputs.ready == 'true'
         run: |
+          test "$(id -u)" -ne 0
+          python3.11 -m venv "$HOME/venv"
+      - name: Install
+        if: steps.setup.outputs.ready == 'true'
+        run: |
+          test "$(id -u)" -ne 0
+          python -m pip install -c constraints-dev.txt -e '.[dev]'
+      - name: Lint
+        if: steps.setup.outputs.ready == 'true'
+        run: |
+          test "$(id -u)" -ne 0
           ruff check .
           ruff format --check .
       - name: Type check
-        run: pyright
+        if: steps.setup.outputs.ready == 'true'
+        run: |
+          test "$(id -u)" -ne 0
+          PYRIGHT_PYTHON_DEBUG=1 pyright --version  # logs which Node pyright runs on
+          pyright
       - name: Tests as a non-root user (real-cFS tests are opt-in and skipped here)
+        if: steps.setup.outputs.ready == 'true'
         run: |
           test "$(id -u)" -ne 0
           pytest -n auto
       - name: Benchmarks (serial, so the performance ceilings are enforced)
-        run: pytest tests/test_benchmarks.py -n0
+        if: steps.setup.outputs.ready == 'true'
+        run: |
+          test "$(id -u)" -ne 0
+          pytest tests/test_benchmarks.py -n0
       - name: Hand the workspace back to root (root)
         if: always()
         shell: bash
@@ -164,7 +207,6 @@ jobs:
     name: EL8 ${{ matrix.name }} - real cFS acceptance
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
@@ -173,6 +215,8 @@ jobs:
           - { name: ubi8, image: "redhat/ubi8", experimental: true }
     container:
       image: ${{ matrix.image }}
+      # EL8 logins get a soft nofile limit of 1024 (PAM); Docker's default is far higher.
+      options: --ulimit nofile=1024:524288
     env:
       LANG: en_US.UTF-8
       # Inside the user's home so the cached tree has one stable absolute path.
@@ -181,7 +225,7 @@ jobs:
     defaults:
       run:
         shell: >-
-          setpriv --reuid=ci --regid=ci --init-groups
+          setpriv --reuid=ci --regid=ci --init-groups --no-new-privs
           env HOME=/home/ci USER=ci LOGNAME=ci
           PATH=/home/ci/venv/bin:/usr/local/bin:/usr/bin:/bin
           bash --noprofile --norc -eo pipefail {0}
@@ -191,43 +235,74 @@ jobs:
         run: dnf -y --setopt=install_weak_deps=False --nodocs install git tar gzip
       - uses: actions/checkout@v4
       - name: Install EL8 toolchain and create the CI user (root)
+        id: setup
         shell: bash
+        env:
+          BEST_EFFORT: ${{ matrix.experimental }}
         run: |
-          tools/ci/el8-setup.sh
-          chown -R ci:ci "$GITHUB_WORKSPACE"
-      - name: Read pinned cFS commit (root)
+          status=0
+          tools/ci/el8-setup.sh || status=$?
+          if [ "$status" -eq 0 ]; then
+            chown -R ci:ci "$GITHUB_WORKSPACE"
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          elif [ "$status" -eq 3 ] && [ "$BEST_EFFORT" = "true" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=EL8 packages unavailable::el8-setup.sh found packages this best-effort image cannot supply; the rest of the job is skipped"
+          else
+            exit "$status"
+          fi
+      # The key covers the cFS commit, the EL8 toolchain versions (gcc, glibc, cmake) and the
+      # scripts that decide how cFS is built.
+      - name: Cache key inputs (root)
         id: pin
+        if: steps.setup.outputs.ready == 'true'
         shell: bash
-        run: |
-          commit="$(sed -n 's/^readonly DEFAULT_COMMIT="\(.*\)"$/\1/p' tools/cfs/build.sh)"
-          test -n "$commit"
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-      - name: Cache cFS checkout and build
+        run: tools/ci/cache-key.sh --toolchain >> "$GITHUB_OUTPUT"
+      # Restore and save are separate steps: the tree is saved right after the build, before
+      # the tests write their own state (cFS run directories, logs) into it.
+      - name: Restore cFS checkout and build
         id: cache
-        uses: actions/cache@v4
+        if: steps.setup.outputs.ready == 'true'
+        uses: actions/cache/restore@v4
         with:
           path: /home/ci/cfs-build
-          key: cfs-el8-${{ matrix.name }}-${{ steps.pin.outputs.commit }}-${{ hashFiles('tools/cfs/build.sh', 'tools/ci/el8-setup.sh') }}
+          key: cfs-el8-${{ matrix.name }}-${{ steps.pin.outputs.commit }}-${{ steps.pin.outputs.toolchain }}-${{ hashFiles('tools/cfs/build.sh', 'tools/ci/el8-setup.sh', 'tools/ci/cache-key.sh') }}
       - name: Hand the restored cache to the CI user (root)
+        if: steps.setup.outputs.ready == 'true'
         shell: bash
         run: |
           mkdir -p /home/ci/cfs-build
           chown -R ci:ci /home/ci/cfs-build
       - name: Build cFS (gcc 8, as the CI user)
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: tools/cfs/build.sh
+        if: steps.setup.outputs.ready == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          test "$(id -u)" -ne 0
+          tools/cfs/build.sh
+      - name: Save cFS checkout and build
+        if: steps.setup.outputs.ready == 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /home/ci/cfs-build
+          key: ${{ steps.cache.outputs.cache-primary-key }}
       - name: Create venv (EL8 python3.11)
-        run: python3.11 -m venv "$HOME/venv"
+        if: steps.setup.outputs.ready == 'true'
+        run: |
+          test "$(id -u)" -ne 0
+          python3.11 -m venv "$HOME/venv"
       - name: Install ironbird
-        run: python -m pip install -c constraints-dev.txt -e '.[dev]'
+        if: steps.setup.outputs.ready == 'true'
+        run: |
+          test "$(id -u)" -ne 0
+          python -m pip install -c constraints-dev.txt -e '.[dev]'
       - name: Real-cFS acceptance tests as a non-root user
+        if: steps.setup.outputs.ready == 'true'
         # One cFS instance owns fixed UDP ports and /dev/shm/osal:RAM (the container's own
         # network and shm namespaces): run serially.
         run: |
           test "$(id -u)" -ne 0
           pytest tests/cfs -m cfs -n0 -v --basetemp="$HOME/pytest-cfs"
       - name: Keep cFS console logs on failure
-        if: failure()
+        if: failure() && steps.setup.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: cfs-logs-el8-${{ matrix.name }}

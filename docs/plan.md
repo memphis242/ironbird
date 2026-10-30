@@ -1167,6 +1167,30 @@ complete up to mid-file damage in an input recording.
 | Ledger growth: sampling, caps, rotation, retention, send policy | 2d |
 | Output and signals equivalence | Stage 3; Stage 2's new commands keep Stage 1's exit codes, bounded writer and signal path |
 
+### CI notes (EL8 jobs) and deferrals
+
+The EL8 container jobs (`.github/workflows/ci.yml`, `tools/ci/`) are guarded by
+`tests/test_ci_el8.py` (parsed-workflow privilege checks with mutation cases, SIGPIPE static
+check over scripts and workflow `run` blocks). Deferred, not done:
+
+- **SHA-pin third-party actions and move to the v5 actions** (checkout, setup-python, cache,
+  upload-artifact are on floating major tags v4/v5). Needs a pinned-SHA table and an update
+  routine (Dependabot for `github-actions`).
+- **Push + pull_request duplicate cFS builds.** Both events run `cfs`/`el8-cfs` for a PR
+  branch, and the cache is per-ref, so the cFS build runs twice. Fix with `on.push.branches:
+  [main]` plus `pull_request`, or a shared cache scoped to the base ref.
+- **The root-only test never runs in CI.** The EL8 jobs are unprivileged on purpose and the
+  Ubuntu jobs do not run the cFS root path (`run.sh` started as root dropping to
+  `CFS_RUN_UID`, `clean.sh` as root). Needs a dedicated root job or a `sudo`-capable step.
+- **Image digest.** The workflow cannot read the container's own digest from inside it; the
+  digest is only in the runner's "Initialize containers" log. Pinning `image:` by digest
+  (with an update routine) would make runs reproducible.
+- **EL8 kernel behaviour** (rmem_max, `/proc/net/udp`, SO_RXQ_OVFL, SELinux, PAM limits) needs
+  a real EL8 host or VM runner; containers cannot cover it (README "Supported platforms").
+- **`--ulimit nofile=1024:524288` is unverified in Actions**: the full non-cFS suite passes
+  under a 1024 soft limit locally, but no container runtime was available to run the EL8 jobs
+  or the real-cFS tests with it.
+
 ### Decisions
 
 Decided by the user (2026-10-30):

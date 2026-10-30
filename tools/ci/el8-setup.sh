@@ -13,7 +13,13 @@
 # Environment overrides:
 #   CI_USER  unprivileged user to create (default ci)
 #   CI_UID   its uid (default 1500)
+#
+# Exit codes: 0 ready; 1 any other failure; 3 (EXIT_PACKAGES_UNAVAILABLE) the enabled
+# repositories cannot supply some packages. The workflow tolerates only 3, and only on the
+# best-effort image (UBI 8, whose repositories carry a subset of the packages).
 set -euo pipefail
+
+readonly EXIT_PACKAGES_UNAVAILABLE=3
 
 readonly CI_USER="${CI_USER:-ci}"
 readonly CI_UID="${CI_UID:-1500}"
@@ -37,7 +43,8 @@ readonly PACKAGES=(
     which             # which
     ca-certificates   # TLS for git clone and pip
     glibc-langpack-en # en_US.UTF-8, the locale users normally have
-    libatomic         # libatomic.so.1 for the official Node.js binary pyright runs on
+    libstdc++         # the PyPI Node.js wheel (nodejs-wheel-binaries) pyright runs on
+    libatomic         # libatomic.so.1, for Node.js builds that link it
 )
 
 die() { echo "el8-setup.sh: error: $*" >&2; exit 1; }
@@ -58,7 +65,7 @@ command -v dnf >/dev/null || die "'dnf' not found; this script is for Enterprise
 # shellcheck disable=SC1091
 source /etc/os-release
 [[ "${VERSION_ID%%.*}" == "8" ]] || die "expected Enterprise Linux 8, found $PRETTY_NAME"
-echo "el8-setup.sh: $PRETTY_NAME"
+echo "el8-setup.sh: $PRETTY_NAME ($(rpm -qf /etc/os-release))"
 
 # Name every package the enabled repositories cannot supply, rather than leaving it to dnf's
 # transaction error. An installed package counts as present: base images carry packages their
@@ -74,8 +81,11 @@ if (( ${#not_installed[@]} > 0 )); then
     for package in "${not_installed[@]}"; do
         grep -qxF -- "$package" <<<"$available" || missing+=("$package")
     done
-    (( ${#missing[@]} == 0 )) \
-        || die "not available from the enabled dnf repositories: ${missing[*]} (see 'dnf repolist')"
+    if (( ${#missing[@]} > 0 )); then
+        echo "el8-setup.sh: error: not available from the enabled dnf repositories:" \
+            "${missing[*]} (see 'dnf repolist')" >&2
+        exit "$EXIT_PACKAGES_UNAVAILABLE"
+    fi
     dnf -y --setopt=install_weak_deps=False --nodocs install "${not_installed[@]}" \
         || die "dnf install failed for: ${not_installed[*]} (see the dnf output above)"
 fi
