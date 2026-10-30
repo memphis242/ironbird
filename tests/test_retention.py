@@ -291,7 +291,7 @@ def test_nothing_selectable_with_unlimited_age_and_no_flag(state: Path) -> None:
 
 
 def test_an_unreachable_target_names_every_protected_reason(state: Path) -> None:
-    make_session(state, 1, age_days=30, size=50_000, klass="short")
+    make_session(state, 1, age_days=40, size=50_000, klass="short")  # before any long session
     (live,) = make_session(state, 2, age_days=30, size=30_000)
     make_session(state, 3, age_days=-1, size=20_000)
     holder = os.open(live, os.O_RDONLY)

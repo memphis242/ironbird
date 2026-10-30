@@ -635,30 +635,48 @@ category names, enum labels, node and link names, severities.
 | decode | `msg` (commands), `fc`, `hdr.<field>`, `htime` (header time, 2i), `<MSG>.<field>`, bare `<field>` (any message that has it), `event.app`, `event.id`, `event.type` (DEBUG..CRITICAL, ordered), `event.text` | full decode |
 
 - **Names.** `hdr.` and `event.` are reserved namespaces, as are the frame, model, check and
-  decode names in the table. A CCDD message or field that collides with a reserved name
-  (a message called `event`, a field called `hdr`) is reachable only as `MSG.field` when
-  the message name itself is not reserved; an expression that names a colliding message
-  or uses a bare colliding field fails at compile time (`IB-FLT-002`) naming both
-  meanings. Nothing is picked silently.
+  decode names in the table. Reserved names always win: a bare `mid`, `seq` or `status` is the
+  frame's whatever a CCDD calls its fields, so a CCDD update can never change what a script
+  means. A CCDD field with a reserved name is reached as `MSG.field` (`TLM_A.mid`); a message
+  called like a reserved word has its fields reached by their bare names (`hdr.x` and
+  `event.x` always mean the namespaces). A bare namespace (`hdr == 1`) is `IB-FLT-002`, with
+  the `MSG.field` spelling of a CCDD field of that name in the details.
 - **Semantics.** A predicate on something a frame does not have (a field of another
   message, a decode-level name on a malformed frame) is false; `not` inverts that, so
-  `not X.f == 1` matches other messages. Reserved names win over bare field names; a
-  field named `mid` must be qualified. Precedence: `not` > `and` > `or`.
+  `not X.f == 1` matches other messages. A `GARBAGE` frame (serial bytes skipped while
+  resynchronising) is malformed whatever its bytes would decode to: `status` is `malformed`,
+  it is never decoded and nothing that needs a decode matches it. `in [a, b]` is `== a or
+  == b`: each item is judged against each field on its own, an item a field cannot hold
+  (a label its enum lacks, a number for text) is simply never equal there, and a message
+  is out only when no item fits it. `x != L` is `not (x == L)` for every message that has
+  the field, including those whose field cannot hold `L` (`mode != SCIENCE` is true for a
+  message whose `mode` has no `SCIENCE`); a message without the field is false, as above.
+  A float literal is rounded to the width of the field it is compared with (a float32
+  field holds float32 values, so `ratio == 0.1` is true for a stored 0.1f); a decimal
+  compared with an integer field is exact (`big > 18446744073709551614.5`). Precedence:
+  `not` > `and` > `or`.
 - **Compilation** against the CCDD models in use (recording or config):
   `compile_filter(text, models) -> Filter(source, mids, needs_decode, match)`. `mids` is
   the candidate MID set derived from the tree (`and` intersects, `or` unites, `not` makes
   it unknown), applied to `frame.mid` before anything is decoded; `needs_decode` decides
   whether non-candidates are decoded at all. Names, types and literals are checked at
-  compile time (`IB-FLT-002/003`), so a typo fails before any packet is read.
-- **Limits** (`IB-FLT-004`): 4096 characters, 1024 tokens, depth 32, 1024 `in` items,
-  numeric literals of at most 40 characters (sign included). Depth counts every nested `not`
+  compile time (`IB-FLT-002/003`), so a typo fails before any packet is read. A filter that
+  can never match (an `and` whose operands share no MID) is `IB-FLT-003` too, as is one
+  whose candidates share no MID with the run's `--mid` or with the MIDs of event messages.
+- **Limits** (`IB-FLT-004`): 4096 characters, 1024 tokens outside the brackets of `in` lists,
+  depth 32, 1024 `in` items (counted by the parser, not as tokens, so the limit is the one in
+  force), numeric literals of at most 40 characters (sign included). Depth counts every nested `not`
   and every parenthesis; flat `and`/`or` chains are n-ary nodes evaluated iteratively, so
   they add no depth and cannot recurse deeply. Non-ASCII is allowed only inside strings.
 - **Errors** are one line with the column and a short excerpt; the details carry the
   expression with a caret line and up to three close-match suggestions (`difflib`). The
-  query is clipped to 64 characters and at most 256 candidate names are compared (sorted,
-  then cut), so a hostile CCDD or expression cannot make suggestion matching expensive.
-  `IB-FLT-*` codes exit 2 like other usage errors.
+  query is clipped to 64 characters; every candidate name is checked against the cheap
+  similarity bounds (length, letter counts) and the 256 best by that bound are compared in
+  full, so a hostile CCDD or expression cannot make suggestion matching expensive and a name
+  that sorts late is as findable as one that sorts first. In the echo, characters that are
+  not printable or that reorder text (right-to-left letters, Arabic digits, bidi controls)
+  are shown as `?`, one for one, and the caret is placed by display width (wide characters
+  take two columns, combining marks none). `IB-FLT-*` codes exit 2 like other usage errors.
 - `--mid` stays as sugar for `mid in [...]`; `--where` combines with it by `and`.
 
 ### S5. Notice (fixed in 2a)
@@ -993,7 +1011,8 @@ Deliverables
   summarised by one `rx.malformed.summary` record at window close (count, bytes,
   first/last time, first/last seq). A global raw-evidence budget
   (`evidence_raw_bytes_per_second`, default 256 KiB/s, token bucket) drops raw bytes, not
-  records, beyond it. The key table holds at most 1024 keys per window: a new key past
+  records, beyond it. The key table holds at most 1024 keys per window (a key and its
+  `|error` companion count as one, so a malformed frame costs one slot): a new key past
   that folds into one `other` key until the window closes, and the table is cleared at
   each window close. Nothing is evicted mid-window, so no key's count is split across
   two entries. Malformed records carry the frame `seq`, so with a recording running the
@@ -1118,10 +1137,18 @@ Deliverables
   - A write or sync still outstanding after 5 s is a stall, handled like a failed one
     (hung NFS server). The thread is never abandoned mid-line while the process runs: when
     the call returns, its result is handled like any other.
-  - At exit the main thread joins the writer for at most 5 s (the last write attempt
-    below). A writer still blocked then is left to die with the process (daemon); every
-    record it had not confirmed counts as not written, so the exit line and exit 6 report
-    it, and a hung disk cannot hold the process past the bound.
+  - At exit the main thread waits for the writer (the last write attempt below) and for a
+    retention scan still running, all drawing on one budget of 5 s (not 5 s per step), in
+    slices that notice a signal: a signal ends the wait at once and takes its usual exit.
+    A writer still blocked then is left to die with the process (daemon). Every record it
+    had not confirmed counts as not written: a line the writer holds or has not taken yet,
+    and a transmission written but not yet covered by a successful sync, each counted once
+    by record number; a record that was written and synced is never among them. The exit line
+    and exit 6 report them, naming the hung disk or file server and the remedy for it (not
+    "free space"), and a hung disk cannot hold the process past the bound. A bug in the
+    writer thread (an exception that is not an I/O error) puts the batch it held back,
+    stalls the store and is reported (`IB-INT-001`), so the batch is retried and, if never
+    written, counted at exit like any other.
 - **Opening, and what refuses a transmission (decision D-b).** The ledger opens at command
   start: resolve the state directory, `mkdir` (0700), create part 1 with
   `O_WRONLY | O_CREAT | O_EXCL | O_APPEND | O_NOFOLLOW | O_CLOEXEC` (0600; `EEXIST` draws
@@ -1260,7 +1287,9 @@ Deliverables
        session without part 1, or where locks are not supported (the opening rule), is not
        recovered: left untouched and reported (`IB-RET-004`). `EWOULDBLOCK` on part 1 (a
        writer, or another scan recovering the session, holds it) is not a failure: the
-       session is skipped this scan, nothing is reported, and the next scan retries.
+       session is skipped this scan, nothing is reported, and the next scan retries. With the
+       lock held, the session's files are listed again, since the scan's listing may be older
+       than another scan's recovery: a reserve that is gone is not an error and not reported.
     2. Its reserves are handled in `rNNNN` order. That order is the order they were
        allocated, which is not always the order they were written (a reserve whose
        retirement rename failed keeps its name while later parts are written), so the
@@ -1283,15 +1312,23 @@ Deliverables
        number of the session in the listing.
     5. A valid prefix followed by damage (a good `ledger.reserve` header and complete lines,
        then a non-NUL byte after the first NUL, a NUL inside a line, or two partial lines)
-       is salvaged: the header's following complete lines, up to the last newline before
-       the first byte that breaks the layout, are copied to the session's next part name
-       (`O_EXCL`, synced, directory synced), and the damaged file is kept byte-identical
-       under the name `<reserve name>.damaged` by the non-replacing rename. That name is
-       outside the retention patterns, so it is never counted, recovered again or pruned,
-       and the user decides what to do with it. A prefix with no record after the header
-       is not salvaged (treated as below). `ledger.recovered` records the bytes kept and
-       the bytes left in the `.damaged` file, and `IB-RET-004` is shown once:
+       is salvaged in this order, so that it can run only once and a crash at any point loses
+       nothing: (a) the damaged file is set aside byte-identical under the name
+       `<reserve name>.damaged` by the non-replacing rename (one atomic step; a taken name leaves
+       everything as it was and is reported, so nothing is copied twice). That name is outside the
+       retention patterns, so it is never counted, recovered again or pruned, and the user decides
+       what to do with it. (b) The header's following complete lines, up to the last newline before
+       the first byte that breaks the layout, are copied from the descriptor still held on the
+       file into `.<part name>.<16 hex>.tmp` (`O_EXCL`), synced, and committed to the session's
+       next free part name by `rename_noreplace` (directory synced). A crash, or a full disk, in
+       (b) leaves the intact `.damaged` file and at most a dot-temporary file, which no pattern
+       matches: never a torn part and never a duplicate. A prefix with no record after the header
+       is not salvaged (treated as below). `ledger.recovered` is always written (old name, new
+       name or none, bytes kept and cut, the `.damaged` name, the error if the copy failed), and
+       `IB-RET-004` is shown once:
        `warning IB-RET-004: reserve 20261030T120000Z-0123456789ab.r0001.reserve was damaged: 812 KiB saved as part p0004, the rest kept as r0001.reserve.damaged; inspect or delete that file`.
+       When (b) fails, the line says the records could not be saved and that the whole file is kept
+       as `.damaged`.
     6. Anything else (another session's header, no valid header, larger than 1 GiB, not
        ours, a collision, a salvage that fails) is left untouched and reported
        (`IB-RET-004`) with a message that names the file and the action:
@@ -1312,7 +1349,10 @@ Deliverables
   descriptor's device and inode. 2d builds the two helpers both steps use: the
   temporary-file failure helper and the temporary commit (`fdatasync`, then
   `rename_noreplace` to the final name, or `os.replace` only when the caller passed
-  `--force` and the final name is an existing regular file of ours). A temporary file
+  `--force` and the final name is an existing regular file of ours that no other process
+  holds under `flock` (a `LOCK_EX | LOCK_NB` probe; a held file is refused, `Locked`), and
+  whose name is not one retention manages: `ib rec repair --force` and the export of 2h refuse
+  an OUT named like a ledger part, a reserve or a recording of ironbird's own). A temporary file
   left by a crash stays: its leading dot keeps it outside the retention patterns, so it
   is neither counted nor pruned. 2d itself writes no temporary file: the notices file is
   rewritten in place.
@@ -1371,8 +1411,9 @@ Deliverables
       exit (`error IB-LED-004: 12 replies withheld: ledger not writable`) and exits 1.
   - Capture and recording never stop for ledger reasons; the recorder has its own ENOSPC
     path (`IB-REC-002`).
-- **Exit code 6 (decision D12):** a transmission went out but its ledger record was never
-  written, or was written after the last good sync and then possibly lost to a deferred
+- **Exit code 6 (decision D12)** always comes with its line (`IB-LED-004`, also when the
+  failure surfaces at the final close, after the exit lines were printed): a transmission went
+  out but its ledger record was never written, or was written after the last good sync and then possibly lost to a deferred
   sync or close error (6 covers both: never written, or possibly lost). Same tier as 4:
   an error (1, 2), 3 or a signal (128+n) takes precedence; between 4 and 6, 6 wins (the
   `IB-OUT-002` line still reports the lost output); between 5 (decision D8, damaged input recording) and 6, 6 wins (no Stage 2
@@ -1490,10 +1531,16 @@ Deliverables
   - it is among the `keep_recent` most recent long sessions of its directory, or among
     the `keep_recent` most recent of any class: a run of short `ib send` invocations
     cannot push the last overnight run out of the kept set, and a directory of short
-    sessions only still keeps its newest;
-  - it is a short session that started while a protected long session ran (between that
-    session's start stamp and its newest mtime): the `ib send` commands of an overnight
-    run (decision D4) are kept with it;
+    sessions only still keeps its newest. "Most recent" orders by the earlier of the start
+    stamp and the newest file time, and a session with a future mtime (already protected)
+    takes no slot, so files written while a clock ran ahead cannot push the real recent
+    sessions out of the kept set;
+  - it is a short session that started while *any* protected long session ran (between
+    that session's start stamp and its newest mtime): the `ib send` commands of an overnight
+    run (decision D4) are kept with it, whichever rule protects the long session (live,
+    recording present, `keep_recent`), however old. The class of every protected session
+    is read for this (one bounded head read each, at most 10 000 per scan, beyond which a
+    session counts as long);
   - for ledgers: its recording (same session id) is present in the recording directory
     and not itself proposed. Pruning the recording first releases the ledger.
 - **Scan.** One `retention.scan` record per scan (per directory: sessions, bytes,
@@ -1504,6 +1551,15 @@ Deliverables
     runs (the projection needs other sessions' growth); a short command only when the last
     scan by any process is older than `scan_interval` (its time is kept in the notices
     file, below), so a script of a thousand `ib send` runs scans about once per 10 min.
+    *Who recovers*: long sessions and prune. A short command only looks (it warns), since it
+    is about to exit and a recovery rewrites files; a long session's exit gives a step under
+    way (a salvage copy) the exit's waiting budget instead of cutting it off, and starts no
+    further step. The scan and the notices file are used on worker threads only: neither
+    the main thread nor the event loop ever waits for the state directory, so a hung one
+    cannot delay `ib send` or a `listen` loop (the start-of-session warnings are decided on
+    a worker and displayed when its answer is in, at the latest at exit; a scan that dies
+    of an unexpected error is reported as one coalesced `IB-RET-004`, its traceback goes to
+    the ledger, and the next scan runs).
   - *Cost*: in a worker thread, at most 100 000 directory entries per directory; head reads
     newest first and only as far as the protection rules and the candidates need, at most
     one 4 KiB read per session. Beyond the bound, or with a
@@ -1532,9 +1588,10 @@ Deliverables
     checked with `fstat` (regular, ours, one link; else ignored and not written);
   - `flock(LOCK_EX | LOCK_NB)` on it, retried for at most 200 ms on `EWOULDBLOCK`; on
     timeout the warning is displayed (a lock never causes silence) and the file is not
-    written. Where locks are unsupported (`ENOLCK`, `EINVAL`, `EOPNOTSUPP`; the same
-    file systems that give `IB-LED-009`), the file is read and rewritten without the
-    lock: a race between two processes can at worst repeat one warning or one scan, while
+    written. Where the lock cannot be taken for any other reason (`ENOLCK`, `EINVAL`,
+    `EOPNOTSUPP`, and any other errno a file system answers; the same file systems that
+    give `IB-LED-009`), the file is read and rewritten without the
+    lock (and not rewritten at all when the answer changed nothing): a race between two processes can at worst repeat one warning or one scan, while
     the cross-process rate limits (`IB-LED-009` itself, `IB-LED-006`, `IB-RET-*`, the scan
     interval) keep working, so a thousand `ib send` runs on such a file system still
     show `IB-LED-009` once per `warn_interval`. "Displayed, file not written" applies
@@ -1889,8 +1946,9 @@ As built (where the build differs from, or settles, the text above)
   200 000 (64 MiB).
 - **Sampling keys.** `rx.malformed` records and their error records sample under separate keys
   (`CODE:MID:stream` and the same with `|error`), the responder's received commands under
-  `rx.command:NAME`; the 1025th key of a window folds into one `other|<record name>` entry (one per
-  record name, so a summary never mixes two kinds). `Session.__aexit__` calls `Ledger.settle()` so the
+  `rx.command:NAME`; a key and its `|`-suffixed companions share one of the 1024 slots (at most
+  four entries per slot), and the 1025th slot of a window folds into one `other|<record name>`
+  entry (one per record name, so a summary never mixes two kinds). `Session.__aexit__` calls `Ledger.settle()` so the
   open window's summary is written even when the process is not closing the ledger.
 - **Allowance accounting.** The tier's "bytes on disk" are the bytes the writer confirmed, so the
   figure lags the producer by what is queued (at most about a second; the allowance is re-judged at
@@ -1914,11 +1972,12 @@ As built (where the build differs from, or settles, the text above)
   error at `fdatasync` is "possibly lost" and stalls.
 - **Retention.** The scan runs in a worker thread; liveness is the lock probe, a newest mtime within
   10 minutes or in the future, and "no part 1"; the checker's own session is live and never probed.
-  Classes are read from part 1's head newest first and only as far as the keep rules need. "Its
+  Classes are read from part 1's head: newest first as far as the keep rules need, then for every
+  protected session and for every other session that started inside a protected long span. "Its
   recording is present and not itself proposed" is read as: the recording exists and is protected or
   not old enough to be selected under the same age; a recording that `ib rec prune` would propose does
   not hold its ledger back. The notices file keeps at most 32 entries.
-- **Interpretations to review.** (1) The `keep_recent` order is the session start stamp. (2) The
+- **Interpretations to review.** (1) The `keep_recent` order is the earlier of the session start stamp and its newest file time. (2) The
   age used for a ledger's "recording not proposed" test is the prune's own `--older-than`/`max_age`.
   (3) `IB-RET-002` suggests the prune target as the directory's bytes minus the excess over the cap
   (minus 5 % of the cap for a projection). (4) A notice pointer's part is the part current when the
@@ -1940,7 +1999,24 @@ As built (where the build differs from, or settles, the text above)
   notices file, ledger heads, hostile names; corpus `cfg-ledger-*`, `cfg-retention-*`,
   `ret-notices-*`, `led-head-*`, `led-reserve-*`), `test_no_automatic_deletion.py` (the static guard
   and its mutation cases).
-- **Deferred.** The 1000-run `ib send` loops against a no-lock file system are covered by the
+- **PR #10 review (fixed).** Reserve salvage sets the original aside first and copies through a
+  dot-temporary file (rule 5 above); recovery re-lists after taking the lock, completes an
+  interrupted rename only when the inode really has two links, and runs in long sessions and
+  prune only; protection reads the class of every protected session and checks every short
+  session against every protected long span, and sessions stamped by a clock that ran ahead take
+  no `keep_recent` slot; `--force` of `TempOutput` refuses managed names and locked files, and a
+  directory sync failing after the rename is success with `IB-REC-011`; the static guard also
+  flags `Path.replace`, `Path.open('w')`, computed or `+` modes, write flags without `O_EXCL`,
+  `pwrite`, copies onto an existing file, rotating handlers, subprocesses and computed attribute
+  lookups (`tests/guard.py`; the allowlist names each in-place writer); the notices file and the
+  scans run on worker threads only (`ledgergate.py`: `GateWorker`, `WaitBudget`); the writer's
+  catch-all stalls and reports instead of noting; the exit account counts by record number from
+  one consistent snapshot of the store (`LedgerStore.unconfirmed`); a second prune of an already
+  deleted session counts its files as gone; the first-hour `IB-LED-009` rate limit holds for any
+  lock errno.
+- **Deferred.** A salvage whose copy could not be made (full disk) is not retried: the original
+  stays intact as `.damaged` and the user is told. The stderr line for exit 6 found only at the
+  final close is written through a bounded late writer. The 1000-run `ib send` loops against a no-lock file system are covered by the
   in-process 1000-caller test of the notices file and the per-process warnings, not by 1000
   subprocesses. The `IB-RET-002` projection is tested with an injected clock and rate source, not
   against a real recorder. A 100 000-entry directory is tested at a lowered bound.
@@ -2140,6 +2216,120 @@ real cFS: `ib listen fc --where 'msg == SAMPLE_APP_HK and CommandCounter > 0'` a
 NOOP prints only that HK, and `ib events --where 'event.type >= error'` matches
 `--min-type error`.
 
+As built (where the build differs from, or settles, the text above)
+- Package `ironbird.filter`: `lexer.py` (linear scan, anchored fixed patterns only), `parser.py`
+  (recursive descent; only `not` and parentheses recurse, each counted before it does; `and`/`or`
+  chains, also across parentheses of the same kind, are flat n-ary nodes), `compiler.py` (names,
+  types, closure tree, candidate MIDs), `matcher.py` (`Filter`, `Matcher`, `Cost`), `diag.py`
+  (limits, `FilterError`, suggestions). Public API: `compile_filter(text, codecs, *, links=None, aliases=None) ->
+  Filter(source, mids, needs_decode, match, cost)`; `Filter.bind(decode, codec_for) -> Matcher`;
+  `Matcher.__call__(frame) -> bool`, `Matcher.decoded(frame)` (the decode the filter made, or
+  one on demand: made at most once per frame, so a consumer never decodes a matching frame
+  twice), `Matcher.resolved(frame)`, `Matcher.decodes`. 2g builds its matcher the same way with its
+  own decoder and the codecs of the recording's definitions; the filter is valid only for frames
+  decoded with those same definitions. `Session.compile_filter(text, nodes)` and
+  `Session.matcher(flt, decoder)` wrap it for live use.
+- Deviation: `compile_filter` takes the nodes' **codecs** (node name to `Codec`), not bare CCDD
+  models, because `hdr.<field>` names live in the header profiles. `links` (the config's link
+  names) validates `link == ...`; `None` accepts any name. `aliases` (alias to node name) lets
+  `node == flight` mean `node == fc`; an alias of a node not in use is unknown and a node name
+  wins over an alias spelled the same. `Session.compile_filter` passes the config's aliases.
+- Grammar as in S4, plus: strings are `"..."` or `'...'` (escapes `\\ \" \'` only; every
+  character printable); keywords (`and or not in contains`) are lower case and cannot be bare
+  literals (quote them); a bare word and a quoted string are interchangeable wherever a name is
+  expected (message, category, enum label, node, link, severity, `dir`, `kind`, `status`,
+  `true`/`false`); `event.app`, `event.text`, `source` and char fields take quoted text only;
+  bytes fields take quoted hex (`==`, `!=`, `in`, `contains`); `HEX` is `[-]0x...`; `TIME` needs
+  seconds (`...T12:00:00[.f]` and `Z`, `+HH`, `+HHMM` or `+HH:MM`), a zone is mandatory.
+- Meaning of the names: `len` is `orig_len` (size on the wire); `msg` and `category` of a telemetry
+  frame come from `frame.mid` alone (so a malformed frame of a known MID still has them); `msg`
+  of a command frame costs a header check (`Codec.resolve`, or the ingest token), not a full
+  decode, so `msg` is MODEL level; `status` is `unknown` when the check says `IB-DEC-006`,
+  `malformed` for every other failure (truncated and garbage frames included), else `ok`;
+  a `GARBAGE` frame is malformed by definition (`frame.garbage_error`, `IB-DEC-004`) in
+  `Matcher.resolved`/`decoded` and in `FrameDecoder.decode`: it is never handed to the decoder
+  and `hdr.*` and field names are not evaluated on it;
+  `fc` is the decoded command's function code; `event.type` takes severity names
+  (`debug info information warn warning error critical`, case-insensitive). An event whose type
+  value maps to no severity is unranked: `>=` and `>` let it through (`ccdd.model.meets_floor`,
+  the rule `--min-type` uses, so `event.type >= error` and `--min-type error` show the same
+  events), `!=` is true as `not ==` is, and every other operator is false; `htime` is reserved
+  and refused (`IB-FLT-002`) until 2i.
+- Field predicates (`MSG.f`, bare `f`): a message is a candidate when it has the field. `in` is an
+  `or` of `==`: every item is converted for every field on its own and the items a field cannot
+  take (a label its enum lacks, wrong kind, bytes of the wrong size) are dropped for that
+  message; a message is left out only when no item fits it. A single literal a field cannot take
+  leaves the message out for `==`, the orderings and `contains`, and makes `!=` true for it
+  (`x != L` is `not (x == L)` wherever the field exists; the message without the field stays
+  false). An operator the type lacks leaves the message out. The filter is `IB-FLT-003` when no
+  message takes the operator, when an item (or the single literal) fits no message at all (a
+  typo), or when the integer is outside every qualifying field's range for `==`, `!=` or `in`
+  (`counter == 300` on a uint8 is an error; next to a uint16 `counter` it selects that one, and
+  `counter != 300` on the uint8 is plainly true). Ordering allows a decimal on an integer field
+  (`x > 1.5`), equality does not. Decimals are lexed to `Decimal` and turned into the integer
+  bound that orders every integer the same way (`x > 1.5` is `x > 1`, `x >= 1.5` is `x >= 2`), so
+  no precision is lost at 2**64; a float field gets the literal as float, rounded to float32 for
+  a `float32` field (through float64: a literal within 2**-53 relative of a float32 rounding
+  boundary can land on the other side) and to the infinity it overflows to.
+- Work is grouped, not repeated: the messages that have a field of a name are grouped by wire
+  type and enum once, a predicate is judged once per group, and identical predicates are
+  compiled once. A 2048-message CCDD with a 256-way `or` compiles in about 30 ms (3 s before).
+- Reserved names win (S4): a bare reserved name is the frame's, `hdr.x` and `event.x` are the
+  namespaces even if a message has that name, and a CCDD field with a reserved name is
+  `MSG.field`. `MSG.x` for a message named like a reserved word is `IB-FLT-002`; a bare namespace
+  (`hdr == 1`) is `IB-FLT-002` with the CCDD spelling in the details. There is no collision error,
+  so a CCDD update cannot break a script.
+- A filter that can never match is refused (`IB-FLT-003`): an `and` whose operands' candidate MIDs
+  do not overlap (also inside a `not`), `Session.listen` when the filter's candidates share no MID
+  with `--mid`, `Session.events` when they share none with the nodes' event MIDs.
+- Evaluation: `and`/`or` children are sorted by cost (frame, model, check, decode; stable), the
+  root rejects a frame whose MID is outside the candidate set before anything runs, and every
+  decode-level predicate checks its own messages' MIDs (per node) before it asks for a decode, so
+  a frame is decoded only when some message can match, also under an `or` with an unbounded
+  operand. A predicate on `mid` itself sets candidates only for `==`/`in`. No candidate message
+  at all for `msg`, `category`, `fc`, `event.*` is `IB-FLT-003`/`-002` (the filter could never match).
+- Live: `Session.listen(..., where=)` and `Session.events(..., where=)` compile before anything is
+  opened. `ib listen`/`ib events --where EXPR` (`--mid` and `--where` combine by and). `events`
+  decodes every event MID frame for the ledger first and tests the filter on that frame after
+  `--min-type`, so a hidden event is still ledgered in full. `listen` yields decoded packets only
+  (as before): frames a `status` filter selects that do not decode are counted in the
+  `listen.stop` ledger record (`where_undecodable`), not shown; replay/export (2g, 2h) show them.
+  `listen.start` and `events.start` record the expression (`where`) only when there is one;
+  `listen.start` adds the candidate count (`where_mid_count`) and the first 32 MIDs (`where_mids`),
+  and `listen.stop` adds `where_undecodable` only for a filtered listener.
+- With `--record` (2e) the filter only limits what is shown: the recorder is a sink that sees every
+  frame of the link before any consumer queue, so a filtered `listen`/`events` still records every
+  frame (malformed and filtered-out ones included). A bad `--where` is `IB-FLT-*` (exit 2) raised
+  before the capture opens, so no recording file is created.
+- `IB-FLT-*` is usage (exit 2). One-line message with column and (for names and literals) the best
+  suggestion; `--verbose` and the ledger get the expression window, a caret line and up to three
+  close names. Non-printable and right-to-left or bidi characters in the shown expression are `?`,
+  one for one, and the caret sits at the display width of what precedes it.
+  `RecursionError` cannot occur at the limits and is reported as `IB-FLT-004` if a caller is
+  already deep in the stack. The `in` list limit (1024 items) is checked by the parser; the lexer
+  does not count the tokens inside the brackets of a list against the 1024-token limit.
+- Tests: `tests/test_filter.py` (lexer, parser, limits, names, types, mids, semantics, cost
+  ordering, errors, corpus), `tests/test_filter_fuzz.py` (Hypothesis: arbitrary text, token soup and
+  deep nesting raise only `FilterError` within a time bound; compiled filters equal a naive reference
+  evaluator, `tests/filter_defs.py`, on random expressions and random valid, mutated, truncated,
+  garbage and live-token frames over two nodes with clashing MIDs and names; the candidate set never
+  excludes a match; no frame outside it is decoded), `tests/test_filter_diff.py` (seeded random
+  expressions and frames against a second, independently written reference,
+  `tests/filter_ref_independent.py`, written from the documented semantics alone), `tests/test_filter_live.py`
+  (loopback sessions and CLI processes on ports 53000-53999), corpus `tests/corpus/malformed/flt-*.txt`
+  and `frame-garbage-flagged-valid-looking-tlm.bin` (a valid packet flagged garbage),
+  `tools/fuzz/fuzz_filter.py` (atheris), two `cfs` acceptance cases.
+- Benchmarks (`tests/test_benchmarks.py`, 4-core dev host): per frame, frame-level
+  `seq > 0 and node == fc and dir == rx and len >= 16` 1.4-1.6 us (about 650k frames/s); model-level
+  (`msg == MOCK_HK and category == housekeeping`) 0.9-1.0 us (1.1M/s); check-level 0.5-0.8 us; decode-level
+  (`msg == MOCK_HK and cmd_counter >= 0 and mode in [...]`) 7-11 us including the one decode (90-140k/s);
+  a frame outside the candidate MIDs about 0.3 us. Whole listen path with a decode-level filter 22-25 us
+  against 17-21 us for the bare decode and render (guard 1.8x; 1.5x without a filter). End to end
+  `ib listen --where ...` at 10k pkt/s: 30000 of 30000 lines, no `IB-OUT-*`. Marginal cost of one
+  more predicate in a chain of true ones: 0.13 us (frame), 0.3 us (model), 0.25 us (check), 0.17 us
+  (decoded field) - guarded at 3 us and 6 us per predicate. Compile time of a 256-way `or`, a
+  500-item `in` and a 256-way `and` over a 2048-message CCDD: 30-110 ms, guarded at 0.5 s.
+
 ### 2g - Replay
 
 Deliverables
@@ -2152,8 +2342,8 @@ Deliverables
 - `ib replay FILE [--where EXPR] [--from T] [--to T] [--speed X] [--follow]
   [--format line|json|hex] [--defs recording|config] [--skip-damage] [--count N]`.
   `T` is ISO 8601 UTC or `+offset` from the first frame (`+90s`, `+1m30s`). `--speed 0`
-  (default) runs as fast as possible; `1` paces by recorded `time_ns` deltas (negative
-  deltas from clock steps clamp to zero).
+  (default) runs as fast as possible; `1` paces by recorded `time_ns` deltas (each negative
+  delta from a clock step clamps to zero, so the frames after a step keep their own spacing).
 - Chunk selection by time range and candidate MID set from the index or chunk
   summaries; frames decoded with the recording's embedded definitions by default
   (`IB-REC-009` info when they differ from the current config, error when an adapter is
@@ -2179,6 +2369,121 @@ mid-file, bad index) with expected codes and exit codes; benchmark of replay fra
 with and without field filters; real cFS: replay the 2e recording with
 `--where 'event.app == "SAMPLE_APP" and event.id == 3'` yields exactly the K NOOP events
 sent during the capture.
+
+As built (where the build differs from, or settles, the text above)
+- Modules: `recording/replay.py` (`Replay`: the frames of a file or split set, ranges, chunk
+  selection, damage, `Follower`, `Pacer`, `parse_time_spec`), `recording/defs.py` (the head of a
+  recording, codecs from embedded BLOBs or the configuration, comparison with the configuration),
+  `recording/player.py` (`play`: pace, filter, decode, render; `compile_where`), the renderers in
+  `render.py` (`undecoded_line/record`, `hex_line/record`), `ib replay` in `cli/main.py`. Shared
+  pieces gained entry points: `ccdd.loader.load_ccdd_bytes` and `header.load_profile_bytes` (the
+  on-disk loaders now read the file and call the same code), `filter.lexer.parse_time`,
+  `RecordingReader.items(skip=, wait=)` and `skip_chunk`, `BoundedWriter.write_wait`, and
+  `FrameDecoder(codec_for, reject, report_checked=)` (it no longer needs an `Engine`;
+  `Engine.decoder()` builds the live one, so replay needs no `_labels`). `ib rec repair` was
+  already done in 2e.
+- Command: `ib replay FILE... [--where] [--from] [--to] [--speed] [--follow] [--follow-idle S]
+  [--format line|json|hex] [--defs recording|config] [--skip-damage] [--count N]`. Runs offline
+  (no session, no sockets, no ledger requirement beyond the usual); `-c PATH` is read only for
+  `--defs config` and for the one-line comparison below. A decoded frame prints exactly as `listen`
+  does (line and JSON), so replay output equals a live `listen` of the same traffic by record
+  (the E2E test compares them without the receive times). A frame that does not decode prints
+  `MALFORMED`, `UNKNOWN`, `GARBAGE` or `UNDECODED` with its code, the failing byte in brackets,
+  `frame=` (the recording's seq; `seq=` is the packet's), its flags and its hex (256 bytes in
+  lines, 1024 in JSON, which has `status`, `error`, `hex_truncated`); `--format hex` dumps every
+  frame undecoded and, if the recording has no usable definitions, still works, with a `--where`
+  made of frame-level names (a name it cannot check says `IB-REC-009` is why).
+- Definitions: the BLOBs at the head are read with `head_records` (at most 4096 records, 64 MiB,
+  256 nodes), each digest must equal the one META names (`IB-REC-009` if not; a META digest that
+  is not text is ignored), a repeated definition that differs, or a head longer than those limits,
+  is a problem recorded in the head (so streams and definitions past a cut are never taken for
+  frames of a node the recording lacks) and refused when definitions are needed, never at open. Loading goes through the strict loaders
+  with the recording's `max_packet_bytes`, and the `python:` header escape hatch is refused in
+  `load_profile_bytes`. Every failure there (any loader, `Codec`, adapter, missing definition) is
+  `IB-REC-009`, exit 1 (a bad file, not the user's configuration), naming `--defs config` and
+  `--format hex`. `--defs config` uses the configuration's files with the recording's cap and its
+  aliases (a node it lacks is `IB-REC-009`; a message that does not fit the recording's cap is
+  `IB-ENC-004` saying the cap is the recording's). With the default, when a configuration is found and a
+  file's digest differs from the embedded one, one `info IB-REC-009` line lists `node:kind`s and the
+  ledger records them; no configuration is not mentioned (ledger only).
+- Ranges and chunk selection: `--from/--to` are ISO 8601 with a zone or `+<n>h|m|s|ms` offsets
+  (decimals allowed, at most 100 years) from the first frame of the first part actually read (after
+  damage that `--skip-damage` goes past; damage that ends the replay before any frame is reported
+  as usual and nothing is selected); half open on `time_ns`. `--from` not earlier than `--to` is
+  `IB-CLI-001` (two times or two offsets before the file is opened; a time against an offset once
+  the first frame is known). With a closed file whose index checks out (`read_trailer`, `read_chunks`), a chunk is
+  skipped when its summary shows no time in range, no frames, or (summary not overflowed) none of
+  the filter's candidate MIDs; the reader jumps to the next chunk after learning the skipped chunk's
+  stream and source definitions from its head and restarting the sequence check, because a chunk's
+  frames may use definitions made in an earlier one. The index stays a hint: damage inside a
+  skipped chunk is not seen (the summary counts the chunks skipped unchecked), the GAP records at
+  a skipped chunk's head are still counted when they overlap the range, and a bad index is
+  `IB-REC-008` (info) and a full read.
+- Pace: `Pacer` anchors a schedule at the first frame and sleeps in 100 ms slices (so a closed output
+  or a signal ends it at once); the schedule advances by `max(0, t - previous t)` for each frame, so
+  every backward step counts as zero and the frames after it keep their spacing (a step back by an
+  hour does not leave the next hour unpaced); a late consumer is not waited for,
+  `--speed` is 0 or 1e-6..1e9. Frames outside the filter still count for time. A forward clock step
+  is not corrected (no `--max-gap`): a recorded hour of silence is an hour.
+- Sets: one file that is part 1 plays `name.p0002.ibrec`, ... in order (found by name; the
+  parts' META must give the same session and cap, part numbers ascending, else `IB-CLI-001`); the
+  search for names goes on past a missing number until 8 names in a row are absent. A part that is
+  missing (a later one exists, or the named parts skip a number) is reported once, listing the
+  numbers, as `IB-REC-006` (error line, exit 5); every later part that exists still plays. Several FILEs play as given. Mid-file damage without
+  `--skip-damage` ends the whole replay; a torn tail ends only its part.
+- Damage and exit codes: 0 normal (including `--count` reached, a closed pipe, a torn tail or a
+  recording never closed: `warning IB-REC-007`; a file a recorder holds open is not torn, it says
+  `--follow` keeps reading); 5 mid-file damage seen (`IB-REC-006`, at most 3 lines printed and 100
+  ledgered, the stop record and the summary count all) or a missing part (not when `--count` ended
+  the run first); 1 `IB-REC-004..009`; 2 usage and `IB-FLT-*`; 4 stdout closed from the start or
+  failing (a reader that goes away, as `| head` does, is a normal end: 0); 128+n a signal. 5 wins
+  over 4 (4 only replaces an exit of 0; the `IB-OUT-002` line still reports the loss). 6 (2d) is
+  not produced here. "Shown" (the summary, `--count`) means accepted by the output queue.
+- Follow: `Follower` probes `flock(LOCK_SH | LOCK_NB)` on part 1 (the lock the writer holds for the
+  whole session), `Replay` polls every 100 ms for growth, treats an incomplete last record or a bad
+  record with no valid chain yet as pending (`items(wait=)`), reads once more when the probe says
+  the writer is gone, and moves on to the next part when the file ends at its trailer and the writer
+  is still alive. No lock support (probe `ENOLCK`/`EINVAL`/`EOPNOTSUPP`) without `--follow-idle` is
+  `IB-CLI-001` before anything is read; `--follow-idle S` ends after S seconds without growth. A
+  recorder that ran unlocked (`IB-LED-009`, 2d) looks dead to the probe. Following a later part
+  probes part 1's lock (found by name), and a part that appears while following goes through the
+  same session, order and cap check as the parts named at the start. The "not closed cleanly"
+  warning (`IB-REC-007`) is given only when the probe found the writer gone (or no follow was
+  asked for); a follow that ended on `--follow-idle`, or because the output went away, says why it
+  stopped instead and does not claim the recorder left the file unclosed.
+- Output: replay writes with `write_wait`, so a reader that stops reading stops replay and nothing
+  is dropped (`IB-OUT-001` cannot occur); a signal ends the wait, and whatever was queued is
+  abandoned and counted by the existing `IB-OUT-002` path. Per frame costs the ledger nothing; the
+  ledger gets `replay.start`, `replay.stop` (reason, counts, rejects by code, chunks skipped), the
+  first 100 damage records and any definition note.
+- Tests: `test_replay.py` (67: records equal `listen`'s, flagged frames, ranges, chunk skipping
+  against a straight read, pacing with a fake clock, count, split sets, damage, definitions,
+  filter compilation, follow with a partial record, a dead writer, idle and a lockless file system,
+  `write_wait`), `test_replay_malformed.py` (31: the 20-file corpus `rpl-*.ibrec` built by
+  `tests/replay_corpus.py` and run through the CLI, Hypothesis over mutated and arbitrary BLOB
+  contents, over bit flips and cuts of a file with embedded definitions in every format, over any
+  payload in any frame, and over ranges with clock steps equal to a frame-by-frame selection, plus
+  a flip of every 97th bit and a cut every 37 bytes of the head), `test_replay_cli.py` (41 over
+  loopback on ports 58000-58999: the `respond` + `listen --record` round trip against replay by
+  record, nothing sent, exit codes, SIGTERM during pacing and while blocked, closed and slow
+  readers, following a real `ib record` to a clean close and to `kill -9`), a `cfs` acceptance
+  case (record a session with K NOOPs; `--where 'event.app == "SAMPLE_APP" and event.id == 3'`
+  yields K, the last SAMPLE_APP_HK counts K; not run on the dev host), `tools/fuzz/fuzz_replay.py`
+  (atheris, in the nightly fuzz job; atheris is not installed on the dev host, so the target ran
+  only against a stub). A 100 s bit-flip hunt (10270 corrupted files, each in every format and with three filters)
+  and 198610 mutated definition sets in 60 s found nothing beyond coded errors.
+- Benchmarks (4-core dev host, 60k frames of 28 bytes, to a null output): replay as lines 21.8k
+  frames/s (the bare reader + decode + render is 24.0k/s; 5 us decode, 22 us the shared
+  `render.line`, 7 us read), as JSON 30.7k/s, as hex 48k/s; `ib replay` to a file 18.8k lines/s
+  end to end; filtered: `seq > 59990` (no decode) 158k/s, `msg == MOCK_HK and cmd_counter > 250`
+  96k/s with 40k frames read of 60k, `msg == MOCK_STATUS` 64k/s with 20k read; a 500-frame range of
+  60k reads under 10 percent of it. Guards (`needs_a_quiet_host`): at least 15k frames/s, at most
+  1.5x the bare path, a filter that selects little at 0.9x of the unfiltered time or better.
+- Deferred: the index of a recording is read whole for a selection (memory grows with the chunk
+  count, as `rec info`'s does); no `--max-gap` for pacing; `--mid` is not offered (use
+  `--where 'mid in [...]'`); the atheris target has not run on a real fuzzer. The `rpl-defs-*`
+  corpus entries carry the META digests of their own content so each reaches its loader (the test
+  asserts the loader's reason for every entry).
 
 ### 2h - Export CSV and text
 
@@ -2431,8 +2736,8 @@ Verification
 | `IB-REC-010` | `REC_SPACE` | low disk space for the recording | 2e |
 | `IB-REC-011` | `REC_DIRSYNC` | the recording's directory cannot be synced; its name may not survive a power loss (warning) | 2e |
 | `IB-FLT-001` | `FLT_SYNTAX` | filter syntax error (column, excerpt) | 2f |
-| `IB-FLT-002` | `FLT_NAME` | unknown name in a filter | 2f |
-| `IB-FLT-003` | `FLT_TYPE` | literal does not fit the name's type | 2f |
+| `IB-FLT-002` | `FLT_NAME` | unknown name in a filter, or a reserved name misused | 2f |
+| `IB-FLT-003` | `FLT_TYPE` | literal does not fit the name's type, or the filter can never match | 2f |
 | `IB-FLT-004` | `FLT_LIMIT` | filter too long, deep or wide | 2f |
 | `IB-EXP-001` | `EXP_WRITE` | cannot write export output | 2h |
 | `IB-EXP-002` | `EXP_EXISTS` | export output exists (pass `--force`), is the input, or is a file retention manages (`--force` does not apply to these two) | 2h |

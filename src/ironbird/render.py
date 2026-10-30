@@ -10,7 +10,9 @@ from typing import Any
 from ironbird.ccdd.model import FieldDef, MessageKind, TypeClass
 from ironbird.codec import DecodedPacket
 from ironbird.config import format_hostport
+from ironbird.errors import Code, DecodeError
 from ironbird.events import Event
+from ironbird.frame import Frame, FrameFlag
 from ironbird.ledger import format_ts
 from ironbird.sanitize import DEFAULT_MAX_LEN, clean_json, clean_terminal
 
@@ -162,3 +164,109 @@ def respond_banner(node: str, addr: tuple[str, int] | None) -> str:
 def respond_line(node: str, command: str, sequence: int | None, reply: str | None) -> str:
     arrow = f" -> {term(reply)}" if reply else ""
     return f"{term(node)} rx {term(command)} seq={sequence}{arrow}"
+
+
+# -- frames that did not decode (replay shows what a live listener hides) ---------------------
+
+MAX_HEX_SHOWN = 256  # bytes of a frame a line shows; the JSON record carries up to MAX_HEX_JSON
+MAX_HEX_JSON = 1024
+
+
+def flag_names(frame: Frame) -> list[str]:
+    """Lower-case names of the flags of ``frame`` that say something to a reader (``HAS_MID`` is
+    implied by the MID shown)."""
+    return [
+        flag.name.lower()
+        for flag in FrameFlag
+        if flag and flag is not FrameFlag.HAS_MID and flag in frame.flags and flag.name
+    ]
+
+
+def frame_status(frame: Frame, error: DecodeError | None) -> str:
+    """``garbage``, ``unknown`` (a MID or function code the CCDD lacks), ``malformed`` or
+    ``undecoded`` (no definitions to decode with)."""
+    if frame.flags & FrameFlag.GARBAGE:
+        return "garbage"
+    if error is None:
+        return "undecoded"
+    return "unknown" if error.code is Code.DEC_UNKNOWN else "malformed"
+
+
+def hex_dump(data: bytes, limit: int = MAX_HEX_SHOWN, mark: int | None = None) -> str:
+    """Spaced hex of the first ``limit`` bytes, the byte at ``mark`` in brackets, and how many
+    bytes were left out."""
+    shown = data[:limit]
+    parts = [f"{b:02x}" for b in shown]
+    if mark is not None and 0 <= mark < len(parts):
+        parts[mark] = f"[{parts[mark]}]"
+    text = " ".join(parts)
+    if len(data) > limit:
+        text += f" ...(+{len(data) - limit} bytes)"
+    return text
+
+
+def _frame_head(frame: Frame) -> str:
+    stream = frame.stream
+    mid = f" mid=0x{frame.mid:04X}" if frame.mid is not None else ""
+    flags = flag_names(frame)
+    extra = f" flags={','.join(flags)}" if flags else ""
+    cut = f" (of {frame.orig_len})" if frame.orig_len != len(frame.data) else ""
+    return (
+        f"{format_ts(frame.time_ns)} {term(stream.node)} {stream.direction.value} "
+        f"{term(stream.link)} frame={frame.seq}{mid} len={len(frame.data)}{cut}{extra}"
+    )
+
+
+def undecoded_line(frame: Frame, error: DecodeError | None, note: str = "") -> str:
+    """One line for a frame that did not decode: status, why, and its bytes in hex with the
+    failing byte in brackets (a garbage frame has no failing byte)."""
+    status = frame_status(frame, error)
+    if error is None:
+        why = term(note) if note else "no definitions"
+    else:
+        where = "" if status == "garbage" else f" at byte {error.offset}"
+        why = f"{error.code.value}{where}: {term(error.reason)}"
+    mark = None if status == "garbage" or error is None else error.offset
+    return f"{_frame_head(frame)} {status.upper()} {why}  hex: {hex_dump(frame.data, mark=mark)}"
+
+
+def hex_line(frame: Frame) -> str:
+    """One line for ``--format hex``: the frame's fields and all of its bytes."""
+    return f"{_frame_head(frame)} hex: {hex_dump(frame.data, len(frame.data))}"
+
+
+def _frame_record(frame: Frame) -> dict[str, Any]:
+    stream = frame.stream
+    shown = frame.data[:MAX_HEX_JSON]
+    return {
+        "time": format_ts(frame.time_ns),
+        "node": jtext(stream.node),
+        "dir": stream.direction.value,
+        "link": jtext(stream.link),
+        "seq": frame.seq,
+        "source": jtext(frame.source),
+        "mid": f"0x{frame.mid:04X}" if frame.mid is not None else None,
+        "len": len(frame.data),
+        "orig_len": frame.orig_len,
+        "flags": flag_names(frame),
+        "hex": shown.hex(),
+        "hex_truncated": len(frame.data) > len(shown),
+    }
+
+
+def undecoded_record(frame: Frame, error: DecodeError | None, note: str = "") -> dict[str, Any]:
+    """JSON record of a frame that did not decode (``status`` tells which kind; a decoded
+    packet's record has no ``status``)."""
+    out = _frame_record(frame)
+    out["status"] = frame_status(frame, error)
+    out["error"] = (
+        {"code": error.code.value, "offset": error.offset, "reason": jtext(error.reason)}
+        if error is not None
+        else {"code": None, "offset": None, "reason": jtext(note or "no definitions")}
+    )
+    return out
+
+
+def hex_record(frame: Frame) -> dict[str, Any]:
+    """JSON record for ``--format hex``."""
+    return _frame_record(frame)

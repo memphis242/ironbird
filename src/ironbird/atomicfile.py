@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import os
 import stat
 from pathlib import Path
 from typing import Final
 
 from ironbird.fsops import (
+    INSPECT_FLAGS,
     REAL_FS,
     FileSystem,
     close_quietly,
@@ -39,6 +41,15 @@ class Collision(OSError):
 
     def __init__(self, name: str) -> None:
         super().__init__(errno.EEXIST, "file exists", name)
+
+
+class Locked(Collision):
+    """The final name is an existing file that another process holds under ``flock``: a live
+    writer's file, never replaced, ``--force`` or not."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.strerror = "file is in use (locked by another process)"
 
 
 class SyncAfterCommit(OSError):
@@ -189,12 +200,45 @@ class TempOutput:
                 and stat.S_ISREG(existing.st_mode)
                 and existing.st_uid == os.getuid()
             ):
+                if self._in_use(final):
+                    raise Locked(final)
                 fs.rename_at(self._dir_fd, self.name, final)  # --force: the one replacement
                 self._committed = True
-                fs.fsync(self._dir_fd)
+                try:
+                    fs.fsync(self._dir_fd)
+                except OSError as exc:
+                    raise SyncAfterCommit(
+                        exc.errno, exc.strerror or "directory sync failed", final
+                    ) from exc
                 return
-        rename_noreplace(self._dir_fd, self.name, final, self.fd, fs=fs)
+        try:
+            rename_noreplace(self._dir_fd, self.name, final, self.fd, fs=fs)
+        except SyncAfterCommit:
+            self._committed = True  # renamed; only the directory sync failed
+            raise
         self._committed = True
+
+    def _in_use(self, name: str) -> bool:
+        """Whether another process holds ``name`` under ``flock`` (probed ``LOCK_EX | LOCK_NB``
+        and released at once; a file that cannot be probed counts as in use)."""
+        fs = self._fs
+        try:
+            probe = fs.open_at(self._dir_fd, name, INSPECT_FLAGS)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        try:
+            try:
+                fs.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                # held by someone; any other error (locks unsupported) proves nothing
+                return exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN)
+            with contextlib.suppress(OSError):
+                fs.flock(probe, fcntl.LOCK_UN)
+            return False
+        finally:
+            close_quietly(fs, probe)
 
     def __exit__(self, *exc_info: object) -> None:
         fs = self._fs

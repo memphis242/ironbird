@@ -11,10 +11,15 @@ from typing import Any
 import pytest
 
 from ironbird import ledger as ledger_module
+from ironbird.config import load_config
 from ironbird.errors import Code, IronbirdError
+from ironbird.frame import FrameFlag
 from ironbird.ledger import Ledger
 from ironbird.ledgertiers import Tier
+from ironbird.session import Session
+from ironbird.transport import LinkEnd
 from ledgerutil import records as ledger_records
+from ledgerutil import session_records
 
 FLOOD = 500
 
@@ -22,21 +27,32 @@ FLOOD = 500
 def test_malformed_packet_flood_does_not_crowd_out_essential_records(
     mock_config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # No prompt flush between errors, so only the tier caps decide what is accepted.
+    # No prompt flush between errors, so only the tier caps and the sampler decide what is kept.
     monkeypatch.setattr(ledger_module, "ERROR_FLUSH_MIN_INTERVAL_S", 1e9)
+    config = load_config(mock_config_path)
     ledger = Ledger(tmp_path / "l", session_id="t", max_queue=100, max_evidence_queue=75)
 
-    async def main() -> tuple[int | None, int, int]:
-        for _ in range(FLOOD):  # evidence records no sampling key thins out: only the caps decide
-            ledger.record("packet", "rx.malformed", raw=b"\x00")
-            ledger.record_error(IronbirdError(Code.DEC_CHECKSUM, "bad"))
-        number = ledger.record("command", "tx.command")
-        return number, ledger.dropped, ledger._dropped[Tier.ESSENTIAL]  # before close() summarises
+    async def main() -> tuple[int | None, int, int, int]:
+        async with Session(config, role="ground", ledger=ledger, notify=lambda _: None) as ground:
+            capture = await ground.capture([ground.route("fc")])
+            io = ground._engine._ios[(config.links[0].name, LinkEnd.SOURCE)]
+            for _ in range(FLOOD):  # one-byte garbage frames, as the transport would deliver them
+                io.on_data(b"\x00", 0, "127.0.0.1:1", 1, FrameFlag.NONE)
+            assert ground.malformed_total == FLOOD
+            await capture.close()
+            number = ledger.record("command", "tx.command")
+            # before close() summarises
+            return number, ledger.dropped, ledger._dropped[Tier.ESSENTIAL], ledger.sampled_away
 
-    number, dropped, dropped_essential = asyncio.run(main())
+    number, dropped, dropped_essential, sampled_away = asyncio.run(main())
     assert number is not None, "an operator command record was refused"
-    assert dropped > 0  # the flood itself was capped and counted
     assert dropped_essential == 0
+    # The rejected frames went to the evidence tier end to end: sampled per key (the same key
+    # for all of them), what the queue took plus what was sampled away or refused is the flood.
+    assert sampled_away + dropped > 0 and sampled_away + dropped + ledger.pending >= FLOOD
+    ledger.close()
+    events = [r["event"] for r in session_records(tmp_path / "l", bookkeeping=True)]
+    assert "rx.malformed.summary" in events  # and the sampler accounted for the rest
 
 
 def test_explicit_evidence_tier_overrides_the_kind_default(

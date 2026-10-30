@@ -55,6 +55,11 @@ class Rig:
 
     def settle(self) -> None:
         self.retention.finish()
+        self.ledger.settle_warnings()  # the rate limit is asked on a worker; wait for its answer
+
+    def poll(self) -> None:
+        self.retention.poll()
+        self.ledger.settle_warnings()
 
     def codes(self) -> list[Code]:
         return [n.code for n in self.shown]
@@ -86,13 +91,13 @@ def test_the_projection_warns_once_when_growth_over_the_horizon_would_pass_the_c
     rig.retention.start()
     rig.settle()
     rig.clock.advance(11)
-    rig.retention.poll()
+    rig.poll()
     assert Code.RET_TOTAL not in rig.codes()  # a quiet process does not trip it
     rate = {"bps": 100 * KIB}  # a recorder writing 100 KiB/s
     rig.retention.add_rate_source(lambda: float(rate["bps"]))
     for _ in range(5):
         rig.clock.advance(11)
-        rig.retention.poll()
+        rig.poll()
     projected = [n for n in rig.shown if n.code is Code.RET_TOTAL]
     assert len(projected) == 1
     assert "projected past 1 MiB within 1 h" in projected[0].summary
@@ -107,11 +112,11 @@ def test_the_horizon_is_what_is_left_of_the_duration(tmp_path: Path) -> None:
     rig.retention.start()
     rig.settle()
     rig.clock.advance(11)
-    rig.retention.poll()
+    rig.poll()
     assert Code.RET_TOTAL not in rig.codes()
     rig.retention.set_deadline(300)  # five minutes: 300 KiB would pass the cap
     rig.clock.advance(11)
-    rig.retention.poll()
+    rig.poll()
     assert Code.RET_TOTAL in rig.codes()
     rig.ledger.close()
 
@@ -124,11 +129,11 @@ def test_a_long_session_rescans_every_scan_interval_and_not_before(tmp_path: Pat
     first = rig.fs.count("scandir")
     assert first >= 1
     rig.clock.advance(599)
-    rig.retention.poll()
+    rig.poll()
     rig.settle()
     assert rig.fs.count("scandir") == first
     rig.clock.advance(2)
-    rig.retention.poll()
+    rig.poll()
     rig.settle()
     assert rig.fs.count("scandir") > first
     rig.ledger.close()

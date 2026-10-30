@@ -123,10 +123,8 @@ def test_a_send_whose_ledger_recovers_before_exit_writes_late_and_exits_0(
     assert done.returncode == 0, done.stderr
     assert "IB-LED" not in done.stderr  # written by the last attempt: nothing to act on
     rows = session_records(_isolated_state, bookkeeping=True)
-    assert [r["event"] for r in rows if r["event"] in ("tx.command", "ledger.resumed")] == [
-        "tx.command",
-        "ledger.resumed",
-    ] or "tx.command" in [r["event"] for r in rows]
+    events = [r["event"] for r in rows if r["event"] in ("tx.command", "ledger.resumed")]
+    assert events == ["tx.command", "ledger.resumed"], events  # written late, and counted as such
 
 
 def test_refuse_commands_sends_nothing_and_exits_1_with_one_line(

@@ -43,7 +43,7 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
     ("atomicfile.py", "removal"): {"_link", "_placeholder_rename", "TempOutput.__exit__"},
     ("atomicfile.py", "rename"): {"_link", "_placeholder_rename", "TempOutput.commit"},
     # recovery: completing an interrupted rename, cutting a reserve at its last record
-    ("retention.py", "removal"): {"_recover_reserve"},
+    ("retention.py", "removal"): {"_complete_interrupted_rename"},
     ("retention.py", "truncation"): {"_commit_recovered"},
     # the ledger: cutting a part back to its last line, a reserve to its header or last record
     ("ledgerstore.py", "truncation"): {
@@ -54,6 +54,21 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
     },
     # the notices file is rewritten in place
     ("retnotices.py", "truncation"): {"Notices._transaction"},
+    # in-place writes (a write flag without O_EXCL, ``pwrite``): the file system seam itself, the
+    # reserve written inside its allocated extent, the notices file, the final ledger part
+    # appended to after close (O_APPEND), the descriptors 0-2 re-opened on /dev/null, and the
+    # recording created with O_EXCL (the flags are built in a local the analysis cannot follow)
+    ("fsops.py", "overwrite"): {
+        "",
+        "FileSystem.open_dir",
+        "FileSystem.open_at",
+        "FileSystem.pwrite",
+    },
+    ("ledgerstore.py", "overwrite"): {"LedgerStore._pwrite_all"},
+    ("retnotices.py", "overwrite"): {"Notices._transaction"},
+    ("ledger.py", "overwrite"): {"Ledger._write_late"},
+    ("cli/main.py", "overwrite"): {"_fill_standard_descriptors"},
+    ("recording/writer.py", "overwrite"): {"create_exclusive"},
     # the recorder removes the partial file it created itself when a start fails
     ("recording/writer.py", "removal"): {"_discard_partial"},
 }
@@ -149,6 +164,44 @@ def test_every_allowlist_entry_is_still_used() -> None:
         ("from ctypes import CDLL\ndef f():\n    pass", "ctypes"),
         ("import tempfile\ndef f():\n    tempfile.NamedTemporaryFile()", "tempfile"),
         ("import tempfile as t\ndef f():\n    t.TemporaryDirectory()", "tempfile"),
+        # review findings: forms that used to escape
+        ("from pathlib import Path\ndef f(p, q):\n    Path(p).replace(q)", "rename"),
+        ("def f(p, q):\n    p.replace(q)", "rename"),
+        ("from pathlib import Path\ndef f(p):\n    Path(p).open('w')", "truncation"),
+        ("from pathlib import Path\ndef f(p):\n    Path(p).open(mode='w')", "truncation"),
+        ("def f(p):\n    m = 'w'\n    open(p, m)", "truncation"),
+        ("def f(p, m):\n    open(p, mode=m)", "truncation"),
+        ("from pathlib import Path\ndef f(p, m):\n    Path(p).open(m)", "truncation"),
+        ("def f(p):\n    open(p, 'r+').write('x')", "overwrite"),
+        ("def f(p):\n    open(p, 'rb+')", "overwrite"),
+        ("import os\ndef f(p):\n    os.open(p, os.O_WRONLY | os.O_CREAT)", "overwrite"),
+        ("import os\ndef f(p):\n    os.open(p, os.O_RDWR)", "overwrite"),
+        ("from os import O_WRONLY as W\ndef f(p):\n    return W", "overwrite"),
+        ("import os\ndef f(p, flags):\n    os.open(p, flags)", "overwrite"),
+        ("import os\ndef f(p):\n    os.open(p, os.O_WRONLY | 512)", "truncation"),
+        ("import shutil\ndef f(a, b):\n    shutil.copyfile(a, b)", "rename"),
+        ("import shutil\ndef f(a, b):\n    shutil.copy2(a, b)", "rename"),
+        ("import shutil\ndef f(a, b):\n    shutil.copytree(a, b, dirs_exist_ok=True)", "rename"),
+        ("import io\ndef f(p):\n    io.FileIO(p, 'w')", "truncation"),
+        ("import logging\ndef f(p):\n    logging.FileHandler(p, mode='w')", "truncation"),
+        ("import zipfile\ndef f(p):\n    zipfile.ZipFile(p, 'w')", "truncation"),
+        ("import gzip\ndef f(p):\n    gzip.open(p, 'wb')", "truncation"),
+        (
+            "from logging.handlers import RotatingFileHandler\n"
+            "def f(p):\n    RotatingFileHandler(p, maxBytes=1, backupCount=1)",
+            "rename",
+        ),
+        ("import subprocess\ndef f(p):\n    subprocess.run(['rm', p])", "subprocess"),
+        ("from subprocess import run\ndef f(p):\n    run(['rm', p])", "subprocess"),
+        ("import os\ndef f(p):\n    os.system('rm ' + p)", "subprocess"),
+        ("import os\ndef f(p):\n    os.popen('rm ' + p)", "subprocess"),
+        ("import os\ndef f(p):\n    getattr(os, 'remove')(p)", "removal"),
+        ("import os\ndef f(p, n):\n    getattr(os, n)(p)", "dynamic"),
+        ("import os\ndef f(p):\n    vars(os)['unlink'](p)", "dynamic"),
+        ("import importlib\ndef f():\n    importlib.import_module('ctypes')", "dynamic"),
+        ("def f():\n    __import__('ctypes')", "dynamic"),
+        ("def f(fs, fd):\n    fs.pwrite(fd, b'x', 0)", "overwrite"),
+        ("import os\ndef f(fd):\n    os.pwrite(fd, b'x', 0)", "overwrite"),
     ],
 )
 def test_the_guard_flags_every_removal_form_with_aliases_resolved(
@@ -164,7 +217,15 @@ def test_the_guard_flags_every_removal_form_with_aliases_resolved(
         "def f(text):\n    return text.replace('a', 'b')",
         "def f(p):\n    return open(p)",
         "def f(p):\n    return open(p, 'rb')",
+        "def f(p):\n    return open(p, 'a')",
+        "def f(p):\n    return open(p, 'x')",
+        "from pathlib import Path\ndef f(p):\n    return Path(p).open('rb')",
+        "def f(transport, receiver):\n    return transport.open(receiver)",
+        "import os\ndef f(p):\n    return os.open(p, os.O_RDONLY | os.O_NOFOLLOW)",
+        "import os\ndef f(p):\n    return os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL)",
         "import os\ndef f(p):\n    os.stat(p)",
+        "def f(text):\n    return text.replace('a', 'b', 1)",
+        "import os\ndef f(p):\n    return getattr(os, 'sep')",
     ],
 )
 def test_the_guard_leaves_harmless_calls_alone(source: str) -> None:

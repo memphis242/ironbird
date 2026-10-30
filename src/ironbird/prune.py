@@ -192,7 +192,7 @@ def _delete_session(
     try:
         lock_fd = fs.open_at(dir_fd, part1.name, INSPECT_FLAGS)
     except FileNotFoundError:
-        skip("part 1 is gone")
+        _already_gone(fs, dir_fd, session, outcome, record, skip)
         return
     except OSError as exc:
         skip(f"part 1 cannot be opened ({exc.strerror})")
@@ -237,6 +237,32 @@ def _delete_session(
         outcome.deleted_sessions += 1
     finally:
         close_quietly(fs, lock_fd)
+
+
+def _already_gone(
+    fs: FileSystem,
+    dir_fd: int,
+    session: Session,
+    outcome: Outcome,
+    record: Callable[..., Any],
+    skip: Callable[[str], None],
+) -> None:
+    """Part 1 is not there: another prune (or the user) got to the session first. When none of
+    its listed files remains it is simply gone - counted, not an error. A file that does remain
+    belongs to a session that is no longer complete, which prune leaves alone."""
+    remaining = 0
+    for entry in session.files:
+        try:
+            fs.stat_at(dir_fd, entry.name)
+        except FileNotFoundError:
+            outcome.gone_files += 1
+            record("prune.gone", target=session.id, name=entry.name)
+        except OSError:
+            remaining += 1
+        else:
+            remaining += 1
+    if remaining:
+        skip("part 1 is gone but other files of the session remain")
 
 
 def interactive() -> bool:

@@ -400,7 +400,7 @@ def test_fifty_transmissions_while_stalled_give_bounded_lines_then_one_summary(
     assert (report.unlogged, report.exit_code) == (50, 6)
 
 
-def test_a_single_announced_transmission_adds_no_exit_line_in_a_long_session(
+def test_exit_6_is_never_silent_even_for_a_transmission_announced_when_it_was_sent(
     tmp_path: Path,
 ) -> None:
     rig = Rig(tmp_path, long=True)
@@ -410,7 +410,9 @@ def test_a_single_announced_transmission_adds_no_exit_line_in_a_long_session(
     rig.ledger.flush()
     rig.ledger.record_tx("tx.command", "NOOP", "fc", node="fc")
     report = rig.ledger.close()
-    assert report.notices == () and report.unlogged == 1 and report.exit_code == 6
+    (line,) = report.notices  # one line with the exit code, announced earlier or not
+    assert line.code is Code.LED_UNLOGGED and line.summary.startswith("NOOP sent to fc but not")
+    assert report.unlogged == 1 and report.exit_code == 6
 
 
 def test_refuse_commands_refuses_before_anything_is_sent(tmp_path: Path) -> None:

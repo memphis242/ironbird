@@ -9,9 +9,9 @@ timestamps not in the future; anything else is ignored and rewritten. It is rewr
 torn by a crash reads as invalid and is rewritten, at worst repeating one warning.
 
 A lock never causes silence: when it is held for more than 200 ms the warning is displayed and
-the file is left unwritten. Where locks are unsupported (``ENOLCK``, ``EINVAL``,
-``EOPNOTSUPP``) the file is read and rewritten without one - a race can at worst repeat one
-warning or one scan.
+the file is left unwritten. Where a lock cannot be taken for any other reason (``ENOLCK``,
+``EINVAL``, ``EOPNOTSUPP`` and whatever else a file system answers) the file is read and rewritten
+without one - a race can at worst repeat one warning or one scan, and the rate limits still work.
 """
 
 from __future__ import annotations
@@ -40,7 +40,6 @@ MAX_KEY_LEN: Final = 200
 LOCK_TRIES: Final = 20  # x 10 ms: the 200 ms bound
 LOCK_STEP_S: Final = 0.01
 SCHEMA: Final = 1
-_NO_LOCK: Final = frozenset({errno.ENOLCK, errno.EINVAL, errno.EOPNOTSUPP, errno.EBADF})
 _OPEN_FLAGS: Final = INSPECT_RW_FLAGS | os.O_CREAT
 
 
@@ -144,8 +143,9 @@ class Notices:
             shown, last = parse_notices(raw, now)
             shown, last, result = change(shown, last)
             data = render_notices(shown, last)
-            fs.pwrite(fd, data, 0)
-            fs.ftruncate(fd, len(data))  # the rewrite helper: in place, no temporary file
+            if data != raw:  # an answer that changed nothing leaves the file alone
+                fs.pwrite(fd, data, 0)
+                fs.ftruncate(fd, len(data))  # the rewrite helper: in place, no temporary file
             return result, True
         except OSError:
             return change({}, None)[2], False
@@ -163,10 +163,11 @@ class Notices:
                 if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
                     self._sleep(LOCK_STEP_S)
                     continue
-                if exc.errno in _NO_LOCK:
-                    self.unlocked = True
-                    return True  # read and rewritten without the lock
-                return False
+                # Any other refusal (unsupported, a file system that fails locks in its own way)
+                # means no usable lock here, whatever the errno: read and rewritten without it,
+                # so the cross-process rate limits keep working.
+                self.unlocked = True
+                return True
         return False
 
     # -- the two questions -----------------------------------------------------------------

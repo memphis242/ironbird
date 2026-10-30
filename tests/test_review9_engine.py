@@ -23,7 +23,6 @@ from ironbird.ccdd.loader import load_ccdd
 from ironbird.ccdd.model import MessageKind
 from ironbird.codec import Codec, Resolved
 from ironbird.config import Endpoint, load_config
-from ironbird.engine import FrameDecoder
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.frame import Decoded, Direction, Frame, FrameFlag, Stream
 from ironbird.header import load_profile
@@ -272,7 +271,7 @@ def test_a_tampered_or_foreign_token_always_decodes_like_the_whole_decode(
     status = codec.encode_telemetry("MOCK_STATUS").data
     live = _live_frame(codec, hk)
     other = _codec(max_packet_bytes=2048)  # a second codec with its own identity
-    decoder = FrameDecoder(probe.engine, report_checked=False)
+    decoder = probe.engine.decoder(report_checked=False)
     frame: Frame
     match op:
         case "replace_data":
@@ -505,7 +504,7 @@ def test_a_live_frame_decodes_through_its_token_without_checking_again(
         raise AssertionError("the whole decode ran for a frame that carries its check")
 
     monkeypatch.setattr(probe.codec, "resolve", refuse)
-    live = FrameDecoder(probe.engine, report_checked=False).decode(frame)
+    live = probe.engine.decoder(report_checked=False).decode(frame)
     assert isinstance(live, Decoded) and live.packet == expected
 
 

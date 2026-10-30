@@ -23,13 +23,15 @@ import json
 import os
 import re
 import stat
+import threading
 import time
+from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
-from ironbird.atomicfile import Collision, SyncAfterCommit, rename_noreplace
+from ironbird.atomicfile import Collision, SyncAfterCommit, TempOutput, rename_noreplace
 from ironbird.fsops import (
     INSPECT_FLAGS,
     INSPECT_RW_FLAGS,
@@ -37,15 +39,15 @@ from ironbird.fsops import (
     close_quietly,
     same_file,
     try_stat_at,
-    write_all,
 )
-from ironbird.ledgerstore import part_name
+from ironbird.ledgerstore import NAME_TRIES, part_name
 from ironbird.units import MIB, format_size
 
 MAX_ENTRIES: Final = 100_000
 HEAD_BYTES: Final = 4096
 MAX_RESERVE_BYTES: Final = 1 << 30
 READ_BLOCK: Final = MIB
+MAX_CLASS_READS: Final = 10_000  # head reads per scan; a session past it counts as long
 FRESH_S: Final = 600.0  # a session whose newest file is younger than this is live
 _N: Final = r"(?:[0-9]{4}|[1-9][0-9]{4,8})"
 _STAMP: Final = r"([0-9]{8}T[0-9]{6}Z)-([0-9a-f]{12})"
@@ -68,6 +70,11 @@ REASON_GROUPS: Final = {
     INCOMPLETE: "incomplete or hard-linked",
     HARDLINKED: "incomplete or hard-linked",
 }
+
+
+def is_managed_name(name: str) -> bool:
+    """Whether ``name`` is one retention manages: a ledger part, a reserve or a recording."""
+    return any(p.fullmatch(name) for p in (LEDGER_RE, RESERVE_RE, RECORDING_RE))
 
 
 def _valid_stamp(stamp: str) -> float | None:
@@ -177,6 +184,18 @@ class DirScan:
         return sorted(self.sessions.values(), key=lambda s: (s.start, s.id), reverse=True)
 
 
+@dataclass(slots=True)
+class ScanControl:
+    """The two-way signal between a scan's thread and whoever waits for it.
+
+    ``stop`` asks the scan not to begin any further recovery step; ``stepping`` is set while a
+    step that must not be cut short is under way (a salvage after its original was set aside),
+    so the waiter can give it the time to end instead of exiting mid-copy."""
+
+    stop: threading.Event = field(default_factory=threading.Event)
+    stepping: threading.Event = field(default_factory=threading.Event)
+
+
 def directory_unsafe(mode: int) -> bool:
     """Writable by group or others without the sticky bit: another user could swap names
     between a check and an unlink or rename."""
@@ -205,7 +224,11 @@ def scan_directory(
         return scan
     scan.exists = True
     try:
-        scan.unsafe = directory_unsafe(fs.fstat(dir_fd).st_mode)
+        try:
+            scan.unsafe = directory_unsafe(fs.fstat(dir_fd).st_mode)
+        except OSError as exc:
+            scan.partial = f"{path} cannot be examined ({exc.strerror or exc})"
+            return scan
         try:
             entries = fs.scandir(dir_fd)
         except OSError as exc:
@@ -233,44 +256,67 @@ def _take_entry(
         if found is None:
             continue
         is_reserve = pattern is RESERVE_RE
-        stamp, session_id, number_text = found.group(1), found.group(2), found.group(3)
-        start = _valid_stamp(stamp)
+        start = _valid_stamp(found.group(1))
+        number_text = found.group(3)
         number = int(number_text) if number_text else 1
-        if is_reserve:
-            number = int(found.group(3))
         if start is None or (number_text and not is_reserve and number < 2):
             scan.unparseable += 1
             return
-        try:
-            fd = fs.open_at(dir_fd, name, INSPECT_FLAGS)
-        except OSError:
-            scan.foreign += 1  # a symbolic link (ELOOP), a vanished or unreadable name
+        st = _regular_owned_stat(fs, dir_fd, name)
+        if st is None:
+            scan.foreign += 1  # a symbolic link, a vanished or unreadable name, not ours
             return
-        try:
-            st = fs.fstat(fd)
-        finally:
-            close_quietly(fs, fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
-            scan.foreign += 1
-            return
+        session_id = found.group(2)
         session = scan.sessions.get(session_id)
         if session is None:
             session = scan.sessions[session_id] = Session(session_id, start)
         else:
             session.start = min(session.start, start)
-        session.files.append(
-            FileEntry(
-                name,
-                number,
-                is_reserve,
-                st.st_dev,
-                st.st_ino,
-                st.st_size,
-                st.st_mtime,
-                st.st_nlink,
-            )
-        )
+        session.files.append(_file_entry(name, number, is_reserve, st))
         return
+
+
+def _regular_owned_stat(fs: FileSystem, dir_fd: int, name: str) -> os.stat_result | None:
+    """``fstat`` of ``name`` opened the inspection way; ``None`` unless it is a regular file of
+    this user (a symbolic link, a FIFO, someone else's file, a vanished name)."""
+    try:
+        fd = fs.open_at(dir_fd, name, INSPECT_FLAGS)
+    except OSError:
+        return None
+    try:
+        st = fs.fstat(fd)
+    except OSError:
+        return None
+    finally:
+        close_quietly(fs, fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        return None
+    return st
+
+
+def _file_entry(name: str, number: int, is_reserve: bool, st: os.stat_result) -> FileEntry:
+    return FileEntry(
+        name, number, is_reserve, st.st_dev, st.st_ino, st.st_size, st.st_mtime, st.st_nlink
+    )
+
+
+def _relist(fs: FileSystem, dir_fd: int, session: Session) -> list[FileEntry]:
+    """The session's pattern files as the directory holds them right now (a scan's listing can
+    be stale by the time a recovery holds the session's lock)."""
+    files: list[FileEntry] = []
+    for entry in fs.scandir(dir_fd):
+        for pattern in (LEDGER_RE, RESERVE_RE):
+            found = pattern.fullmatch(entry.name)
+            if found is None or found.group(2) != session.id:
+                continue
+            is_reserve = pattern is RESERVE_RE
+            number_text = found.group(3)
+            number = int(number_text) if number_text else 1
+            st = _regular_owned_stat(fs, dir_fd, entry.name)
+            if st is not None and not (number_text and not is_reserve and number < 2):
+                files.append(_file_entry(entry.name, number, is_reserve, st))
+            break
+    return files
 
 
 # -- liveness ----
@@ -385,6 +431,48 @@ def session_class(fs: FileSystem, dir_fd: int, session: Session, kind: str) -> s
 # -- protection ----
 
 
+class _ClassReader:
+    """Reads each session's class at most once, and at most ``budget`` heads per scan. A session
+    past the budget, or with no directory to read it from, counts as long: protected rather than
+    spent."""
+
+    def __init__(self, fs: FileSystem, dir_fd: int, kind: str, budget: int = MAX_CLASS_READS):
+        self._fs, self._dir_fd, self._kind, self._budget = fs, dir_fd, kind, budget
+
+    def __call__(self, session: Session) -> str:
+        if session.klass is None:
+            if self._kind == "recording" or self._dir_fd < 0 or self._budget <= 0:
+                session.klass = "long"
+            else:
+                self._budget -= 1
+                session.klass = session_class(self._fs, self._dir_fd, session, self._kind)
+        return session.klass
+
+
+def _recency(session: Session) -> tuple[float, str]:
+    """How recent a session is for ``keep_recent``: its stamp, or its newest file time when that
+    is earlier (a stamp from a clock that ran ahead must not outrank the real recent ones)."""
+    return min(session.start, session.newest_mtime), session.id
+
+
+def _merge_spans(spans: list[tuple[float, float]]) -> tuple[list[float], list[float]]:
+    """The union of ``(lo, hi)`` intervals as sorted, disjoint ``los`` and ``his``."""
+    los: list[float] = []
+    his: list[float] = []
+    for lo, hi in sorted(spans):
+        if his and lo <= his[-1]:
+            his[-1] = max(his[-1], hi)
+        else:
+            los.append(lo)
+            his.append(hi)
+    return los, his
+
+
+def _inside(los: list[float], his: list[float], moment: float) -> bool:
+    index = bisect_right(los, moment) - 1
+    return index >= 0 and moment <= his[index]
+
+
 def apply_protection(
     fs: FileSystem,
     scan: DirScan,
@@ -393,13 +481,21 @@ def apply_protection(
     live: dict[str, str],
     has_recording: Callable[[str], bool] | None = None,
 ) -> None:
-    """Fill ``Session.protected`` for every session of the directory (see the module notes)."""
+    """Fill ``Session.protected`` for every session of the directory (see the module notes).
+
+    A session is protected when it is live, incomplete, hard-linked, holds an unrecoverable
+    reserve, has its recording, is among the ``keep_recent`` most recent (of any class, and of
+    the long ones), or is a short session that started inside the span (start to newest file
+    time) of any protected long session.
+    """
     try:
         dir_fd = fs.open_dir(scan.path)
     except OSError:
         dir_fd = -1
     try:
-        for session in scan.sessions.values():
+        class_of = _ClassReader(fs, dir_fd, scan.kind)
+        sessions = list(scan.sessions.values())
+        for session in sessions:
             session.protected = []
             if session.id in live:
                 session.protected.append(live[session.id])
@@ -411,40 +507,39 @@ def apply_protection(
                 session.protected.append(UNRECOVERABLE)
             if has_recording is not None and has_recording(session.id):
                 session.protected.append(HAS_RECORDING)
-        ordered = scan.ordered()
-        # keep_recent: the most recent of any class, and the most recent long ones. Classes are
-        # read newest first and only as far as these rules need them.
-        for session in ordered[:keep_recent]:
-            session.protected.append(KEEP_RECENT)
-        long_kept: list[Session] = []
-        for session in ordered:
-            if len(long_kept) >= keep_recent:
+        # keep_recent: the most recent of any class, and the most recent long ones. A session
+        # with a future mtime is already protected and takes no slot, so a run of files from a
+        # clock that was ahead cannot push the real recent sessions out of the kept set.
+        eligible = sorted(
+            (s for s in sessions if FUTURE not in s.protected), key=_recency, reverse=True
+        )
+        for session in eligible[:keep_recent]:
+            if KEEP_RECENT not in session.protected:
+                session.protected.append(KEEP_RECENT)
+        long_kept = 0
+        for session in eligible:
+            if long_kept >= keep_recent:
                 break
-            if session.klass is None:
-                session.klass = (
-                    session_class(fs, dir_fd, session, scan.kind) if dir_fd >= 0 else "long"
-                )
-            if session.klass == "long":
-                long_kept.append(session)
+            if class_of(session) == "long":
+                long_kept += 1
                 if KEEP_RECENT not in session.protected:
                     session.protected.append(KEEP_RECENT)
-        oldest_start = min((s.start for s in long_kept), default=None)
+        if scan.kind == "recording":
+            return  # recordings are all long: no short session to hold back
+        # a short session that started while any protected long session ran is kept with it
         spans = [
-            (s.start, s.newest_mtime)
-            for s in scan.sessions.values()
-            if s.klass == "long" and s.protected
+            (s.start, s.newest_mtime) for s in sessions if s.protected and class_of(s) == "long"
         ]
-        if oldest_start is not None and spans:
-            for session in ordered:
-                if session.start < oldest_start:
-                    break
-                if session.klass is None:
-                    session.klass = (
-                        session_class(fs, dir_fd, session, scan.kind) if dir_fd >= 0 else "long"
-                    )
-                inside = any(lo <= session.start <= hi for lo, hi in spans)
-                if session.klass == "short" and inside and INSIDE_LONG not in session.protected:
-                    session.protected.append(INSIDE_LONG)
+        if not spans:
+            return
+        los, his = _merge_spans(spans)
+        for session in sessions:
+            if (
+                not session.protected
+                and _inside(los, his, session.start)
+                and class_of(session) == "short"
+            ):
+                session.protected.append(INSIDE_LONG)
     finally:
         close_quietly(fs, dir_fd)
 
@@ -536,6 +631,11 @@ class RecoveryContext:
     scan: DirScan
     session: Session
     next_part: int = 2
+    control: ScanControl | None = None
+
+    @property
+    def stopping(self) -> bool:
+        return self.control is not None and self.control.stop.is_set()
 
 
 def _unrecoverable(scan: DirScan, session: Session, name: str, why: str) -> None:
@@ -547,11 +647,17 @@ def _unrecoverable(scan: DirScan, session: Session, name: str, why: str) -> None
 
 
 def recover_directory(
-    fs: FileSystem, scan: DirScan, live: dict[str, str], own_session: str | None
+    fs: FileSystem,
+    scan: DirScan,
+    live: dict[str, str],
+    own_session: str | None,
+    control: ScanControl | None = None,
 ) -> bool:
     """Recover the leftover reserves of every non-live session of a ledger directory (cut at the
     last complete record and renamed to the next part, never deleted). A directory writable by
-    others without the sticky bit is not touched. Returns whether any file changed."""
+    others without the sticky bit is not touched. Returns whether any file changed.
+
+    ``control.stop`` ends the pass between sessions: no recovery step begins after it is set."""
     if scan.kind != "ledger" or scan.unsafe or not scan.exists:
         return False
     try:
@@ -561,9 +667,11 @@ def recover_directory(
     changed = False
     try:
         for session in sorted(scan.sessions.values(), key=lambda s: s.id):
+            if control is not None and control.stop.is_set():
+                break
             if session.id in live or session.id == own_session or not session.reserves:
                 continue
-            ctx = RecoveryContext(fs, dir_fd, scan, session)
+            ctx = RecoveryContext(fs, dir_fd, scan, session, control=control)
             changed |= _recover_session(ctx)
     finally:
         close_quietly(fs, dir_fd)
@@ -593,10 +701,33 @@ def _recover_session(ctx: RecoveryContext) -> bool:
             scan.unlocked = True
             _unrecoverable(scan, session, reserves[0].name, "file locks are unavailable here")
             return False
+        # The listing is from before the lock: another scan may have recovered the session
+        # meanwhile, so what is left to do is what the directory holds now.
+        try:
+            session.files = _relist(fs, ctx.dir_fd, session)
+        except OSError as exc:
+            _unrecoverable(
+                scan, session, reserves[0].name, f"the directory cannot be listed: {exc.strerror}"
+            )
+            return False
+        reserves = session.reserves
+        if not reserves:
+            return False  # the session was recovered by another scan: nothing left, nothing to say
+        if session.part1() is None:
+            _unrecoverable(scan, session, reserves[0].name, "its session has no part 1")
+            return False
         numbers = [f.number for f in session.files if not f.is_reserve]
         ctx.next_part = max(numbers, default=1) + 1
         for reserve in reserves:
-            outcome = _recover_reserve(ctx, reserve, held)
+            if ctx.stopping:
+                return changed
+            try:
+                outcome = _recover_reserve(ctx, reserve, held)
+            except OSError as exc:  # the file system failed mid-way: nothing more is touched
+                _unrecoverable(
+                    scan, session, reserve.name, f"the file system failed: {exc.strerror or exc}"
+                )
+                return changed
             if outcome == "skip":
                 return changed
             changed |= outcome == "changed"
@@ -639,17 +770,9 @@ def _recover_reserve(ctx: RecoveryContext, reserve: FileEntry, held: list[int]) 
         _unrecoverable(scan, session, name, "header is another session's")
         return "stop"
     header_len = first.find(b"\n") + 1
-    # An interrupted rename (the link path): another name of the same session holds this inode.
-    for other in session.files:
-        if not other.is_reserve and (other.dev, other.ino) == (st.st_dev, st.st_ino):
-            named = try_stat_at(fs, ctx.dir_fd, name)
-            if named is not None and same_file(st, named):
-                fs.unlink_at(ctx.dir_fd, name)  # completes the rename: one name remains
-                scan.recovered += 1
-                scan.recoveries.append(
-                    {"old": name, "new": other.name, "kept": st.st_size, "cut": 0}
-                )
-                return "changed"
+    completed = _complete_interrupted_rename(ctx, reserve, fd, st)
+    if completed is not None:
+        return completed
     facts = _read_facts(fs, fd, st.st_size)
     cut = facts.last_newline + 1
     if facts.junk_after_nul is None:
@@ -661,6 +784,36 @@ def _recover_reserve(ctx: RecoveryContext, reserve: FileEntry, held: list[int]) 
         return _salvage(ctx, reserve, fd, st, cut)
     _unrecoverable(scan, session, name, "damaged, with no record after its header")
     return "stop"
+
+
+def _complete_interrupted_rename(
+    ctx: RecoveryContext, reserve: FileEntry, fd: int, st: os.stat_result
+) -> str | None:
+    """A reserve whose inode also carries a part name of the session is an interrupted rename
+    (the ``link`` path of the helper): the reserve name is unlinked, leaving the part name.
+
+    Both names are looked at again now, and the inode must really have two links, so a stale
+    listing cannot make this unlink a name that is not a second name of the file."""
+    fs, scan, session, name = ctx.fs, ctx.scan, ctx.session, reserve.name
+    for other in session.files:
+        if other.is_reserve or (other.dev, other.ino) != (st.st_dev, st.st_ino):
+            continue
+        held = fs.fstat(fd)
+        current = try_stat_at(fs, ctx.dir_fd, other.name)
+        named = try_stat_at(fs, ctx.dir_fd, name)
+        if (
+            current is None
+            or named is None
+            or not same_file(held, current)
+            or not same_file(held, named)
+            or held.st_nlink < 2
+        ):
+            continue
+        fs.unlink_at(ctx.dir_fd, name)  # completes the rename: one name remains
+        scan.recovered += 1
+        scan.recoveries.append({"old": name, "new": other.name, "kept": st.st_size, "cut": 0})
+        return "changed"
+    return None
 
 
 def _commit_recovered(
@@ -689,52 +842,92 @@ def _commit_recovered(
 def _salvage(
     ctx: RecoveryContext, reserve: FileEntry, fd: int, st: os.stat_result, cut: int
 ) -> str:
-    """A valid prefix followed by damage: the prefix's complete lines go to the next part (made
-    ``O_EXCL``, synced), and the damaged original is kept byte-identical as ``<name>.damaged``."""
+    """A valid prefix followed by damage.
+
+    The damaged original is set aside first, byte-identical, as ``<name>.damaged`` (one atomic
+    non-replacing rename): that name is outside the retention patterns, so no later scan finds
+    the reserve again, whatever happens next. Then the prefix's complete lines are copied from
+    the held descriptor to a temporary file and committed to the session's next part name; a
+    crash or a full disk leaves only a dot-temporary file and the intact ``.damaged`` file,
+    never a torn or a duplicate part. ``ledger.recovered`` is always written."""
     fs, scan, session, name = ctx.fs, ctx.scan, ctx.session, reserve.name
-    new = part_name(_stamp_of(session), session.id, ctx.next_part)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-    try:
-        out = fs.open_at(ctx.dir_fd, new, flags, 0o600)
-    except FileExistsError:
-        _unrecoverable(scan, session, name, f"a file already has the next part name {new}")
-        return "stop"
-    except OSError as exc:
-        _unrecoverable(
-            scan, session, name, f"the salvaged part could not be created: {exc.strerror}"
-        )
-        return "stop"
-    try:
-        offset = 0
-        while offset < cut:
-            block = fs.pread(fd, min(READ_BLOCK, cut - offset), offset)
-            write_all(fs, out, block)
-            offset += len(block)
-        fs.fdatasync(out)
-        fs.fsync(ctx.dir_fd)
-    except OSError as exc:
-        _unrecoverable(scan, session, name, f"the prefix could not be saved: {exc.strerror}")
-        return "stop"  # the partial part we created stays: later numbers skip it
-    finally:
-        close_quietly(fs, out)
     damaged = f"{name}.damaged"
+    if ctx.stopping:
+        return "stop"  # nothing is committed to yet: the next scan salvages it
     try:
         rename_noreplace(ctx.dir_fd, name, damaged, fd, fs=fs)
     except SyncAfterCommit:
         pass
-    except (Collision, OSError) as exc:
-        _unrecoverable(scan, session, name, f"it could not be set aside as .damaged ({exc})")
+    except Collision:
+        _unrecoverable(scan, session, name, f"a file named {damaged} already exists")
         return "stop"
+    except OSError as exc:
+        _unrecoverable(
+            scan, session, name, f"it could not be set aside as .damaged: {exc.strerror}"
+        )
+        return "stop"
+    control = ctx.control
+    if control is not None:
+        control.stepping.set()  # from here the copy runs to its end
+    try:
+        new, error = _copy_prefix(ctx, fd, cut)
+    finally:
+        if control is not None:
+            control.stepping.clear()
+    record: dict[str, Any] = {
+        "old": name,
+        "new": new,
+        "kept": cut if new else 0,
+        "cut": st.st_size - (cut if new else 0),
+        "damaged": damaged,
+    }
     scan.recovered += 1
-    scan.recoveries.append(
-        {"old": name, "new": new, "kept": cut, "cut": st.st_size - cut, "damaged": damaged}
-    )
+    if new is None:
+        record["error"] = error
+        scan.recoveries.append(record)
+        scan.unrecoverable.add(session.id)
+        scan.messages.append(
+            f"reserve {name} was damaged and its records could not be saved ({error}); "
+            f"the whole file is kept as {damaged}; inspect or delete that file"
+        )
+        return "stop"
+    scan.recoveries.append(record)
     scan.messages.append(
         f"reserve {name} was damaged: {format_size(cut)} saved as part "
         f"p{ctx.next_part:04d}, the rest kept as {damaged}; inspect or delete that file"
     )
     ctx.next_part += 1
     return "changed"
+
+
+def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, str]:
+    """Copy the first ``cut`` bytes of ``fd`` to the session's next free part name through a
+    temporary file. Returns ``(part name, "")``, or ``(None, why)``."""
+    fs, session = ctx.fs, ctx.session
+    new = ""
+    for _ in range(NAME_TRIES):
+        new = part_name(_stamp_of(session), session.id, ctx.next_part)
+        if try_stat_at(fs, ctx.dir_fd, new) is None:
+            break
+        ctx.next_part += 1
+    else:
+        return None, "no free part name"
+    try:
+        with TempOutput(ctx.scan.path / new, fs=fs) as out:
+            offset = 0
+            while offset < cut:
+                block = fs.pread(fd, min(READ_BLOCK, cut - offset), offset)
+                if not block:
+                    raise OSError(errno.EIO, "the reserve ended early")
+                out.write(block)
+                offset += len(block)
+            with contextlib.suppress(SyncAfterCommit):
+                out.commit()  # a failed directory sync after the rename does not undo it
+    except Collision:
+        return None, f"a file appeared at {new}"
+    except OSError as exc:
+        return None, exc.strerror or str(exc)
+    return new, ""
 
 
 def _stamp_of(session: Session) -> str:
@@ -750,12 +943,15 @@ def full_scan(
     own_session: str | None,
     keep_recent: int,
     has_recording: Callable[[str], bool] | None = None,
+    recover: bool = True,
+    control: ScanControl | None = None,
 ) -> DirScan:
-    """Scan, probe liveness, recover leftover reserves (a ledger directory), then decide the
-    protections - the one pass a warning check and a prune both start from."""
+    """Scan, probe liveness, recover leftover reserves (a ledger directory; ``recover=False``
+    leaves them for a scan that may), then decide the protections - the one pass a warning check
+    and a prune both start from."""
     scan = scan_directory(fs, path, kind)
     live = liveness(fs, path, scan, now, own_session)
-    if kind == "ledger" and recover_directory(fs, scan, live, own_session):
+    if kind == "ledger" and recover and recover_directory(fs, scan, live, own_session, control):
         again = scan_directory(fs, path, kind)
         again.recovered, again.recoveries = scan.recovered, scan.recoveries
         again.unrecoverable, again.messages = scan.unrecoverable, scan.messages

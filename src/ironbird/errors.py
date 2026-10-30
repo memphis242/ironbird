@@ -85,19 +85,25 @@ class Code(StrEnum):
     REC_DAMAGED = "IB-REC-006"  # damaged record mid-file
     REC_TORN = "IB-REC-007"  # recording ends in an incomplete record (not closed cleanly)
     REC_INDEX = "IB-REC-008"  # index missing or invalid; rebuilt by scanning
+    REC_DEFS = "IB-REC-009"  # embedded definitions differ from the config, or cannot be loaded
     REC_SPACE = "IB-REC-010"  # low disk space for the recording
     REC_DIRSYNC = "IB-REC-011"  # the recording's directory cannot be synced (name not durable)
     # Engine
     ENG_LAG = "IB-ENG-001"  # a consumer fell behind: frames not shown to it (sinks still saw them)
     # System resources
     SYS_RESOURCE = "IB-SYS-001"  # the OS refused a resource needed to start (file descriptors)
+    # Filter expressions (--where)
+    FLT_SYNTAX = "IB-FLT-001"  # filter syntax error (column, excerpt)
+    FLT_NAME = "IB-FLT-002"  # unknown name in a filter, or a reserved name misused
+    FLT_TYPE = "IB-FLT-003"  # literal or operator does not fit the type; filter can never match
+    FLT_LIMIT = "IB-FLT-004"  # filter too long, deep or wide
     # CLI / internal
     CLI_USAGE = "IB-CLI-001"  # command line usage error
     INTERNAL = "IB-INT-001"  # unexpected internal error (bug)
 
 
 MAX_SUMMARY_LEN = 600
-_USAGE_PREFIXES = ("IB-CFG-", "IB-HDR-", "IB-CCD-", "IB-CLI-", "IB-EVT-")
+_USAGE_PREFIXES = ("IB-CFG-", "IB-HDR-", "IB-CCD-", "IB-CLI-", "IB-EVT-", "IB-FLT-")
 
 
 class IronbirdError(Exception):

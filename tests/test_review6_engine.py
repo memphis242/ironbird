@@ -42,10 +42,17 @@ def test_a_ledger_in_an_unusable_location_stops_taking_records_after_one_report(
     blocker.write_text("a file, not a directory")
     failures: list[IronbirdError] = []
     ledger = Ledger(blocker / "sub", session_id="f", on_failure=failures.append)
-    ledger.record_error(IronbirdError(Code.DEC_CHECKSUM, "bad"))
-    ledger.flush()  # the writer's first open finds the location wrong
+    # The ledger opens on the writer thread, so the first record is queued before anyone knows
+    # the location is wrong: it gets a number, the writer's open then fails and says so once
+    # (IB-LED-002), and the record is discarded with the rest. From then on there is no number
+    # to point at.
+    first = ledger.record_error(IronbirdError(Code.DEC_CHECKSUM, "bad"))
+    assert first is not None
+    ledger.flush()
     assert [f.code for f in failures] == [Code.LED_DIR]
+    assert not ledger.enabled and ledger.pending == 0
     assert ledger.record_error(IronbirdError(Code.DEC_CHECKSUM, "bad")) is None
+    assert [f.code for f in failures] == [Code.LED_DIR]  # reported once, not per record
     assert not ledger.path.exists()  # nothing was written, so there is nothing to point at
 
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import itertools
 import os
 import queue
 import signal
@@ -257,7 +258,13 @@ class LedgerStore:
         self.possibly_lost_records = 0
         self.possibly_lost_tx = TxTally()
         self.backlog: deque[Line] = deque()
+        self.inflight: list[Line] = []  # taken from the backlog, being written right now
+        self.resolved_n = 0  # every line numbered at most this has been written or dropped
         self.confirmed_lines = 0  # lines written so far (for an exit while a call is blocked)
+        # Guards ``backlog``, ``inflight``, ``resolved_n`` and ``_unsynced_tx`` where the writer
+        # moves lines between them, so :meth:`unconfirmed` sees one consistent picture. Held for
+        # a few list operations, never across a file system call.
+        self._state_lock = threading.Lock()
         # -- owned by the writer thread
         self._dir_fd = -1
         self._stamp = stamp_of(start_ns)
@@ -451,23 +458,60 @@ class LedgerStore:
     # -- accounting ------------------------------------------------------------------------
 
     def _written(self, lines: list[Line]) -> None:
+        """Account for ``lines``, which reached the file: they are resolved (in order, so the
+        highest number stands for all of them) and, until the next sync, unconfirmed."""
+        if not lines:
+            return
+        with self._state_lock:
+            self.resolved_n = max(self.resolved_n, lines[-1].n)
+            for line in lines:
+                if line.tx is not None:
+                    self._unsynced_tx.add(line.tx)
         for line in lines:
             self.tier_bytes[line.tier] += len(line.data)
             self.tier_records[line.tier] += 1
             self._unsynced_records += 1
-            if line.tx is not None:
-                self._unsynced_tx.add(line.tx)
         self.confirmed_lines += len(lines)
         if self.stalled:
             self._stall_written += len(lines)
             self._stall_written_tx += sum(line.tx.count for line in lines if line.tx is not None)
+
+    def unconfirmed(self) -> tuple[list[Line], int, TxTally]:
+        """What the store cannot vouch for, as one consistent snapshot (callable from any
+        thread): the lines handed to it that are not written yet (in order: those being written,
+        then the backlog), the highest record number written, and the transmissions written
+        since the last good sync."""
+        with self._state_lock:
+            resolved = self.resolved_n
+            lines = [
+                line for line in itertools.chain(self.inflight, self.backlog) if line.n > resolved
+            ]
+            unsynced = TxTally()
+            unsynced.merge(self._unsynced_tx)
+        return lines, resolved, unsynced
+
+    def internal_failure(self, exc: BaseException) -> None:
+        """A bug, not an I/O error, interrupted a job (writer thread). What was being written
+        goes back to the front of the backlog and the part is cut back to its last complete
+        line, so no line is lost or torn; the store stalls (the lines are retried, and counted
+        at exit if never written) and the failure is reported, never just noted."""
+        with self._state_lock:
+            if self.inflight:
+                self.backlog.extendleft(reversed(self.inflight))
+                self.inflight = []
+        active = self._active
+        if active is not None and not active.is_reserve and active.fd >= 0:
+            self._cut_back(active)
+        self._enter_stall(_Stall(None, f"internal error {type(exc).__name__}"))
+        self._emit("internal", error=repr(exc))
 
     # -- the write path ----------------------------------------------------------------------
 
     def write(self, lines: list[Line], *, force: bool = False) -> None:
         """Take ``lines`` (in order) and write what can be written now. Never raises: a
         failure stalls the store and the lines wait in :attr:`backlog`."""
-        self.backlog.extend(lines)
+        with self._state_lock:
+            self.backlog.extend(lines)
         self._advance(force)
 
     def _advance(self, force: bool) -> None:
@@ -493,7 +537,9 @@ class LedgerStore:
             self._enter_stall(stall)
         except ConfigFailure as failure:  # only a lazy first open: the ledger has no location
             self.config_failure = failure.cause
-            self.backlog.clear()
+            with self._state_lock:
+                self.backlog.clear()
+                self.inflight = []
             self._closed = True
 
     def _drain_backlog(self) -> None:
@@ -527,13 +573,15 @@ class LedgerStore:
                     return
             taken: list[Line] = []
             total = 0
-            while backlog and len(taken) < MAX_RUN:
-                size = len(backlog[0].data)
-                over = part.size + total + size > limit
-                if taken and over and self.clock() >= self._rotation_retry_at:
-                    break
-                taken.append(backlog.popleft())
-                total += size
+            with self._state_lock:
+                while backlog and len(taken) < MAX_RUN:
+                    size = len(backlog[0].data)
+                    over = part.size + total + size > limit
+                    if taken and over and self.clock() >= self._rotation_retry_at:
+                        break
+                    taken.append(backlog.popleft())
+                    total += size
+                self.inflight = taken
             data = b"".join(line.data for line in taken)
             try:
                 self._call(write_all, self.fs, part.fd, data)
@@ -547,12 +595,15 @@ class LedgerStore:
                     complete += 1
                 part.size += used
                 self._written(taken[:complete])
-                backlog.extendleft(reversed(taken[complete:]))
+                with self._state_lock:
+                    backlog.extendleft(reversed(taken[complete:]))
+                    self.inflight = []
                 self._cut_back(part)
                 self._touch()
                 raise _Stall(exc) from exc
             part.size += total
             self._written(taken)
+            self.inflight = []
             self._touch()
 
     def _drain_into_reserve(self, reserve: _File) -> None:
@@ -561,7 +612,9 @@ class LedgerStore:
         while backlog:
             line = backlog[0]
             if line.tier != Tier.ESSENTIAL and self.in_reserve:
-                backlog.popleft()
+                with self._state_lock:
+                    backlog.popleft()
+                    self.resolved_n = max(self.resolved_n, line.n)
                 self._emit("dropped", tier=int(line.tier), records=1, bytes=len(line.data))
                 continue
             if reserve.size + len(line.data) > reserve.extent:
@@ -570,9 +623,10 @@ class LedgerStore:
                 self._call(self._pwrite_all, reserve, line.data)
             except OSError as exc:
                 raise _Stall(exc) from exc
-            backlog.popleft()
             reserve.size += len(line.data)
-            self._written([line])
+            self._written([line])  # resolved before it leaves the backlog: never in neither
+            with self._state_lock:
+                backlog.popleft()
             self._touch()
 
     def _pwrite_all(self, f: _File, data: bytes) -> None:
@@ -644,15 +698,17 @@ class LedgerStore:
         try:
             self._call(self.fs.fdatasync, active.fd)
         except OSError as exc:
+            with self._state_lock:
+                self.possibly_lost_tx.merge(self._unsynced_tx)
+                self._unsynced_tx = TxTally()
             self.possibly_lost_records += self._unsynced_records
-            self.possibly_lost_tx.merge(self._unsynced_tx)
             self._unsynced_records = 0
-            self._unsynced_tx = TxTally()
             self._dirty = False
             self._emit("sync_error", errno=exc.errno, text=exc.strerror or str(exc))
             raise _Stall(exc) from exc
+        with self._state_lock:
+            self._unsynced_tx = TxTally()
         self._unsynced_records = 0
-        self._unsynced_tx = TxTally()
         self._dirty = False
         self._last_sync = self.clock()
 
@@ -1033,7 +1089,8 @@ class LedgerStore:
         reserve hold the closing records and retire as the final part. Never raises."""
         if self._closed:
             return
-        self.backlog.extend(lines)
+        with self._state_lock:
+            self.backlog.extend(lines)
         try:
             if not self.opened and not self._closed:
                 self.open()
@@ -1120,59 +1177,80 @@ class LedgerWriter:
         self.start()
         self._jobs.put((kind, payload))
 
-    def wait(self, timeout: float) -> bool:
-        """Wait for every job submitted so far to be handled (``False`` on timeout)."""
+    def barrier(self) -> threading.Event:
+        """An event set once every job submitted so far has been handled."""
         done = threading.Event()
         self.submit("barrier", done)
-        return done.wait(timeout)
+        return done
+
+    def wait(self, timeout: float) -> bool:
+        """Wait for every job submitted so far to be handled (``False`` on timeout)."""
+        return self.barrier().wait(timeout)
 
     def _run(self) -> None:
-        store = self.store
+        jobs = self._jobs
         while True:
-            kind: str
-            payload: Any
             try:
-                kind, payload = self._jobs.get(timeout=self._poll_s)
+                kind, payload = jobs.get(timeout=self._poll_s)
             except queue.Empty:
                 kind, payload = "tick", None
             try:
-                if kind == "write":
-                    lines, force = payload
-                    store.write(lines, force=force)
-                elif kind == "open":
-                    done, box = payload
-                    try:
-                        store.open()
-                        if store.opened:
-                            store.ensure_reserve()
-                        box.append(None if store.opened else "stalled")
-                    except ConfigFailure as failure:
-                        box.append(failure)
-                    done.set()
-                elif kind == "tick":
-                    store.tick()
-                elif kind == "barrier":
-                    store.tick()
-                    payload.set()
-                elif kind == "finish":
-                    lines, done = payload
-                    store.write(lines, force=True)
-                    store.sync_for_exit()
-                    done.set()
-                elif kind == "close":
-                    lines, done = payload
-                    store.close(lines)
-                    done.set()
+                if self._handle(kind, payload) == "closed":
                     return
-            except BaseException as exc:  # the thread must survive a bug in a job
-                store._emit("internal", error=repr(exc))
-                if kind in ("open", "close", "finish"):
-                    payload[0 if kind == "open" else 1].set()
-                    if kind == "close":
-                        return
-            else:
                 if kind != "tick":
-                    store.tick()
+                    self.store.tick()
+            except BaseException as exc:  # the thread must survive a bug in a job or a tick
+                self._survive(kind, payload, exc)
+                if kind == "close":
+                    return
+
+    def _handle(self, kind: str, payload: Any) -> str:
+        store = self.store
+        match kind:
+            case "write":
+                lines, force = payload
+                store.write(lines, force=force)
+            case "open":
+                done, box = payload
+                try:
+                    store.open()
+                    if store.opened:
+                        store.ensure_reserve()
+                    box.append(None if store.opened else "stalled")
+                except ConfigFailure as failure:
+                    box.append(failure)
+                done.set()
+            case "tick":
+                store.tick()
+            case "barrier":
+                store.tick()
+                payload.set()
+            case "finish":
+                lines, done = payload
+                store.write(lines, force=True)
+                store.sync_for_exit()
+                done.set()
+            case "close":
+                lines, done = payload
+                store.close(lines)
+                done.set()
+                return "closed"
+            case _:
+                pass
+        return ""
+
+    def _survive(self, kind: str, payload: Any, exc: BaseException) -> None:
+        """A bug interrupted a job: the store puts back what it was writing and reports, and
+        whoever waits on the job is released (the lines stay unwritten, so they are counted)."""
+        try:
+            self.store.internal_failure(exc)
+        except BaseException as again:  # never let the report of a failure end the thread
+            self.store.events.append(("internal", {"error": f"{exc!r}; then {again!r}"}))
+        waiter = {"open": 0, "finish": 1, "close": 1}.get(kind)
+        if waiter is not None:
+            payload[waiter].set()
+        elif kind == "barrier":
+            payload.set()
 
 
 def is_regular_owned(st: os.stat_result) -> bool:

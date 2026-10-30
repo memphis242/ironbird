@@ -19,7 +19,6 @@ from hypothesis import strategies as st
 from ironbird.ccdd.model import MessageKind
 from ironbird.cli.output import CHUNK_BYTES, WRITE_SLICE, BoundedWriter, write_slice_for
 from ironbird.config import load_config
-from ironbird.engine import FrameDecoder
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.frame import Decoded, Frame, FrameFlag
 from ironbird.ledger import Ledger
@@ -505,7 +504,7 @@ def test_decoding_a_live_frame_gives_what_the_whole_decode_gives(
         if index < len(wire):
             wire[index] = value
     candidates = [bytes(wire[: len(wire) - cut]), data, bytes(wire) + data[:cut]]
-    decoder = FrameDecoder(probe.engine, report_checked=False)
+    decoder = probe.engine.decoder(report_checked=False)
     for candidate in candidates:
         probe.io[LinkEnd.SOURCE].on_data(candidate, 1, "p", len(candidate), FrameFlag.NONE)
         frame = probe.sink.frames[-1]

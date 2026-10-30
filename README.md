@@ -103,14 +103,20 @@ The ledger writes through one writer thread, so a slow or hung disk never blocks
 - **Locks.** Every session holds `flock` on its first part for its life, which is how other
   processes tell a live session from a dead one. Where locks are unsupported (some NFS and FUSE
   mounts) the session runs unlocked and says so (`IB-LED-009`); keep the state and recording
-  directories on a local file system, or prune only from the host that writes them.
+  directories on a local file system, or prune only from the host that writes them. Without a
+  lock, a session is told apart from a dead one only by how recently its files changed (it
+  touches its file every minute while idle): a clock stepped forward by more than ten minutes,
+  or a host suspended for longer, can make a live unlocked session look idle, and a prune may
+  then propose it. A clock stepped backward leaves future file times, which count as live until
+  the clock catches up. Where this matters, do not prune while such a session runs.
 - **Retention only warns.** ironbird never deletes a ledger part, a reserve or a recording on its
   own. `IB-RET-001` says that sessions older than `[retention] max_age` (7d) exist, `IB-RET-002`
   that ledgers plus recordings are past, or projected past, `max_total_bytes` (8GiB), `IB-RET-004`
   that a scan was partial or a reserve could not be recovered. Warnings are shown at most once per
   `warn_interval` (24h) per code and directory across processes. A crashed session's leftover
   reserve is cut at its last complete record and renamed to the next part (or, if damaged,
-  salvaged and the original kept as `*.reserve.damaged`); it is never deleted.
+  salvaged and the original kept as `*.reserve.damaged`); it is never deleted. Long sessions and
+  `prune` do this recovery; a short command only warns.
 - **Pruning** is explicit: `ib ledger prune` and `ib rec prune [--older-than AGE] [--until-under SIZE]
   [--keep N] [--dry-run] [--yes] [--format line|json]` list exactly what they would delete and ask
   `delete 14 sessions (310 MiB)? [y/N]` (only `y` or `yes` confirms; without a terminal pass
@@ -183,6 +189,80 @@ ib rec repair /data/run1.ibrec /data/run1.fixed.ibrec [--force]
   naming the session, its part number and the previous part's last sequence number; part 1 stays
   open and locked until the session ends.
 
+## Replay
+
+`ib replay FILE... [--where EXPR] [--from T] [--to T] [--speed X] [--follow] [--follow-idle S]
+[--format line|json|hex] [--defs recording|config] [--skip-damage] [--count N]` reads a recording
+and prints what `ib listen` would have printed for it, plus what `listen` hides. It needs no
+configuration and sends nothing anywhere (replay to the wire is a later stage).
+
+```bash
+ib replay /data/run1.ibrec                                    # every frame, as fast as possible
+ib replay run1.ibrec --where 'msg == SAMPLE_APP_HK and CommandCounter > 0' --format json
+ib replay run1.ibrec --from +90s --to +2m --speed 1           # that minute, at the recorded pace
+ib replay run1.ibrec --where 'status != ok'                   # malformed, unknown and garbage frames
+ib replay run1.ibrec --follow                                 # a recording still being written
+```
+
+- **Definitions.** A recording decodes with the CCDD and header profiles it embeds (decision D1), so
+  it still decodes after the CCDD changes. They are loaded through the same strict loaders as files
+  on disk (labelled `FILE#ccdd/<node>` in errors; the `python:` header escape hatch is refused) with
+  the recording's own packet cap, and each must match the digest its META names. One that cannot be
+  used, or that the recording does not carry (`embed_definitions = false`), is `IB-REC-009` (exit 1)
+  with the way out: `--defs config` decodes with the current configuration's files (`-c PATH`),
+  and `--format hex` needs no definitions at all. When a configuration is found and its files differ
+  from the embedded ones, one `info IB-REC-009` line says so; the recording's still win.
+- **What is shown.** Every frame of both directions, in order, inside the range and the filter. A
+  decoded frame prints exactly as `listen` prints it (`--format line`) or as the same JSON record
+  (`--format json`). A frame that does not decode is printed flagged instead of being dropped:
+  `MALFORMED`, `UNKNOWN` (a MID or function code the CCDD lacks) or `GARBAGE` (serial bytes skipped
+  while resynchronising), with the error code, the failing byte in brackets, the frame number
+  (`frame=`, the recording's `seq`), its flags (`truncated`, `stale`) and its bytes in hex (the first
+  256 bytes; JSON carries 1024 and a `status` key that decoded records lack). `--format hex` dumps
+  every frame's bytes without decoding. `--where` is the `listen` filter language compiled against
+  the recording's definitions, so `status == malformed` selects what `listen` cannot show.
+- **Ranges.** `--from` and `--to` take ISO 8601 with `Z` or an offset (`2026-10-30T12:00:00Z`) or
+  `+90s`, `+1m30s`, `+250ms` from the first frame; the range is half open (`from <= time < to`) on
+  the frames' receive times. `--from` must be earlier than `--to` (`IB-CLI-001`, also when one is an
+  offset and one a time, once the first frame is known). A `+offset` counts from the first frame
+  actually read, after any damage that `--skip-damage` goes past. Where the file has a usable
+  index, chunks outside the range or without a message the filter can match are skipped from their
+  summaries: the summary line says how many were skipped unchecked, and damage inside a skipped
+  chunk is not seen (its GAP records are still counted when they overlap the range). A missing or
+  bad index falls back to reading every record (`info IB-REC-008`).
+- **Pace.** `--speed 0` (default) runs as fast as possible; `--speed 1` follows the recorded time
+  between frames, `--speed 2` twice as fast. Each backward step of the recorded clock between two
+  frames counts as zero time (the frames after it keep their own spacing); a forward step is not
+  shortened, so an hour of recorded silence is an hour.
+- **Split recordings.** Part 1 of a split recording plays all its parts in order; several files
+  play as given (same session, ascending part numbers, else `IB-CLI-001`). A part that is missing
+  is `IB-REC-006` and exit 5 (not when `--count` ended the run first); the parts that exist after
+  it still play.
+- **Damage.** A torn tail, or a recording that was never closed, is a warning (`IB-REC-007`) after
+  everything before it was replayed (exit 0); a recording a recorder still holds open is not called
+  torn. Mid-file damage is `IB-REC-006` with its offset and span: replay stops there (exit 5), or
+  with `--skip-damage` goes on at the next valid record (still exit 5; the lost frames show as a
+  sequence gap). The end-of-run summary on stderr counts frames read, in range, shown, malformed,
+  unknown and garbage, skipped chunks, GAP records (and the frames they say were lost) and damage.
+- **Following.** `--follow` keeps reading a recording that is being written: at the end of the file
+  it polls every 100 ms, treats a partly written last record as pending, and ends at the trailer
+  (next part of a split recording first) or on a signal. A recorder that died would keep it waiting
+  for ever, so when nothing new has arrived it probes the recorder's file lock
+  (`flock(LOCK_SH | LOCK_NB)` on part 1, held until the session ends or the process dies): granted
+  means the recorder is gone, the end of the file is read once more, and a partial record is a torn
+  tail. Following a later part (`run.p0003.ibrec`) probes part 1's lock all the same, and a part that
+  appears while following must belong to the same session. On a file system without usable locks
+  (some NFS mounts) `--follow` needs `--follow-idle S`, which ends after S seconds without growth
+  (the recorder may still be alive then, so the file is not called unclosed); a recorder that ran
+  unlocked looks dead to the probe.
+- **Output.** Replay blocks rather than drops: when the reader of stdout is slow, replay waits for
+  room and loses no line, where `ib listen` has to keep up with the wire and drops lines with
+  `IB-OUT-001` instead. A reader that goes away (`| head`) ends replay quietly (exit 0); stdout
+  closed from the start (`>&-`) or failing is exit 4. "Shown" (in the summary and for `--count N`,
+  which stops after N frames are shown) means accepted by the output queue; a reader that leaves
+  at once may not have been handed the last of them. The ledger records the start (files, options) and the end (counts, how it
+  ended); malformed frames are not ledgered one by one, the recording is their evidence.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -191,9 +271,9 @@ ib rec repair /data/run1.ibrec /data/run1.fixed.ibrec [--force]
 | 1 | Runtime error (`error IB-...`), `find` with no match; `ib rec check` found damage; a recording failed to write (`IB-REC-002`) |
 | 2 | Usage, configuration, CCDD or header-profile error |
 | 3 | `listen`, `events` or `respond` had `--count N` and `--timeout` elapsed first |
-| 5 | `ib rec repair` produced its output, but the input was damaged mid-file and valid frames after the damage are in the original only |
+| 5 | The output was produced, but the input recording was damaged mid-file: `ib rec repair` left valid frames after the damage out of the copy; `ib replay` stopped at the damage (or, with `--skip-damage`, went past it) or a part of a split recording is missing |
 | 6 | A command or reply went out but its ledger record was never written, or may have been lost to a deferred sync or close error (`IB-LED-004`). Same tier as 4 and wins over 4 and 5; an error (1, 2), 3 or a signal takes precedence. A `respond` that withheld replies under `on_full = "refuse_commands"` exits 1 |
-| 4 | The command otherwise succeeded but stdout lines were lost (`IB-OUT-002`): dropped while stdout was not draining, abandoned when a signal cut the final drain short, or stdout is closed (`>&-`). An error (1, 2), 3 or a signal (128+n) takes precedence. A `send` that exits 4 still went out |
+| 4 | The command otherwise succeeded but stdout lines were lost (`IB-OUT-002`): dropped while stdout was not draining, abandoned when a signal cut the final drain short, or stdout is closed (`>&-`). An error (1, 2), 3, 5 or a signal (128+n) takes precedence. A `send` that exits 4 still went out |
 | 128+n | Ended by signal n: 130 (Ctrl-C), 129 (SIGHUP), 143 (SIGTERM). The ledger is flushed first; an interrupted `send` says whether the command went out |
 
 Output never blocks the tool while it runs: a stalled stdout (unread pipe, paused pager) drops
@@ -231,6 +311,51 @@ Telemetry messages carry a `category` in the CCDD, in priority order: `event`,
 `command_response`, `housekeeping`, `status`, `commanded`, `other` (default). An event message
 also has an `event` mapping naming its app/id/type/message fields; see `docs/plan.md`
 ("Telemetry categories and events") and `examples/ccdd/cfs.json`.
+
+## Filtering with --where
+
+`ib listen NODE --where EXPR` and `ib events --where EXPR` show only the frames the expression
+matches (`--mid` stays and combines with it by `and`). The expression is compiled against the
+CCDD of the nodes in use before anything is opened, so a typo fails at once with a coded one-line
+error (`IB-FLT-001` syntax, `-002` unknown or ambiguous name, `-003` literal or operator that does
+not fit, `-004` over a limit; exit 2); `--verbose` adds the expression with a caret under the
+column and up to three close names.
+
+```bash
+ib listen fc --where 'msg == MOCK_HK and cmd_counter > 0'
+ib listen fc --where 'category in [event, command_response] and not mode == SAFE'
+ib events --where 'event.type >= error and event.app == "SAMPLE_APP"'
+```
+
+Grammar: `expr = term {or term}`, `term = factor {and factor}`, `factor = not factor | (expr) |
+name op literal`; `op` is `== != < <= > >= in [a, b] contains "text"`. Literals: integers (`-1`,
+`0x1f`), decimals (`-0.5`), quoted text (`"..."` or `'...'`), bare words (message, category, enum,
+node and severity names; quote one that is a keyword) and ISO 8601 times with `Z` or an offset
+(`2026-10-29T12:00:00.5Z`; local times are refused).
+
+| Names | Meaning |
+|-------|---------|
+| `seq time len node link dir kind source mid truncated garbage` | the frame itself (`len` is the size on the wire) |
+| `category msg` | from the MID alone (`msg` of a command frame needs its header check) |
+| `status` | `ok`, `malformed` or `unknown` (the ingest check) |
+| `fc hdr.<field> event.app event.id event.type event.text` | decoded (`event.type` orders DEBUG < ... < CRITICAL) |
+| `<MSG>.<field>`, bare `<field>` | a CCDD field (a bare field means any message that has it) |
+
+A predicate on something the frame does not have is false (`not` inverts it). Reserved names always
+win: a bare `mid` or `seq` is the frame's whatever a CCDD calls its fields, so a CCDD update never
+changes what a script means; write `MSG.field` (`TLM_A.mid`) for a CCDD field with such a name.
+`in [a, b]` is `== a or == b`, item by item per message (a label one message's enum lacks is simply
+never equal there), and `x != L` is `not x == L` for every message that has `x`. A float literal is
+rounded to the field's width (`ratio == 0.1` matches a stored float32 0.1) and a decimal compared
+with an integer is exact. `node ==` accepts a node's alias. `event.type >= error` shows what
+`--min-type error` shows, including events whose type has no severity. A filter that can never
+match (`msg == A and msg == B`, or MIDs outside `--mid`) is refused with `IB-FLT-003`. Limits: 4096
+characters, 1024 tokens outside `in` lists, 32 levels of `not` and parentheses, 1024 `in` items,
+numbers of at most 40 characters. A frame whose MID cannot match is never decoded for the filter,
+and neither is a serial garbage frame (it is malformed whatever its bytes say). Malformed frames
+are reported at ingest as before and `listen` shows decoded packets only, so
+`--where 'status == malformed'` selects them for replay and
+export, not for `listen`.
 
 ## Configuration
 

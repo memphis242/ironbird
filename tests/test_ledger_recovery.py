@@ -218,7 +218,7 @@ def test_a_foreign_file_at_the_next_part_name_stays_and_the_reserve_is_left(stat
         real_flock(fd, op)
         if op & fcntl.LOCK_EX:
             exclusive["calls"] += 1
-            if exclusive["calls"] == 3:
+            if exclusive["calls"] == 4:
                 foreign.write_bytes(b"not ours")
                 os.utime(foreign, (NOW - 3 * DAY, NOW - 3 * DAY))
 

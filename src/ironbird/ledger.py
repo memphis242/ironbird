@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import itertools
 import json
 import math
@@ -49,6 +50,7 @@ from ironbird.config import LedgerConfig
 from ironbird.errors import Code, IronbirdError
 from ironbird.fsops import REAL_FS, FileSystem, close_quietly, write_all
 from ironbird.header import DEFAULT_MAX_PACKET_BYTES
+from ironbird.ledgergate import GateWorker, WaitBudget
 from ironbird.ledgerstore import (
     POLL_S as WRITER_POLL_S,
 )
@@ -149,6 +151,12 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "rec.check": Tier.ESSENTIAL,
         "rec.repair.start": Tier.ESSENTIAL,
         "rec.repair.done": Tier.ESSENTIAL,
+        "replay.start": Tier.ESSENTIAL,
+        "replay.stop": Tier.ESSENTIAL,
+        "replay.note": Tier.ESSENTIAL,
+        "replay.no_definitions": Tier.ESSENTIAL,
+        "replay.defs_compare_skipped": Tier.ESSENTIAL,
+        "replay.defs_differ": Tier.ESSENTIAL,
         "recording.start": Tier.ESSENTIAL,
         "recording.not_started": Tier.ESSENTIAL,
         "recording.overrun": Tier.ESSENTIAL,
@@ -436,6 +444,13 @@ class Ledger:
         self._coalescer = Coalescer(self._deliver, clock=clock)
         self._tickers: list[Callable[[], None]] = []
         self._warn_gate: Callable[[Code], bool] = warn_gate or (lambda _code: True)
+        self._default_gate = warn_gate is None  # nothing to ask: no file behind it
+        # Gated warnings ask the cross-process rate limit on a worker thread (it reads and
+        # rewrites a file); the warning completes on the loop when the answer is in.
+        self._gates = GateWorker()
+        self._gate_tokens = itertools.count(1)
+        self._pending_warns: dict[int, Callable[[bool], None]] = {}
+        self._budget: WaitBudget | None = None
         # tiers
         self._budgets: list[TierBudget | None] = [
             None,
@@ -462,7 +477,6 @@ class Ledger:
         self._late_lost = TxTally()
         self._withheld = 0
         self._refused = False  # a transmission was refused (its error line names the stall)
-        self._tx_announced = 0
         self._hung_reported = False
         scfg = StoreConfig(
             directory,
@@ -598,10 +612,32 @@ class Ledger:
             for notice in early:
                 notify(notice)
 
+    def begin_exit(self, abort: Callable[[], bool] | None = None) -> None:
+        """Arm the exit: from now on every wait of :meth:`flush`, :meth:`finish` and
+        :meth:`close` (and the caller's own, through :attr:`wait_budget`) draws on one shared
+        budget of ``join_timeout_s``, so a hung disk costs that once; ``abort`` ends a wait early
+        (a signal arrived)."""
+        self._budget = WaitBudget(self._join_timeout_s, abort)
+
+    @property
+    def wait_budget(self) -> WaitBudget | None:
+        return self._budget
+
+    @property
+    def join_timeout_s(self) -> float:
+        return self._join_timeout_s
+
+    def _wait(self, event: threading.Event) -> bool:
+        """Wait for a writer job: against the exit budget when it is armed, else on its own."""
+        if self._budget is not None:
+            return self._budget.wait(event)
+        return event.wait(self._join_timeout_s)
+
     def set_warn_gate(self, gate: Callable[[Code], bool]) -> None:
         """Cross-process rate limit of the start-of-session warnings (``IB-LED-006/008/009``):
         ``gate(code)`` says whether this one may be displayed (it is ledgered either way)."""
         self._warn_gate = gate
+        self._default_gate = False
 
     def flush_notices(self) -> None:
         """Emit the ledger's pending coalesced summaries now (shutdown)."""
@@ -800,11 +836,20 @@ class Ledger:
 
     # -- transmissions ---------------------------------------------------------------------------
 
-    def cause_text(self) -> str:
+    def cause_text(self, *, hung: bool | None = None) -> str:
+        """Why the ledger cannot be written: the failure the writer met, or that a call has not
+        returned (``hung``; by default whether one is outstanding right now)."""
+        if self._hung(hung):
+            return "the disk or file server is not responding"
         return self._store.stall_text or "the ledger is stalled"
 
-    def remedy(self) -> str:
+    def remedy(self, *, hung: bool | None = None) -> str:
+        if self._hung(hung):
+            return f"check the disk or file server of {self._directory}"
         return f"free space in {self._directory} or set IRONBIRD_STATE_DIR"
+
+    def _hung(self, hung: bool | None) -> bool:
+        return self._hung_now() if hung is None else hung
 
     def check_transmit(self, subject: str, target: str = "") -> None:
         """Under ``on_full = "refuse_commands"`` a stalled ledger refuses a transmission before
@@ -851,7 +896,7 @@ class Ledger:
         if number is None:
             self._tx_refused.add(info)
         if self._long and (number is None or self.stalled):
-            self._tx_announced += count
+            self._pump_events()  # the stall's own line comes before the lines about its effects
             state = "stalled" if self.stalled else "queue full"
             self._coalescer.report(
                 Code.LED_UNLOGGED,
@@ -988,15 +1033,37 @@ class Ledger:
         level: Level = Level.WARNING,
         slow: bool = False,
         gated: bool = False,
+        gate: Callable[[], bool] | None = None,
         key: str | None = None,
         event: str = "ledger.warning",
         display: bool = True,
         **fields: Any,
     ) -> None:
-        """Ledger a warning in full and display it (coalesced; ``gated`` ones go through the
-        cross-process rate limit but are ledgered whatever it says; ``display=False`` only
-        ledgers)."""
-        allowed = display and (not gated or self._warn_gate(code))
+        """Ledger a warning in full and display it (coalesced).
+
+        A ``gated`` warning (or one with its own ``gate``) goes through the cross-process rate
+        limit, which is asked on a worker thread, never here: the warning is ledgered and
+        displayed when the answer is in (at the latest at :meth:`finish` or :meth:`close`),
+        ledgered whatever the answer is. ``display=False`` only ledgers."""
+        finish = functools.partial(self._warn_now, code, summary, level, slow, key, event, fields)
+        if display and (gate is not None or (gated and not self._default_gate)):
+            token = next(self._gate_tokens)
+            self._pending_warns[token] = finish
+            self._gates.submit(token, gate or functools.partial(self._warn_gate, code))
+            return
+        finish(display)
+
+    def _warn_now(
+        self,
+        code: Code,
+        summary: str,
+        level: Level,
+        slow: bool,
+        key: str | None,
+        event: str,
+        fields: dict[str, Any],
+        allowed: bool,
+    ) -> None:
         number = self.record(
             "warning",
             event,
@@ -1019,6 +1086,26 @@ class Ledger:
             ledger_file=self.part_file,
         )
 
+    def _pump_gates(self) -> None:
+        """Complete the gated warnings whose answer has arrived."""
+        for token, allowed in self._gates.take():
+            finish = self._pending_warns.pop(token, None)
+            if finish is not None:
+                finish(allowed)
+
+    def settle_warnings(self) -> None:
+        """Wait (within the exit budget, when armed) for the gated warnings still undecided,
+        then complete what is left as displayed: a rate limit that cannot be consulted never
+        causes silence."""
+        while self._pending_warns:
+            self._gates.progress.clear()
+            self._pump_gates()
+            if not self._pending_warns or not self._wait(self._gates.progress):
+                break
+        self._pump_gates()
+        for token in list(self._pending_warns):
+            self._pending_warns.pop(token)(True)
+
     def _note(self, what: str, **data: Any) -> None:
         self.record("state", "ledger.note", tier=Tier.ESSENTIAL, note=what, **data)
 
@@ -1028,6 +1115,8 @@ class Ledger:
         while events:
             name, data = events.popleft()
             self._on_store_event(name, data)
+        if self._pending_warns:
+            self._pump_gates()
 
     def _on_store_event(self, name: str, data: dict[str, Any]) -> None:
         directory = self._directory
@@ -1080,6 +1169,14 @@ class Ledger:
                     "runs unlocked and its liveness rests on freshness",
                     slow=True,
                     gated=True,
+                )
+            case "internal":
+                self.warn(
+                    Code.INTERNAL,
+                    "the ledger writer hit an internal error (a bug): records are queued and "
+                    f"retried; report it ({data['error'][:200]})",
+                    slow=True,
+                    error=data["error"],
                 )
             case "dropped":
                 self._lost_total += data["records"]
@@ -1162,7 +1259,7 @@ class Ledger:
             return  # an open step is blocked: transient, the stall watchdog takes over
         failure = box[0] if box else None
         if isinstance(failure, ConfigFailure):
-            self._dead = True
+            self.disable()  # and the records queued meanwhile go with it
             exc = failure.cause
             raise IronbirdError(
                 Code.LED_DIR,
@@ -1286,7 +1383,7 @@ class Ledger:
             if tail:
                 self._writer.submit("write", (tail, True))
         self._last_flush = time.monotonic()
-        self._writer.wait(self._join_timeout_s)
+        self._wait(self._writer.barrier())
         self._check_config_failure()
         self._pump_events()
 
@@ -1401,6 +1498,7 @@ class Ledger:
         surfaces here). The writer is waited for at most ``join_timeout_s``; a writer still
         blocked then is left alone and everything it had not confirmed counts as not written.
         """
+        self.settle_warnings()
         if self._dead or not (self._any or self._opened_by_caller):
             return self._build_report(finished=True)
         self._ensure_opened()
@@ -1412,7 +1510,7 @@ class Ledger:
         self._jobs_lines.append(lines)
         done = threading.Event()
         self._writer.submit("finish", (lines, done))
-        finished = done.wait(self._join_timeout_s)
+        finished = self._wait(done)
         self._check_config_failure()
         self._pump_events()
         return self._build_report(finished=finished)
@@ -1429,6 +1527,7 @@ class Ledger:
         if self._exit_report is not None:
             self._write_late()
             return self._exit_report
+        self.settle_warnings()
         if self._dead or not (self._any or self._opened_by_caller):
             report = self._build_report(finished=True)
             self._exit_report = report
@@ -1444,7 +1543,7 @@ class Ledger:
         self._jobs_lines.append(lines)
         done = threading.Event()
         self._writer.submit("close", (lines, done))
-        finished = done.wait(self._join_timeout_s)
+        finished = self._wait(done)
         self._check_config_failure()
         self._pump_events()
         report = self._build_report(finished=finished)
@@ -1478,18 +1577,29 @@ class Ledger:
                     self._late_lost.add(line.tx)
 
     def _build_report(self, *, finished: bool) -> ExitReport:
+        """The account of what is not written, from the store's own picture of it.
+
+        A line is unwritten when the writer has neither written nor dropped it: those still in
+        its backlog or in its hands, and - when the writer is stuck inside a call - the lines
+        handed to it that it has not taken yet. Each is counted once, by record number, and a
+        record that was written and synced is never among them. Transmissions written since the
+        last good sync are unconfirmed while the writer cannot sync."""
         store = self._store
         tally = TxTally()
         tally.merge(self._tx_refused)
         tally.merge(store.possibly_lost_tx)
         tally.merge(self._late_lost)
-        unwritten: list[Line] = list(store.backlog)
-        if not finished:  # the writer is stuck inside a call: its whole current job is unconfirmed
+        stored, resolved, unsynced = store.unconfirmed()
+        unwritten: dict[int, Line] = {line.n: line for line in stored}
+        if not finished:
             for batch in self._jobs_lines:
-                unwritten.extend(batch)
+                for line in batch:
+                    if line.n > resolved:
+                        unwritten.setdefault(line.n, line)
+            tally.merge(unsynced)
         records = len(unwritten) + len(self._queue) + store.possibly_lost_records
         tx_lines: list[str] = []
-        for line in unwritten:
+        for line in sorted(unwritten.values(), key=lambda line: line.n):
             if line.tx is not None:
                 tally.add(line.tx)
                 tx_lines.append(line.data.decode("ascii").rstrip("\n"))
@@ -1506,16 +1616,16 @@ class Ledger:
                     f"{self._withheld} replies withheld: ledger not writable",
                 )
             )
+        hung = not finished
         if tally.count:
-            notice = self._unlogged_notice(tally)
-            if notice is not None:
-                notices.append(notice)
+            notices.append(self._unlogged_notice(tally, hung=hung))
         elif stalled and not (self._refused and not self._long):
             notices.append(
                 _exit_notice(
                     Code.LED_WRITE,
                     Level.WARNING,
-                    f"ledger stalled at exit; {records} records not written",
+                    f"ledger stalled at exit; {records} records not written"
+                    + (f"; {self.remedy(hung=True)}" if hung else ""),
                 )
             )
         return ExitReport(
@@ -1527,14 +1637,17 @@ class Ledger:
             stalled=stalled,
         )
 
-    def _unlogged_notice(self, tally: TxTally) -> Notice | None:
+    def _unlogged_notice(self, tally: TxTally, *, hung: bool) -> Notice:
+        """The one line that goes with exit code 6: what was sent and not logged, and why."""
         first, last = tally.first, tally.last
         assert first is not None and last is not None
-        cause = self._store.stall_text or "a write or sync failed"
+        cause = self.cause_text(hung=hung) if hung else self._store.stall_text
+        cause = cause or "a write or sync failed"
         if tally.count == 1:
-            if self._long and self._tx_announced >= 1 and not self._store.possibly_lost_tx.count:
-                return None  # already announced when it was sent
-            text = f"{first.sent()} but not logged (ledger not writable: {cause}); {self.remedy()}"
+            text = (
+                f"{first.sent()} but not logged (ledger not writable: {cause}); "
+                f"{self.remedy(hung=hung)}"
+            )
             return _exit_notice(Code.LED_UNLOGGED, Level.WARNING, text)
         noun = "commands" if tally.kinds == {"command"} else "transmissions"
         text = (

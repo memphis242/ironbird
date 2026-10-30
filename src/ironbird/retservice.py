@@ -17,28 +17,34 @@ displayed once per process when it first crosses and once when usage itself cros
 from __future__ import annotations
 
 import queue
-import signal
 import threading
 import time
+import traceback
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from ironbird.config import RetentionConfig
 from ironbird.errors import Code
 from ironbird.fsops import REAL_FS, FileSystem
 from ironbird.ledger import Ledger
-from ironbird.ledgerstore import SHUTDOWN_SIGNALS
-from ironbird.retention import DirScan, full_scan, protected_bytes_by_reason, recording_blocks
+from ironbird.ledgergate import start_thread
+from ironbird.retention import (
+    DirScan,
+    ScanControl,
+    full_scan,
+    protected_bytes_by_reason,
+    recording_blocks,
+)
 from ironbird.retnotices import Notices
 from ironbird.units import MIB, compact_duration, format_duration, format_size
 
 PROJECTION_INTERVAL_S: Final = 10.0
 RATE_WINDOW_S: Final = 60.0
 DEFAULT_HORIZON_S: Final = 3600.0
-JOIN_S: Final = 2.0
+JOIN_S: Final = 2.0  # a scan still running at exit gets this long to report
 
 
 def size_argument(size: int) -> str:
@@ -51,9 +57,14 @@ def size_argument(size: int) -> str:
 
 @dataclass(slots=True)
 class ScanResult:
-    ledger: DirScan
-    recordings: DirScan | None
+    """What a scan thread hands back: the scans, or why there are none (not due, or it failed)."""
+
+    ledger: DirScan | None = None
+    recordings: DirScan | None = None
     finished: float = 0.0
+    not_due: bool = False
+    failure: BaseException | None = None
+    failure_text: str = ""
 
 
 @dataclass(slots=True)
@@ -100,6 +111,7 @@ class Retention:
         self._last_ledger: DirScan | None = None
         self._last_recordings: DirScan | None = None
         self._pending = False
+        self._control = ScanControl()
 
     # -- wiring -------------------------------------------------------------------------------
 
@@ -116,26 +128,39 @@ class Retention:
 
     def start(self) -> None:
         """Begin the start-of-session scan: a long session always, a short command only when
-        the last scan by any process is older than ``scan_interval``."""
-        if self._long or self._notices.scan_due(self._cfg.scan_interval_s):
-            self._begin_scan()
+        the last scan by any process is older than ``scan_interval``. Nothing here touches the
+        file system: the scan thread asks the notices file whether a scan is due."""
+        self._begin_scan(ask_due=not self._long)
 
-    def _begin_scan(self) -> None:
+    def _begin_scan(self, *, ask_due: bool = False) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         self._state.last_scan = self._clock()
         self._pending = True
-        previous = signal.pthread_sigmask(signal.SIG_BLOCK, SHUTDOWN_SIGNALS)
-        try:
-            self._thread = threading.Thread(target=self._scan, name="retention-scan", daemon=True)
-            self._thread.start()
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        self._thread = threading.Thread(
+            target=self._scan, args=(ask_due,), name="retention-scan", daemon=True
+        )
+        start_thread(self._thread)
 
-    def _scan(self) -> None:
+    def _scan(self, ask_due: bool) -> None:
+        """The scan thread: nothing may escape it - a failure is handed back as a result."""
+        try:
+            if ask_due and not self._notices.scan_due(self._cfg.scan_interval_s):
+                self._results.put(ScanResult(not_due=True))
+                return
+            self._results.put(self._scan_directories())
+        except BaseException as exc:
+            self._results.put(
+                ScanResult(failure=exc, failure_text="".join(traceback.format_exception(exc)))
+            )
+
+    def _scan_directories(self) -> ScanResult:
         now = self._wall()
         own = self._ledger.session_id
         keep = self._cfg.keep_recent
+        # A short command only looks: recovering a reserve rewrites files, and a command about
+        # to exit must not leave that half done. Long sessions and prune recover.
+        recover = self._long
         recordings: DirScan | None = None
         if self._recording_dir is not None:
             recordings = full_scan(
@@ -155,8 +180,10 @@ class Retention:
             own_session=own,
             keep_recent=keep,
             has_recording=has_recording,
+            recover=recover,
+            control=self._control,
         )
-        self._results.put(ScanResult(ledger_scan, recordings, now))
+        return ScanResult(ledger_scan, recordings, now)
 
     def poll(self) -> None:
         """Handle a finished scan, start the next when due, and check the projection. Called
@@ -178,16 +205,33 @@ class Retention:
             self._project(now)
 
     def finish(self) -> None:
-        """Wait (bounded) for a scan in flight and report its result before the command ends."""
+        """Wait (bounded) for a scan in flight and report its result before the command ends.
+
+        No new recovery step begins once the exit has started, but one under way (a salvage
+        copying a reserve) is given the exit's whole waiting budget to end rather than being
+        cut off half done; a scan that is only reading gets :data:`JOIN_S`."""
         thread = self._thread
         if thread is not None and thread.is_alive():
-            thread.join(JOIN_S)
+            self._control.stop.set()
+            budget = self._ledger.wait_budget
+            if budget is not None:
+                if not budget.join(thread, cap=JOIN_S) and self._control.stepping.is_set():
+                    budget.join(thread)
+            else:
+                thread.join(JOIN_S)
+                if self._control.stepping.is_set():
+                    thread.join(self._ledger.join_timeout_s)
         self.poll()
 
     # -- results ----------------------------------------------------------------------------------
 
     def _handle(self, result: ScanResult) -> None:
-        self._pending = False
+        self._pending = False  # whatever came back, the next scan may run
+        if result.not_due:
+            return
+        if result.failure is not None or result.ledger is None:
+            self._report_failure(result)
+            return
         self._last_ledger, self._last_recordings = result.ledger, result.recordings
         ledger = self._ledger
         usage = result.ledger.total_bytes() + (
@@ -212,7 +256,20 @@ class Retention:
                     scan.path,
                 )
             self._check_age(scan, result.finished)
-        self._check_total(result, usage)
+        self._check_total(result.ledger, result.recordings, usage)
+
+    def _report_failure(self, result: ScanResult) -> None:
+        """A scan that died of an unexpected error: one coalesced ``IB-RET-004`` line, the full
+        traceback in the ledger. The next scan runs as usual."""
+        exc = result.failure
+        what = f"{type(exc).__name__}: {exc}" if exc is not None else "no result"
+        self._warn(
+            Code.RET_SCAN,
+            f"retention scan failed ({what[:160]}); the figures are missing, see the ledger",
+            self._state_dir,
+            error=what,
+            traceback=result.failure_text,
+        )
 
     def _record_scan(self, scan: DirScan, now: float) -> None:
         sessions = list(scan.sessions.values())
@@ -236,14 +293,18 @@ class Retention:
             unsafe=scan.unsafe,
         )
 
-    def _warn(self, code: Code, summary: str, directory: Path) -> None:
-        allowed = self._notices.allow(code.value, directory, self._cfg.warn_interval_s)
+    def _warn(self, code: Code, summary: str, directory: Path, **fields: Any) -> None:
+        """Ledger a warning and display it at most once per ``warn_interval`` per code and
+        directory across processes. The notices file is asked on the ledger's worker thread, so
+        neither the loop nor the main thread waits for it."""
+        interval = self._cfg.warn_interval_s
         self._ledger.warn(
             code,
             summary,
             event="retention.warning",
-            display=allowed,
+            gate=lambda: self._notices.allow(code.value, directory, interval),
             directory=str(directory),
+            **fields,
         )
 
     def _check_age(self, scan: DirScan, now: float) -> None:
@@ -280,12 +341,12 @@ class Retention:
         ledger_rate = (samples[-1][1] - first[1]) / span if span > 0 else 0.0
         return ledger_rate + sum(source() for source in self._rate_sources)
 
-    def _check_total(self, result: ScanResult, usage: int) -> None:
+    def _check_total(self, ledger: DirScan, recordings: DirScan | None, usage: int) -> None:
         cap = self._cfg.max_total_bytes
         if cap is None or usage <= cap or self._state.usage_warned:
             return
         self._state.usage_warned = True
-        self._warn_total(result.ledger, result.recordings, usage, projected=False, horizon=0.0)
+        self._warn_total(ledger, recordings, usage, projected=False, horizon=0.0)
 
     def _project(self, now: float) -> None:
         """Every 10 s in a long session: usage plus this process's growth over the horizon

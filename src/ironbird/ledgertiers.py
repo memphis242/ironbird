@@ -42,6 +42,7 @@ SAMPLE_WINDOW_S: Final = 10.0
 SAMPLE_KEEP_FIRST: Final = 8
 SAMPLE_PERIOD_S: Final = 1.0
 SAMPLE_MAX_KEYS: Final = 1024
+SAMPLE_MAX_VARIANTS: Final = 4  # entries one key may have: itself and its ``|``-suffixed companions
 OTHER_KEY: Final = "other"
 REPLY_RATE_PER_S: Final = 10.0
 REPLY_BURST: Final = 600
@@ -169,7 +170,10 @@ class EvidenceSampler:
     bytes*, not records, beyond it. The key table holds at most ``max_keys`` keys per window: a
     new key past that folds into the single :data:`OTHER_KEY` entry until the window closes,
     and the table is cleared at each close. Nothing is evicted mid-window, so no key's count is
-    split across two entries.
+    split across two entries. A key may have companions written ``key|suffix`` (a malformed
+    frame is counted once by its packet key and once by its ``|error`` key): the companions
+    share the key's slot, at most :data:`SAMPLE_MAX_VARIANTS` entries in all, so ``max_keys``
+    distinct keys fit whichever companions they carry.
     """
 
     def __init__(
@@ -190,6 +194,7 @@ class EvidenceSampler:
         self._max_keys = max_keys
         self._raw = TokenBucket(float(raw_bytes_per_s), float(raw_bytes_per_s), clock)
         self._keys: dict[str, _KeyState] = {}
+        self._families: dict[str, int] = {}  # key (without suffix) -> entries it has
         self._window_start = clock()
         self.admitted = 0
         self.sampled_away = 0
@@ -197,6 +202,7 @@ class EvidenceSampler:
 
     @property
     def keys(self) -> int:
+        """Entries in the table (a key and its companions each count)."""
         return len(self._keys)
 
     def admit(
@@ -213,10 +219,16 @@ class EvidenceSampler:
         now = self._clock()
         state = self._keys.get(key)
         if state is None:
-            if len(self._keys) >= self._max_keys:
+            family = key.partition("|")[0]
+            entries = self._families.get(family)
+            if (entries is None and len(self._families) >= self._max_keys) or (
+                entries is not None and entries >= SAMPLE_MAX_VARIANTS
+            ):
                 key = f"{OTHER_KEY}|{event}"  # one fold-in entry per record kind, never more
                 state = self._keys.get(key)
             if state is None:
+                if key != f"{OTHER_KEY}|{event}":
+                    self._families[family] = self._families.get(family, 0) + 1
                 state = self._keys[key] = _KeyState(event, first_ns=time_ns, first_seq=seq)
         state.count += 1
         state.bytes += size
@@ -260,5 +272,6 @@ class EvidenceSampler:
             if s.skipped
         ]
         self._keys.clear()
+        self._families.clear()
         self._window_start = self._clock()
         return summaries
