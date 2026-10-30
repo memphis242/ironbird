@@ -70,20 +70,63 @@ class Node:
 
 
 @dataclass(frozen=True, slots=True)
-class Link:
-    """Directional UDP link. Commands flow ``source`` -> ``destination``; telemetry back.
+class UdpLinkSpec:
+    """The UDP shape of a link: where each side receives.
 
-    ``command_endpoint`` is where ``destination`` receives commands and
-    ``telemetry_endpoint`` is where ``source`` receives telemetry. The ``destination`` node
-    owns the CCDD and header profiles describing both directions.
+    ``command_endpoint`` is where the link's destination receives commands and
+    ``telemetry_endpoint`` is where its source receives telemetry.
+    """
+
+    command_endpoint: Endpoint
+    telemetry_endpoint: Endpoint
+
+
+@dataclass(frozen=True, slots=True)
+class SerialLinkSpec:
+    """The serial shape of a link: one device carries both directions.
+
+    The config does not accept serial links yet (``SUPPORTED_TRANSPORTS``); the serial
+    transport step parses and validates the ``serial`` table into this.
+    """
+
+    device: str
+    baud: int
+    data_bits: int = 8
+    parity: str = "none"
+    stop_bits: str = "1"
+    flow: str = "none"
+
+
+@dataclass(frozen=True, slots=True)
+class Link:
+    """Directional link. Commands flow ``source`` -> ``destination``; telemetry back.
+
+    The ``destination`` node owns the CCDD and header profiles describing both directions.
+    Exactly one of ``udp`` and ``serial`` is set, the one ``transport`` names.
     """
 
     name: str
     source: str
     destination: str
     transport: str
-    command_endpoint: Endpoint
-    telemetry_endpoint: Endpoint
+    udp: UdpLinkSpec | None = None
+    serial: SerialLinkSpec | None = None
+
+    def __post_init__(self) -> None:
+        assert (self.udp is None) != (self.serial is None), "exactly one transport spec is set"
+        assert (self.transport == "udp") == (self.udp is not None), "the spec matches the transport"
+
+    @property
+    def command_endpoint(self) -> Endpoint:
+        """UDP links only: where ``destination`` receives commands."""
+        assert self.udp is not None, f"link {self.name} is not a UDP link"
+        return self.udp.command_endpoint
+
+    @property
+    def telemetry_endpoint(self) -> Endpoint:
+        """UDP links only: where ``source`` receives telemetry."""
+        assert self.udp is not None, f"link {self.name} is not a UDP link"
+        return self.udp.telemetry_endpoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,9 +395,13 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
                 source=ends[0],
                 destination=ends[1],
                 transport=transport,
-                command_endpoint=ctx.endpoint(raw["command_endpoint"], f"{lpath}.command_endpoint"),
-                telemetry_endpoint=ctx.endpoint(
-                    raw["telemetry_endpoint"], f"{lpath}.telemetry_endpoint"
+                udp=UdpLinkSpec(
+                    command_endpoint=ctx.endpoint(
+                        raw["command_endpoint"], f"{lpath}.command_endpoint"
+                    ),
+                    telemetry_endpoint=ctx.endpoint(
+                        raw["telemetry_endpoint"], f"{lpath}.telemetry_endpoint"
+                    ),
                 ),
             )
         )

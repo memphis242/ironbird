@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import functools
 import os
 import resource
 import signal
@@ -344,12 +343,12 @@ def test_socket_creation_failure_is_a_coded_open_error_with_a_remedy(
     monkeypatch: pytest.MonkeyPatch, error: int, remedy: str
 ) -> None:
     monkeypatch.setattr(udp, "socket", fake_socket_module(error))
-    for transport in (
-        UdpTransport(remote=Endpoint("127.0.0.1", 9)),
-        UdpTransport(local=Endpoint("127.0.0.1", 0)),
+    for transport, receiver in (
+        (UdpTransport(remote=Endpoint("127.0.0.1", 9)), None),
+        (UdpTransport(local=Endpoint("127.0.0.1", 0)), lambda *_: None),
     ):
         with pytest.raises(IronbirdError) as info:
-            asyncio.run(transport.open())
+            asyncio.run(transport.open(receiver))
         assert info.value.code is Code.TX_OPEN
         assert remedy in info.value.summary.lower()
 
@@ -421,6 +420,13 @@ class ScanProbe:
             self.running -= 1
 
 
+def transport_of(listener: Any) -> UdpTransport:
+    """The UDP transport behind a listener (the engine's, reached through its capture)."""
+    transport = listener.capture._subs[0].io.transport
+    assert isinstance(transport, UdpTransport)
+    return transport
+
+
 def test_no_proc_scan_while_the_kernel_counter_rides_on_datagrams(
     run_session: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -431,7 +437,7 @@ def test_no_proc_scan_while_the_kernel_counter_rides_on_datagrams(
 
     async def scenario(ground: Session, *_: Any) -> None:
         listener = await ground.listen("fc")
-        if not listener._transport.overflow_counter_active:
+        if not transport_of(listener).overflow_counter_active:
             await listener.close()
             pytest.skip("SO_RXQ_OVFL is not available on this kernel")
         await asyncio.sleep(0.5)  # ten ticks with an idle socket
@@ -452,7 +458,7 @@ def test_tail_of_a_burst_is_scanned_once_after_the_traffic_stops(
 
     async def scenario(ground: Session, *_: Any) -> None:
         listener = await ground.listen("fc")
-        if not listener._transport.overflow_counter_active:
+        if not transport_of(listener).overflow_counter_active:
             await listener.close()
             pytest.skip("SO_RXQ_OVFL is not available on this kernel")
         addr = listener.local_address
@@ -490,7 +496,7 @@ def test_proc_scan_without_the_kernel_counter_runs_off_the_loop_once_per_tick(
 
     async def scenario(ground: Session, *_: Any) -> None:
         listener = await ground.listen("fc")
-        assert not listener._transport.overflow_counter_active
+        assert not transport_of(listener).overflow_counter_active
         heartbeat = asyncio.ensure_future(beat())
         await asyncio.sleep(1.0)
         heartbeat.cancel()
@@ -536,16 +542,14 @@ def test_send_with_a_relative_state_dir_sends_nothing(
 # -- 8: drops counted while closing are reported --------------------------------------------------
 
 
-def test_drops_counted_when_the_transport_closes_are_reported(
+def test_frames_a_consumer_queue_refused_are_reported_and_counted(
     run_session: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        "ironbird.session.UdpTransport", functools.partial(UdpTransport, queue_size=4)
-    )
+    monkeypatch.setattr("ironbird.engine.CONSUMER_QUEUE_FRAMES", 4)
     final: list[int] = []
 
     async def scenario(ground: Session, *_: Any) -> None:
-        listener = await ground.listen("fc")  # opened, never read: the 4-slot queue fills
+        listener = await ground.listen("fc")  # opened, never read: the 4-frame queue fills
         addr = listener.local_address
         assert addr is not None
         raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -553,13 +557,12 @@ def test_drops_counted_when_the_transport_closes_are_reported(
             raw.sendto(b"x" * 40, addr)
         raw.close()
         await asyncio.sleep(0.2)
-        await listener.close()  # making room for the end marker drops one more datagram
-        final.append(listener._transport.dropped)
+        await listener.close()  # the final count is part of the close
+        final.append(listener.capture.stats().not_shown)
 
     ledger, _, _ = run_session(scenario)
     drops = [e for e in read_ledger(ledger) if e["event"] == "rx.queue_drops"]
-    assert drops and drops[-1]["total"] == final[0]
-    assert final[0] > 6
+    assert drops and drops[-1]["total"] == final[0] == 6
 
 
 # -- 9: a signal during session teardown still ends the command by signal -------------------------

@@ -77,13 +77,16 @@ def test_corpus_command_packets_are_rejected_with_typed_errors(path: Path) -> No
     data = path.read_bytes()
     result = CODEC.decode(CMD, data)
     assert isinstance(result, DecodeError), result
+    assert CODEC.check(CMD, data) == result  # the cheap half already rejects it, the same way
     assert _well_formed(CODEC.decode(TLM, data))  # wrong direction must not crash either
 
 
 @pytest.mark.parametrize("path", _corpus("packet-tlm-*.bin"), ids=lambda p: p.stem)
 def test_corpus_telemetry_packets_are_rejected_with_typed_errors(path: Path) -> None:
     data = path.read_bytes()
-    assert isinstance(CODEC.decode(TLM, data), DecodeError)
+    result = CODEC.decode(TLM, data)
+    assert isinstance(result, DecodeError)
+    assert CODEC.check(TLM, data) == result
     assert _well_formed(CODEC.decode(CMD, data))
 
 
@@ -120,6 +123,69 @@ def test_decode_arbitrary_bytes_never_raises(data: bytes, kind: MessageKind) -> 
     assert isinstance(parsed, header.Header | DecodeError)
     if isinstance(parsed, header.Header):
         assert parsed.size <= len(data) <= CODEC.max_packet_bytes
+
+
+@FUZZ
+@given(st.binary(max_size=3000), st.sampled_from([CMD, TLM]))
+def test_check_accepts_exactly_what_decode_accepts(data: bytes, kind: MessageKind) -> None:
+    error = CODEC.check(kind, data)
+    result = CODEC.decode(kind, data)
+    if error is None:
+        assert isinstance(result, DecodedPacket)
+    else:
+        assert result == error  # decode reports what check found, nothing else
+    header_error = header.check(CODEC.profile(kind), data, max_size=CODEC.max_packet_bytes)
+    parsed = header.unpack(CODEC.profile(kind), data, max_size=CODEC.max_packet_bytes)
+    assert (header_error is None) == isinstance(parsed, header.Header)
+    if header_error is not None:
+        assert parsed == header_error
+
+
+@FUZZ
+@given(
+    st.sampled_from([(CMD, p) for p in VALID_CMDS] + [(TLM, p) for p in VALID_TLMS]),
+    st.integers(min_value=0),
+    st.integers(min_value=1, max_value=255),
+)
+def test_check_agrees_with_decode_on_one_corrupted_byte(
+    kind_and_packet: tuple[MessageKind, bytes], index: int, flip: int
+) -> None:
+    kind, packet = kind_and_packet
+    corrupted = bytearray(packet)
+    corrupted[index % len(packet)] ^= flip
+    error = CODEC.check(kind, bytes(corrupted))
+    result = CODEC.decode(kind, bytes(corrupted))
+    assert (error is None) == isinstance(result, DecodedPacket)
+    if error is not None:
+        assert result == error
+
+
+@pytest.mark.parametrize("kind", [CMD, TLM], ids=["cmd", "tlm"])
+def test_fixed_field_mask_catches_every_flipped_fixed_bit(kind: MessageKind) -> None:
+    profile = CODEC.profile(kind)
+    packet = (VALID_CMDS if kind is CMD else VALID_TLMS)[0]
+    checked = [f for f in profile.fields if f.kind is header.FieldKind.FIXED and f.check]
+    assert checked and profile.fixed_mask != 0
+    for f in profile.fields:
+        for bit in range(f.bits):
+            flipped = int.from_bytes(packet[: profile.size_bytes], "big") ^ (1 << (f.shift + bit))
+            forged = flipped.to_bytes(profile.size_bytes, "big") + packet[profile.size_bytes :]
+            error = header.check(profile, forged, max_size=CODEC.max_packet_bytes)
+            if f in checked:
+                assert error is not None, (f.name, bit)
+                # a flipped bit of the length field is the length error, which comes first
+                assert error.code is Code.DEC_FIXED, (f.name, bit, error)
+                assert error.offset == profile.byte_offset(f)
+            elif f.name not in {"length", "checksum"}:  # those have their own errors
+                assert error is None or error.code is not Code.DEC_FIXED, (f.name, bit)
+
+
+def test_oversize_frames_are_reported_with_the_size_on_the_wire() -> None:
+    cap = CODEC.max_packet_bytes
+    cut = VALID_TLMS[0] + bytes(cap - len(VALID_TLMS[0]))
+    error = CODEC.oversize_error(TLM, cut, 70000)
+    assert error.code is Code.DEC_OVERSIZE and "70000" in error.reason and error.offset == cap
+    assert error.mid == CODEC.peek_mid(TLM, cut)
 
 
 @FUZZ

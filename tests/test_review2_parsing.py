@@ -14,7 +14,7 @@ from conftest import CORPUS, EXAMPLES
 from ironbird import header, sanitize
 from ironbird.ccdd.json_adapter import JsonAdapter, parse_model
 from ironbird.ccdd.model import FieldDef, MessageKind, parse_type
-from ironbird.codec import Codec, DatagramClass, coerce_value
+from ironbird.codec import Codec, coerce_value
 from ironbird.config import load_config, parse_config
 from ironbird.errors import Code, IronbirdError
 
@@ -266,22 +266,27 @@ def test_message_too_long_for_the_length_field_fails_at_codec_load() -> None:
         Codec(edge, cmd, narrow)
 
 
-# -- 8. cheap datagram classification --------------------------------------------------------------
+# -- 8. the cheap half of the decode boundary ------------------------------------------------------
 
 
-def test_classify_separates_known_unknown_and_malformed(mock_codec: Codec) -> None:
+def test_check_separates_known_unknown_and_malformed(mock_codec: Codec) -> None:
     good = mock_codec.encode_telemetry("MOCK_HK").data
-    info = mock_codec.classify(TLM, good)
-    assert info.kind is DatagramClass.KNOWN_MID and info.mid == 0x0890
+    assert mock_codec.check(TLM, good) is None
     unknown = bytearray(good)
     unknown[1] ^= 0x7F  # another APID
-    info = mock_codec.classify(TLM, bytes(unknown))
-    assert info.kind is DatagramClass.UNKNOWN_MID and info.mid is not None
-    for bad in (b"", good[:5], good + bytes(mock_codec.max_packet_bytes)):
-        assert mock_codec.classify(TLM, bad).kind is DatagramClass.MALFORMED
-    # Classification never claims more than decode: a KNOWN_MID datagram may still fail decode.
-    lying = good + b"\0"
-    assert mock_codec.classify(TLM, lying).kind is DatagramClass.KNOWN_MID
+    error = mock_codec.check(TLM, bytes(unknown))
+    assert error is not None and error.code is Code.DEC_UNKNOWN and error.mid is not None
+    expected = {
+        b"": Code.DEC_SHORT,
+        good[:5]: Code.DEC_SHORT,
+        good + bytes(mock_codec.max_packet_bytes): Code.DEC_OVERSIZE,
+        good + b"\0": Code.DEC_LENGTH,  # the length field disagrees with the datagram
+    }
+    for bad, code in expected.items():
+        error = mock_codec.check(TLM, bad)
+        assert error is not None and error.code is code, (bad[:8], code)
+    # An unknown MID is reported as such even when the rest of the header is also wrong.
+    assert mock_codec.check(TLM, bytes(unknown) + b"\0").code is Code.DEC_UNKNOWN  # type: ignore[union-attr]
 
 
 # -- 3. sanitize ----------------------------------------------------------------------------------

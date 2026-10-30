@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -68,10 +68,10 @@ class HeaderField:
     algorithm: str | None = None
     check: bool = True
     description: str = ""
+    mask: int = field(init=False, repr=False, compare=False)  # (1 << bits) - 1, set once
 
-    @property
-    def mask(self) -> int:
-        return (1 << self.bits) - 1
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mask", (1 << self.bits) - 1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +91,10 @@ class HeaderProfile:
     sequence_field: HeaderField | None
     checksum_field: HeaderField | None
     source: str = "<memory>"
+    # One compare checks every fixed field: ``(word & fixed_mask) == fixed_value`` over the
+    # header word (fixed fields with ``check = false`` are left out).
+    fixed_mask: int = 0
+    fixed_value: int = 0
 
     def byte_offset(self, field: HeaderField) -> int:
         return (self.total_bits - field.shift - field.bits) // 8
@@ -381,6 +385,13 @@ def parse_profile(data: Mapping[str, Any], source: str = "<memory>") -> HeaderPr
                 f"fields.{f.name}", "computed = 'from_mid' needs the field in mid_fields"
             )
 
+    fixed_mask = fixed_value = 0
+    for f in fields:
+        if f.kind is FieldKind.FIXED and f.check:
+            assert f.value is not None
+            fixed_mask |= f.mask << f.shift
+            fixed_value |= f.value << f.shift
+
     return HeaderProfile(
         name=name,
         kind=kind,
@@ -396,6 +407,8 @@ def parse_profile(data: Mapping[str, Any], source: str = "<memory>") -> HeaderPr
         sequence_field=sequence_field,
         checksum_field=checksum_field,
         source=source,
+        fixed_mask=fixed_mask,
+        fixed_value=fixed_value,
     )
 
 
@@ -560,8 +573,106 @@ def pack(
 
 
 # ---------------------------------------------------------------------------------------
-# Unpack (decode boundary for headers)
+# Check and unpack (decode boundary for headers)
 # ---------------------------------------------------------------------------------------
+
+
+def oversize_error(
+    profile: HeaderProfile, data: bytes | bytearray | memoryview, size: int, max_size: int
+) -> DecodeError:
+    """The error for a packet of ``size`` bytes on the wire above the cap (``data`` may be a
+    prefix of it)."""
+    return DecodeError(
+        Code.DEC_OVERSIZE,
+        max_size,
+        f"packet of {size} bytes exceeds cap {max_size}",
+        peek_mid(profile, data),
+    )
+
+
+def check_word(
+    profile: HeaderProfile,
+    data: bytes | bytearray | memoryview,
+    *,
+    max_size: int = DEFAULT_MAX_PACKET_BYTES,
+) -> int | DecodeError:
+    """Validate the header of one whole packet and return the header word, or the first error.
+
+    This is the cheap half of the header boundary: size bounds, the length field, every fixed
+    field (one mask compare) and the checksum. It builds no field table; the caller that wants
+    one passes the word to :func:`parse_word`.
+    """
+    n = len(data)
+    if n > max_size:
+        return oversize_error(profile, data, n, max_size)
+    size = profile.size_bytes
+    if n < size:
+        return DecodeError(
+            Code.DEC_SHORT,
+            n,
+            f"packet of {n} bytes is shorter than the {size}-byte header",
+            peek_mid(profile, data),
+        )
+    word = int.from_bytes(data[:size], "big")
+
+    lf = profile.length_field
+    if lf is not None:
+        declared = ((word >> lf.shift) & lf.mask) - lf.bias
+        if declared != n:
+            return DecodeError(
+                Code.DEC_LENGTH,
+                profile.byte_offset(lf),
+                f"{lf.name} field says {declared} bytes, got {n}",
+                peek_mid(profile, data),
+            )
+    if word & profile.fixed_mask != profile.fixed_value:
+        for f in profile.fields:  # the slow path only names the first offender
+            got = (word >> f.shift) & f.mask
+            if f.kind is FieldKind.FIXED and f.check and got != f.value:
+                return DecodeError(
+                    Code.DEC_FIXED,
+                    profile.byte_offset(f),
+                    f"{f.name} is {got}, expected {f.value}",
+                    peek_mid(profile, data),
+                )
+        raise AssertionError("fixed-field mask disagrees with the fields")  # pragma: no cover
+    cf = profile.checksum_field
+    if cf is not None:
+        assert cf.algorithm is not None
+        zeroed = (word & ~(cf.mask << cf.shift)).to_bytes(size, "big")
+        expected = checksum.REGISTRY[cf.algorithm].compute(zeroed + bytes(data[size:]))
+        got = (word >> cf.shift) & cf.mask
+        if expected != got:
+            return DecodeError(
+                Code.DEC_CHECKSUM,
+                profile.byte_offset(cf),
+                f"{cf.name} is 0x{got:02X}, expected 0x{expected:02X}",
+                peek_mid(profile, data),
+            )
+    return word
+
+
+def check(
+    profile: HeaderProfile,
+    data: bytes | bytearray | memoryview,
+    *,
+    max_size: int = DEFAULT_MAX_PACKET_BYTES,
+) -> DecodeError | None:
+    """:func:`check_word` without the word: ``None`` when the header is valid."""
+    result = check_word(profile, data, max_size=max_size)
+    return result if isinstance(result, DecodeError) else None
+
+
+def parse_word(profile: HeaderProfile, word: int, mid: int | None) -> Header:
+    """Build the :class:`Header` of a word :func:`check_word` accepted."""
+    values = {f.name: (word >> f.shift) & f.mask for f in profile.fields}
+    sf = profile.sequence_field
+    return Header(
+        values=MappingProxyType(values),
+        mid=mid,
+        size=profile.size_bytes,
+        sequence=values[sf.name] if sf is not None else None,
+    )
 
 
 def unpack(
@@ -571,54 +682,7 @@ def unpack(
     max_size: int = DEFAULT_MAX_PACKET_BYTES,
 ) -> Header | DecodeError:
     """Validate and unpack the header of one whole packet (one datagram)."""
-    n = len(data)
-    mid = peek_mid(profile, data)
-    if n > max_size:
-        return DecodeError(
-            Code.DEC_OVERSIZE, max_size, f"packet of {n} bytes exceeds cap {max_size}", mid
-        )
-    size = profile.size_bytes
-    if n < size:
-        return DecodeError(
-            Code.DEC_SHORT, n, f"packet of {n} bytes is shorter than the {size}-byte header", mid
-        )
-    word = int.from_bytes(data[:size], "big")
-    values = {f.name: (word >> f.shift) & f.mask for f in profile.fields}
-
-    lf = profile.length_field
-    if lf is not None:
-        declared = values[lf.name] - lf.bias
-        if declared != n:
-            return DecodeError(
-                Code.DEC_LENGTH,
-                profile.byte_offset(lf),
-                f"{lf.name} field says {declared} bytes, got {n}",
-                mid,
-            )
-    for f in profile.fields:
-        if f.kind is FieldKind.FIXED and f.check and values[f.name] != f.value:
-            return DecodeError(
-                Code.DEC_FIXED,
-                profile.byte_offset(f),
-                f"{f.name} is {values[f.name]}, expected {f.value}",
-                mid,
-            )
-    cf = profile.checksum_field
-    if cf is not None:
-        assert cf.algorithm is not None
-        zeroed = (word & ~(cf.mask << cf.shift)).to_bytes(size, "big")
-        expected = checksum.REGISTRY[cf.algorithm].compute(zeroed + bytes(data[size:]))
-        if expected != values[cf.name]:
-            return DecodeError(
-                Code.DEC_CHECKSUM,
-                profile.byte_offset(cf),
-                f"{cf.name} is 0x{values[cf.name]:02X}, expected 0x{expected:02X}",
-                mid,
-            )
-    sf = profile.sequence_field
-    return Header(
-        values=MappingProxyType(values),
-        mid=mid,
-        size=size,
-        sequence=values[sf.name] if sf is not None else None,
-    )
+    word = check_word(profile, data, max_size=max_size)
+    if isinstance(word, DecodeError):
+        return word
+    return parse_word(profile, word, peek_mid(profile, data))

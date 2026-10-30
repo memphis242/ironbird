@@ -820,12 +820,13 @@ def listen(
         async def consume() -> None:
             nonlocal shown
             async for rx in listener:
+                node, time_ns = rx.frame.stream.node, rx.frame.time_ns
                 if fmt is Format.JSON:
-                    io.out(json.dumps(render.record(rx.node, rx.time_ns, rx.packet)))
+                    io.out(json.dumps(render.record(node, time_ns, rx.packet)))
                 else:
-                    io.out(render.line(rx.node, rx.time_ns, rx.packet))
+                    io.out(render.line(node, time_ns, rx.packet))
                 if show_hex:
-                    io.err(f"  from {term(rx.source, err=True)} size {rx.packet.size}")
+                    io.err(f"  from {term(rx.frame.source, err=True)} size {rx.packet.size}")
                 shown += 1
                 if count is not None and shown >= count:
                     return

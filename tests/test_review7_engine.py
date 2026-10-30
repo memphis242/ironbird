@@ -12,12 +12,12 @@ from typing import Any
 import pytest
 
 from ironbird import ledger as ledger_module
-from ironbird.ccdd.model import MessageKind
 from ironbird.config import load_config
 from ironbird.errors import Code, IronbirdError
+from ironbird.frame import FrameFlag
 from ironbird.ledger import Ledger
 from ironbird.session import Session
-from ironbird.transport import Datagram
+from ironbird.transport import LinkEnd
 
 FLOOD = 500
 
@@ -32,12 +32,12 @@ def test_malformed_packet_flood_does_not_crowd_out_essential_records(
 
     async def main() -> tuple[int | None, int, int]:
         async with Session(config, role="ground", ledger=ledger, notify=lambda _: None) as ground:
-            codec = ground.codec_for("fc")
-            for _ in range(FLOOD):
-                result = ground._ingest(
-                    codec, MessageKind.TELEMETRY, Datagram(b"\x00", 0, "127.0.0.1:1"), None, "fc"
-                )
-                assert result is not None
+            capture = await ground.capture([ground.route("fc")])
+            io = ground._engine._ios[(config.links[0].name, LinkEnd.SOURCE)]
+            for _ in range(FLOOD):  # one-byte garbage frames, as the transport would deliver them
+                io.on_data(b"\x00", 0, "127.0.0.1:1", 1, FrameFlag.NONE)
+            assert ground.malformed_total == FLOOD
+            await capture.close()
             number = ledger.record("command", "tx.command")
             return number, ledger.dropped, ledger._dropped_essential  # before close() summarises
 

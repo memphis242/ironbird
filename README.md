@@ -138,3 +138,11 @@ A plain `pytest` skips them. They start and stop cFS themselves and need UDP 123
 and `/dev/shm/osal:RAM` free (one instance per host).
 
 Test corpus of malformed inputs: `tests/corpus/malformed/`. Add a file there for every parser bug.
+
+Internals: the engine (`src/ironbird/engine.py`) turns whatever a transport receives into
+immutable `Frame`s, numbers them, runs the cheap `Codec.check`, hands each frame to its sinks
+(a recorder, later) and then to each consumer's own bounded queue, so a slow consumer never costs
+a captured frame. Malformed and unknown frames are consumers' frames too; they are reported once,
+coalesced, at ingest. `Session.capture()` gives the raw frames, `Session.decoder()` decodes them.
+Throughput guards: `pytest tests/test_benchmarks.py -n0 -s` prints the loopback ingest-only rate
+(receive side alone) and the end-to-end `ib listen` result at 10k packets/s.

@@ -1,9 +1,14 @@
-"""The engine API both front-ends use. In Stage 1 it runs in-process.
+"""The API both front-ends use. It runs in-process; the :mod:`ironbird.engine` it wraps does the
+ingest.
 
 A :class:`Session` is one invocation of ironbird *acting as* one node. Commander side
 (ground): encode commands, decode telemetry. Responder side (a flight node): decode commands,
 answer with telemetry. The same codec serves both. Requests and results are plain frozen
 values so the surface can later be exposed over a control socket unchanged.
+
+Receiving is a :class:`~ironbird.engine.Capture` of raw frames (``Session.capture``). The
+:class:`Listener`, :class:`EventStream` and :class:`Responder` are consumers of one that decode
+what they show; malformed frames are reported once at ingest, not again here.
 """
 
 from __future__ import annotations
@@ -20,17 +25,23 @@ from typing import Any, Final
 from ironbird.ccdd.loader import load_ccdd
 from ironbird.ccdd.model import CcddModel, EventSeverity, Message, MessageKind, TypeClass
 from ironbird.coalesce import Coalescer
-from ironbird.codec import Codec, DatagramClass, DecodedPacket, EncodedPacket
-from ironbird.config import Endpoint, Link, Node, ResponseRule, SystemConfig
+from ironbird.codec import Codec, DecodedPacket, EncodedPacket
+from ironbird.config import Link, Node, ResponseRule, SystemConfig
+from ironbird.engine import (
+    Capture,
+    Engine,
+    FrameDecoder,
+    FrameSink,
+    MidStatSnapshot,
+)
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
+from ironbird.frame import Decoded
 from ironbird.header import load_profile
 from ironbird.ledger import Ledger
 from ironbird.notice import Level, Notice
-from ironbird.transport import Datagram
-from ironbird.transport.udp import UdpTransport, scan_kernel_drops
+from ironbird.transport import LinkEnd
 
-MAX_TRACKED_MIDS: Final = 1024
 TICK_S: Final = 1.0
 EVENT_QUEUE_SIZE: Final = 1024
 
@@ -48,6 +59,11 @@ class Route:
     server: Node  # owns the CCDD and header profiles (always link.destination)
 
 
+def link_end(side: Side) -> LinkEnd:
+    """The end of its link a process on ``side`` is."""
+    return LinkEnd.SOURCE if side is Side.COMMANDER else LinkEnd.DESTINATION
+
+
 @dataclass(frozen=True, slots=True)
 class SentCommand:
     node: str
@@ -58,15 +74,6 @@ class SentCommand:
     size: int
     data: bytes
     endpoint: str
-
-
-@dataclass(frozen=True, slots=True)
-class Received:
-    time_ns: int
-    node: str  # node whose CCDD decoded the packet
-    packet: DecodedPacket
-    source: str
-    raw: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,27 +93,6 @@ class TxAttempt:
 
     command: str
     went_out: bool = False
-
-
-@dataclass(slots=True)
-class _DropWatch:
-    label: str
-    queue_seen: int = 0
-    kernel_seen: int = 0
-
-
-@dataclass(slots=True)
-class _MidStat:
-    """Mutable counters, owned by the session; the outside sees :class:`MidStatSnapshot`."""
-
-    count: int
-    last_ns: int
-
-
-@dataclass(frozen=True, slots=True)
-class MidStatSnapshot:
-    count: int
-    last_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,12 +122,8 @@ class Session:
         self._coalescer: Coalescer = Coalescer(notify)
         self._codecs: dict[str, Codec] = {}
         self._tasks: list[asyncio.Task[None]] = []
-        self._stats: dict[int, _MidStat] = {}
-        self._stats_overflow = 0
-        self._malformed_total = 0  # unknown-MID and malformed datagrams, filtered or not
         self._last_tx: TxAttempt | None = None
-        self._watches: dict[UdpTransport, _DropWatch] = {}
-        self._rcvbuf_warned = False
+        self._engine: Engine = Engine(config, ledger, self.report, self.codec_for)
 
     # -- read-only state -----------------------------------------------------------
 
@@ -166,17 +148,16 @@ class Session:
     @property
     def stats_overflow(self) -> int:
         """Known-MID packets not counted because the per-MID table was full."""
-        return self._stats_overflow
+        return self._engine.stats_overflow
 
     @property
     def malformed_total(self) -> int:
-        return self._malformed_total
+        """Unknown-MID and malformed frames seen, whether a consumer filtered them or not."""
+        return self._engine.malformed_total
 
     def stats_snapshot(self) -> Mapping[int, MidStatSnapshot]:
         """Frozen copy of the per-MID statistics, safe to hold while packets keep arriving."""
-        return MappingProxyType(
-            {mid: MidStatSnapshot(s.count, s.last_ns) for mid, s in self._stats.items()}
-        )
+        return MappingProxyType(self._engine.stats_snapshot())
 
     # -- lifecycle -----------------------------------------------------------------
 
@@ -207,6 +188,7 @@ class Session:
             # (rather than suppressing CancelledError around each await) lets a cancellation of
             # this very task, such as a signal, propagate.
             await asyncio.gather(*self._tasks, return_exceptions=True)
+            await self._engine.close()
         finally:
             try:
                 self.flush_notices()
@@ -233,10 +215,7 @@ class Session:
         while True:
             await asyncio.sleep(TICK_S)
             self._coalescer.tick()
-            watched = tuple(self._watches)
-            await scan_kernel_drops([t for t in watched if t.kernel_scan_due()])
-            for transport in watched:
-                self._poll_drops(transport)
+            await self._engine.tick()
 
     # -- error reporting ---------------------------------------------------------------
 
@@ -424,15 +403,18 @@ class Session:
         encoded = codec.encode_command(command, args, tamper=tamper)
         attempt = TxAttempt(encoded.message.name)
         self._last_tx = attempt
-        transport = UdpTransport(remote=endpoint)
         result = "not_sent"
-        try:
-            await transport.open()
-            transport.send_nowait(encoded.data)
+
+        def handed_off() -> None:
+            nonlocal attempt, result
             attempt = replace(attempt, went_out=True)
             self._last_tx = attempt
             result = "sent"
-            await transport.confirm()
+
+        try:
+            await self._engine.send(
+                route.link, link_end(route.side), encoded.data, confirm=True, handed_off=handed_off
+            )
         except IronbirdError as exc:
             result = exc.code.value
             raise
@@ -443,7 +425,6 @@ class Session:
             result = type(exc).__name__
             raise
         finally:
-            await transport.close()
             self.ledger.record(
                 "command",
                 "tx.command",
@@ -470,133 +451,43 @@ class Session:
             endpoint=str(endpoint),
         )
 
-    # -- shared ingest (peek, filter, count, decode through the boundary) -------------
+    # -- capture (raw frames) and decoding ---------------------------------------------
 
-    def _count(self, mid: int, time_ns: int) -> None:
-        """Per-MID statistics; only called for MIDs the CCDD defines, so garbage cannot fill it."""
-        stat = self._stats.get(mid)
-        if stat is not None:
-            stat.count += 1
-            stat.last_ns = time_ns
-        elif len(self._stats) < MAX_TRACKED_MIDS:
-            self._stats[mid] = _MidStat(1, time_ns)
-            self.ledger.record("state", "rx.first", mid=mid)
-        else:
-            self._stats_overflow += 1
-
-    def _reject(self, error: DecodeError, datagram: Datagram, source_label: str) -> DecodeError:
-        self._malformed_total += 1
-        self.ledger.record("packet", "rx.malformed", raw=datagram.data, source=datagram.source)
-        self.report(error, context=f"from {source_label}", evidence=True)
-        return error
-
-    def _ingest(
+    async def capture(
         self,
-        codec: Codec,
-        kind: MessageKind,
-        datagram: Datagram,
-        mids: frozenset[int] | None,
-        source_label: str,
-    ) -> DecodedPacket | DecodeError | None:
-        """``None`` means filtered out; errors are already reported (coalesced) and ledgered.
+        routes: Sequence[Route],
+        *,
+        sinks: Sequence[FrameSink] = (),
+        queue_frames: int | None = None,
+    ) -> Capture:
+        """Start receiving on ``routes``: an async iterator of every frame they carry.
 
-        A MID filter only hides *valid* packets of other MIDs. Unknown-MID and malformed
-        datagrams are counted, reported and ledgered whether or not they would have matched.
+        ``sinks`` see each frame, synchronously, before any consumer queue (and also the frames
+        this session sends); a consumer that falls behind loses frames from its own queue only.
+        Close the capture when done.
         """
-        self.ledger.mark_busy()
-        data = datagram.data
-        info = codec.classify(kind, data)
-        if info.kind is DatagramClass.UNKNOWN_MID:
-            assert info.mid is not None
-            return self._reject(
-                DecodeError(
-                    Code.DEC_UNKNOWN, 0, f"unknown {kind.value} MID 0x{info.mid:04X}", info.mid
-                ),
-                datagram,
-                source_label,
-            )
-        if info.kind is DatagramClass.KNOWN_MID:
-            assert info.mid is not None
-            self._count(info.mid, datagram.time_ns)
-        result = codec.decode(kind, data)  # the single validation boundary
-        if isinstance(result, DecodeError):
-            return self._reject(result, datagram, source_label)
-        if mids is not None and result.message.mid not in mids:
-            return None
-        return result
+        ends = [(route.link, link_end(route.side)) for route in routes]
+        return await self._engine.open_capture(ends, sinks=sinks, queue_frames=queue_frames)
 
-    # -- drop accounting (user-space queue overflow and kernel socket-buffer overflow) ----
+    def add_sink(self, sink: FrameSink) -> None:
+        """Attach ``sink`` to every frame this session ingests or sends until it is removed.
 
-    def _watch_drops(self, transport: UdpTransport, label: str) -> None:
-        self._watches[transport] = _DropWatch(label)
-
-    def _unwatch_drops(self, transport: UdpTransport) -> None:
-        """Report the final counts and stop watching; call after the transport has closed."""
-        self._poll_drops(transport)
-        self._watches.pop(transport, None)
-
-    def _poll_drops(self, transport: UdpTransport) -> None:
-        """Report new drops of ``transport`` since the last poll (coalesced, ledgered).
-
-        Only counters already in memory are looked at; the 1 Hz ticker refreshes the kernel's
-        counter from ``/proc/net/udp`` (off the loop) first when that is due.
+        A sink attached by several holders (this call, captures naming it) sees each frame once
+        and stays until each has removed it; one that raises is detached and reported once.
         """
-        watch = self._watches.get(transport)
-        if watch is None:
-            return
-        queue = transport.dropped
-        if queue != watch.queue_seen:
-            delta, watch.queue_seen = queue - watch.queue_seen, queue
-            self.ledger.record(
-                "state", "rx.queue_drops", label=watch.label, delta=delta, total=queue
-            )
-            self.report(
-                IronbirdError(
-                    Code.TX_OVERRUN,
-                    f"{watch.label}: receive queue overflow, {queue} datagram(s) dropped so far",
-                ),
-                context=f"queue {watch.label}",
-            )
-        kernel = transport.kernel_dropped
-        if kernel != watch.kernel_seen:
-            delta, watch.kernel_seen = kernel - watch.kernel_seen, kernel
-            self.ledger.record(
-                "state", "rx.kernel_drops", label=watch.label, delta=delta, total=kernel
-            )
-            self.report(
-                IronbirdError(
-                    Code.TX_OVERRUN,
-                    f"{watch.label}: kernel dropped {kernel} datagram(s) so far "
-                    "(socket buffer full; see net.core.rmem_max)",
-                ),
-                context=f"kernel {watch.label}",
-            )
+        self._engine.add_sink(sink)
 
-    async def _open_listening(
-        self, transport: UdpTransport, endpoint: Endpoint, label: str
-    ) -> None:
-        """Open ``transport``, ledger its effective receive buffer, start watching its drops."""
-        await transport.open()
-        self.ledger.record(
-            "state",
-            "udp.open",
-            endpoint=str(endpoint),
-            rcvbuf_requested=transport.rcvbuf_requested,
-            rcvbuf_effective=transport.rcvbuf_effective,
-            drop_counter="SO_RXQ_OVFL" if transport.overflow_counter_active else "/proc/net/udp",
-        )
-        if transport.rcvbuf_below_target and not self._rcvbuf_warned:
-            self._rcvbuf_warned = True
-            self.report(
-                IronbirdError(
-                    Code.TX_RCVBUF,
-                    f"{label}: kernel receive buffer is {transport.rcvbuf_effective} bytes, "
-                    f"below the {transport.rcvbuf_requested} requested; bursts may be lost - "
-                    "raise net.core.rmem_max (sysctl)",
-                ),
-                context=label,
-            )
-        self._watch_drops(transport, label)
+    def remove_sink(self, sink: FrameSink) -> None:
+        """Release one ``add_sink`` of ``sink``."""
+        self._engine.remove_sink(sink)
+
+    def decoder(self, *, report_checked: bool) -> FrameDecoder:
+        """A decoder for frames of this session's streams.
+
+        ``report_checked`` is ``False`` for frames that came through live ingest, which already
+        reported what the check found, and ``True`` where nothing did (replay).
+        """
+        return FrameDecoder(self._engine, report_checked=report_checked)
 
     # -- listen (either side) -----------------------------------------------------
 
@@ -606,24 +497,27 @@ class Session:
         route = self.route(peer, link_name=link)
         return await self._open_listener(route, mids)
 
-    async def _open_listener(self, route: Route, mids: frozenset[int] | None) -> Listener:
-        codec = self.codec_for(route.server.name)
+    def _listen_endpoint(self, route: Route) -> str:
+        link = route.link
         if route.side is Side.COMMANDER:
-            kind, endpoint = MessageKind.TELEMETRY, route.link.telemetry_endpoint
-        else:
-            kind, endpoint = MessageKind.COMMAND, route.link.command_endpoint
-        transport = UdpTransport(local=endpoint)
-        await self._open_listening(transport, endpoint, f"udp {endpoint}")
+            return str(link.telemetry_endpoint)
+        return str(link.command_endpoint)
+
+    async def _open_listener(self, route: Route, mids: frozenset[int] | None) -> Listener:
+        capture = await self.capture([route])
+        self._record_listen_start(route, mids)
+        return Listener(self, route, capture, mids)
+
+    def _record_listen_start(self, route: Route, mids: frozenset[int] | None) -> None:
         self.ledger.record(
             "action",
             "listen.start",
             peer=route.peer.name,
             side=route.side.value,
             link=route.link.name,
-            endpoint=str(endpoint),
+            endpoint=self._listen_endpoint(route),
             mids=sorted(mids) if mids else None,
         )
-        return Listener(self, route, codec, kind, transport, mids)
 
     # -- events (all telemetry links of the selected nodes) ---------------------------
 
@@ -676,38 +570,38 @@ class Session:
         stream yields. Nodes whose CCDD defines no event messages are skipped with a notice;
         if none is left, that is an error.
         """
-        listeners: list[Listener] = []
-        try:
-            for route in self._event_routes(nodes):
-                codec = self.codec_for(route.server.name)
-                mids = frozenset(m.mid for m in codec.model.event_messages())
-                if not mids:
-                    self.report(
-                        IronbirdError(
-                            Code.EVT_NONE,
-                            f"node {route.server.name!r} defines no event telemetry in "
-                            f"{codec.model.source}; skipped",
-                        )
+        routes: list[Route] = []
+        event_mids: dict[str, frozenset[int]] = {}
+        for route in self._event_routes(nodes):
+            codec = self.codec_for(route.server.name)
+            mids = frozenset(m.mid for m in codec.model.event_messages())
+            if not mids:
+                self.report(
+                    IronbirdError(
+                        Code.EVT_NONE,
+                        f"node {route.server.name!r} defines no event telemetry in "
+                        f"{codec.model.source}; skipped",
                     )
-                    continue
-                listeners.append(await self._open_listener(route, mids))
-            if not listeners:
-                raise IronbirdError(
-                    Code.EVT_NONE,
-                    "no selected node defines event telemetry; mark event messages with "
-                    '"category": "event" and an "event" mapping in the CCDD',
                 )
-        except BaseException:
-            for opened in listeners:
-                await opened.close()
-            raise
+                continue
+            routes.append(route)
+            event_mids[route.server.name] = mids
+        if not routes:
+            raise IronbirdError(
+                Code.EVT_NONE,
+                "no selected node defines event telemetry; mark event messages with "
+                '"category": "event" and an "event" mapping in the CCDD',
+            )
+        capture = await self.capture(routes)
+        for route in routes:
+            self._record_listen_start(route, event_mids[route.server.name])
         self.ledger.record(
             "action",
             "events.start",
-            nodes=[lst.node for lst in listeners],
+            nodes=[route.server.name for route in routes],
             min_severity=min_severity.name if min_severity else None,
         )
-        return EventStream(self, listeners, min_severity)
+        return EventStream(self, routes, capture, event_mids, min_severity)
 
     # -- responder ------------------------------------------------------------------
 
@@ -736,10 +630,7 @@ class Session:
         route = Route(chosen, Side.RESPONDER, self.config.nodes[chosen.source], self.node)
         codec = self.codec_for(me)
         rules = _validate_rules(self.node, codec, self.config)
-        transport = UdpTransport(local=chosen.command_endpoint, reply_to=chosen.telemetry_endpoint)
-        await self._open_listening(
-            transport, chosen.command_endpoint, f"udp {chosen.command_endpoint}"
-        )
+        capture = await self.capture([route])
         self.ledger.record(
             "action",
             "respond.start",
@@ -748,7 +639,7 @@ class Session:
             reply_to=str(chosen.telemetry_endpoint),
             rules=len(rules),
         )
-        return Responder(self, route, codec, transport, rules)
+        return Responder(self, route, codec, capture, rules)
 
 
 class Listener:
@@ -758,16 +649,13 @@ class Listener:
         self,
         session: Session,
         route: Route,
-        codec: Codec,
-        kind: MessageKind,
-        transport: UdpTransport,
+        capture: Capture,
         mids: frozenset[int] | None,
     ) -> None:
         self._session = session
         self._route = route
-        self._codec = codec
-        self._kind = kind
-        self._transport = transport
+        self._capture = capture
+        self._decoder = session.decoder(report_checked=False)
         self._mids = mids
 
     @property
@@ -776,63 +664,78 @@ class Listener:
         return self._route.server.name
 
     @property
-    def local_address(self) -> tuple[str, int] | None:
-        return self._transport.local_address
+    def capture(self) -> Capture:
+        return self._capture
 
-    def __aiter__(self) -> AsyncIterator[Received]:
+    @property
+    def local_address(self) -> tuple[str, int] | None:
+        return self._capture.addresses[0][1]
+
+    def __aiter__(self) -> AsyncIterator[Decoded]:
         return self._iterate()
 
-    async def _iterate(self) -> AsyncIterator[Received]:
-        label = self._route.peer.name
-        async for datagram in self._transport.receive():
-            result = self._session._ingest(self._codec, self._kind, datagram, self._mids, label)
-            self._session._poll_drops(self._transport)
-            if isinstance(result, DecodedPacket):
-                yield Received(
-                    datagram.time_ns,
-                    self._route.server.name,
-                    result,
-                    datagram.source,
-                    datagram.data,
-                )
+    async def _iterate(self) -> AsyncIterator[Decoded]:
+        # Frames are taken off the capture's own queue as they are handled, so an iteration that
+        # is abandoned (a ``break``) leaves the rest for the next one.
+        mids, decode, wait_frames = self._mids, self._decoder.decode, self._capture.wait_frames
+        while unread := await wait_frames():
+            popleft = unread.popleft
+            while unread:
+                frame = popleft()
+                if mids is not None and frame.mid not in mids:
+                    continue  # a MID filter hides valid packets only; ingest reported the rest
+                result = decode(frame)
+                if not isinstance(result, DecodeError):
+                    yield result
 
     async def close(self) -> None:
-        try:
-            await self._transport.close()
-        finally:  # drops counted while closing are part of the final report
-            self._session._unwatch_drops(self._transport)
-        self._session.ledger.record("action", "listen.stop", peer=self._route.peer.name)
+        await self._capture.close()
+        stats = self._capture.stats()
+        self._session.ledger.record(
+            "action", "listen.stop", peer=self._route.peer.name, unread=stats.unread
+        )
+        if stats.unread and self._capture.overloaded:
+            # The user already has drop notices; say what the end adds to them.
+            self._session.report(
+                IronbirdError(
+                    Code.TX_OVERRUN,
+                    f"listening ended with {stats.unread} frame(s) received but not shown",
+                )
+            )
 
 
 class EventStream:
-    """Events from several listeners merged into one stream. Close when done.
+    """Events from several links merged into one stream. Close when done.
 
-    One pump task per listener decodes, ledgers (every event, in full) and queues; the
-    bounded queue applies back-pressure to a pump, and from there to its socket queue, whose
-    overflow the session already reports as one coalesced error.
+    One pump task decodes the event frames of one capture, ledgers every event in full, and
+    queues those at or above the severity floor; the bounded queue applies back-pressure to the
+    pump, and from there to the capture's own bounded queue, whose overflow is reported as one
+    coalesced error.
     """
 
     def __init__(
         self,
         session: Session,
-        listeners: Sequence[Listener],
+        routes: Sequence[Route],
+        capture: Capture,
+        event_mids: Mapping[str, frozenset[int]],
         min_severity: EventSeverity | None,
     ) -> None:
-        assert listeners
+        assert routes
         self._session = session
-        self._listeners = tuple(listeners)
+        self._routes = tuple(routes)
+        self._capture = capture
+        self._decoder = session.decoder(report_checked=False)
+        self._event_mids = event_mids
         self._min_severity = min_severity
         self._queue: asyncio.Queue[Event | BaseException] = asyncio.Queue(EVENT_QUEUE_SIZE)
         loop = asyncio.get_running_loop()
-        self._pumps = [
-            loop.create_task(self._pump(listener), name=f"events-{listener.node}")
-            for listener in self._listeners
-        ]
+        self._pump_task = loop.create_task(self._pump(), name="events")
 
     @property
     def endpoints(self) -> tuple[tuple[str, tuple[str, int] | None], ...]:
-        """``(node, bound address)`` per listener."""
-        return tuple((lst.node, lst.local_address) for lst in self._listeners)
+        """``(node, bound address)`` per link."""
+        return tuple((stream.node, addr) for stream, addr in self._capture.addresses)
 
     def __aiter__(self) -> AsyncIterator[Event]:
         return self._iterate()
@@ -844,12 +747,19 @@ class EventStream:
                 raise item
             yield item
 
-    async def _pump(self, listener: Listener) -> None:
+    async def _pump(self) -> None:
         ledger = self._session.ledger
         try:
-            async for rx in listener:
-                event = extract_event(rx.node, rx.time_ns, rx.packet)
-                if event is None:  # the listener filters on event MIDs; stay defensive
+            async for frame in self._capture:
+                node = frame.stream.node
+                mids = self._event_mids.get(node)
+                if mids is None or frame.mid not in mids:
+                    continue
+                decoded = self._decoder.decode(frame)
+                if isinstance(decoded, DecodeError):
+                    continue
+                event = extract_event(node, frame.time_ns, decoded.packet)
+                if event is None:  # the filter above keeps event MIDs; stay defensive
                     continue
                 ledger.record(
                     "event",
@@ -864,8 +774,8 @@ class EventStream:
                     message=event.name,
                     mid=event.mid,
                     sequence=event.sequence,
-                    source=rx.source,
-                    raw=rx.raw,
+                    source=frame.source,
+                    raw=frame.data,
                 )
                 floor = self._min_severity
                 if floor is not None and event.severity is not None and event.severity < floor:
@@ -877,12 +787,14 @@ class EventStream:
             await self._queue.put(exc)
 
     async def close(self) -> None:
-        for pump in self._pumps:
-            pump.cancel()
-        await asyncio.gather(*self._pumps, return_exceptions=True)
-        for listener in self._listeners:
-            await listener.close()
-        self._session.ledger.record("action", "events.stop")
+        self._pump_task.cancel()
+        await asyncio.gather(self._pump_task, return_exceptions=True)
+        try:
+            await self._capture.close()
+        finally:
+            for route in self._routes:
+                self._session.ledger.record("action", "listen.stop", peer=route.peer.name)
+            self._session.ledger.record("action", "events.stop")
 
 
 def _validate_rules(node: Node, codec: Codec, config: SystemConfig) -> Mapping[str, ResponseRule]:
@@ -941,13 +853,14 @@ class Responder:
         session: Session,
         route: Route,
         codec: Codec,
-        transport: UdpTransport,
+        capture: Capture,
         rules: Mapping[str, ResponseRule],
     ) -> None:
         self._session = session
         self._route = route
         self._codec = codec
-        self._transport = transport
+        self._capture = capture
+        self._decoder = session.decoder(report_checked=False)
         self._rules = rules
         self._accepted = 0
         self._rejected = 0
@@ -962,36 +875,33 @@ class Responder:
 
     @property
     def local_address(self) -> tuple[str, int] | None:
-        return self._transport.local_address
+        return self._capture.addresses[0][1]
 
     def __aiter__(self) -> AsyncIterator[Handled]:
         return self._iterate()
 
     async def _iterate(self) -> AsyncIterator[Handled]:
         session = self._session
-        label = self._route.peer.name
-        async for datagram in self._transport.receive():
-            result = session._ingest(self._codec, MessageKind.COMMAND, datagram, None, label)
-            session._poll_drops(self._transport)
-            if result is None:  # pragma: no cover - no filter is set
-                continue
-            if isinstance(result, DecodeError):
+        async for frame in self._capture:
+            result = self._decoder.decode(frame)
+            if isinstance(result, DecodeError):  # reported once, at ingest
                 self._rejected += 1
-                yield Handled(datagram.time_ns, None, result, None)
+                yield Handled(frame.time_ns, None, result, None)
                 continue
+            command = result.packet
             self._accepted += 1
             session.ledger.record(
                 "command",
                 "rx.command",
-                command=result.message.name,
-                mid=result.message.mid,
-                function_code=result.message.function_code,
-                sequence=result.header.sequence,
-                args=result.as_dict(),
-                source=datagram.source,
+                command=command.message.name,
+                mid=command.message.mid,
+                function_code=command.message.function_code,
+                sequence=command.header.sequence,
+                args=command.as_dict(),
+                source=frame.source,
             )
-            reply = await self._answer(result)
-            yield Handled(datagram.time_ns, result, None, reply)
+            reply = await self._answer(command)
+            yield Handled(frame.time_ns, command, None, reply)
 
     async def _answer(self, command: DecodedPacket) -> EncodedPacket | None:
         session = self._session
@@ -1023,7 +933,7 @@ class Responder:
                 values[counter] = lo + (count - lo) % (hi - lo + 1)  # flight counters wrap
         try:
             encoded = self._codec.encode_telemetry(rule.reply, values)
-            await self._transport.send(encoded.data)
+            await session._engine.send(self._route.link, link_end(self._route.side), encoded.data)
         except IronbirdError as exc:
             session.report(exc)
             return None
@@ -1039,10 +949,7 @@ class Responder:
         return encoded
 
     async def close(self) -> None:
-        try:
-            await self._transport.close()
-        finally:  # drops counted while closing are part of the final report
-            self._session._unwatch_drops(self._transport)
+        await self._capture.close()
         self._session.ledger.record(
             "action", "respond.stop", accepted=self._accepted, rejected=self._rejected
         )

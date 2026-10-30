@@ -160,7 +160,7 @@ def read_ledger(ledger: Ledger) -> list[dict[str, Any]]:
 
 SLOW_OPEN = """
     from ironbird.transport.udp import UdpTransport
-    async def slow_open(self):
+    async def slow_open(self, receiver):
         print("READY", file=sys.stderr, flush=True)
         await asyncio.sleep(60)
     UdpTransport.open = slow_open
@@ -262,10 +262,10 @@ def test_tx_command_result_is_not_sent_when_cancelled_or_failed_before_sendto(
     run_session: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario(ground: Session, *_: Any) -> None:
-        async def hang(self: UdpTransport) -> None:
+        async def hang(self: UdpTransport, receiver: Any) -> None:
             await asyncio.sleep(60)
 
-        async def boom(self: UdpTransport) -> None:
+        async def boom(self: UdpTransport, receiver: Any) -> None:
             raise RuntimeError("open exploded")
 
         with monkeypatch.context() as patch:
@@ -623,26 +623,32 @@ def test_transport_counts_datagrams_the_kernel_dropped() -> None:
     total = 20_000
 
     async def main() -> tuple[int, UdpTransport]:
+        received = 0
+
+        def receiver(*_: Any) -> None:
+            nonlocal received
+            received += 1
+
         transport = UdpTransport(local=Endpoint("127.0.0.1", port))
-        await transport.open()
+        await transport.open(receiver)
         raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         for _ in range(total):  # no await: the loop cannot read while the socket buffer fills
             raw.sendto(bytes(1000), ("127.0.0.1", port))
         raw.close()
-        received = 0
-        iterator = transport.receive()
-        while True:
-            try:
-                await asyncio.wait_for(iterator.__anext__(), timeout=0.5)
-            except TimeoutError:
+        while True:  # let the loop read what the buffer holds
+            seen = received
+            await asyncio.sleep(0.3)
+            if received == seen:
                 break
-            received += 1
         transport.refresh_kernel_drops()
+        stats = transport.stats()
+        assert stats.rx_frames == received
+        await transport.close()
         return received, transport
 
     received, transport = asyncio.run(main())
     assert transport.kernel_dropped > 0
-    assert received + transport.kernel_dropped + transport.dropped == total
+    assert received + transport.kernel_dropped == total
 
 
 def test_overflow_counter_rides_on_the_next_received_datagram() -> None:
@@ -651,14 +657,11 @@ def test_overflow_counter_rides_on_the_next_received_datagram() -> None:
 
     async def main() -> tuple[bool, int]:
         transport = UdpTransport(local=Endpoint("127.0.0.1", port))
-        await transport.open()
+        await transport.open(lambda *_: None)
         raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         for _ in range(20_000):
             raw.sendto(bytes(1000), ("127.0.0.1", port))
-        iterator = transport.receive()
-        for _ in range(100):  # make room, then one more datagram carries the counter
-            await asyncio.wait_for(iterator.__anext__(), timeout=2)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.4)  # the loop reads the buffer; each datagram carries the counter
         raw.sendto(b"tail", ("127.0.0.1", port))
         await asyncio.sleep(0.2)
         raw.close()
