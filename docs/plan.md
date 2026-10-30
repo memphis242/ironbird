@@ -732,7 +732,7 @@ Deliverables
   stops at `max_evidence_bytes` (`IB-LED-003`, warning, once); the essential tier
   continues to `max_session_bytes`. At the hard cap the ledger stops and, by default,
   commands are refused (`IB-LED-004`) because a command must not go out without a trace;
-  capture and recording continue (decision D2 for the default).
+  capture and recording continue (decision D2: 128 MiB per session by default).
 - **Rotation**: at `max_file_bytes` the ledger continues in `<stamp>-<session>.pNNNN.jsonl`,
   each part opening with a `ledger.part` record naming the previous one.
 - **Retention** at session start, in a worker thread: delete ledger files (our name
@@ -740,9 +740,9 @@ Deliverables
   or `retention_total_bytes`, oldest first, skipping live sessions (each live ledger
   holds `flock(LOCK_SH)`; the pruner needs `LOCK_EX | LOCK_NB`). Deletions are
   ledgered; failures are `IB-LED-005` (warning).
-- Config `[ledger]`: `max_session_bytes` (512 MiB), `max_evidence_bytes` (256 MiB),
-  `max_file_bytes` (64 MiB), `evidence_rate` (256 KiB/s), `retention_days` (30),
-  `retention_total_bytes` (2 GiB), `on_full = "refuse_commands" | "continue"`. Sizes are
+- Config `[ledger]`: `max_session_bytes` (128 MiB), `max_evidence_bytes` (64 MiB),
+  `max_file_bytes` (32 MiB), `evidence_rate` (256 KiB/s), `retention_days` (7),
+  `retention_total_bytes` (512 MiB), `on_full = "refuse_commands" | "continue"`. Sizes are
   integers or strings matching `^[0-9]{1,12}(B|KiB|MiB|GiB|TiB)$`; anything else is
   `IB-CFG-003`.
 
@@ -1066,37 +1066,32 @@ complete up to mid-file damage in an input recording.
 | Ledger growth: sampling, caps, rotation, retention, send policy | 2d |
 | Output and signals equivalence | Stage 3; Stage 2's new commands keep Stage 1's exit codes, bounded writer and signal path |
 
-### Decisions for the user
+### Decisions
 
-- **D1 Embed definitions in recordings.** Recommended: yes, each recording carries its
-  nodes' CCDD and header profiles (8 MiB cap each), and replay uses them by default
-  (`--defs config` overrides), so a recording decodes correctly after the CCDD changes.
-- **D2 Ledger full policy and caps.** Recommended: refuse commands at the session hard
-  cap (`on_full = "refuse_commands"`), capture continues; caps 512 MiB per session (256
-  MiB evidence), retention 30 days or 2 GiB per state directory.
-- **D3 Events under floods.** The plan says events are never sampled; recommended to
-  keep that, with the session cap as the only backstop.
-- **D4 Commands from a separate `ib send`** are in the ledger (with raw bytes) but not in
-  a Stage 2 recording; the Stage 3 engine fixes this. Recommended: accept the gap
-  (alternative: replay and export interleave TX records from a ledger file).
-- **D5 Replay to the wire** (retransmitting a recording) deferred to Stage 5 send modes,
-  since it can transmit commands. Recommended: defer.
-- **D6 Variable-length acceptance on real cFS.** Stock cFS appears to have no
-  variable-length packet. Recommended: add a small `ib_test` cFS app under `tools/cfs`
-  that emits a counted-array packet and can blast telemetry at 10k pkt/s, which also
-  gives the throughput gate a real-cFS source. Alternative: mock only.
-- **D7 Real serial hardware.** The pty bridge is the gate for now; which device and baud
-  should a hardware acceptance run use, and when is it available?
-- **D8 Exit code 5** for "output produced, but the input recording was damaged
-  mid-file" (a torn tail alone is a warning with exit 0). Recommended: adopt.
-- **D9 Ring shape (Stage 3).** A variable-length byte ring carrying S3 records needs
-  about 7x less memory at the 200-byte average than fixed slots, and the plan's
-  1536-byte slots are smaller than the 2048-byte default `max_packet_bytes`.
-  Recommended: byte ring; decide at Stage 3 planning.
-- **D10 CCDD placeholder schema** bumps to `ironbird-ccdd/1` for variable-length fields
-  and per-message header values; `/0` keeps loading. Recommended: adopt.
-- **D11 Arrays of structs** (e.g. EVS HK `AppData[16]`) stay out of Stage 2.
-  Recommended: a follow-up after 2j, reusing its layout compiler.
+Decided by the user (2026-10-30):
+- **D1 Embed definitions in recordings: yes.** Each recording carries its nodes' CCDD and
+  header profiles (8 MiB cap each); replay uses them by default (`--defs config`
+  overrides), so a recording decodes correctly after the CCDD changes.
+- **D2 Ledger caps: smaller than first proposed.** 128 MiB per session (64 MiB of it raw
+  evidence), retention 7 days or 512 MiB per state directory, all configurable. At the
+  session hard cap, commands are refused (`on_full = "refuse_commands"`) and capture
+  continues.
+- **D6 Variable-length and throughput on real cFS: add an `ib_test` cFS app** under
+  `tools/cfs`, built with the pinned bundle, that emits a counted-array packet and can
+  generate up to 10k pkt/s of telemetry. Used only for acceptance and the throughput gate.
+- **D7 Serial hardware: none yet.** The pty bridge (mock E2E and pty-to-cFS-UDP) is the
+  gate; a real-UART run is added when hardware is available.
+
+Adopted as recommended (revisit on request):
+- **D3** Events are never sampled; the session cap is the only backstop.
+- **D4** Commands from a separate `ib send` are in the ledger but not in a Stage 2
+  recording; the Stage 3 engine closes the gap.
+- **D5** Replay to the wire is deferred to Stage 5 send modes.
+- **D8** Exit code 5 = output produced but the input recording was damaged mid-file; a
+  torn tail alone is a warning with exit 0.
+- **D9** Ring shape is decided at Stage 3 planning (byte ring preferred).
+- **D10** CCDD placeholder schema bumps to `ironbird-ccdd/1`; `/0` keeps loading.
+- **D11** Arrays of structs are a follow-up after 2j.
 
 ## Later stages (outline; each gets its own plan)
 
