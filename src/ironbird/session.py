@@ -23,7 +23,14 @@ from types import MappingProxyType
 from typing import Any, Final
 
 from ironbird.ccdd.loader import load_ccdd
-from ironbird.ccdd.model import CcddModel, EventSeverity, Message, MessageKind, TypeClass
+from ironbird.ccdd.model import (
+    CcddModel,
+    EventSeverity,
+    Message,
+    MessageKind,
+    TypeClass,
+    meets_floor,
+)
 from ironbird.coalesce import Coalescer
 from ironbird.codec import Codec, DecodedPacket, EncodedPacket
 from ironbird.config import Link, Node, ResponseRule, SystemConfig
@@ -36,6 +43,7 @@ from ironbird.engine import (
 )
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
+from ironbird.filter import Filter, FilterError, Matcher, compile_filter
 from ironbird.frame import Decoded, Stream
 from ironbird.header import load_profile
 from ironbird.ledger import Ledger
@@ -44,6 +52,8 @@ from ironbird.transport import LinkEnd
 
 TICK_S: Final = 1.0
 EVENT_QUEUE_SIZE: Final = 1024
+LEDGER_FILTER_MIDS: Final = 32  # MIDs of a filter's candidate set a ledger record lists
+SHOWN_MIDS: Final = 4  # MIDs named in a one-line error
 
 
 class Side(StrEnum):
@@ -557,13 +567,54 @@ class Session:
         """
         return FrameDecoder(self._engine, report_checked=report_checked)
 
+    def compile_filter(self, text: str, nodes: Sequence[str]) -> Filter:
+        """Compile the ``--where`` expression ``text`` against the definitions of ``nodes`` (the
+        nodes whose frames it will test) and this configuration's link names. Raises
+        ``IB-FLT-*`` (exit 2) before anything is opened."""
+        codecs = {name: self.codec_for(name) for name in dict.fromkeys(nodes)}
+        return compile_filter(
+            text,
+            codecs,
+            links=[link.name for link in self.config.links],
+            aliases={node.alias: node.name for node in self.config.nodes.values()},
+        )
+
+    @staticmethod
+    def _require_overlap(flt: Filter, allowed: frozenset[int] | None, what: str) -> None:
+        """Refuse a filter whose candidate MIDs share none with ``allowed`` (``what`` names that
+        set for the message): no frame could pass both, so the run would show nothing."""
+        if flt.mids is None or not allowed or not flt.mids.isdisjoint(allowed):
+            return
+        raise FilterError(
+            Code.FLT_TYPE,
+            flt.source,
+            0,
+            f"the filter can never match: it selects MID {_mids_text(flt.mids)} "
+            f"but {what} {_mids_text(allowed)}",
+        )
+
+    def matcher(self, flt: Filter, decoder: FrameDecoder) -> Matcher:
+        """A matcher of ``flt`` that decodes through ``decoder`` (the consumer's own, so a frame
+        the filter decodes is not decoded again)."""
+        return flt.bind(decoder.decode, self.codec_for)
+
     # -- listen (either side) -----------------------------------------------------
 
     async def listen(
-        self, peer: str, *, mids: frozenset[int] | None = None, link: str | None = None
+        self,
+        peer: str,
+        *,
+        mids: frozenset[int] | None = None,
+        link: str | None = None,
+        where: str | None = None,
     ) -> Listener:
+        """Open a listener for ``peer``. ``where`` is a filter expression (S4) that frames must
+        match to be yielded; it is compiled first, so a bad one fails before any socket opens."""
         route = self.route(peer, link_name=link)
-        return await self._open_listener(route, mids)
+        flt = self.compile_filter(where, [route.server.name]) if where is not None else None
+        if flt is not None:
+            self._require_overlap(flt, mids, "--mid allows")
+        return await self._open_listener(route, mids, flt)
 
     def _listen_endpoint(self, route: Route) -> str:
         link = route.link
@@ -571,12 +622,25 @@ class Session:
             return str(link.telemetry_endpoint)
         return str(link.command_endpoint)
 
-    async def _open_listener(self, route: Route, mids: frozenset[int] | None) -> Listener:
+    async def _open_listener(
+        self, route: Route, mids: frozenset[int] | None, flt: Filter | None
+    ) -> Listener:
         capture = await self.capture([route])
-        self._record_listen_start(route, mids)
-        return Listener(self, route, capture, mids)
+        self._record_listen_start(route, mids, flt)
+        return Listener(self, route, capture, mids, flt)
 
-    def _record_listen_start(self, route: Route, mids: frozenset[int] | None) -> None:
+    def _record_listen_start(
+        self, route: Route, mids: frozenset[int] | None, flt: Filter | None = None
+    ) -> None:
+        # A filter is recorded only when there is one; its candidate MIDs by count and the
+        # first few, because the set can be as large as the CCDD.
+        where: dict[str, Any] = {}
+        if flt is not None:
+            where["where"] = flt.source
+            if flt.mids is not None:
+                ordered = sorted(flt.mids)
+                where["where_mid_count"] = len(ordered)
+                where["where_mids"] = ordered[:LEDGER_FILTER_MIDS]
         self.ledger.record(
             "action",
             "listen.start",
@@ -585,6 +649,7 @@ class Session:
             link=route.link.name,
             endpoint=self._listen_endpoint(route),
             mids=sorted(mids) if mids else None,
+            **where,
         )
 
     # -- events (all telemetry links of the selected nodes) ---------------------------
@@ -639,13 +704,18 @@ class Session:
         ]
 
     async def events(
-        self, nodes: Sequence[str] | None = None, *, min_severity: EventSeverity | None = None
+        self,
+        nodes: Sequence[str] | None = None,
+        *,
+        min_severity: EventSeverity | None = None,
+        where: str | None = None,
     ) -> EventStream:
         """Listen on every telemetry link of ``nodes`` (default: all) for event packets.
 
-        Every received event is ledgered in full; ``min_severity`` only limits what the
-        stream yields. Nodes whose CCDD defines no event messages are skipped with a notice;
-        if none is left, that is an error.
+        Every received event is ledgered in full; ``min_severity`` and ``where`` (a filter
+        expression, S4, tested on the event's frame) only limit what the stream yields. Nodes
+        whose CCDD defines no event messages are skipped with a notice; if none is left, that
+        is an error.
         """
         routes: list[Route] = []
         event_mids: dict[str, frozenset[int]] = {}
@@ -669,16 +739,25 @@ class Session:
                 "no selected node defines event telemetry; mark event messages with "
                 '"category": "event" and an "event" mapping in the CCDD',
             )
+        flt = (
+            self.compile_filter(where, [route.server.name for route in routes])
+            if where is not None
+            else None
+        )
+        if flt is not None:
+            self._require_overlap(flt, frozenset().union(*event_mids.values()), "events carry")
         capture = await self.capture(routes)
         for route in routes:
-            self._record_listen_start(route, event_mids[route.server.name])
+            self._record_listen_start(route, event_mids[route.server.name], flt)
+        recorded: dict[str, Any] = {"where": flt.source} if flt is not None else {}
         self.ledger.record(
             "action",
             "events.start",
             nodes=[route.server.name for route in routes],
             min_severity=min_severity.name if min_severity else None,
+            **recorded,
         )
-        return EventStream(self, routes, capture, event_mids, min_severity)
+        return EventStream(self, routes, capture, event_mids, min_severity, flt)
 
     # -- responder ------------------------------------------------------------------
 
@@ -725,6 +804,13 @@ class Session:
         return Responder(self, route, codec, capture, rules)
 
 
+def _mids_text(mids: frozenset[int]) -> str:
+    """Up to :data:`SHOWN_MIDS` of ``mids`` in hex, for a one-line message."""
+    ordered = sorted(mids)
+    shown = ", ".join(f"0x{mid:04X}" for mid in ordered[:SHOWN_MIDS])
+    return f"{shown}, ... ({len(ordered)})" if len(ordered) > SHOWN_MIDS else shown
+
+
 class Listener:
     """Opened receive endpoint; iterate for decoded packets. Close when done."""
 
@@ -734,12 +820,17 @@ class Listener:
         route: Route,
         capture: Capture,
         mids: frozenset[int] | None,
+        where: Filter | None = None,
     ) -> None:
         self._session = session
         self._route = route
         self._capture = capture
         self._decoder = session.decoder(report_checked=False)
         self._mids = mids
+        self._matcher: Matcher | None = (
+            session.matcher(where, self._decoder) if where is not None else None
+        )
+        self._undecodable = 0  # frames the filter matched that do not decode (shown nowhere)
 
     @property
     def node(self) -> str:
@@ -761,21 +852,32 @@ class Listener:
         # Frames are taken off the capture's own queue as they are handled, so an iteration that
         # is abandoned (a ``break``) leaves the rest for the next one.
         mids, decode, wait_frames = self._mids, self._decoder.decode, self._capture.wait_frames
+        matcher = self._matcher
         while unread := await wait_frames():
             popleft = unread.popleft
             while unread:
                 frame = popleft()
                 if mids is not None and frame.mid not in mids:
                     continue  # a MID filter hides valid packets only; ingest reported the rest
-                result = decode(frame)
+                if matcher is not None:
+                    if not matcher(frame):
+                        continue
+                    result = matcher.decoded(frame)  # the filter's decode, if it made one
+                else:
+                    result = decode(frame)
                 if not isinstance(result, DecodeError):
                     yield result
+                elif matcher is not None:
+                    self._undecodable += 1
 
     async def close(self) -> None:
         await self._capture.close()
         stats = self._capture.stats()
+        undecodable: dict[str, Any] = (
+            {"where_undecodable": self._undecodable} if self._matcher is not None else {}
+        )
         self._session.ledger.record(
-            "action", "listen.stop", peer=self._route.peer.name, unread=stats.unread
+            "action", "listen.stop", peer=self._route.peer.name, unread=stats.unread, **undecodable
         )
         if stats.unread and stats.not_shown:
             # The queue refused frames, so the consumer was behind and what is still queued was
@@ -805,12 +907,16 @@ class EventStream:
         capture: Capture,
         event_mids: Mapping[str, frozenset[int]],
         min_severity: EventSeverity | None,
+        where: Filter | None = None,
     ) -> None:
         assert routes
         self._session = session
         self._routes = tuple(routes)
         self._capture = capture
         self._decoder = session.decoder(report_checked=False)
+        self._matcher: Matcher | None = (
+            session.matcher(where, self._decoder) if where is not None else None
+        )
         self._event_mids = event_mids
         self._min_severity = min_severity
         self._queue: asyncio.Queue[Event | BaseException] = asyncio.Queue(EVENT_QUEUE_SIZE)
@@ -840,7 +946,11 @@ class EventStream:
                 mids = self._event_mids.get(node)
                 if mids is None or frame.mid not in mids:
                     continue
-                decoded = self._decoder.decode(frame)
+                decoded = (
+                    self._matcher.decoded(frame)
+                    if self._matcher is not None
+                    else self._decoder.decode(frame)
+                )
                 if isinstance(decoded, DecodeError):
                     continue
                 event = extract_event(node, frame.time_ns, decoded.packet)
@@ -863,8 +973,10 @@ class EventStream:
                     raw=frame.data,
                 )
                 floor = self._min_severity
-                if floor is not None and event.severity is not None and event.severity < floor:
+                if floor is not None and not meets_floor(event.severity, floor):
                     continue
+                if self._matcher is not None and not self._matcher(frame):
+                    continue  # ledgered above; the filter only limits what is shown
                 await self._queue.put(event)
         except asyncio.CancelledError:
             raise

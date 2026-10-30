@@ -262,6 +262,80 @@ def test_listen_record_captures_what_listen_prints(
     assert "recorded 4 frame(s)" in listen.stderr
 
 
+def test_listen_where_with_record_still_records_every_frame(
+    tmp_path: Path, env: dict[str, str], mock_codec: Codec
+) -> None:
+    """The filter limits what is shown; the recording holds every frame of the link."""
+    out = tmp_path / "w.ibrec"
+    _, telemetry = ports(env)
+    listen = Proc(
+        tmp_path,
+        "listen",
+        ["listen", "fc", "--count", "1", "--format", "json", "--where",
+         "msg == MOCK_HK and cmd_counter == 5", "--record", str(out)],
+        env,
+    )  # fmt: skip
+    status = mock_codec.encode_telemetry("MOCK_STATUS").data  # not a candidate of the filter
+    sent = [
+        hk(mock_codec, 1),
+        status,
+        hk(mock_codec, 2),
+        hk(mock_codec, 3),
+        b"\x01\x02",
+        hk(mock_codec, 5),
+    ]
+    try:
+        listen.wait_for("istening")
+        send_datagrams(telemetry, sent, pause=0.01)
+        assert listen.finish() == 0, listen.stderr
+    finally:
+        listen.kill()
+    printed = [json.loads(line) for line in listen.stdout.splitlines()]
+    assert len(printed) == 1  # one frame passed the filter
+    assert [f.data for f in read(out)] == sent  # every frame, malformed one included
+    assert "recorded 6 frame(s)" in listen.stderr
+    assert rec_inspect.scan(out).status == "closed"
+
+
+def test_events_where_with_record_still_records_every_frame(
+    tmp_path: Path, env: dict[str, str], mock_codec: Codec
+) -> None:
+    out = tmp_path / "ew.ibrec"
+    _, telemetry = ports(env)
+    events = Proc(
+        tmp_path,
+        "events",
+        ["events", "--count", "1", "--where", "event.id == 7", "--record", str(out)],
+        env,
+    )
+    other = mock_codec.encode_telemetry(
+        "MOCK_EVENT", {"app": "DEMO", "event_id": 3, "event_type": "ERROR", "message": "x"}
+    ).data
+    wanted = mock_codec.encode_telemetry(
+        "MOCK_EVENT", {"app": "DEMO", "event_id": 7, "event_type": "ERROR", "message": "y"}
+    ).data
+    sent = [hk(mock_codec), other, wanted]
+    try:
+        events.wait_for("istening")
+        send_datagrams(telemetry, sent, pause=0.02)
+        assert events.finish() == 0, events.stderr
+    finally:
+        events.kill()
+    assert len(events.stdout.splitlines()) == 1
+    assert [f.data for f in read(out)] == sent
+
+
+def test_a_bad_where_with_record_exits_2_and_leaves_no_recording(
+    tmp_path: Path, env: dict[str, str]
+) -> None:
+    out = tmp_path / "bad.ibrec"
+    done = run_ib(
+        tmp_path, ["listen", "fc", "--where", "cmd_countr > 1", "--record", str(out)], env
+    )
+    assert done.returncode == 2 and "IB-FLT-002" in done.stderr, done.stderr
+    assert not out.exists()
+
+
 def test_events_record_and_default_location(
     tmp_path: Path, env: dict[str, str], mock_codec: Codec
 ) -> None:

@@ -26,6 +26,7 @@ from typing import Any, Final, NamedTuple, Self
 
 from ironbird.ccdd.model import MessageKind
 from ironbird.codec import DecodedPacket, Resolved
+from ironbird.errors import Code, DecodeError
 
 IDENTITY_FIELDS: Final = 8  # the packet fields of a frame; ``checked`` follows them
 MAX_FRAME_BYTES: Final = 65535  # the largest max_packet_bytes the config accepts
@@ -39,6 +40,14 @@ FLAG_TRUNCATED: Final = 0x02  # data cut at max_packet_bytes; orig_len is the si
 FLAG_GARBAGE: Final = 0x04  # serial: bytes skipped while resynchronising, not a packet
 FLAG_STALE: Final = 0x08  # serial: partial packet flushed by the inter-byte timeout
 KNOWN_FLAG_BITS: Final = FLAG_HAS_MID | FLAG_TRUNCATED | FLAG_GARBAGE | FLAG_STALE
+
+
+def garbage_error(size: int) -> DecodeError:
+    """The decode result of a ``GARBAGE`` frame: bytes skipped while resynchronising are not a
+    packet, whatever they would decode to, so no consumer may unpack them."""
+    return DecodeError(
+        Code.DEC_FIXED, 0, f"{size} bytes skipped while resynchronising are not a packet"
+    )
 
 
 class Direction(StrEnum):

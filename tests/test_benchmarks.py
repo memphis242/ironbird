@@ -23,13 +23,17 @@ import pytest
 import yaml
 
 from conftest import EXAMPLES, REPO
+from filter_defs import make_frame
 from ironbird import render
+from ironbird.ccdd.loader import load_ccdd
 from ironbird.ccdd.model import MessageKind
 from ironbird.coalesce import Coalescer
 from ironbird.codec import Codec, DecodedPacket
 from ironbird.config import load_config
 from ironbird.errors import Code
-from ironbird.frame import Frame, FrameFlag
+from ironbird.filter import compile_filter
+from ironbird.frame import Decoded, Direction, Frame, FrameFlag, Stream
+from ironbird.header import load_profile
 from ironbird.ledger import Ledger
 from ironbird.notice import Level
 from ironbird.session import Session
@@ -40,6 +44,7 @@ from test_engine import _Probe
 DECODE_CEILING_S = 100e-6
 INGEST_CEILING_S = 100e-6
 LISTEN_OVERHEAD_RATIO = 1.5  # listen path vs. the bare decode + render it must wrap
+LISTEN_FILTER_OVERHEAD_RATIO = 1.8  # the same with a decode-level filter evaluated per frame
 FLOOR_PPS = 1_000  # the plan's hard floor, aggregate packets per second
 TARGET_PPS = 10_000  # the plan's design target
 PACKET_BYTES = 200  # the plan's average packet size
@@ -128,6 +133,189 @@ def test_ingest_only_per_frame_cost(benchmark: Any, tmp_path: Path) -> None:
     benchmark(io.on_data, wire, 1, "127.0.0.1:1", len(wire), FrameFlag.NONE)
     assert probe.engine.last_seq > before and probe.engine.malformed_total == 0
     _check_ceiling(benchmark, INGEST_CEILING_S)
+
+
+# -- filter evaluation (docs/plan.md S4): per frame, by the dearest level an expression needs --
+
+FILTER_FRAME_CEILING_S = 5e-6  # frame-level fields only
+FILTER_MODEL_CEILING_S = 5e-6  # a MID lookup
+FILTER_DECODE_CEILING_S = 100e-6  # a decode (the plan's per-packet ceiling) plus field tests
+
+FILTER_CASES = {
+    "frame": "seq > 0 and node == fc and dir == rx and len >= 16",
+    "model": "msg == MOCK_HK and category == housekeeping",
+    "check": "status == ok",
+    "decode": "msg == MOCK_HK and cmd_counter >= 0 and mode in [SAFE, NOMINAL, SCIENCE, 0]",
+    "decode_hdr_event": "hdr.sequence >= 0 and event.type >= error",
+}
+
+
+def _decode_for_filter(codec: Codec, frame: Frame) -> Any:
+    checked = frame.checked
+    packet = (
+        codec.decode_resolved(frame.stream.kind, checked, frame.data)
+        if checked is not None
+        else codec.decode(frame.stream.kind, frame.data)
+    )
+    assert isinstance(packet, DecodedPacket)
+    return Decoded(frame, packet)
+
+
+FILTER_STREAM = Stream(
+    id=1,
+    link="ground-fc",
+    node="fc",
+    kind=MessageKind.TELEMETRY,
+    direction=Direction.RX,
+    transport="udp",
+    endpoint="udp 127.0.0.1:1",
+)
+
+
+@pytest.mark.parametrize("case", list(FILTER_CASES))
+def test_filter_evaluation_rate(benchmark: Any, mock_codec: Codec, case: str) -> None:
+    """One frame through a compiled filter, by the dearest level the expression needs. The decode
+    level includes one full decode of the frame (the matcher shares it with the consumer)."""
+    wire = mock_codec.encode_telemetry("MOCK_HK").data
+    # Two equal frames, tested alternately: the matcher memoises the frame it saw last, and a
+    # repeat of the same frame would not pay for its decode.
+    first = make_frame(mock_codec, FILTER_STREAM, wire, live=True)
+    second = make_frame(mock_codec, FILTER_STREAM, wire, live=True, seq=2)
+    flt = compile_filter(FILTER_CASES[case], {"fc": mock_codec})
+    ceiling = {"frame": FILTER_FRAME_CEILING_S, "model": FILTER_MODEL_CEILING_S}.get(
+        case, FILTER_DECODE_CEILING_S
+    )
+    matcher = flt.bind(lambda f: _decode_for_filter(mock_codec, f), lambda _node: mock_codec)
+    expected = case != "decode_hdr_event"  # a housekeeping frame has no event type
+
+    def run() -> tuple[bool, bool]:
+        return matcher(first), matcher(second)
+
+    assert benchmark(run) == (expected, expected)
+    benchmark.extra_info["level"] = flt.cost.name
+    stats = getattr(benchmark, "stats", None)
+    if stats is not None and not getattr(benchmark, "disabled", False):
+        per_frame = stats.stats.mean / 2
+        benchmark.extra_info["frames_per_s"] = round(1 / per_frame)
+        print(f"\nfilter {case}: {per_frame * 1e6:.2f} us/frame, {1 / per_frame:,.0f} frames/s")
+        assert per_frame < ceiling, f"{per_frame * 1e6:.1f} us"
+
+
+# Cost of one more predicate: a chain of N predicates that are all true, so each one runs.
+FILTER_PREDICATE_CEILING_S = 3e-6  # per predicate at frame, model and check level
+FILTER_FIELD_PREDICATE_CEILING_S = 6e-6  # per decoded-field test, the decode itself excluded
+
+PREDICATE_CASES = {
+    "frame": (16, " and ".join(f"seq >= {i % 2}" for i in range(16))),
+    "model": (8, " and ".join(["msg == MOCK_HK", "category == housekeeping"] * 4)),
+    "check": (8, " and ".join(["status == ok", "status != malformed"] * 4)),
+    "field": (8, " and ".join(["cmd_counter >= 0", "err_counter >= 0"] * 4)),
+}
+
+
+@needs_a_quiet_host
+@pytest.mark.parametrize("case", list(PREDICATE_CASES))
+def test_filter_cost_per_predicate(benchmark: Any, mock_codec: Codec, case: str) -> None:
+    """The marginal cost of a predicate, by level: a chain of all-true predicates divided by its
+    length (the single decode a field test needs is taken out by timing a one-predicate chain
+    of the same level)."""
+    count, text = PREDICATE_CASES[case]
+    wire = mock_codec.encode_telemetry("MOCK_HK").data
+    first = make_frame(mock_codec, FILTER_STREAM, wire, live=True)
+    second = make_frame(mock_codec, FILTER_STREAM, wire, live=True, seq=2)
+
+    def bound(expression: str) -> Any:
+        flt = compile_filter(expression, {"fc": mock_codec})
+        return flt.bind(lambda f: _decode_for_filter(mock_codec, f), lambda _node: mock_codec)
+
+    matcher = bound(text)
+
+    def run() -> tuple[bool, bool]:
+        return matcher(first), matcher(second)
+
+    assert benchmark(run) == (True, True)
+    stats = getattr(benchmark, "stats", None)
+    if stats is not None and not getattr(benchmark, "disabled", False):
+        single = bound(text.split(" and ")[0])
+        started = time.perf_counter()
+        for _ in range(20_000):
+            single(first)
+            single(second)
+        base = (time.perf_counter() - started) / 40_000
+        per_predicate = (stats.stats.mean / 2 - base) / max(count - 1, 1)
+        print(f"\nfilter {case}: {per_predicate * 1e6:.2f} us per extra predicate")
+        ceiling = (
+            FILTER_FIELD_PREDICATE_CEILING_S if case == "field" else FILTER_PREDICATE_CEILING_S
+        )
+        assert per_predicate < ceiling, f"{per_predicate * 1e6:.2f} us"
+
+
+COMPILE_MESSAGES = 2048
+COMPILE_ALTERNATIVES = 256
+FILTER_COMPILE_CEILING_S = 0.5  # a 256-way `or` over a 2048-message CCDD (0.03-0.11 s measured)
+
+
+@needs_a_quiet_host
+def test_filter_compile_time_does_not_grow_with_the_message_count(tmp_path: Path) -> None:
+    """Fields of one type are judged once however many messages have them, so a wide `or` over a
+    large CCDD compiles in milliseconds (it took seconds when each message was judged alone)."""
+    mids = [m for m in range(0x10000) if m & 0x1800 == 0x0800][:COMPILE_MESSAGES]
+    assert len(mids) == COMPILE_MESSAGES
+    messages = [
+        {
+            "name": f"M{i}",
+            "kind": "telemetry",
+            "mid": hex(mid),
+            "category": "housekeeping",
+            "fields": [
+                {"name": "x", "type": "uint16" if i % 2 else "uint8"},
+                {"name": "mode", "type": "uint8", "enum": {"SAFE": 1, "NOMINAL": 2}},
+            ],
+        }
+        for i, mid in enumerate(mids)
+    ]
+    path = tmp_path / "wide.json"
+    path.write_text(
+        json.dumps({"schema": "ironbird-ccdd/0", "target": "wide", "messages": messages})
+    )
+    codec = Codec(
+        load_ccdd(path),
+        load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_cmd.toml"),
+        load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_tlm.toml"),
+    )
+    texts = {
+        "or": " or ".join(f"x == {i}" for i in range(COMPILE_ALTERNATIVES)),
+        "in": "x in [" + ", ".join(str(i) for i in range(500)) + "]",
+        "and": " and ".join(f"x != {i}" for i in range(COMPILE_ALTERNATIVES)),
+        "labels": " or ".join(["mode == SAFE", "mode in [NOMINAL, SAFE]"] * 60),
+    }
+    for kind, text in texts.items():
+        started = time.perf_counter()
+        flt = compile_filter(text, {"wide": codec})
+        took = time.perf_counter() - started
+        print(f"\ncompile {kind} ({len(text)} chars): {took * 1e3:.1f} ms")
+        assert flt.mids is not None and len(flt.mids) == COMPILE_MESSAGES
+        assert took < FILTER_COMPILE_CEILING_S, f"{kind}: {took:.2f} s"
+
+
+def test_filter_rejects_a_non_candidate_frame_without_decoding(
+    benchmark: Any, mock_codec: Codec
+) -> None:
+    """The cost of a frame outside the candidate MIDs: one set lookup, no decode."""
+    frame = make_frame(
+        mock_codec, FILTER_STREAM, mock_codec.encode_telemetry("MOCK_STATUS").data, live=True
+    )
+    flt = compile_filter("msg == MOCK_HK and cmd_counter > 0", {"fc": mock_codec})
+    decoded: list[Frame] = []
+
+    def decode(f: Frame) -> Any:
+        decoded.append(f)
+        return _decode_for_filter(mock_codec, f)
+
+    matcher = flt.bind(decode, lambda _node: mock_codec)
+    assert benchmark(matcher, frame) is False
+    assert decoded == []
+    _check_ceiling(benchmark, FILTER_FRAME_CEILING_S)
 
 
 # -- engine ingest on loopback (ingest only: a sender and a draining consumer, no decode) --
@@ -289,9 +477,12 @@ def test_ingest_only_at_the_target_rate_loses_nothing_on_loopback(tmp_path: Path
 
 
 @needs_a_quiet_host
-def test_listen_path_costs_little_over_decode_and_render(tmp_path: Path) -> None:
+@pytest.mark.parametrize("where", [None, 'msg == BENCH_TLM and blob contains "xx"'])
+def test_listen_path_costs_little_over_decode_and_render(tmp_path: Path, where: str | None) -> None:
     """The per-packet cost of receive + queue + decode + JSON render, against the cost of the
     bare decode + render it wraps, measured in the same process so the ratio holds on any host.
+    With ``where`` a typical decode-level filter is applied to every frame as well; its decode is
+    the one the render reuses, so the filter adds only its own few microseconds of tests.
 
     Frames arrive in bursts as they do off a socket (50 per reader wake-up); what is timed is
     the engine and the listener around the decoder, which must stay a small fraction of it.
@@ -304,7 +495,7 @@ def test_listen_path_costs_little_over_decode_and_render(tmp_path: Path) -> None
         async with Session(config, role="ground", ledger=ledger, notify=_ignore) as ground:
             codec = ground.codec_for("fc")
             wire = codec.encode_telemetry("BENCH_TLM", {"blob": "x" * 20}).data
-            listener = await ground.listen("fc")
+            listener = await ground.listen("fc", where=where)
             link = ground.route("fc").link
             io = ground._engine._ios[(link.name, LinkEnd.SOURCE)]
             frames = aiter(listener)
@@ -331,7 +522,8 @@ def test_listen_path_costs_little_over_decode_and_render(tmp_path: Path) -> None
     print(
         f"\nlisten path {listen_s * 1e6:.1f} us/packet, bare decode+render {floor_s * 1e6:.1f} us"
     )
-    assert listen_s < LISTEN_OVERHEAD_RATIO * floor_s, (
+    ratio = LISTEN_OVERHEAD_RATIO if where is None else LISTEN_FILTER_OVERHEAD_RATIO
+    assert listen_s < ratio * floor_s, (
         f"listen path {listen_s * 1e6:.1f} us/packet vs {floor_s * 1e6:.1f} us for decode+render"
     )
 
@@ -341,9 +533,11 @@ LISTEN_RATE = TARGET_PPS
 CLI_MAIN = "import sys; from ironbird.cli.main import main; sys.exit(main())"
 
 
-def _run_listen_cli(tmp_path: Path, count: int, rate: int) -> tuple[int, int, str]:
-    """``ib listen --format json`` to a file while another process sends ``count`` packets at
-    ``rate``/s. Returns (sent, lines written, standard error text)."""
+def _run_listen_cli(
+    tmp_path: Path, count: int, rate: int, extra: tuple[str, ...] = ()
+) -> tuple[int, int, str]:
+    """``ib listen --format json`` (plus ``extra`` arguments) to a file while another process
+    sends ``count`` packets at ``rate``/s. Returns (sent, lines written, standard error text)."""
     config_path = _bench_config(tmp_path)
     config = load_config(config_path)
     codec = Session(
@@ -359,7 +553,7 @@ def _run_listen_cli(tmp_path: Path, count: int, rate: int) -> tuple[int, int, st
     out_path, err_path = tmp_path / "listen.out", tmp_path / "listen.err"
     with out_path.open("wb") as out, err_path.open("wb") as err:
         listener = subprocess.Popen(
-            [sys.executable, "-c", CLI_MAIN, "listen", "fc", "--format", "json"],
+            [sys.executable, "-c", CLI_MAIN, "listen", "fc", "--format", "json", *extra],
             stdout=out,
             stderr=err,
             env=environment,
@@ -393,6 +587,20 @@ def test_listen_cli_at_the_target_rate_loses_no_output(tmp_path: Path) -> None:
     """
     sent, lines, errors = _run_listen_cli(tmp_path, LISTEN_PACKETS, LISTEN_RATE)
     print(f"\nib listen at {LISTEN_RATE:,} pkt/s: {lines}/{sent} lines written")
+    assert "IB-OUT-" not in errors, errors
+    assert lines >= 0.95 * sent, (
+        f"{sent - lines} of {sent} packets did not reach the output; stderr: {errors}"
+    )
+
+
+@needs_a_quiet_host
+def test_listen_cli_with_a_filter_at_the_target_rate_loses_no_output(tmp_path: Path) -> None:
+    """END TO END with a typical filter: the same run as above with ``--where`` selecting every
+    packet by a message name and a decoded field, so the filter is evaluated 30000 times and the
+    output must still keep up with the design target."""
+    where = "msg == MOCK_HK and err_counter >= 0 and not status == malformed"
+    sent, lines, errors = _run_listen_cli(tmp_path, LISTEN_PACKETS, LISTEN_RATE, ("--where", where))
+    print(f"\nib listen --where at {LISTEN_RATE:,} pkt/s: {lines}/{sent} lines written")
     assert "IB-OUT-" not in errors, errors
     assert lines >= 0.95 * sent, (
         f"{sent - lines} of {sent} packets did not reach the output; stderr: {errors}"

@@ -56,6 +56,12 @@ class EventSeverity(IntEnum):
     CRITICAL = 5
 
 
+def meets_floor(severity: EventSeverity | None, floor: EventSeverity) -> bool:
+    """Whether an event of ``severity`` passes a minimum severity ``floor``. An event whose type
+    value maps to no severity (``None``) is never hidden by a floor: nothing says it is low."""
+    return severity is None or severity >= floor
+
+
 # Spellings projects use for an event type enum label, case-insensitive.
 SEVERITY_LABELS: Final[Mapping[str, EventSeverity]] = MappingProxyType(
     {
