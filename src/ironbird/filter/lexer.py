@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from enum import Enum, auto
 from typing import Any, Final, NamedTuple
 
@@ -26,7 +27,7 @@ class Tok(Enum):
     IDENT = auto()  # value: the name
     INT = auto()  # value: int
     HEX = auto()  # value: int
-    FLOAT = auto()  # value: float
+    FLOAT = auto()  # value: Decimal, exactly as written
     STRING = auto()  # value: str
     TIME = auto()  # value: int, nanoseconds since the Unix epoch
     OP = auto()  # value: one of == != < <= > >=
@@ -77,7 +78,9 @@ def tokenize(text: str) -> list[Token]:
     """The tokens of ``text`` followed by one ``END`` token.
 
     Raises :class:`FilterError` (``IB-FLT-001`` for a character or literal that is not valid,
-    ``IB-FLT-004`` for text or numbers over the limits).
+    ``IB-FLT-004`` for text or numbers over the limits). At most :data:`MAX_TOKENS` tokens are
+    allowed outside the brackets of a list; what is inside is bounded by the text length and,
+    item by item, by the parser.
     """
     if len(text) > MAX_FILTER_CHARS:
         raise FilterError(
@@ -89,18 +92,26 @@ def tokenize(text: str) -> list[Token]:
     tokens: list[Token] = []
     size = len(text)
     i = 0
+    counted = 0  # tokens outside an ``in`` list; the items of a list are limited by the parser
+    in_list = False
     while i < size:
         ch = text[i]
         if ch in _WHITESPACE:
             i += 1
             continue
-        if len(tokens) >= MAX_TOKENS:
+        if counted >= MAX_TOKENS:
             raise FilterError(
                 Code.FLT_LIMIT, text, i, f"more than {MAX_TOKENS} tokens; simplify the filter"
             )
         token = _next_token(text, i)
         tokens.append(token)
         i = token.end
+        if token.kind is Tok.RBRACKET:
+            in_list = False
+        if not in_list:
+            counted += 1
+        if token.kind is Tok.LBRACKET:
+            in_list = True
     tokens.append(Token(Tok.END, None, size, size))
     return tokens
 
@@ -164,7 +175,7 @@ def _number(text: str, i: int) -> Token:
     if body[:2] in ("0x", "0X"):
         return Token(Tok.HEX, int(literal, 16), i, end)
     if "." in literal:
-        return Token(Tok.FLOAT, float(literal), i, end)
+        return Token(Tok.FLOAT, Decimal(literal), i, end)
     return Token(Tok.INT, int(literal), i, end)
 
 

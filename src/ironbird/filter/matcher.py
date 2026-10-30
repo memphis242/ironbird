@@ -17,7 +17,7 @@ from enum import IntEnum
 
 from ironbird.codec import Codec, Resolved
 from ironbird.errors import DecodeError
-from ironbird.frame import FLAG_TRUNCATED, Decoded, Frame
+from ironbird.frame import FLAG_GARBAGE, FLAG_TRUNCATED, Decoded, Frame, garbage_error
 
 FrameDecode = Callable[[Frame], Decoded | DecodeError]
 MatchFn = Callable[[Frame, "Matcher"], bool]
@@ -90,10 +90,15 @@ class Matcher:
         return self._match(frame, self)
 
     def decoded(self, frame: Frame) -> Decoded | DecodeError:
-        """The decode of ``frame``, made once however many times it is asked for."""
+        """The decode of ``frame``, made once however many times it is asked for. A garbage frame
+        is malformed by definition and is never handed to the decoder."""
         if self._decoded_of is frame:
             result = self._decoded
             assert result is not None
+            return result
+        if int(frame.flags) & FLAG_GARBAGE:
+            result = garbage_error(len(frame.data))
+            self._decoded, self._decoded_of = result, frame
             return result
         result = self._decode(frame)
         self.decodes += 1
@@ -109,7 +114,9 @@ class Matcher:
             return result
         checked = frame.checked
         result2: Resolved | DecodeError
-        if checked is not None:
+        if int(frame.flags) & FLAG_GARBAGE:
+            result2 = garbage_error(len(frame.data))
+        elif checked is not None:
             result2 = checked
         else:
             stream = frame.stream

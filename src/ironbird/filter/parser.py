@@ -32,7 +32,7 @@ _LITERAL_KINDS: Final = frozenset({Tok.INT, Tok.HEX, Tok.FLOAT, Tok.STRING, Tok.
 
 class Literal(NamedTuple):
     kind: Tok  # INT, HEX, FLOAT, STRING, IDENT or TIME
-    value: Any  # int, float, str (IDENT and STRING), or int nanoseconds (TIME)
+    value: Any  # int, Decimal (FLOAT), str (IDENT and STRING), or int nanoseconds (TIME)
     pos: int
     end: int
 

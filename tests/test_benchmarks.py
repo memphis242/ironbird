@@ -24,6 +24,7 @@ import pytest
 from conftest import EXAMPLES, free_udp_ports
 from filter_defs import make_frame
 from ironbird import render
+from ironbird.ccdd.loader import load_ccdd
 from ironbird.ccdd.model import MessageKind
 from ironbird.coalesce import Coalescer
 from ironbird.codec import Codec, DecodedPacket
@@ -31,6 +32,7 @@ from ironbird.config import load_config
 from ironbird.errors import Code
 from ironbird.filter import compile_filter
 from ironbird.frame import Decoded, Direction, Frame, FrameFlag, Stream
+from ironbird.header import load_profile
 from ironbird.ledger import Ledger
 from ironbird.notice import Level
 from ironbird.session import Session
@@ -184,6 +186,101 @@ def test_filter_evaluation_rate(benchmark: Any, mock_codec: Codec, case: str) ->
         benchmark.extra_info["frames_per_s"] = round(1 / per_frame)
         print(f"\nfilter {case}: {per_frame * 1e6:.2f} us/frame, {1 / per_frame:,.0f} frames/s")
         assert per_frame < ceiling, f"{per_frame * 1e6:.1f} us"
+
+
+# Cost of one more predicate: a chain of N predicates that are all true, so each one runs.
+FILTER_PREDICATE_CEILING_S = 3e-6  # per predicate at frame, model and check level
+FILTER_FIELD_PREDICATE_CEILING_S = 6e-6  # per decoded-field test, the decode itself excluded
+
+PREDICATE_CASES = {
+    "frame": (16, " and ".join(f"seq >= {i % 2}" for i in range(16))),
+    "model": (8, " and ".join(["msg == MOCK_HK", "category == housekeeping"] * 4)),
+    "check": (8, " and ".join(["status == ok", "status != malformed"] * 4)),
+    "field": (8, " and ".join(["cmd_counter >= 0", "err_counter >= 0"] * 4)),
+}
+
+
+@pytest.mark.parametrize("case", list(PREDICATE_CASES))
+def test_filter_cost_per_predicate(benchmark: Any, mock_codec: Codec, case: str) -> None:
+    """The marginal cost of a predicate, by level: a chain of all-true predicates divided by its
+    length (the single decode a field test needs is taken out by timing a one-predicate chain
+    of the same level)."""
+    count, text = PREDICATE_CASES[case]
+    wire = mock_codec.encode_telemetry("MOCK_HK").data
+    first = make_frame(mock_codec, FILTER_STREAM, wire, live=True)
+    second = make_frame(mock_codec, FILTER_STREAM, wire, live=True, seq=2)
+
+    def bound(expression: str) -> Any:
+        flt = compile_filter(expression, {"fc": mock_codec})
+        return flt.bind(lambda f: _decode_for_filter(mock_codec, f), lambda _node: mock_codec)
+
+    matcher = bound(text)
+
+    def run() -> tuple[bool, bool]:
+        return matcher(first), matcher(second)
+
+    assert benchmark(run) == (True, True)
+    stats = getattr(benchmark, "stats", None)
+    if stats is not None and not getattr(benchmark, "disabled", False):
+        single = bound(text.split(" and ")[0])
+        started = time.perf_counter()
+        for _ in range(20_000):
+            single(first)
+            single(second)
+        base = (time.perf_counter() - started) / 40_000
+        per_predicate = (stats.stats.mean / 2 - base) / max(count - 1, 1)
+        print(f"\nfilter {case}: {per_predicate * 1e6:.2f} us per extra predicate")
+        ceiling = (
+            FILTER_FIELD_PREDICATE_CEILING_S if case == "field" else FILTER_PREDICATE_CEILING_S
+        )
+        assert per_predicate < ceiling, f"{per_predicate * 1e6:.2f} us"
+
+
+COMPILE_MESSAGES = 2048
+COMPILE_ALTERNATIVES = 256
+FILTER_COMPILE_CEILING_S = 0.5  # a 256-way `or` over a 2048-message CCDD (0.03-0.11 s measured)
+
+
+def test_filter_compile_time_does_not_grow_with_the_message_count(tmp_path: Path) -> None:
+    """Fields of one type are judged once however many messages have them, so a wide `or` over a
+    large CCDD compiles in milliseconds (it took seconds when each message was judged alone)."""
+    mids = [m for m in range(0x10000) if m & 0x1800 == 0x0800][:COMPILE_MESSAGES]
+    assert len(mids) == COMPILE_MESSAGES
+    messages = [
+        {
+            "name": f"M{i}",
+            "kind": "telemetry",
+            "mid": hex(mid),
+            "category": "housekeeping",
+            "fields": [
+                {"name": "x", "type": "uint16" if i % 2 else "uint8"},
+                {"name": "mode", "type": "uint8", "enum": {"SAFE": 1, "NOMINAL": 2}},
+            ],
+        }
+        for i, mid in enumerate(mids)
+    ]
+    path = tmp_path / "wide.json"
+    path.write_text(
+        json.dumps({"schema": "ironbird-ccdd/0", "target": "wide", "messages": messages})
+    )
+    codec = Codec(
+        load_ccdd(path),
+        load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_cmd.toml"),
+        load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_tlm.toml"),
+    )
+    texts = {
+        "or": " or ".join(f"x == {i}" for i in range(COMPILE_ALTERNATIVES)),
+        "in": "x in [" + ", ".join(str(i) for i in range(500)) + "]",
+        "and": " and ".join(f"x != {i}" for i in range(COMPILE_ALTERNATIVES)),
+        "labels": " or ".join(["mode == SAFE", "mode in [NOMINAL, SAFE]"] * 60),
+    }
+    for kind, text in texts.items():
+        started = time.perf_counter()
+        flt = compile_filter(text, {"wide": codec})
+        took = time.perf_counter() - started
+        print(f"\ncompile {kind} ({len(text)} chars): {took * 1e3:.1f} ms")
+        assert flt.mids is not None and len(flt.mids) == COMPILE_MESSAGES
+        assert took < FILTER_COMPILE_CEILING_S, f"{kind}: {took:.2f} s"
 
 
 def test_filter_rejects_a_non_candidate_frame_without_decoding(

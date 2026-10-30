@@ -634,30 +634,48 @@ category names, enum labels, node and link names, severities.
 | decode | `msg` (commands), `fc`, `hdr.<field>`, `htime` (header time, 2i), `<MSG>.<field>`, bare `<field>` (any message that has it), `event.app`, `event.id`, `event.type` (DEBUG..CRITICAL, ordered), `event.text` | full decode |
 
 - **Names.** `hdr.` and `event.` are reserved namespaces, as are the frame, model, check and
-  decode names in the table. A CCDD message or field that collides with a reserved name
-  (a message called `event`, a field called `hdr`) is reachable only as `MSG.field` when
-  the message name itself is not reserved; an expression that names a colliding message
-  or uses a bare colliding field fails at compile time (`IB-FLT-002`) naming both
-  meanings. Nothing is picked silently.
+  decode names in the table. Reserved names always win: a bare `mid`, `seq` or `status` is the
+  frame's whatever a CCDD calls its fields, so a CCDD update can never change what a script
+  means. A CCDD field with a reserved name is reached as `MSG.field` (`TLM_A.mid`); a message
+  called like a reserved word has its fields reached by their bare names (`hdr.x` and
+  `event.x` always mean the namespaces). A bare namespace (`hdr == 1`) is `IB-FLT-002`, with
+  the `MSG.field` spelling of a CCDD field of that name in the details.
 - **Semantics.** A predicate on something a frame does not have (a field of another
   message, a decode-level name on a malformed frame) is false; `not` inverts that, so
-  `not X.f == 1` matches other messages. Reserved names win over bare field names; a
-  field named `mid` must be qualified. Precedence: `not` > `and` > `or`.
+  `not X.f == 1` matches other messages. A `GARBAGE` frame (serial bytes skipped while
+  resynchronising) is malformed whatever its bytes would decode to: `status` is `malformed`,
+  it is never decoded and nothing that needs a decode matches it. `in [a, b]` is `== a or
+  == b`: each item is judged against each field on its own, an item a field cannot hold
+  (a label its enum lacks, a number for text) is simply never equal there, and a message
+  is out only when no item fits it. `x != L` is `not (x == L)` for every message that has
+  the field, including those whose field cannot hold `L` (`mode != SCIENCE` is true for a
+  message whose `mode` has no `SCIENCE`); a message without the field is false, as above.
+  A float literal is rounded to the width of the field it is compared with (a float32
+  field holds float32 values, so `ratio == 0.1` is true for a stored 0.1f); a decimal
+  compared with an integer field is exact (`big > 18446744073709551614.5`). Precedence:
+  `not` > `and` > `or`.
 - **Compilation** against the CCDD models in use (recording or config):
   `compile_filter(text, models) -> Filter(source, mids, needs_decode, match)`. `mids` is
   the candidate MID set derived from the tree (`and` intersects, `or` unites, `not` makes
   it unknown), applied to `frame.mid` before anything is decoded; `needs_decode` decides
   whether non-candidates are decoded at all. Names, types and literals are checked at
-  compile time (`IB-FLT-002/003`), so a typo fails before any packet is read.
-- **Limits** (`IB-FLT-004`): 4096 characters, 1024 tokens, depth 32, 1024 `in` items,
-  numeric literals of at most 40 characters (sign included). Depth counts every nested `not`
+  compile time (`IB-FLT-002/003`), so a typo fails before any packet is read. A filter that
+  can never match (an `and` whose operands share no MID) is `IB-FLT-003` too, as is one
+  whose candidates share no MID with the run's `--mid` or with the MIDs of event messages.
+- **Limits** (`IB-FLT-004`): 4096 characters, 1024 tokens outside the brackets of `in` lists,
+  depth 32, 1024 `in` items (counted by the parser, not as tokens, so the limit is the one in
+  force), numeric literals of at most 40 characters (sign included). Depth counts every nested `not`
   and every parenthesis; flat `and`/`or` chains are n-ary nodes evaluated iteratively, so
   they add no depth and cannot recurse deeply. Non-ASCII is allowed only inside strings.
 - **Errors** are one line with the column and a short excerpt; the details carry the
   expression with a caret line and up to three close-match suggestions (`difflib`). The
-  query is clipped to 64 characters and at most 256 candidate names are compared (sorted,
-  then cut), so a hostile CCDD or expression cannot make suggestion matching expensive.
-  `IB-FLT-*` codes exit 2 like other usage errors.
+  query is clipped to 64 characters; every candidate name is checked against the cheap
+  similarity bounds (length, letter counts) and the 256 best by that bound are compared in
+  full, so a hostile CCDD or expression cannot make suggestion matching expensive and a name
+  that sorts late is as findable as one that sorts first. In the echo, characters that are
+  not printable or that reorder text (right-to-left letters, Arabic digits, bidi controls)
+  are shown as `?`, one for one, and the caret is placed by display width (wide characters
+  take two columns, combining marks none). `IB-FLT-*` codes exit 2 like other usage errors.
 - `--mid` stays as sugar for `mid in [...]`; `--where` combines with it by `and`.
 
 ### S5. Notice (fixed in 2a)
@@ -1825,7 +1843,7 @@ As built (where the build differs from, or settles, the text above)
   (recursive descent; only `not` and parentheses recurse, each counted before it does; `and`/`or`
   chains, also across parentheses of the same kind, are flat n-ary nodes), `compiler.py` (names,
   types, closure tree, candidate MIDs), `matcher.py` (`Filter`, `Matcher`, `Cost`), `diag.py`
-  (limits, `FilterError`, suggestions). Public API: `compile_filter(text, codecs, *, links=None) ->
+  (limits, `FilterError`, suggestions). Public API: `compile_filter(text, codecs, *, links=None, aliases=None) ->
   Filter(source, mids, needs_decode, match, cost)`; `Filter.bind(decode, codec_for) -> Matcher`;
   `Matcher.__call__(frame) -> bool`, `Matcher.decoded(frame)` (the decode the filter made, or
   one on demand: made at most once per frame, so a consumer never decodes a matching frame
@@ -1835,7 +1853,9 @@ As built (where the build differs from, or settles, the text above)
   `Session.matcher(flt, decoder)` wrap it for live use.
 - Deviation: `compile_filter` takes the nodes' **codecs** (node name to `Codec`), not bare CCDD
   models, because `hdr.<field>` names live in the header profiles. `links` (the config's link
-  names) validates `link == ...`; `None` accepts any name.
+  names) validates `link == ...`; `None` accepts any name. `aliases` (alias to node name) lets
+  `node == flight` mean `node == fc`; an alias of a node not in use is unknown and a node name
+  wins over an alias spelled the same. `Session.compile_filter` passes the config's aliases.
 - Grammar as in S4, plus: strings are `"..."` or `'...'` (escapes `\\ \" \'` only; every
   character printable); keywords (`and or not in contains`) are lower case and cannot be bare
   literals (quote them); a bare word and a quoted string are interchangeable wherever a name is
@@ -1848,19 +1868,42 @@ As built (where the build differs from, or settles, the text above)
   of a command frame costs a header check (`Codec.resolve`, or the ingest token), not a full
   decode, so `msg` is MODEL level; `status` is `unknown` when the check says `IB-DEC-006`,
   `malformed` for every other failure (truncated and garbage frames included), else `ok`;
+  a `GARBAGE` frame is malformed by definition (`frame.garbage_error`, `IB-DEC-004`) in
+  `Matcher.resolved`/`decoded` and in `FrameDecoder.decode`: it is never handed to the decoder
+  and `hdr.*` and field names are not evaluated on it;
   `fc` is the decoded command's function code; `event.type` takes severity names
-  (`debug info information warn warning error critical`, case-insensitive) and an unmapped type
-  value is false; `htime` is reserved and refused (`IB-FLT-002`) until 2i.
-- Field predicates (`MSG.f`, bare `f`): a message is a candidate when it has the field; a literal the
-  field cannot take (wrong kind, a label its enum lacks, bytes of the wrong size, an operator its
-  type lacks) leaves that message out, never matching it even for `!=`; the filter is
-  `IB-FLT-003` only when no message qualifies, or when the integer is outside every
-  qualifying field's range for `==`, `!=` or `in` (`counter == 300` on a uint8 is an error;
-  next to a uint16 `counter` it selects that one, and `counter != 300` on the uint8 is plainly
-  true). Ordering allows a decimal on an integer field (`x > 1.5`), equality does not.
-- Collisions: a bare name that is reserved and is also a CCDD field name, `hdr.x` or `event.x` when a
-  message called `hdr`/`event` exists, and `MSG.x` for a message named like a reserved word fail with
-  `IB-FLT-002` naming both meanings; a field named `hdr` next to `hdr.length` is not ambiguous.
+  (`debug info information warn warning error critical`, case-insensitive). An event whose type
+  value maps to no severity is unranked: `>=` and `>` let it through (`ccdd.model.meets_floor`,
+  the rule `--min-type` uses, so `event.type >= error` and `--min-type error` show the same
+  events), `!=` is true as `not ==` is, and every other operator is false; `htime` is reserved
+  and refused (`IB-FLT-002`) until 2i.
+- Field predicates (`MSG.f`, bare `f`): a message is a candidate when it has the field. `in` is an
+  `or` of `==`: every item is converted for every field on its own and the items a field cannot
+  take (a label its enum lacks, wrong kind, bytes of the wrong size) are dropped for that
+  message; a message is left out only when no item fits it. A single literal a field cannot take
+  leaves the message out for `==`, the orderings and `contains`, and makes `!=` true for it
+  (`x != L` is `not (x == L)` wherever the field exists; the message without the field stays
+  false). An operator the type lacks leaves the message out. The filter is `IB-FLT-003` when no
+  message takes the operator, when an item (or the single literal) fits no message at all (a
+  typo), or when the integer is outside every qualifying field's range for `==`, `!=` or `in`
+  (`counter == 300` on a uint8 is an error; next to a uint16 `counter` it selects that one, and
+  `counter != 300` on the uint8 is plainly true). Ordering allows a decimal on an integer field
+  (`x > 1.5`), equality does not. Decimals are lexed to `Decimal` and turned into the integer
+  bound that orders every integer the same way (`x > 1.5` is `x > 1`, `x >= 1.5` is `x >= 2`), so
+  no precision is lost at 2**64; a float field gets the literal as float, rounded to float32 for
+  a `float32` field (through float64: a literal within 2**-53 relative of a float32 rounding
+  boundary can land on the other side) and to the infinity it overflows to.
+- Work is grouped, not repeated: the messages that have a field of a name are grouped by wire
+  type and enum once, a predicate is judged once per group, and identical predicates are
+  compiled once. A 2048-message CCDD with a 256-way `or` compiles in about 30 ms (3 s before).
+- Reserved names win (S4): a bare reserved name is the frame's, `hdr.x` and `event.x` are the
+  namespaces even if a message has that name, and a CCDD field with a reserved name is
+  `MSG.field`. `MSG.x` for a message named like a reserved word is `IB-FLT-002`; a bare namespace
+  (`hdr == 1`) is `IB-FLT-002` with the CCDD spelling in the details. There is no collision error,
+  so a CCDD update cannot break a script.
+- A filter that can never match is refused (`IB-FLT-003`): an `and` whose operands' candidate MIDs
+  do not overlap (also inside a `not`), `Session.listen` when the filter's candidates share no MID
+  with `--mid`, `Session.events` when they share none with the nodes' event MIDs.
 - Evaluation: `and`/`or` children are sorted by cost (frame, model, check, decode; stable), the
   root rejects a frame whose MID is outside the candidate set before anything runs, and every
   decode-level predicate checks its own messages' MIDs (per node) before it asks for a decode, so
@@ -1873,19 +1916,26 @@ As built (where the build differs from, or settles, the text above)
   `--min-type`, so a hidden event is still ledgered in full. `listen` yields decoded packets only
   (as before): frames a `status` filter selects that do not decode are counted in the
   `listen.stop` ledger record (`where_undecodable`), not shown; replay/export (2g, 2h) show them.
-  `listen.start` and `events.start` record the expression (`where`, `where_mids`).
+  `listen.start` and `events.start` record the expression (`where`) only when there is one;
+  `listen.start` adds the candidate count (`where_mid_count`) and the first 32 MIDs (`where_mids`),
+  and `listen.stop` adds `where_undecodable` only for a filtered listener.
 - `IB-FLT-*` is usage (exit 2). One-line message with column and (for names and literals) the best
   suggestion; `--verbose` and the ledger get the expression window, a caret line and up to three
-  close names. Non-printable characters in the shown expression are `?`, one for one.
+  close names. Non-printable and right-to-left or bidi characters in the shown expression are `?`,
+  one for one, and the caret sits at the display width of what precedes it.
   `RecursionError` cannot occur at the limits and is reported as `IB-FLT-004` if a caller is
-  already deep in the stack.
+  already deep in the stack. The `in` list limit (1024 items) is checked by the parser; the lexer
+  does not count the tokens inside the brackets of a list against the 1024-token limit.
 - Tests: `tests/test_filter.py` (lexer, parser, limits, names, types, mids, semantics, cost
   ordering, errors, corpus), `tests/test_filter_fuzz.py` (Hypothesis: arbitrary text, token soup and
   deep nesting raise only `FilterError` within a time bound; compiled filters equal a naive reference
   evaluator, `tests/filter_defs.py`, on random expressions and random valid, mutated, truncated,
   garbage and live-token frames over two nodes with clashing MIDs and names; the candidate set never
-  excludes a match; no frame outside it is decoded), `tests/test_filter_live.py` (loopback sessions
-  and CLI processes on ports 53000-53999), corpus `tests/corpus/malformed/flt-*.txt`,
+  excludes a match; no frame outside it is decoded), `tests/test_filter_diff.py` (seeded random
+  expressions and frames against a second, independently written reference,
+  `tests/filter_ref_independent.py`, written from the documented semantics alone), `tests/test_filter_live.py`
+  (loopback sessions and CLI processes on ports 53000-53999), corpus `tests/corpus/malformed/flt-*.txt`
+  and `frame-garbage-flagged-valid-looking-tlm.bin` (a valid packet flagged garbage),
   `tools/fuzz/fuzz_filter.py` (atheris), two `cfs` acceptance cases.
 - Benchmarks (`tests/test_benchmarks.py`, 4-core dev host): per frame, frame-level
   `seq > 0 and node == fc and dir == rx and len >= 16` 1.4-1.6 us (about 650k frames/s); model-level
@@ -1893,7 +1943,10 @@ As built (where the build differs from, or settles, the text above)
   (`msg == MOCK_HK and cmd_counter >= 0 and mode in [...]`) 7-11 us including the one decode (90-140k/s);
   a frame outside the candidate MIDs about 0.3 us. Whole listen path with a decode-level filter 22-25 us
   against 17-21 us for the bare decode and render (guard 1.8x; 1.5x without a filter). End to end
-  `ib listen --where ...` at 10k pkt/s: 30000 of 30000 lines, no `IB-OUT-*`.
+  `ib listen --where ...` at 10k pkt/s: 30000 of 30000 lines, no `IB-OUT-*`. Marginal cost of one
+  more predicate in a chain of true ones: 0.13 us (frame), 0.3 us (model), 0.25 us (check), 0.17 us
+  (decoded field) - guarded at 3 us and 6 us per predicate. Compile time of a 256-way `or`, a
+  500-item `in` and a 256-way `and` over a 2048-message CCDD: 30-110 ms, guarded at 0.5 s.
 
 ### 2g - Replay
 
@@ -2185,8 +2238,8 @@ Verification
 | `IB-REC-009` | `REC_DEFS` | embedded definitions differ from config, or cannot be loaded | 2g |
 | `IB-REC-010` | `REC_SPACE` | low disk space for the recording | 2e |
 | `IB-FLT-001` | `FLT_SYNTAX` | filter syntax error (column, excerpt) | 2f |
-| `IB-FLT-002` | `FLT_NAME` | unknown name in a filter | 2f |
-| `IB-FLT-003` | `FLT_TYPE` | literal does not fit the name's type | 2f |
+| `IB-FLT-002` | `FLT_NAME` | unknown name in a filter, or a reserved name misused | 2f |
+| `IB-FLT-003` | `FLT_TYPE` | literal does not fit the name's type, or the filter can never match | 2f |
 | `IB-FLT-004` | `FLT_LIMIT` | filter too long, deep or wide | 2f |
 | `IB-EXP-001` | `EXP_WRITE` | cannot write export output | 2h |
 | `IB-EXP-002` | `EXP_EXISTS` | export output exists (pass `--force`), is the input, or is a file retention manages (`--force` does not apply to these two) | 2h |

@@ -139,12 +139,20 @@ node and severity names; quote one that is a keyword) and ISO 8601 times with `Z
 | `fc hdr.<field> event.app event.id event.type event.text` | decoded (`event.type` orders DEBUG < ... < CRITICAL) |
 | `<MSG>.<field>`, bare `<field>` | a CCDD field (a bare field means any message that has it) |
 
-A predicate on something the frame does not have is false (`not` inverts it). A CCDD message or
-field named like a reserved word is never picked silently: use `MSG.field`, or the expression
-fails naming both meanings. Limits: 4096 characters, 1024 tokens, 32 levels of `not` and
-parentheses, 1024 `in` items, numbers of at most 40 characters. A frame whose MID cannot match is
-never decoded for the filter. Malformed frames are reported at ingest as before and `listen`
-shows decoded packets only, so `--where 'status == malformed'` selects them for replay and
+A predicate on something the frame does not have is false (`not` inverts it). Reserved names always
+win: a bare `mid` or `seq` is the frame's whatever a CCDD calls its fields, so a CCDD update never
+changes what a script means; write `MSG.field` (`TLM_A.mid`) for a CCDD field with such a name.
+`in [a, b]` is `== a or == b`, item by item per message (a label one message's enum lacks is simply
+never equal there), and `x != L` is `not x == L` for every message that has `x`. A float literal is
+rounded to the field's width (`ratio == 0.1` matches a stored float32 0.1) and a decimal compared
+with an integer is exact. `node ==` accepts a node's alias. `event.type >= error` shows what
+`--min-type error` shows, including events whose type has no severity. A filter that can never
+match (`msg == A and msg == B`, or MIDs outside `--mid`) is refused with `IB-FLT-003`. Limits: 4096
+characters, 1024 tokens outside `in` lists, 32 levels of `not` and parentheses, 1024 `in` items,
+numbers of at most 40 characters. A frame whose MID cannot match is never decoded for the filter,
+and neither is a serial garbage frame (it is malformed whatever its bytes say). Malformed frames
+are reported at ingest as before and `listen` shows decoded packets only, so
+`--where 'status == malformed'` selects them for replay and
 export, not for `listen`.
 
 ## Configuration

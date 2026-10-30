@@ -16,9 +16,12 @@ Two optimisations never change a verdict:
 
 from __future__ import annotations
 
+import math
 import operator
+import struct
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from functools import partial
 from typing import Any, Final, NamedTuple
 
@@ -124,11 +127,14 @@ def _found(lit: Literal) -> str:
 
 def _int_literal(lit: Literal, op: str) -> Any:
     """An integer; a decimal number too, but only for ordering (``x > 1.5``): an integer is never
-    equal to one."""
+    equal to one. A decimal is replaced by the integer bound that orders every integer the same
+    way (``x > 1.5`` is ``x > 1``, ``x >= 1.5`` is ``x >= 2``), computed exactly from the digits
+    as written, so no precision is lost however large the integer."""
     if lit.kind in (Tok.INT, Tok.HEX):
         return lit.value
     if lit.kind is Tok.FLOAT and op in ORDERING_OPS:
-        return lit.value
+        exact: Decimal = lit.value
+        return math.floor(exact) if op in (">", "<=") else math.ceil(exact)
     raise _Reject(f"expected an integer, found {_found(lit)}")
 
 
@@ -141,10 +147,24 @@ def _out_of_range(op: str, values: Sequence[Any], lo: int, hi: int) -> str | Non
     return f"{shown} is outside {lo}..{hi}"
 
 
-def _float_literal(lit: Literal) -> float:
-    if lit.kind in (Tok.INT, Tok.HEX, Tok.FLOAT):
-        return float(lit.value)
-    raise _Reject(f"expected a number, found {_found(lit)}")
+_FLOAT32: Final = struct.Struct("<f")
+
+
+def _float_literal(lit: Literal, width: int = 8) -> float:
+    """A number as a float of the field's ``width`` in bytes: a float32 field holds values of
+    that precision, so the literal is rounded to it before it is compared (``ratio == 0.1`` is
+    true for a stored 0.1f). A literal beyond the float32 range becomes the infinity it rounds
+    to. Rounding goes through float64, so a literal within 2**-53 (relative) of a float32
+    rounding boundary can land on the other side of it."""
+    if lit.kind not in (Tok.INT, Tok.HEX, Tok.FLOAT):
+        raise _Reject(f"expected a number, found {_found(lit)}")
+    value = float(lit.value)
+    if width == _FLOAT32.size:
+        try:
+            return float(_FLOAT32.unpack(_FLOAT32.pack(value))[0])
+        except OverflowError:
+            return math.copysign(math.inf, value)
+    return value
 
 
 def _text_literal(lit: Literal) -> str:
@@ -328,7 +348,89 @@ def _decode_fn(table: _Table) -> MatchFn:
     return fn
 
 
+@dataclass(frozen=True, slots=True)
+class _Group:
+    """The messages whose field of one name has the same wire type and enum, so that every
+    predicate means the same to all of them. ``by_node`` maps a node to the MIDs of its members
+    and to the slot of the field by message name."""
+
+    sample: _Located
+    mids: frozenset[int]
+    by_node: Mapping[str, tuple[frozenset[int], Mapping[str, int]]]
+
+    @classmethod
+    def of(cls, members: Sequence[_Located]) -> _Group:
+        mids: dict[str, set[int]] = {}
+        slots: dict[str, dict[str, int]] = {}
+        for loc in members:
+            mids.setdefault(loc.node, set()).add(loc.message.mid)
+            slots.setdefault(loc.node, {})[loc.message.name] = loc.index
+        by_node = {node: (frozenset(found), slots[node]) for node, found in mids.items()}
+        return cls(members[0], frozenset().union(*mids.values()), by_node)
+
+
+def _union(sets: Iterable[frozenset[int]]) -> frozenset[int]:
+    found = list(sets)
+    return found[0] if len(found) == 1 else frozenset().union(*found)
+
+
+def _group_fn(chosen: Sequence[tuple[_Group, Test]]) -> MatchFn:
+    """Decode-level predicate over groups of messages, each with its own test. A frame is
+    decoded only if its MID belongs to one of the groups, and a message belongs to one."""
+
+    def one(group: _Group, test: Test) -> MatchFn:
+        by_node = group.by_node
+
+        def fn(frame: Frame, probe: Matcher) -> bool:
+            row = by_node.get(frame.stream.node)
+            if row is None or frame.mid not in row[0]:
+                return False
+            decoded = probe.decoded(frame)
+            if isinstance(decoded, DecodeError):
+                return False
+            packet = decoded.packet
+            slot = row[1].get(packet.message.name)
+            return slot is not None and test(packet.values[slot])
+
+        return fn
+
+    fns = [one(group, test) for group, test in chosen]
+    return fns[0] if len(fns) == 1 else _any_of(fns)
+
+
 # -- the compiler ------------------------------------------------------------------------
+
+
+def _always(value: Any) -> bool:
+    return True
+
+
+class _Plan(NamedTuple):
+    """One predicate against one field type: its test (``None``: the field never matches), why
+    the test can never be true (a range), and per literal why the field cannot hold it (``None``:
+    it can). ``op_reject`` is set when the operator is not defined for the type."""
+
+    test: Test | None
+    problem: str | None
+    rejects: tuple[_Reject | None, ...]
+    op_reject: _Reject | None
+
+
+def _enum_key(enum: Mapping[str, int] | None) -> Any:
+    """What makes two fields' enums interchangeable for one predicate: equal labels, which is
+    checked for the small enums that are common; a large one is only the same as itself."""
+    if enum is None:
+        return None
+    if len(enum) <= _ENUM_KEY_ITEMS:
+        return frozenset(enum.items())
+    return id(enum)
+
+
+_ENUM_KEY_ITEMS: Final = 32
+_UNRANKED_PASSES: Final = frozenset({">=", ">", "!="})
+_SHADOW_NOTE: Final = (
+    "{0} is the reserved namespace; the fields of a message called {0!r} are bare field names"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,9 +446,19 @@ class _Located:
 class _Env:
     """What names mean for this run: the codecs of the nodes in use, indexed on first use."""
 
-    def __init__(self, codecs: Mapping[str, Codec], links: Iterable[str] | None) -> None:
+    def __init__(
+        self,
+        codecs: Mapping[str, Codec],
+        links: Iterable[str] | None,
+        aliases: Mapping[str, str] | None,
+    ) -> None:
         self.codecs: dict[str, Codec] = dict(codecs)
         self.links: frozenset[str] | None = frozenset(links) if links is not None else None
+        # What `node ==` accepts: a node's name, or the alias of a node in use (a name wins).
+        self.node_names: dict[str, str] = {name: name for name in self.codecs}
+        for alias, name in (aliases or {}).items():
+            if name in self.codecs:
+                self.node_names.setdefault(alias, name)
         self.messages: list[tuple[str, Message]] = [
             (node, message)
             for node, codec in self.codecs.items()
@@ -392,9 +504,17 @@ class _Env:
 
 
 class _Compiler:
-    def __init__(self, text: str, codecs: Mapping[str, Codec], links: Iterable[str] | None) -> None:
+    def __init__(
+        self,
+        text: str,
+        codecs: Mapping[str, Codec],
+        links: Iterable[str] | None,
+        aliases: Mapping[str, str] | None,
+    ) -> None:
         self.text = text
-        self.env = _Env(codecs, links)
+        self.env = _Env(codecs, links, aliases)
+        self._group_memo: dict[str, list[_Group]] = {}
+        self._fields_memo: dict[tuple[Any, ...], _Node] = {}
         self._scalars: Mapping[str, Callable[[Predicate], _Node]] = {
             "seq": self._seq,
             "time": self._time,
@@ -430,6 +550,14 @@ class _Compiler:
                 for part in parts:
                     if part.mids is not None:
                         mids = part.mids if mids is None else mids & part.mids
+                if mids is not None and not mids:
+                    raise FilterError(
+                        Code.FLT_TYPE,
+                        self.text,
+                        tree.pos,
+                        "these conditions can never match together: no message ID satisfies "
+                        "all of them",
+                    )
                 return _Node(parts[-1].cost, mids, _all_of([p.fn for p in parts]))
             case Or(children=children):
                 parts = sorted((self.compile(c) for c in children), key=lambda n: n.cost)
@@ -444,19 +572,10 @@ class _Compiler:
     # -- errors ----------------------------------------------------------------------
 
     def _name_error(
-        self, pos: int, message: str, pool: Iterable[str], query: str = ""
+        self, pos: int, message: str, pool: Iterable[str], query: str = "", notes: str = ""
     ) -> FilterError:
         found = suggest(query, pool) if query else ()
-        return FilterError(Code.FLT_NAME, self.text, pos, message, suggestions=found)
-
-    def _collision(self, pos: int, name: str, reserved: str, other: str, fix: str) -> FilterError:
-        return FilterError(
-            Code.FLT_NAME,
-            self.text,
-            pos,
-            f"{name!r} is ambiguous: it is {reserved} and also {other}",
-            notes=f"{fix}\nnothing is picked silently; no CCDD name can hide a reserved name",
-        )
+        return FilterError(Code.FLT_NAME, self.text, pos, message, suggestions=found, notes=notes)
 
     def _wrong_op(self, p: Predicate, name: str, allowed: Iterable[str]) -> FilterError:
         return FilterError(
@@ -507,18 +626,18 @@ class _Compiler:
     def _bare(self, p: Predicate, name: str) -> _Node:
         located = self.env.fields_named(name)
         if name in RESERVED_NAMES:
-            if located:
-                shown = ", ".join(sorted({loc.message.name for loc in located})[:3])
-                raise self._collision(
-                    p.pos,
-                    name,
-                    (SCALAR_NAMES.get(name) or NAMESPACES[name]),
-                    f"a field of {shown}",
-                    f"write MSG.{name} for the field (MSG is one of {shown})",
-                )
+            # A reserved name is the frame's, whatever the CCDD calls its fields, so a CCDD
+            # update can never change what a script means; the field is `MSG.name`.
             if name in NAMESPACES:
-                raise self._name_error(
-                    p.pos, f"{name!r} is a namespace: write {name}.<name>", (), ""
+                spelled = ", ".join(
+                    f"{m}.{name}" for m in sorted({x.message.name for x in located})[:3]
+                )
+                raise FilterError(
+                    Code.FLT_NAME,
+                    self.text,
+                    p.pos,
+                    f"{name!r} is a namespace: write {name}.<name>",
+                    notes=f"the CCDD field {name} is written {spelled}" if located else "",
                 )
             return self._scalars[name](p)
         if not located:
@@ -527,17 +646,14 @@ class _Compiler:
         return self._fields(p, name, located)
 
     def _qualified(self, p: Predicate, message_name: str, field_name: str) -> _Node:
-        messages = self.env.named(message_name)
         if message_name in RESERVED_NAMES:
-            if messages:
-                raise self._collision(
-                    p.pos,
-                    message_name,
-                    (SCALAR_NAMES.get(message_name) or NAMESPACES[message_name]),
-                    "the name of a message",
-                    f"a message called {message_name!r} is reachable by its bare field names only",
-                )
-            raise self._name_error(p.pos, f"{message_name!r} has no fields to select", (), "")
+            raise self._name_error(
+                p.pos,
+                f"{message_name!r} is a reserved name and has no fields to select",
+                (),
+                "",
+            )
+        messages = self.env.named(message_name)
         if not messages:
             pool = [*self.env.message_names(), *NAMESPACES]
             raise self._name_error(
@@ -562,45 +678,87 @@ class _Compiler:
     def _fields(self, p: Predicate, name: str, located: Sequence[_Located]) -> _Node:
         """A message field: every message that has it and can compare it with the literal(s).
 
-        A message whose field cannot take the literal (wrong kind, a label its enum lacks, bytes
-        of the wrong size) is left out; one that can, but whose range excludes it (``x == 300``
-        on a uint8), is kept, where the comparison is simply never true. The filter is an error
-        when no message qualifies, or none can ever match.
+        ``in`` is an ``or`` of ``==``, each item judged against each field on its own: a message
+        takes the items its field can hold and is left out when it can hold none. For the other
+        operators a literal the field cannot hold (wrong kind, a label its enum lacks, bytes of
+        the wrong size) leaves the message out, except for ``!=``, which is ``not ==`` and so is
+        true there. A literal outside the range of a field is kept: the comparison is simply
+        never true (``x == 300`` on a uint8), or always (``x != 300``).
+
+        The filter is an error when the operator fits no field, when an item no message can hold
+        (a typo), or when every message that holds the literal cannot reach it by range.
+
+        Fields of one type and enum mean the same thing to a predicate, so the work is done once
+        per such group, however many messages a CCDD has.
         """
-        rows: list[tuple[str, Message, _Entry]] = []
-        first_reject: tuple[_Located, _Reject, Literal | None] | None = None
-        first_range: tuple[_Located, str] | None = None
+        key = (name, p.op, tuple((lit.kind, lit.value) for lit in p.values))
+        cached = self._fields_memo.get(key)
+        if cached is not None:
+            return cached
+        groups = self._groups(name, located)
+        chosen: list[tuple[_Group, Test]] = []
+        first_op: tuple[_Group, _Reject] | None = None
+        taken = [False] * len(p.values)
+        first_reject: dict[int, tuple[_Group, _Reject]] = {}
+        first_range: tuple[_Group, str] | None = None
         reachable = False
-        for loc in located:
-            try:
-                test, problem = self._field_test(p, loc)
-            except _FieldReject as bad:
-                if first_reject is None:
-                    first_reject = (loc, bad.reject, bad.literal)
+        for group in groups:
+            plan = self._plan(p, group.sample.field)
+            if plan.op_reject is not None:
+                first_op = first_op or (group, plan.op_reject)
                 continue
-            rows.append((loc.node, loc.message, _Entry(loc.index, test)))
-            if problem is None:
+            for i, reject in enumerate(plan.rejects):
+                if reject is None:
+                    taken[i] = True
+                elif i not in first_reject:
+                    first_reject[i] = (group, reject)
+            if plan.test is None:
+                continue
+            chosen.append((group, plan.test))
+            if plan.problem is None:
                 reachable = True
             elif first_range is None:
-                first_range = (loc, problem)
-        if not rows:
-            assert first_reject is not None
-            loc, reject, literal = first_reject
-            where = f"{name} (a {loc.field.type.text} in {loc.message.name})"
-            if literal is None:
-                raise FilterError(Code.FLT_TYPE, self.text, p.op_pos, f"{where}: {reject.reason}")
-            raise self._literal_error(literal, reject, where)
+                first_range = (group, plan.problem)
+        if not chosen and not first_reject and first_op is not None:  # no field takes the operator
+            group, reject = first_op
+            where = self._where(name, group)
+            raise FilterError(Code.FLT_TYPE, self.text, p.op_pos, f"{where}: {reject.reason}")
+        for i, was_taken in enumerate(taken):
+            if not was_taken and i in first_reject:
+                group, reject = first_reject[i]
+                raise self._literal_error(p.values[i], reject, self._where(name, group))
         if not reachable:
             assert first_range is not None
-            loc, problem = first_range
-            where = f"{name} (a {loc.field.type.text} in {loc.message.name})"
-            raise FilterError(Code.FLT_TYPE, self.text, p.values[0].pos, f"{where}: {problem}")
-        mids = frozenset(message.mid for _, message, _ in rows)
-        return _Node(Cost.DECODE, mids, _decode_fn(_freeze(rows)))
+            group, problem = first_range
+            raise FilterError(
+                Code.FLT_TYPE,
+                self.text,
+                p.values[0].pos,
+                f"{self._where(name, group)}: {problem}",
+            )
+        node = _Node(Cost.DECODE, _union(g.mids for g, _ in chosen), _group_fn(chosen))
+        self._fields_memo[key] = node
+        return node
 
-    def _field_test(self, p: Predicate, loc: _Located) -> tuple[Test, str | None]:
-        """The test of one message's field, and why it can never be true (``None``: it can)."""
-        fld = loc.field
+    @staticmethod
+    def _where(name: str, group: _Group) -> str:
+        sample = group.sample
+        return f"{name} (a {sample.field.type.text} in {sample.message.name})"
+
+    def _groups(self, name: str, located: Sequence[_Located]) -> list[_Group]:
+        """``located`` grouped by field type and enum, built once per field name."""
+        cached = self._group_memo.get(name)
+        if cached is not None:
+            return cached
+        members: dict[tuple[Any, ...], list[_Located]] = {}
+        for loc in located:
+            members.setdefault((loc.field.type, _enum_key(loc.field.enum)), []).append(loc)
+        groups = [_Group.of(locs) for locs in members.values()]
+        self._group_memo[name] = groups
+        return groups
+
+    def _plan(self, p: Predicate, fld: FieldDef) -> _Plan:
+        """What the predicate means for any field of the type and enum of ``fld``."""
         op = p.op
         klass = fld.type.type_class
         allowed = {
@@ -610,20 +768,25 @@ class _Compiler:
             TypeClass.BYTES: _WORD_OPS,
         }[klass]
         if op not in allowed:
-            raise _FieldReject(
-                _Reject(f"{op!r} is not defined here; it takes {', '.join(sorted(allowed))}"), None
-            )
+            reason = f"{op!r} is not defined here; it takes {', '.join(sorted(allowed))}"
+            return _Plan(None, None, (), _Reject(reason))
         values: list[Any] = []
+        rejects: list[_Reject | None] = []
         for lit in p.values:
             try:
                 values.append(self._field_literal(fld, op, lit))
+                rejects.append(None)
             except _Reject as reject:
-                raise _FieldReject(reject, lit) from None
+                rejects.append(reject)
         problem = None
-        if klass is TypeClass.INT:
+        if klass is TypeClass.INT and values:
             lo, hi = fld.type.bit_range
             problem = _out_of_range(op, values, lo, hi)
-        return _make_test(op, values), problem
+        if values:
+            return _Plan(_make_test(op, values), problem, tuple(rejects), None)
+        if op == "!=":  # not ==: the field cannot hold the value, so it is never equal to it
+            return _Plan(_always, None, tuple(rejects), None)
+        return _Plan(None, None, tuple(rejects), None)
 
     @staticmethod
     def _field_literal(fld: FieldDef, op: str, lit: Literal) -> Any:
@@ -637,7 +800,7 @@ class _Compiler:
                     raise _Reject(f"{fld.name} has no enum; expected an integer")
                 return _int_literal(lit, op)
             case TypeClass.FLOAT:
-                return _float_literal(lit)
+                return _float_literal(lit, fld.type.size)
             case TypeClass.CHAR:
                 return _text_literal(lit)
             case TypeClass.BYTES:
@@ -697,7 +860,7 @@ class _Compiler:
             raise FilterError(Code.FLT_TYPE, self.text, p.values[0].pos, f"{what}: {problem}")
 
     def _node(self, p: Predicate) -> _Node:
-        table = {name: name for name in self.env.codecs}
+        table = self.env.node_names
         return self._scalar(
             p,
             "node",
@@ -893,14 +1056,6 @@ class _Compiler:
         )
 
     def _header(self, p: Predicate, field_name: str) -> _Node:
-        if self.env.named("hdr"):
-            raise self._collision(
-                p.pos,
-                "hdr",
-                NAMESPACES["hdr"],
-                "the name of a message",
-                "a message called 'hdr' is reachable by its bare field names only",
-            )
         widest = self.env.header_fields()
         if field_name not in widest:
             raise self._name_error(
@@ -908,6 +1063,7 @@ class _Compiler:
                 f"no header field {field_name[:64]!r} in the header profiles in use",
                 widest,
                 field_name,
+                notes=_SHADOW_NOTE.format("hdr") if self.env.named("hdr") else "",
             )
         limit = widest[field_name]
         values = self._convert(p, f"hdr.{field_name}", _NUMBER_OPS, _int_literal)
@@ -924,16 +1080,14 @@ class _Compiler:
         return _Node(Cost.DECODE, None, fn)
 
     def _event(self, p: Predicate, part: str) -> _Node:
-        if self.env.named("event"):
-            raise self._collision(
-                p.pos,
-                "event",
-                NAMESPACES["event"],
-                "the name of a message",
-                "a message called 'event' is reachable by its bare field names only",
-            )
         if part not in EVENT_PARTS:
-            raise self._name_error(p.name_pos[1], f"no event part {part[:64]!r}", EVENT_PARTS, part)
+            raise self._name_error(
+                p.name_pos[1],
+                f"no event part {part[:64]!r}",
+                EVENT_PARTS,
+                part,
+                notes=_SHADOW_NOTE.format("event") if self.env.named("event") else "",
+            )
         what = f"event.{part}"
         severities = {name.lower(): sev for name, sev in SEVERITY_LABELS.items()}
         match part:
@@ -958,7 +1112,8 @@ class _Compiler:
                 continue
             index = next(i for i, f in enumerate(message.fields) if f.name == field_name)
             if part == "type":
-                rows.append((node, message, _Entry(index, _severity_test(spec.severities, test))))
+                ranked = _severity_test(spec.severities, test, p.op)
+                rows.append((node, message, _Entry(index, ranked)))
             else:
                 rows.append((node, message, _Entry(index, test)))
         if not rows:
@@ -971,33 +1126,37 @@ class _Compiler:
         return _Node(Cost.DECODE, frozenset(m.mid for _, m, _ in rows), _decode_fn(_freeze(rows)))
 
 
-def _severity_test(severities: Mapping[int, EventSeverity], test: Test) -> Test:
+def _severity_test(severities: Mapping[int, EventSeverity], test: Test, op: str) -> Test:
+    """The test of an event's type value through its severity. A value that maps to no severity
+    has no rank: a lower bound (``>=``, ``>``) lets it through, as ``--min-type`` does, and ``!=``
+    is true as ``not ==`` is; every other operator is false."""
+    unranked = op in _UNRANKED_PASSES
+
     def check(value: int) -> bool:
         severity = severities.get(value)
-        return severity is not None and test(severity)
+        return unranked if severity is None else test(severity)
 
     return check
 
 
-class _FieldReject(Exception):
-    def __init__(self, reject: _Reject, literal: Literal | None) -> None:
-        super().__init__(reject.reason)
-        self.reject = reject
-        self.literal = literal
-
-
 def compile_filter(
-    text: str, codecs: Mapping[str, Codec], *, links: Iterable[str] | None = None
+    text: str,
+    codecs: Mapping[str, Codec],
+    *,
+    links: Iterable[str] | None = None,
+    aliases: Mapping[str, str] | None = None,
 ) -> Filter:
     """Compile ``text`` against the codecs of the nodes a run uses (node name to codec).
 
-    ``links`` are the link names ``link == ...`` may name (``None``: any). The returned
-    :class:`Filter` is valid for frames decoded with these same codecs. Raises
+    ``links`` are the link names ``link == ...`` may name (``None``: any); ``aliases`` maps a
+    node alias to its node name, so ``node == flight`` works as ``node == fc`` (an alias of a
+    node not in ``codecs`` is unknown, and a node name wins over an alias spelled the same).
+    The returned :class:`Filter` is valid for frames decoded with these same codecs. Raises
     :class:`FilterError` (``IB-FLT-001..004``) and nothing else.
     """
     tree = parse(text)
     try:
-        root = _Compiler(text, codecs, links).compile(tree)
+        root = _Compiler(text, codecs, links, aliases).compile(tree)
     except RecursionError:
         raise FilterError(
             Code.FLT_LIMIT, text, 0, f"nesting deeper than {MAX_DEPTH} levels"

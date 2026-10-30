@@ -168,14 +168,16 @@ def test_listen_where_combines_with_mid_by_and(config_path: Path, tmp_path: Path
         responder = await fc.respond()
         server = serve(responder)
         both = await ground.listen("fc", mids=frozenset({0x0890}), where="cmd_counter == 1")
-        wrong_mid = await ground.listen("fc", mids=frozenset({0x0891}), where="cmd_counter == 1")
         try:
             await ground.send_command("fc", "MOCK_NOOP")
             assert (await next_of(both)).packet.as_dict()["cmd_counter"] == 1
-            await nothing_more(wrong_mid)
+            # No MID can satisfy both: refused up front, with nothing opened for it.
+            with pytest.raises(FilterError) as info:
+                await ground.listen("fc", mids=frozenset({0x0891}), where="cmd_counter == 1")
+            assert info.value.code is Code.FLT_TYPE and "--mid" in info.value.summary
+            assert "can never match" in info.value.summary
         finally:
             await both.close()
-            await wrong_mid.close()
             server.cancel()
             await responder.close()
 
@@ -247,9 +249,84 @@ def test_events_where_matches_min_type_and_the_ledger_keeps_everything(
     seen = [r["event_id"] for r in records_of(ledger) if r["event"] == "rx.event"]
     assert sorted(set(seen)) == [7, 8, 9, 10]  # hidden events are ledgered in full
     starts = [r for r in records_of(ledger) if r["event"] == "events.start"]
-    assert sorted(str(r["where"]) for r in starts) == sorted(
+    assert sorted(str(r.get("where")) for r in starts) == sorted(
         ["None", "event.type >= error", 'event.app == "BETA" and event.id in [8, 9]']
     )
+    assert "where" not in next(r for r in starts if "where" not in r) and len(starts) == 3
+
+
+def test_events_where_that_cannot_match_an_event_message_is_refused(
+    config_path: Path, tmp_path: Path
+) -> None:
+    config = load_config(config_path)
+
+    async def scenario(ground: Session, fc: Session) -> None:
+        with pytest.raises(FilterError) as info:
+            await ground.events(where="msg == MOCK_HK")  # housekeeping is not an event message
+        assert info.value.code is Code.FLT_TYPE and "event" in info.value.summary
+        stream = await ground.events(where="mid in [0x0890, 0x0891] or event.id == 1")
+        await stream.close()  # an event MID is among the candidates: fine
+
+    ledger = run_two(config, tmp_path, scenario)
+    assert len([r for r in records_of(ledger) if r["event"] == "events.start"]) == 1
+
+
+def test_node_in_a_filter_accepts_the_nodes_alias(config_path: Path, tmp_path: Path) -> None:
+    config = load_config(config_path)
+    assert config.nodes["fc"].alias == "flight"
+
+    async def scenario(ground: Session, fc: Session) -> None:
+        responder = await fc.respond()
+        server = serve(responder)
+        by_alias = await ground.listen("fc", where="node == flight and msg == MOCK_HK")
+        by_name = await ground.listen("fc", where="node in [fc, flight]")
+        try:
+            await ground.send_command("fc", "MOCK_NOOP")
+            assert (await next_of(by_alias)).packet.message.name == "MOCK_HK"
+            assert (await next_of(by_name)).packet.message.name == "MOCK_HK"
+            with pytest.raises(FilterError) as info:
+                await ground.listen("fc", where="node == gnd")  # an alias of a node not in use
+            assert info.value.code is Code.FLT_TYPE
+        finally:
+            await by_alias.close()
+            await by_name.close()
+            server.cancel()
+            await responder.close()
+
+    run_two(config, tmp_path, scenario)
+
+
+def test_the_ledger_records_a_filter_only_when_there_is_one_and_bounds_its_mids(
+    config_path: Path, tmp_path: Path
+) -> None:
+    config = load_config(config_path)
+    many = "mid in [" + ", ".join(str(0x1000 + i) for i in range(100)) + "]"
+
+    async def scenario(ground: Session, fc: Session) -> None:
+        plain = await ground.listen("fc")
+        filtered = await ground.listen("fc", where=many)
+        events = await ground.events()
+        try:
+            pass
+        finally:
+            await plain.close()
+            await filtered.close()
+            await events.close()
+
+    ledger = run_two(config, tmp_path, scenario)
+    records = records_of(ledger)
+    starts = [r for r in records if r["event"] == "listen.start"]
+    plain = [r for r in starts if "where" not in r]
+    [filtered] = [r for r in starts if "where" in r]
+    assert len(plain) == 2  # the plain listener and the events link
+    for record in plain:
+        assert not {"where", "where_mids", "where_mid_count"} & record.keys()
+    assert filtered["where_mid_count"] == 100
+    assert filtered["where_mids"] == [0x1000 + i for i in range(32)]
+    stops = [r for r in records if r["event"] == "listen.stop"]
+    assert sum("where_undecodable" in r for r in stops) == 1
+    [events_start] = [r for r in records if r["event"] == "events.start"]
+    assert "where" not in events_start
 
 
 # -- the CLI ---------------------------------------------------------------------------------

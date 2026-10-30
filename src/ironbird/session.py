@@ -23,7 +23,14 @@ from types import MappingProxyType
 from typing import Any, Final
 
 from ironbird.ccdd.loader import load_ccdd
-from ironbird.ccdd.model import CcddModel, EventSeverity, Message, MessageKind, TypeClass
+from ironbird.ccdd.model import (
+    CcddModel,
+    EventSeverity,
+    Message,
+    MessageKind,
+    TypeClass,
+    meets_floor,
+)
 from ironbird.coalesce import Coalescer
 from ironbird.codec import Codec, DecodedPacket, EncodedPacket
 from ironbird.config import Link, Node, ResponseRule, SystemConfig
@@ -36,7 +43,7 @@ from ironbird.engine import (
 )
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
-from ironbird.filter import Filter, Matcher, compile_filter
+from ironbird.filter import Filter, FilterError, Matcher, compile_filter
 from ironbird.frame import Decoded
 from ironbird.header import load_profile
 from ironbird.ledger import Ledger
@@ -45,6 +52,8 @@ from ironbird.transport import LinkEnd
 
 TICK_S: Final = 1.0
 EVENT_QUEUE_SIZE: Final = 1024
+LEDGER_FILTER_MIDS: Final = 32  # MIDs of a filter's candidate set a ledger record lists
+SHOWN_MIDS: Final = 4  # MIDs named in a one-line error
 
 
 class Side(StrEnum):
@@ -495,7 +504,26 @@ class Session:
         nodes whose frames it will test) and this configuration's link names. Raises
         ``IB-FLT-*`` (exit 2) before anything is opened."""
         codecs = {name: self.codec_for(name) for name in dict.fromkeys(nodes)}
-        return compile_filter(text, codecs, links=[link.name for link in self.config.links])
+        return compile_filter(
+            text,
+            codecs,
+            links=[link.name for link in self.config.links],
+            aliases={node.alias: node.name for node in self.config.nodes.values()},
+        )
+
+    @staticmethod
+    def _require_overlap(flt: Filter, allowed: frozenset[int] | None, what: str) -> None:
+        """Refuse a filter whose candidate MIDs share none with ``allowed`` (``what`` names that
+        set for the message): no frame could pass both, so the run would show nothing."""
+        if flt.mids is None or not allowed or not flt.mids.isdisjoint(allowed):
+            return
+        raise FilterError(
+            Code.FLT_TYPE,
+            flt.source,
+            0,
+            f"the filter can never match: it selects MID {_mids_text(flt.mids)} "
+            f"but {what} {_mids_text(allowed)}",
+        )
 
     def matcher(self, flt: Filter, decoder: FrameDecoder) -> Matcher:
         """A matcher of ``flt`` that decodes through ``decoder`` (the consumer's own, so a frame
@@ -516,6 +544,8 @@ class Session:
         match to be yielded; it is compiled first, so a bad one fails before any socket opens."""
         route = self.route(peer, link_name=link)
         flt = self.compile_filter(where, [route.server.name]) if where is not None else None
+        if flt is not None:
+            self._require_overlap(flt, mids, "--mid allows")
         return await self._open_listener(route, mids, flt)
 
     def _listen_endpoint(self, route: Route) -> str:
@@ -534,6 +564,15 @@ class Session:
     def _record_listen_start(
         self, route: Route, mids: frozenset[int] | None, flt: Filter | None = None
     ) -> None:
+        # A filter is recorded only when there is one; its candidate MIDs by count and the
+        # first few, because the set can be as large as the CCDD.
+        where: dict[str, Any] = {}
+        if flt is not None:
+            where["where"] = flt.source
+            if flt.mids is not None:
+                ordered = sorted(flt.mids)
+                where["where_mid_count"] = len(ordered)
+                where["where_mids"] = ordered[:LEDGER_FILTER_MIDS]
         self.ledger.record(
             "action",
             "listen.start",
@@ -542,8 +581,7 @@ class Session:
             link=route.link.name,
             endpoint=self._listen_endpoint(route),
             mids=sorted(mids) if mids else None,
-            where=flt.source if flt is not None else None,
-            where_mids=sorted(flt.mids) if flt is not None and flt.mids is not None else None,
+            **where,
         )
 
     # -- events (all telemetry links of the selected nodes) ---------------------------
@@ -629,15 +667,18 @@ class Session:
             if where is not None
             else None
         )
+        if flt is not None:
+            self._require_overlap(flt, frozenset().union(*event_mids.values()), "events carry")
         capture = await self.capture(routes)
         for route in routes:
             self._record_listen_start(route, event_mids[route.server.name], flt)
+        recorded: dict[str, Any] = {"where": flt.source} if flt is not None else {}
         self.ledger.record(
             "action",
             "events.start",
             nodes=[route.server.name for route in routes],
             min_severity=min_severity.name if min_severity else None,
-            where=flt.source if flt is not None else None,
+            **recorded,
         )
         return EventStream(self, routes, capture, event_mids, min_severity, flt)
 
@@ -678,6 +719,13 @@ class Session:
             rules=len(rules),
         )
         return Responder(self, route, codec, capture, rules)
+
+
+def _mids_text(mids: frozenset[int]) -> str:
+    """Up to :data:`SHOWN_MIDS` of ``mids`` in hex, for a one-line message."""
+    ordered = sorted(mids)
+    shown = ", ".join(f"0x{mid:04X}" for mid in ordered[:SHOWN_MIDS])
+    return f"{shown}, ... ({len(ordered)})" if len(ordered) > SHOWN_MIDS else shown
 
 
 class Listener:
@@ -742,12 +790,11 @@ class Listener:
     async def close(self) -> None:
         await self._capture.close()
         stats = self._capture.stats()
+        undecodable: dict[str, Any] = (
+            {"where_undecodable": self._undecodable} if self._matcher is not None else {}
+        )
         self._session.ledger.record(
-            "action",
-            "listen.stop",
-            peer=self._route.peer.name,
-            unread=stats.unread,
-            where_undecodable=self._undecodable if self._matcher is not None else None,
+            "action", "listen.stop", peer=self._route.peer.name, unread=stats.unread, **undecodable
         )
         if stats.unread and self._capture.overloaded:
             # The user already has drop notices; say what the end adds to them.
@@ -841,7 +888,7 @@ class EventStream:
                     raw=frame.data,
                 )
                 floor = self._min_severity
-                if floor is not None and event.severity is not None and event.severity < floor:
+                if floor is not None and not meets_floor(event.severity, floor):
                     continue
                 if self._matcher is not None and not self._matcher(frame):
                     continue  # ledgered above; the filter only limits what is shown

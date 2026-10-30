@@ -4,6 +4,8 @@ naive reference evaluator that shares nothing with the compiler but the parser."
 from __future__ import annotations
 
 import json
+import math
+import struct
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
@@ -16,7 +18,7 @@ from ironbird.errors import Code, DecodeError
 from ironbird.filter import parse
 from ironbird.filter.lexer import Tok
 from ironbird.filter.parser import And, Expr, Literal, Not, Or, Predicate
-from ironbird.frame import Decoded, Direction, Frame, FrameFlag, Stream
+from ironbird.frame import Decoded, Direction, Frame, FrameFlag, Stream, garbage_error
 from ironbird.header import load_profile
 
 EVENT_TYPES: Final = {"DEBUG": 1, "INFORMATION": 2, "ERROR": 3, "CRITICAL": 4}
@@ -68,6 +70,8 @@ CCDD_N1: Final = {
                 {"name": "counter", "type": "uint16"},
                 {"name": "ratio", "type": "float64"},
                 {"name": "label", "type": "char[6]"},
+                {"name": "mode", "type": "uint8", "enum": {"SAFE": 1, "SCIENCE": 3}},
+                {"name": "big", "type": "uint64"},
             ],
         ),
         _tlm(
@@ -203,6 +207,8 @@ def make_frame(
 def decode_frame(codecs: Mapping[str, Codec], frame: Frame) -> Decoded | DecodeError:
     """The full decode of a frame, as a consumer without the ingest's token would do it."""
     codec = codecs[frame.stream.node]
+    if frame.flags & FrameFlag.GARBAGE:
+        return garbage_error(len(frame.data))
     if frame.flags & FrameFlag.TRUNCATED:
         return codec.oversize_error(frame.stream.kind, frame.data, frame.orig_len)
     result = codec.decode(frame.stream.kind, frame.data)
@@ -277,7 +283,7 @@ def _field_value(fld: FieldDef, lit: Literal, op: str) -> Any:
             return _number(lit, op)
         case TypeClass.FLOAT:
             if lit.kind in (Tok.INT, Tok.HEX, Tok.FLOAT):
-                return float(lit.value)
+                return _at_width(float(lit.value), fld.type.size)
             raise _Inexpressible
         case TypeClass.CHAR:
             return _text(lit)
@@ -293,6 +299,31 @@ def _field_value(fld: FieldDef, lit: Literal, op: str) -> Any:
                 raise _Inexpressible
             return raw
     raise AssertionError("unreachable")
+
+
+def _at_width(value: float, size: int) -> float:
+    """``value`` as a float field of ``size`` bytes holds it."""
+    if size != 4:
+        return value
+    try:
+        return float(struct.unpack("<f", struct.pack("<f", value))[0])
+    except OverflowError:
+        return math.copysign(math.inf, value)
+
+
+def _field_compare(fld: FieldDef, op: str, lits: Sequence[Literal], actual: Any) -> bool:
+    """``actual OP literal(s)`` for a field. ``in`` is an ``or`` of ``==`` that skips the items
+    the field cannot hold; a single literal the field cannot hold is never equal to it, so only
+    ``!=`` is true."""
+    wanted: list[Any] = []
+    for lit in lits:
+        try:
+            wanted.append(_field_value(fld, lit, op))
+        except _Inexpressible:
+            continue
+    if not wanted:
+        return op == "!="
+    return _apply(op, actual, wanted)
 
 
 def _field_allows(fld: FieldDef, op: str) -> bool:
@@ -401,7 +432,7 @@ class Reference:
         fld = decoded.message.field(field_name)
         if fld is None or not _field_allows(fld, op):
             return False
-        return _apply(op, values[field_name], [_field_value(fld, x, op) for x in lits])
+        return _field_compare(fld, op, lits, values[field_name])
 
     @staticmethod
     def _event(part: str, op: str, lits: Sequence[Literal], decoded: DecodedPacket) -> bool:
@@ -413,8 +444,8 @@ class Reference:
                 return _apply(op, values[spec.id], [_number(x, op) for x in lits])
             case "type":
                 severity = spec.severities.get(int(values[spec.type]))  # type: ignore[call-overload]
-                if severity is None:
-                    return False
+                if severity is None:  # an unranked type passes a lower bound, as --min-type does
+                    return op in (">=", ">", "!=")
                 wanted = []
                 for x in lits:
                     key = _word(x).lower()

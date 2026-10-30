@@ -183,6 +183,15 @@ PREDICATES = st.one_of(
             "mode == SAFE",
             "mode != NOMINAL",
             "mode >= SAFE",
+            "mode in [SAFE, SCIENCE]",
+            "mode in [NOMINAL, SCIENCE, SAFE]",
+            "mode != SCIENCE",
+            "ratio == 0.1",
+            "ratio in [0.1, 2.5]",
+            "big > 254.5",
+            "event.type > information",
+            "event.type != error",
+            "event.type in [debug, error]",
             'label contains "b"',
             'blob == "00112233"',
             'blob contains "11"',
@@ -225,7 +234,7 @@ EXPRESSIONS = st.recursive(PREDICATES, combine, max_leaves=8)
 CAP = 2048
 SAMPLES: dict[TypeClass, Any] = {
     TypeClass.INT: st.sampled_from([0, 1, 2, 3, 4, 5, 9, 255]),
-    TypeClass.FLOAT: st.sampled_from([0.0, 0.5, 1.0, -1.0, 2.5]),
+    TypeClass.FLOAT: st.sampled_from([0.0, 0.5, 1.0, -1.0, 2.5, 0.1]),
     TypeClass.CHAR: st.sampled_from(["", "abc", "APP", "hi", "a", "b"]),
 }
 

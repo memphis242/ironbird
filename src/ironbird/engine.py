@@ -33,6 +33,7 @@ from ironbird.codec import Codec, Resolved
 from ironbird.config import Link, SystemConfig
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.frame import (
+    FLAG_GARBAGE,
     FLAG_HAS_MID,
     FLAG_TRUNCATED,
     FLAGS_BY_BITS,
@@ -41,6 +42,7 @@ from ironbird.frame import (
     Direction,
     Frame,
     Stream,
+    garbage_error,
 )
 from ironbird.ledger import Ledger
 from ironbird.transport import LinkEnd, Receiver, Transport, TransportClosed, open_transport
@@ -315,7 +317,7 @@ class FrameDecoder:
 
     A frame that live ingest accepted carries what its check established, so its fields are
     unpacked without checking the packet a second time; every other frame goes through the whole
-    of ``Codec.decode``.
+    of ``Codec.decode``. A garbage frame is never unpacked: it is malformed by definition.
     """
 
     def __init__(self, engine: Engine, *, report_checked: bool) -> None:
@@ -325,11 +327,16 @@ class FrameDecoder:
 
     def decode(self, frame: Frame) -> Decoded | DecodeError:
         stream = frame.stream
+        result: Decoded | DecodeError
+        if int(frame.flags) & FLAG_GARBAGE:  # int(): an IntFlag operation is a Python call
+            result = garbage_error(len(frame.data))
+            if self._report_checked:
+                self._engine.reject(frame, result)
+            return result
         codec = self._codecs.get(stream.node)
         if codec is None:
             codec = self._codecs[stream.node] = self._engine._codec_for(stream.node)
         checked = frame.checked
-        result: Decoded | DecodeError
         if checked is not None:
             decoded = codec.decode_resolved(stream.kind, checked, frame.data)
             if not isinstance(decoded, DecodeError):
