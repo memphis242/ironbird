@@ -37,6 +37,7 @@ from ironbird.frame import (
     FLAG_TRUNCATED,
     FLAGS_BY_BITS,
     KNOWN_FLAG_BITS,
+    MAX_STREAM_ID,
     Decoded,
     Direction,
     Frame,
@@ -49,7 +50,7 @@ from ironbird.transport import LinkEnd, Receiver, Transport, TransportClosed, op
 MAX_TRACKED_MIDS: Final = 1024
 CONSUMER_QUEUE_FRAMES: Final = 16384
 READ_BATCH_FRAMES: Final = 512  # most frames one ``next_batch`` hands a consumer
-_MAX_STREAMS: Final = 0x10000
+_MAX_STREAMS: Final = MAX_STREAM_ID + 1
 OPEN_TIMEOUT_S: Final = 5.0  # longest a transport may take to open (name resolution, bind)
 
 Reporter = Callable[..., None]  # Session.report: (error, *, context, level, evidence)
@@ -902,6 +903,18 @@ class Engine:
             return
         label = io.description
         self._ledger.record("state", "rx.unread_at_close", label=label, datagrams=left)
+        # Datagrams the OS discards unread are lost before the transport read them, like a kernel
+        # drop: sinks that record gaps get one, bracketing the loss by the last poll and now.
+        watch, now_ns = io.kernel, time.time_ns()
+        self._notify_gap(
+            io.rx_stream,
+            GapReason.KERNEL_DROP,
+            left,
+            watch.last_ns,
+            now_ns,
+            watch.last_seq,
+            self._seq,
+        )
         if io.lossy or transport.stats().kernel_dropped:
             self._report(
                 IronbirdError(

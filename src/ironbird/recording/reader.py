@@ -12,10 +12,12 @@ present, CRC (seeded with the preamble's nonce), type known or skippable, then t
 a file that shrinks or grows under the reader is never mapped, so it cannot raise ``SIGBUS``.
 
 After damage the scan for the next record is conservative: a candidate must pass every record
-rule *and* be followed by a second valid record where its length says it ends, and the scan has
-a CRC budget so a hostile file cannot make it quadratic. Damage that reaches the end of the
-file with no such candidate is a *torn tail* (a crash); damage followed by a valid chain is
-*mid-file damage*.
+rule *and* be followed by a second valid record where its length says it ends. The scan shares
+one work budget with the rest of the pass (bytes read and CRC-checked, proportional to the size of
+the file and never reset by a new stretch of damage), and a record whose declared length runs
+past the end of the file is refused before any of it is read, so a hostile file cannot make the
+reader quadratic. Damage that reaches the end of the file with no valid chain after it is a
+*torn tail* (a crash); damage followed by a valid chain is *mid-file damage*.
 
 Frames carry no ``checked`` token: the reader never copies one from anywhere.
 """
@@ -54,8 +56,10 @@ from ironbird.sanitize import clean
 
 READ_BLOCK: Final = 1 << 20
 SMALL_BLOCK: Final = 16 * 1024  # random access (index, chunk heads) reads this much, not a MiB
-RESYNC_CRC_FLOOR: Final = 16 * 1024 * 1024  # bytes a resync may CRC however little it scanned
-RESYNC_CRC_FACTOR: Final = 4  # ... plus this many per byte scanned
+WORK_FLOOR: Final = 4 * 1024 * 1024  # bytes of work a resync may do however small the file
+WORK_FACTOR: Final = 4  # ... plus this many times the size of the file, over the whole pass
+CANDIDATE_COST: Final = 64  # work charged for looking at one candidate, however cheap
+MAX_DAMAGE_KEPT: Final = 1000  # Damage objects retained; the count and bytes cover them all
 MAX_STREAMS: Final = fmt.MAX_STREAM_ID + 1
 
 # A record envelope's type byte followed by its flags and reserved bytes (all zero in v1) is the
@@ -73,6 +77,7 @@ class _Fail(NamedTuple):
     reason: str
     eof: bool = False  # no bytes at all at the offset: the file ended at a record boundary
     unsupported: bool = False  # a valid record of a type this version cannot skip
+    incomplete: bool = False  # the file ends inside the record (as opposed to a bad record)
 
 
 class _Raw(NamedTuple):
@@ -101,14 +106,16 @@ class Damage:
     reason: str
     resumed_at: int | None = None  # where valid records resume, when they do
     trailing: bool = False  # bytes after a valid trailer
+    incomplete: bool = True  # the file ends inside the record, rather than the record being bad
 
     def to_error(self) -> IronbirdError:
         """The coded error for this damage (not raised; the caller decides how loud to be)."""
         where = f"at offset {self.offset}"
         if self.torn:
+            what = "an incomplete record" if self.incomplete else "a damaged record"
             return IronbirdError(
                 Code.REC_TORN,
-                f"the recording ends in an incomplete record {where} ({self.reason}); "
+                f"the recording ends in {what} {where} ({self.reason}); "
                 "everything before it is readable",
             )
         span = f"{self.span} bytes" if self.resumed_at is not None else "to the end of the file"
@@ -146,9 +153,10 @@ class RecordingReader:
     def __init__(self, path: Path | str, *, skip_damage: bool = False) -> None:
         self.path: Path = Path(path)
         self._skip_damage = skip_damage
-        self.damage: list[Damage] = []
+        self.damage: list[Damage] = []  # the first MAX_DAMAGE_KEPT stretches
+        self.damage_count = 0  # every stretch met
+        self.damage_bytes = 0
         self.trailer: fmt.Trailer | None = None
-        self.blobs: list[fmt.Blob] = []
         self.version: tuple[int, int] = (0, 0)
         self.nonce = 0
         self._seed = 0
@@ -157,7 +165,8 @@ class RecordingReader:
         self.writer_active = False  # a writer holds the file's lock: it is being recorded now
         self.locked = False
         self._state = _State()
-        self._crc_bytes = 0
+        self._work = 0  # bytes read and CRC-checked this pass, charged against the budget
+        self._known_size = 0
         self._buf = b""
         self._base = 0
         try:
@@ -202,7 +211,12 @@ class RecordingReader:
             raise IronbirdError(
                 Code.REC_FORMAT,
                 f"{shown} is not an ironbird recording "
-                + ("(the file is empty)" if not head else "(it is shorter than a preamble)"),
+                + (
+                    "(the file is empty; a recorder killed just after creating a split part "
+                    "leaves one, and the earlier parts are complete)"
+                    if not head
+                    else "(it is shorter than a preamble)"
+                ),
             )
         magic, major, minor, flags, nonce = fmt.PREAMBLE.unpack(head)
         if magic != fmt.MAGIC:
@@ -285,6 +299,13 @@ class RecordingReader:
 
     # -- low level: one record --
 
+    def _file_covers(self, end: int) -> bool:
+        """Whether the file extends to ``end`` (the size is looked up again only when needed)."""
+        if end <= self._known_size:
+            return True
+        self._known_size = self.size()
+        return end <= self._known_size
+
     def _window(self, offset: int, size: int, block: int = READ_BLOCK) -> memoryview:
         """Up to ``size`` bytes at ``offset`` (fewer only at the end of the file)."""
         buf, base = self._buf, self._base
@@ -308,7 +329,7 @@ class RecordingReader:
         if len(head) < fmt.ENVELOPE_SIZE:
             if not head:
                 return _Fail("end of file", eof=True)
-            return _Fail("ends inside a record envelope")
+            return _Fail("ends inside a record envelope", incomplete=True)
         body_len, rtype, flags, reserved, crc = fmt.ENVELOPE.unpack_from(head, 0)
         if flags or reserved:
             return _Fail("envelope flags or reserved bytes are not zero")
@@ -318,11 +339,15 @@ class RecordingReader:
                 f"{fmt.describe_type(rtype)} body length {body_len} is outside {low}..{high}"
             )
         total = fmt.record_size(body_len)
+        if not self._file_covers(
+            offset + total
+        ):  # nothing of a record that runs past the end is read
+            return _Fail(f"ends inside a {fmt.describe_type(rtype)} record", incomplete=True)
+        self._work += total
         data = self._window(offset, total, block)
         if len(data) < total:
-            return _Fail(f"ends inside a {fmt.describe_type(rtype)} record")
+            return _Fail(f"ends inside a {fmt.describe_type(rtype)} record", incomplete=True)
         end_body = fmt.ENVELOPE_SIZE + body_len
-        self._crc_bytes += body_len
         if zlib.crc32(data[fmt.ENVELOPE_SIZE : end_body], zlib.crc32(data[:8], self._seed)) != crc:
             return _Fail(f"{fmt.describe_type(rtype)} record fails its CRC")
         if any(data[end_body:total]):
@@ -464,7 +489,7 @@ class RecordingReader:
 
     def _chain_valid(self, offset: int) -> bool:
         """Whether a record at ``offset`` passes every rule and is followed by another one."""
-        first = self._read_raw(offset)
+        first = self._read_raw(offset, SMALL_BLOCK)
         if isinstance(first, _Fail):
             return False
         state = self._state
@@ -485,7 +510,7 @@ class RecordingReader:
                     sources = ChainMap({effect[1]: effect[2]}, state.sources)
                 case _:
                     pass
-        second = self._read_raw(first.end)
+        second = self._read_raw(first.end, SMALL_BLOCK)
         if isinstance(second, _Fail):
             return False
         try:
@@ -494,18 +519,21 @@ class RecordingReader:
             return False
         return True
 
+    def _over_budget(self) -> bool:
+        """Whether this pass has done more work than its file size allows a resync."""
+        return self._work > WORK_FLOOR + WORK_FACTOR * self.size()
+
     def _resync(self, damaged_at: int) -> tuple[int | None, bool]:
         """The offset of the next valid record after damage at ``damaged_at``, or ``None``.
 
-        The second value says the scan gave up (its CRC budget ran out on implausible record
-        headers) instead of reaching the end of the file.
+        The second value says the scan gave up (the pass's work budget ran out on implausible
+        record headers) instead of reaching the end of the file.
         """
-        start = (damaged_at + fmt.ALIGN) & ~(fmt.ALIGN - 1)
-        position = start
-        self._crc_bytes = 0
+        position = (damaged_at + fmt.ALIGN) & ~(fmt.ALIGN - 1)
+        step = SMALL_BLOCK  # doubles up to a block: a record close by is cheap, a long scan fast
         while True:
             try:
-                block = os.pread(self._fd, READ_BLOCK + 16, position)
+                block = os.pread(self._fd, step + 16, position)
             except OSError as exc:
                 raise IronbirdError(
                     Code.REC_FORMAT,
@@ -514,19 +542,27 @@ class RecordingReader:
                 ) from exc
             if len(block) < fmt.ENVELOPE_SIZE:
                 return None, False
-            for match in _CANDIDATE.finditer(block, 4, READ_BLOCK + 8):
+            for match in _CANDIDATE.finditer(block, 4, step + 7):
                 candidate = position + match.start() - 4
                 if candidate & (fmt.ALIGN - 1):
                     continue
-                if self._crc_bytes > RESYNC_CRC_FLOOR + RESYNC_CRC_FACTOR * (candidate - start):
+                self._work += CANDIDATE_COST
+                if self._over_budget():
                     return None, True
                 if self._chain_valid(candidate):
                     return candidate, False
-            if len(block) <= READ_BLOCK:
+            if len(block) <= step:
                 return None, False
-            position += READ_BLOCK
+            position += step
+            step = min(step * 2, READ_BLOCK)
 
     # -- iteration --
+
+    def _note_damage(self, damage: Damage) -> None:
+        self.damage_count += 1
+        self.damage_bytes += damage.span
+        if len(self.damage) < MAX_DAMAGE_KEPT:
+            self.damage.append(damage)
 
     def items(self) -> Iterator[Item | Damage]:
         """Every valid record after META in file order, and a :class:`Damage` where the file is
@@ -536,6 +572,7 @@ class RecordingReader:
         while True:
             raw = self._read_raw(offset)
             reason: str | None = None
+            incomplete = False
             value: Any = None
             effect: _Effect = None
             if isinstance(raw, _Fail):
@@ -543,7 +580,7 @@ class RecordingReader:
                     return
                 if raw.unsupported:
                     raise _unsupported(self.path, raw.reason)
-                reason = raw.reason
+                reason, incomplete = raw.reason, raw.incomplete
             else:
                 try:
                     value, effect = self._validate(
@@ -556,12 +593,14 @@ class RecordingReader:
                 size = max(self.size(), offset)
                 if found is None:
                     gave = " (the scan for a valid record gave up)" if gave_up else ""
-                    damage = Damage(offset, size - offset, not gave_up, reason + gave)
-                    self.damage.append(damage)
+                    damage = Damage(
+                        offset, size - offset, not gave_up, reason + gave, None, False, incomplete
+                    )
+                    self._note_damage(damage)
                     yield damage
                     return
-                damage = Damage(offset, found - offset, False, reason, found)
-                self.damage.append(damage)
+                damage = Damage(offset, found - offset, False, reason, found, False, incomplete)
+                self._note_damage(damage)
                 yield damage
                 if not self._skip_damage:
                     return
@@ -569,18 +608,32 @@ class RecordingReader:
                 continue
             assert isinstance(raw, _Raw)
             self._apply(effect)
-            if raw.rtype == RecordType.BLOB:
-                self.blobs.append(value)
             yield Item(raw.offset, raw.end, raw.rtype, value)
             offset = raw.end
             if raw.rtype == RecordType.TRAILER:
-                self.trailer = value
+                if self.trailer is None:
+                    self.trailer = value
                 extra = self.size() - offset
-                if extra > 0:
-                    trailing = Damage(offset, extra, False, "bytes after the trailer", None, True)
-                    self.damage.append(trailing)
-                    yield trailing
-                return
+                if extra <= 0:
+                    return
+                # Bytes after a trailer: another file appended, or a trailer that was not the
+                # last record. Reading on (when asked to) finds whatever valid records follow.
+                found = None
+                if self._skip_damage:
+                    found, _ = self._resync(offset - fmt.ALIGN)
+                resumed = Damage(
+                    offset,
+                    (found if found is not None else offset + extra) - offset,
+                    False,
+                    "bytes after the trailer",
+                    found,
+                    True,
+                )
+                self._note_damage(resumed)
+                yield resumed
+                if found is None:
+                    return
+                offset = found
 
     def frames(self) -> Iterator[Frame]:
         """Every valid frame in file order. Damage ends the iteration (see :attr:`damage`) unless
@@ -616,6 +669,8 @@ class RecordingReader:
         raw = self._read_raw(trailer.index_offset, SMALL_BLOCK)
         if isinstance(raw, _Fail) or raw.rtype != RecordType.INDEX:
             raise ValueError("the trailer does not point at an index record")
+        if raw.end != trailer_offset:
+            raise ValueError("the index does not end where the trailer begins")
         try:
             offsets = fmt.decode_index(raw.body)
         except fmt.FormatError as exc:
@@ -639,6 +694,18 @@ class RecordingReader:
         if previous_end != trailer.index_offset:
             raise ValueError("the index does not end at the last chunk")
         return chunks
+
+    def closes_cleanly_at(self, offset: int) -> bool:
+        """Whether the file from ``offset`` is exactly an optional INDEX and then a TRAILER that
+        ends it, the way a recording is closed (so nothing follows the valid records)."""
+        raw = self._read_raw(offset, SMALL_BLOCK)
+        if not isinstance(raw, _Fail) and raw.rtype == RecordType.INDEX:
+            raw = self._read_raw(raw.end, SMALL_BLOCK)
+        return (
+            not isinstance(raw, _Fail)
+            and raw.rtype == RecordType.TRAILER
+            and raw.end == self.size()
+        )
 
     def head_records(self, start: int, stop: int) -> Iterator[Item]:
         """The leading non-frame records of a chunk (``start`` up to its first FRAME or ``stop``),

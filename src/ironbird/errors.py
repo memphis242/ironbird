@@ -69,6 +69,7 @@ class Code(StrEnum):
     REC_TORN = "IB-REC-007"  # recording ends in an incomplete record (not closed cleanly)
     REC_INDEX = "IB-REC-008"  # index missing or invalid; rebuilt by scanning
     REC_SPACE = "IB-REC-010"  # low disk space for the recording
+    REC_DIRSYNC = "IB-REC-011"  # the recording's directory cannot be synced (name not durable)
     # System resources
     SYS_RESOURCE = "IB-SYS-001"  # the OS refused a resource needed to start (file descriptors)
     # CLI / internal

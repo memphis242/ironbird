@@ -550,7 +550,8 @@ per-MID counts without reading frames, and are the work units for a decode worke
   at 256 KiB or every 250 ms the buffer goes to a writer thread (`os.write`, releases the
   GIL, handles partial writes). `fdatasync` once per chunk by default
   (`recording.fsync = "chunk" | "always" | "never"`): a power loss loses at most about
-  1 s, a crash at most the unflushed 250 ms, a clean stop or signal nothing.
+  1 s, a crash at most what was not yet handed to the disk (the 250 ms flush interval plus up
+  to one timer tick, about 500 ms at the worst), a clean stop or signal nothing.
 - Back-pressure is bounded: in-memory plus queued bytes are capped
   (`recording.max_buffer_bytes`, default 256 MiB, about 2 minutes at the 10k pkt/s
   target). Above it, frames are dropped and counted, and a GAP record (reason
@@ -559,8 +560,8 @@ per-MID counts without reading frames, and are the work units for a decode worke
 - Transport drops (kernel, queue) never received a seq; the engine turns their counter
   deltas into GAP records on its 1 Hz tick, so a replay shows every loss and where.
 - Close: final CHUNK, INDEX, TRAILER, `fdatasync`, close. On SIGINT/SIGTERM/SIGHUP the
-  close runs in the cancellation path with a 5 s bound; a second signal abandons it,
-  leaving a readable file without a trailer.
+  close runs in the cancellation path; it ends when the writer makes no progress for 5 s
+  (a draining backlog is waited for), leaving a readable file without a trailer.
 - Write failure (ENOSPC, EIO): `IB-REC-002`, recorder stops, capture goes on;
   `ib record` exits 1 at once, other commands with `--record` finish and exit 1. Free
   space: refuse to start below `recording.min_free_bytes` (default 1 GiB), check every
@@ -1830,8 +1831,11 @@ As built (where the build differs from, or settles, the text above)
   reserved byte is damage, and the envelope `flags`/reserved bytes are checked before the CRC.
 - Resync scans for the envelope shape with a regex over 1 MiB windows, at 8-byte aligned offsets,
   and validates a candidate plus its successor with the state (streams, sources, sequence) a
-  real read would have. A CRC budget (16 MiB plus 4 bytes per byte scanned) bounds hostile files; a
-  scan that exhausts it ends the file as mid-file damage "the scan gave up", not as a torn tail.
+  real read would have. One work budget per pass (4 MiB plus 4 times the file size, charged for
+  bytes read and CRC-checked and 64 per candidate looked at, never reset by a new damaged stretch)
+  bounds hostile files; a record whose declared length runs past the end of the file is refused
+  without reading it (a torn tail), and a scan that exhausts the budget ends the file as mid-file
+  damage "the scan gave up", not as a torn tail.
   A reader takes `LOCK_SH | LOCK_NB` on the file; a writer's `LOCK_EX` shows as `writer_active`
   (`info` reports "recording" rather than torn).
 - GAP reasons emitted: `kernel_drop` (the engine bracket: `first_seq`/`last_seq` are the engine's
@@ -1849,7 +1853,9 @@ As built (where the build differs from, or settles, the text above)
   against the monotonic clock is a MARK. `Recorder.rate_bytes_per_s()` (bytes encoded over the last
   minute) is the hook for 2d's `IB-RET-002` projection; nothing consumes it yet. A split keeps part
   1 open and locked, and every part repeats META, BLOBs and definitions. A second signal does not
-  abandon the close (the CLI ignores repeated signals); the close is bounded to 5 s.
+  abandon the close (the CLI ignores repeated signals); the close gives up only when the writer makes no
+  progress for 5 s, writes the GAP for dropped frames and the trailer first when the disk is
+  merely slow, and says how many frames were not written when it does give up.
 - Commands: `ib record` (exit 0 on `--duration`, `--count` or a signal's 128+n; `--count` stops at
   the first batch past N, so it records at least N), `--record PATH|auto` on `listen`, `events`
   and `respond`, `ib rec info [--format line|json]`, `ib rec check [--strict]` (exit 1 on mid-file
@@ -1872,6 +1878,41 @@ As built (where the build differs from, or settles, the text above)
 - Not done here: replay and `--follow` (2g), retention and prune (2d: the recording name matches
   its patterns, the heartbeat and lock exist, the rate hook is unwired), `IB-LED-009` for a file
   system without locks (the recorder runs unlocked and ledgers nothing), `IB-REC-009` (2g).
+- PR #7 review fixes (reader and tools). The reader does no unbounded work on a hostile file: one work
+  budget per pass (above), and a body that runs past the end of the file is never read. `Damage`
+  objects kept are capped (1000; the count and byte total cover all), `rec check` and the ledger
+  report damage as one coalesced line (`--verbose` lists the kept stretches). The reader no longer
+  retains BLOB contents; `info` lists distinct definitions (set) with a capped output. Holes in the
+  sequence are explained by a bounded merged set of GAP intervals over every GAP (so neither a
+  false failure nor a false pass past the listing cap) and `lost_by_reason` sums all gaps. `rec
+  repair` and `check` treat bytes after the valid prefix as damage: a stale INDEX, a TRAILER in
+  mid-file, or a concatenated file; `repair` exits 5 and names how many bytes and valid frames
+  were left only in the original. Stricter rules the mutation run showed untested are now pinned:
+  nonzero padding, envelope flags, an INDEX that is not increasing or does not end at the trailer,
+  a GAP naming an undefined stream, chunk time bounds and MID order, the trailer's last sequence, a
+  MARK reserved byte, CHUNK `chunk_start` bounds. STREAM id 0xFFFF is reserved (it means "no stream"
+  in a GAP). META nesting is capped at 16 levels (iterative check) and `info --format json` is
+  strict JSON (no NaN or Infinity; nested META values pass through the same sanitizer). A complete
+  final record that fails its CRC is reported as a damaged record, not an incomplete one. An empty
+  split part (a recorder killed just after creating it) reports "the file is empty" with a hint that
+  the earlier parts are complete; every non-first part's head is written and synced before the part
+  takes frames, so the only residue of a crash is that empty or head-less last part.
+- PR #7 review fixes (writer and commands). Statistics count frames when the write completed
+  (`RecorderStats.frames`, `file_bytes`); the rest are `unwritten_frames` (encoded, never written),
+  `after_stop_frames` and `overrun_frames`, and `lost_frames` sums them. A write failure says
+  "recording stopped after N frame(s), M not recorded" in the notice, the CLI summary and the
+  ledger, and words whether the capture goes on (`ib record` ends, `--record` commands continue).
+  Close: no overall limit but "no writer progress for 5 s"; the overrun hysteresis does not fire
+  during a close, so there is no second `IB-REC-003`. `Recorder.append`, `gap` and `mark` never
+  raise: a failure stops the recorder through the internal-failure path (`IB-INT-001`). `--record`
+  creates its file only after the arguments validated and the transport opened (frames are staged,
+  bounded at 65536 events then counted as a `recorder_overrun` GAP, and handed over in one loop
+  turn); a start that fails after the `O_EXCL` create removes its own partial file, or names it
+  when it cannot. Datagrams unread at close become a `kernel_drop` GAP. A directory that cannot be
+  synced (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`) is tolerated with one `IB-REC-011` warning.
+- Deferred (documented, not fixed): an `atheris` run of the recording target (not installed on
+  the dev host); `IB-LED-009`; a crash in the microseconds between creating a non-first split part
+  and writing its head can still leave that one part empty (reported with a hint, not repaired).
 - Verification numbers (4-core dev host): `Recorder.append` of a 200-byte frame about 3-4 us; the
   writer sustains about 210-270k frames/s (52-66 MB/s) to a closed, synced file; the reader reads
   about 105-130k frames/s with every CRC and rule checked; `ib record` at 10k pkt/s of 200-byte
@@ -1879,7 +1920,8 @@ As built (where the build differs from, or settles, the text above)
   whole process, and the `ib listen` guards are unchanged. Tests: `test_recording.py` (writer,
   reader, engine sink), `test_recording_malformed.py` (truncation at every offset, every third
   bit flip, Hypothesis corruption and arbitrary records with valid CRCs, crafted frames, forged
-  records, bounded resync, the 53-file corpus `tests/corpus/malformed/rec-*.ibrec`),
+  records, bounded resync, the 69-file corpus `tests/corpus/malformed/rec-*.ibrec` (each with an expected outcome asserted in
+  `tests/rec_corpus.py`)),
   `test_recording_tools.py` (commit paths, repair), `test_recording_cli.py` (record, `--record`,
   SIGTERM and `kill -9`, `rec` tools, config) and benchmarks; `tests/cfs/test_acceptance.py` has
   a live-session recording case for CI (not run on the dev host: it needs the fixed cFS ports).
@@ -2191,6 +2233,7 @@ Verification
 | `IB-REC-008` | `REC_INDEX` | index missing or invalid; rebuilt by scanning | 2e |
 | `IB-REC-009` | `REC_DEFS` | embedded definitions differ from config, or cannot be loaded | 2g |
 | `IB-REC-010` | `REC_SPACE` | low disk space for the recording | 2e |
+| `IB-REC-011` | `REC_DIRSYNC` | the recording's directory cannot be synced; its name may not survive a power loss (warning) | 2e |
 | `IB-FLT-001` | `FLT_SYNTAX` | filter syntax error (column, excerpt) | 2f |
 | `IB-FLT-002` | `FLT_NAME` | unknown name in a filter | 2f |
 | `IB-FLT-003` | `FLT_TYPE` | literal does not fit the name's type | 2f |

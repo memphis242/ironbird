@@ -18,7 +18,7 @@ import re
 import socket
 import sys
 import time
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -26,7 +26,7 @@ from typing import Any, Final
 import ironbird
 from ironbird.config import RecordingConfig
 from ironbird.errors import Code, IronbirdError
-from ironbird.frame import Stream
+from ironbird.frame import Frame, GapReason, Stream
 from ironbird.recording import format as fmt
 from ironbird.recording.format import BlobKind, MarkKind
 from ironbird.recording.writer import (
@@ -35,12 +35,14 @@ from ironbird.recording.writer import (
     BlobSpec,
     Recorder,
     RecorderOptions,
+    RecorderStats,
 )
 from ironbird.sanitize import clean
 from ironbird.session import Route, Session
 
 MAX_PROFILE_BYTES: Final = 64 * 1024
 MAX_ARGV: Final = 64
+MAX_STAGED_EVENTS: Final = 1 << 16  # frames kept between the capture opening and the file
 _SPLIT_RE: Final = re.compile(r"([0-9]{1,12}(?:\.[0-9]{1,6})?)([a-z]{1,3})")
 _SIZE_UNITS: Final = {"b": 1, "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4}
 _TIME_UNITS: Final = {"s": 1.0, "m": 60.0, "h": 3600.0}
@@ -222,80 +224,166 @@ def build_meta(
     }
 
 
-async def start_recording(
-    session: Session,
-    request: RecordRequest,
-    *,
-    nodes: Sequence[str],
-    routes: Sequence[Route] = (),
-) -> Recorder:
-    """Create the recording for a capture and attach it to ``session``.
+class _Staging:
+    """Holds what a capture ingests from the moment it is attached until the recording exists.
 
-    ``nodes`` are the nodes whose definitions decode what is captured (embedded unless
-    ``recording.embed_definitions`` is false). ``routes``, when known before the capture opens,
-    declare their streams up front; any other stream is defined when its first frame arrives.
+    The recording file is created only after the transport has opened (a port that is busy, or
+    an argument that is wrong, leaves no file behind), yet no frame may be missed while the file
+    is being made. This sink is attached before the capture opens; :meth:`replay` gives its frames
+    and gaps to the recorder in order, and the recorder takes over in the same event-loop turn.
+    It is bounded: past ``limit`` frames the rest are counted per stream and become GAP records
+    (``recorder_overrun``) at the recorder.
     """
-    config = session.config.recording
-    created = time.time_ns()
-    path = resolve_path(request, config, session.ledger.session_id, created)
-    streams: tuple[Stream, ...] = session.streams_for(routes)
-    blobs, node_table = collect_definitions(
-        session, sorted(set(nodes)), embed=config.embed_definitions
-    )
-    options = RecorderOptions(
-        fsync=config.fsync,
-        max_buffer_bytes=config.max_buffer_bytes,
-        min_free_bytes=config.min_free_bytes,
-        split_bytes=request.split_bytes,
-        split_seconds=request.split_seconds,
-    )
-    recorder = Recorder.open(
-        path,
-        build_meta(session, request.command, node_table, created),
-        blobs=blobs,
-        streams=streams,
-        options=options,
-        report=session.report,
-        ledger=session.ledger,
-        loop=asyncio.get_running_loop(),
-    )
-    session.add_sink(recorder)
-    recorder.mark(MarkKind.START, f"{request.command} started")
-    session.ledger.record(
-        "action",
-        "recording.start",
-        path=path,
-        streams=[stream.endpoint for stream in streams if stream.direction.value == "rx"],
-        embedded=[f"{blob.node}:{blob.kind.name.lower()}" for blob in blobs],
-        fsync=config.fsync,
-        max_buffer_bytes=config.max_buffer_bytes,
-        split_bytes=request.split_bytes,
-        split_seconds=request.split_seconds,
-    )
-    return recorder
+
+    def __init__(self, limit: int = MAX_STAGED_EVENTS) -> None:
+        self.events: list[tuple[str, Any]] = []
+        self._limit = limit
+        self._lost: dict[int, list[Any]] = {}  # stream id -> [stream, count, first, last frames]
+
+    def append(self, frame: Frame) -> None:
+        if len(self.events) < self._limit:
+            self.events.append(("frame", frame))
+            return
+        entry = self._lost.get(frame.stream.id)
+        if entry is None:
+            self._lost[frame.stream.id] = [frame.stream, 1, frame, frame]
+        else:
+            entry[1] += 1
+            entry[3] = frame
+
+    def gap(self, *args: Any) -> None:
+        if len(self.events) < self._limit:
+            self.events.append(("gap", args))
+
+    def replay(self, recorder: Recorder) -> None:
+        for kind, payload in self.events:
+            if kind == "frame":
+                recorder.append(payload)
+            else:
+                recorder.gap(*payload)
+        for stream, count, first, last in self._lost.values():
+            recorder.gap(
+                stream,
+                GapReason.RECORDER_OVERRUN,
+                count,
+                first.time_ns,
+                last.time_ns,
+                first.seq,
+                last.seq,
+            )
+        self.events = []
+        self._lost = {}
 
 
-@contextlib.asynccontextmanager
-async def recording_for(
-    session: Session,
-    request: RecordRequest,
-    *,
-    nodes: Sequence[str],
-    routes: Sequence[Route] = (),
-) -> AsyncGenerator[Recorder]:
-    """Record for the duration of the block, then close the recording.
+class PendingRecording:
+    """A recording for one command: :meth:`begin` before the capture opens, :meth:`commit` right
+    after it has, :meth:`finish` on the way out (normal end, ``--duration`` or a signal).
 
-    The closing records are written in the exit path, so a signal that cancels the block still
-    leaves a complete file (the close is bounded to 5 s by the recorder).
+    ``begin`` creates nothing; it checks the target name and attaches a staging sink, so the
+    frames of the first moments are kept. ``commit`` creates the file, embeds the definitions the
+    nodes were configured with (decision D1), declares the streams of the captured routes, hands
+    over the staged frames and attaches the recorder. A command that fails before ``commit``
+    leaves no file.
     """
-    recorder = await start_recording(session, request, nodes=nodes, routes=routes)
-    try:
-        yield recorder
-    finally:
-        interrupted = isinstance(sys.exc_info()[1], asyncio.CancelledError)
+
+    def __init__(
+        self,
+        session: Session,
+        request: RecordRequest,
+        *,
+        nodes: Sequence[str],
+        routes: Sequence[Route] = (),
+    ) -> None:
+        self._session = session
+        self._request = request
+        self._nodes = sorted(set(nodes))
+        self._routes = tuple(routes)
+        self._staging: _Staging | None = None
+        self._created_ns = 0
+        self.path: Path | None = None
+        self.recorder: Recorder | None = None
+
+    def begin(self) -> None:
+        """Choose the file name (refusing one that exists) and start staging frames."""
+        session = self._session
+        self._created_ns = time.time_ns()
+        self.path = resolve_path(
+            self._request, session.config.recording, session.ledger.session_id, self._created_ns
+        )
+        if os.path.lexists(self.path):
+            raise IronbirdError(
+                Code.REC_CREATE,
+                f"{self.path} already exists; a recording is never overwritten (choose another -o)",
+            )
+        self._staging = _Staging()
+        session.add_sink(self._staging)
+
+    def commit(self) -> Recorder:
+        """Create the recording and take over from the staging sink. Raises ``IB-REC-001``,
+        ``IB-REC-002`` or ``IB-REC-010`` (the file, if it was created, is removed)."""
+        assert self.path is not None and self._staging is not None and self.recorder is None
+        session, request = self._session, self._request
+        config = session.config.recording
+        streams: tuple[Stream, ...] = session.streams_for(self._routes)
+        blobs, node_table = collect_definitions(
+            session, self._nodes, embed=config.embed_definitions
+        )
+        options = RecorderOptions(
+            fsync=config.fsync,
+            max_buffer_bytes=config.max_buffer_bytes,
+            min_free_bytes=config.min_free_bytes,
+            split_bytes=request.split_bytes,
+            split_seconds=request.split_seconds,
+        )
+        recorder = Recorder.open(
+            self.path,
+            build_meta(session, request.command, node_table, self._created_ns),
+            blobs=blobs,
+            streams=streams,
+            options=options,
+            report=session.report,
+            ledger=session.ledger,
+            loop=asyncio.get_running_loop(),
+            capture_continues=request.command != "record",
+        )
+        # No await from here to the end: no frame is ingested between the replay and the swap.
+        self._staging.replay(recorder)
+        session.add_sink(recorder)
+        session.remove_sink(self._staging)
+        self._staging = None
+        self.recorder = recorder
+        recorder.mark(MarkKind.START, f"{request.command} started")
+        session.ledger.record(
+            "action",
+            "recording.start",
+            path=self.path,
+            streams=[stream.endpoint for stream in streams if stream.direction.value == "rx"],
+            embedded=[f"{blob.node}:{blob.kind.name.lower()}" for blob in blobs],
+            fsync=config.fsync,
+            max_buffer_bytes=config.max_buffer_bytes,
+            split_bytes=request.split_bytes,
+            split_seconds=request.split_seconds,
+        )
+        return recorder
+
+    async def finish(self, *, interrupted: bool = False) -> RecorderStats | None:
+        """Detach and close what :meth:`begin` and :meth:`commit` set up. The closing records are
+        written here, so a signal that cancelled the command still leaves a complete file (the
+        close ends when the disk makes no progress for 5 s). ``None``: nothing was created."""
+        session = self._session
+        if self._staging is not None:
+            session.remove_sink(self._staging)
+            self._staging = None
+            session.ledger.record(
+                "state", "recording.not_started", path=self.path, command=self._request.command
+            )
+        recorder = self.recorder
+        if recorder is None:
+            return None
         session.remove_sink(recorder)
+        command = self._request.command
         recorder.mark(
             MarkKind.SIGNAL if interrupted else MarkKind.STOP,
-            "interrupted by a signal" if interrupted else f"{request.command} ended",
+            "interrupted by a signal" if interrupted else f"{command} ended",
         )
-        await recorder.close()
+        return await recorder.close()

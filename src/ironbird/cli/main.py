@@ -39,8 +39,8 @@ from ironbird.config import SystemConfig, find_config, load_config
 from ironbird.errors import Code, IronbirdError
 from ironbird.ledger import Ledger, default_state_dir
 from ironbird.recording import inspect as rec_inspect
-from ironbird.recording.render import info_lines, info_record, size_text
-from ironbird.recording.session import RecordRequest, parse_split, recording_for
+from ironbird.recording.render import damage_summary, info_json, info_lines, size_text
+from ironbird.recording.session import PendingRecording, RecordRequest, parse_split
 from ironbird.recording.writer import Recorder
 from ironbird.session import Route, Session, Side
 
@@ -660,10 +660,12 @@ def _parse_args(items: list[str] | None) -> dict[str, str]:
 class _RecordingScope:
     """``--record`` for one command: a recording that lives for the ``async with`` block.
 
-    It starts before the capture opens, so no frame is missed, and closes after the capture
-    closes, so the closing records are written on every way out (normal end, ``--duration``, a
-    signal). Without a target it does nothing. ``exit_code`` folds a failed recorder into the
-    command's exit code (the capture goes on; the command exits 1 at the end).
+    Entering it stages the capture's frames; ``commit`` (called right after the capture has
+    opened, so a wrong argument or a busy port leaves no file) creates the recording and hands
+    the staged frames to it; leaving it closes the recording after the capture has closed, so
+    the closing records are written on every way out (normal end, ``--duration``, a signal).
+    Without a target it does nothing. ``exit_code`` folds a failed recorder into the command's
+    exit code (the capture goes on; the command exits 1 at the end).
     """
 
     def __init__(
@@ -678,39 +680,44 @@ class _RecordingScope:
         split: tuple[int | None, float | None] = (None, None),
     ) -> None:
         self.recorder: Recorder | None = None
-        self._session, self._run = session, run
-        self._target, self._command = target, command
-        self._nodes, self._routes, self._split = nodes, routes or [], split
-        self._cm: contextlib.AbstractAsyncContextManager[Recorder] | None = None
+        self._run = run
+        self._pending: PendingRecording | None = None
+        if target is not None and nodes:
+            request = RecordRequest(
+                None if target == "auto" else Path(target), split[0], split[1], command
+            )
+            self._pending = PendingRecording(session, request, nodes=nodes, routes=routes or [])
 
     async def __aenter__(self) -> _RecordingScope:
-        if self._target is None or not self._nodes:
-            return self
-        request = RecordRequest(
-            None if self._target == "auto" else Path(self._target),
-            self._split[0],
-            self._split[1],
-            self._command,
-        )
-        self._cm = recording_for(self._session, request, nodes=self._nodes, routes=self._routes)
-        self.recorder = await self._cm.__aenter__()
-        self._run.console.err(f"recording to {term(str(self.recorder.path), 1000, err=True)}")
+        if self._pending is not None:
+            self._pending.begin()
         return self
 
-    async def __aexit__(self, *exc_info: Any) -> bool | None:
-        cm, recorder = self._cm, self.recorder
-        if cm is None or recorder is None:
-            return None
-        self._cm = None
-        try:
-            return await cm.__aexit__(*exc_info)
-        finally:
-            stats = recorder.stats()
-            dropped = f", {stats.overrun_frames} dropped" if stats.overrun_frames else ""
+    async def commit(self) -> None:
+        """Create the recording now (call once the capture is open). A no-op without a target."""
+        if self._pending is None:
+            return
+        self.recorder = self._pending.commit()
+        self._run.console.err(f"recording to {term(str(self.recorder.path), 1000, err=True)}")
+
+    async def __aexit__(self, exc_type: object, exc: BaseException | None, tb: object) -> None:
+        pending = self._pending
+        if pending is None:
+            return
+        stats = await pending.finish(interrupted=isinstance(exc, asyncio.CancelledError))
+        recorder = self.recorder
+        if stats is None or recorder is None:
+            return
+        where = term(str(recorder.path), 1000, err=True)
+        size = size_text(stats.file_bytes)
+        if recorder.failed is not None:
             self._run.console.err(
-                f"recorded {stats.frames} frame(s) ({size_text(stats.file_bytes)}{dropped}) to "
-                f"{term(str(recorder.path), 1000, err=True)}"
+                f"recording stopped after {stats.frames} frame(s), {stats.lost_frames} not "
+                f"recorded ({size}) in {where}"
             )
+        else:
+            dropped = f", {stats.overrun_frames} dropped" if stats.overrun_frames else ""
+            self._run.console.err(f"recorded {stats.frames} frame(s) ({size}{dropped}) to {where}")
 
     def exit_code(self, code: int) -> int:
         failed = self.recorder is not None and self.recorder.failed is not None
@@ -913,10 +920,12 @@ def listen(
             nodes=[route.server.name] if route is not None else [],
             routes=[route] if route is not None else [],
         ) as scope:
-            code = await listen_body(session, config, run)
+            code = await listen_body(session, config, run, scope)
         return scope.exit_code(code)
 
-    async def listen_body(session: Session, config: SystemConfig, run: _Run) -> int:
+    async def listen_body(
+        session: Session, config: SystemConfig, run: _Run, scope: _RecordingScope
+    ) -> int:
         io = run.console
         mids = _parse_mids(session, node, mid, link)
         listener = await session.listen(node, mids=mids, link=link)
@@ -939,6 +948,7 @@ def listen(
                     return
 
         try:
+            await scope.commit()
             reason = await _run_until(consume(), timeout, "listen", run)
         finally:
             await listener.close()
@@ -979,10 +989,12 @@ def events(
             nodes=sorted({r.server.name for r in routes}),
             routes=routes,
         ) as scope:
-            code = await events_body(session, config, run)
+            code = await events_body(session, config, run, scope)
         return scope.exit_code(code)
 
-    async def events_body(session: Session, config: SystemConfig, run: _Run) -> int:
+    async def events_body(
+        session: Session, config: SystemConfig, run: _Run, scope: _RecordingScope
+    ) -> int:
         io = run.console
         stream = await session.events(
             node, min_severity=min_type.severity if min_type is not None else None
@@ -1002,6 +1014,7 @@ def events(
                     return
 
         try:
+            await scope.commit()
             reason = await _run_until(consume(), timeout, "events", run)
         finally:
             await stream.close()
@@ -1033,10 +1046,12 @@ def respond(
             nodes=[route.server.name] if route is not None else [],
             routes=[route] if route is not None else [],
         ) as scope:
-            code = await respond_body(session, config, run)
+            code = await respond_body(session, config, run, scope)
         return scope.exit_code(code)
 
-    async def respond_body(session: Session, config: SystemConfig, run: _Run) -> int:
+    async def respond_body(
+        session: Session, config: SystemConfig, run: _Run, scope: _RecordingScope
+    ) -> int:
         io = run.console
         responder = await session.respond(peer=peer, link=link)
         io.err(render.respond_banner(session.node.name, responder.local_address))
@@ -1059,6 +1074,7 @@ def respond(
                     return
 
         try:
+            await scope.commit()
             reason = await _run_until(consume(), timeout, "respond", run)
         finally:
             await responder.close()
@@ -1139,9 +1155,14 @@ def record(
             split=parts,
         )
         async with scope:
+            capture = await session.capture(routes)
+            try:
+                await scope.commit()
+            except BaseException:
+                await capture.close()
+                raise
             recorder = scope.recorder
             assert recorder is not None
-            capture = await session.capture(routes)
             helpers = [asyncio.ensure_future(_close_when_failed(recorder, capture))]
             if not quiet:
                 helpers.append(asyncio.ensure_future(_status_loop(recorder, io)))
@@ -1173,17 +1194,29 @@ def _rec_failure(ledger: Ledger, console: Console, run: _Run, exc: IronbirdError
     return exc.exit_code
 
 
-def _damage_lines(report: rec_inspect.Report) -> list[str]:
+def _damage_lines(report: rec_inspect.Report, *, verbose: bool = False) -> list[str]:
+    """The problems ``rec check`` reports: all the damage in one line (``verbose`` lists the
+    stretches kept; the ledger has the same detail), then findings and unexplained holes."""
     lines: list[str] = []
-    for damage in report.damage:
-        error = damage.to_error()
-        lines.append(f"{'warning' if damage.torn else 'error'} {error.code.value}: {error.summary}")
+    if report.damage_total:
+        code = Code.REC_DAMAGED if report.mid_file_damage else Code.REC_TORN
+        severity = "error" if report.mid_file_damage else "warning"
+        lines.append(f"{severity} {code.value}: {damage_summary(report)}")
+        if verbose and report.damage_total > 1:
+            lines += [f"  {d.offset}+{d.span}: {d.reason}" for d in report.damage]
     for finding in report.findings:
         lines.append(f"error {Code.REC_DAMAGED.value}: {finding}")
-    for first, last in report.holes[:20]:
+    if len(report.holes) == 1:
+        first, last = report.holes[0]
         lines.append(
             f"error {Code.REC_DAMAGED.value}: sequence {first}..{last} is missing and no GAP "
             "record explains it"
+        )
+    elif report.holes:
+        first, last = report.holes[0]
+        lines.append(
+            f"error {Code.REC_DAMAGED.value}: {report.hole_frames} frame(s) are missing in "
+            f"sequence holes no GAP record explains, the first {first}..{last}"
         )
     if report.trailer is None and not report.damage:
         lines.append(
@@ -1216,7 +1249,7 @@ def rec_info(
             source=report.source,
         )
         if fmt is Format.JSON:
-            console.out(json.dumps(info_record(report)))
+            console.out(info_json(report))
         else:
             for line in info_lines(report):
                 console.out(line)
@@ -1256,7 +1289,9 @@ def rec_check(
             file=file,
             status=report.status,
             frames=report.frames,
-            damage=[d.reason for d in report.damage],
+            damage_total=report.damage_total,
+            damage_bytes=report.damage_bytes,
+            damage=[f"{d.offset}+{d.span}: {d.reason}" for d in report.damage],
             findings=report.findings_total,
             holes=report.hole_frames,
             ok=not failed,
@@ -1265,7 +1300,7 @@ def rec_check(
             f"{term(str(file), 400)}: {report.status}, {report.frames} frame(s) in "
             f"{report.chunks} chunk(s), {report.gap_total} gap record(s)"
         )
-        for line in _damage_lines(report):
+        for line in _damage_lines(report, verbose=run.verbose):
             console.err(term(line, 1000, err=True))
         if report.index != "ok" and report.trailer is not None:
             note = term(report.index_note, 200, err=True)

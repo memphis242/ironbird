@@ -14,14 +14,18 @@ Layout rules the writer keeps so a reader (and ``ib rec info``) can use the chun
 * STREAM and SOURCE definitions are repeated every minute at a chunk start, so one damaged
   definition cannot make the rest of a stream unreadable.
 
-Crash safety: the file is created ``O_EXCL`` and locked ``LOCK_EX``, the preamble, META,
-definitions and streams are synced (file and directory) before the first frame, and
-``fdatasync`` runs once per chunk (policy ``chunk``): a power loss loses about a second, a
-process crash only the unflushed 250 ms, and a clean stop or a signal nothing.
+Crash safety: every part is created ``O_EXCL`` and locked ``LOCK_EX``, and its preamble, META,
+definitions and streams are written and synced (file and directory) before the part takes a
+frame, so a crash never leaves a part without a readable head. ``fdatasync`` runs once per chunk
+(policy ``chunk``): a power loss loses about a second; a process crash loses what was not yet
+handed to the disk, which is the frames of the last 250 ms flush interval plus up to one timer
+tick (about 500 ms at the worst); a clean stop or a signal loses nothing.
 
 Back-pressure is bounded: buffered plus queued bytes never exceed ``max_buffer_bytes``; past it
 frames are dropped and counted, and a GAP record (reason ``recorder_overrun``) says which once
 there is room again. A failed write stops the recorder (``IB-REC-002``) and the capture goes on.
+The statistics count frames *written* (handed to the disk by a completed write); frames encoded
+but never written, and frames that arrive after a stop, are counted as not recorded.
 """
 
 from __future__ import annotations
@@ -63,8 +67,9 @@ SPACE_CHECK_NS: Final = 10_000_000_000
 SPACE_WARN_S: Final = 600.0  # warn when the projected time to a full disk drops under this
 RATE_WINDOW_NS: Final = 60_000_000_000
 CLOCK_STEP_NS: Final = 250_000_000  # wall clock vs. monotonic drift that is a clock step
-CLOSE_BOUND_S: Final = 5.0
+CLOSE_STALL_S: Final = 5.0  # a close gives up when the writer makes no progress for this long
 LOCK_WAIT_S: Final = 1.0
+_DIRSYNC_UNSUPPORTED: Final = frozenset({errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP})
 TICK_S: Final = 0.25
 MIN_SPLIT_BYTES: Final = 1024 * 1024
 MIN_SPLIT_SECONDS: Final = 10.0
@@ -119,18 +124,24 @@ class BlobSpec:
 class RecorderStats:
     """A snapshot of what the recorder has done."""
 
-    frames: int  # frames encoded into the recording
+    frames: int  # frames written to the file (a completed write handed them to the disk)
     data_bytes: int  # payload bytes of those frames
-    file_bytes: int  # bytes encoded so far, all parts (buffered bytes included)
+    file_bytes: int  # bytes written to the files, all parts
     overrun_frames: int  # frames dropped because the buffer was full
     not_recorded_frames: int  # frames of streams this recorder was not given
-    after_stop_frames: int  # frames that arrived after the recorder stopped (a failed write)
+    after_stop_frames: int  # frames that arrived after the recorder stopped
+    unwritten_frames: int  # encoded but never written (a failed write, an abandoned close)
     gaps: int  # GAP records written
     chunks: int
     parts: int
     pending_bytes: int  # buffered plus queued for the writer
     peak_pending_bytes: int
     stopped: bool
+
+    @property
+    def lost_frames(self) -> int:
+        """Frames offered to the recorder for its streams that are not in the file."""
+        return self.overrun_frames + self.unwritten_frames + self.after_stop_frames
 
 
 @dataclass(slots=True)
@@ -162,8 +173,9 @@ def _signals_blocked() -> Any:
 
 
 class _WriterThread(threading.Thread):
-    """Writes the jobs the event loop queues: ``(fd, data, sync)``, ``("close", fd)``,
-    ``("active", fd)`` and ``None`` (stop). The only code that blocks on the disk."""
+    """Writes the jobs the event loop queues: ``(fd, data, sync, frames, data_bytes)``,
+    ``("close", fd)``, ``("active", fd)`` and ``None`` (stop). The only code that blocks on the
+    disk."""
 
     def __init__(
         self,
@@ -175,6 +187,10 @@ class _WriterThread(threading.Thread):
         super().__init__(name="recorder-writer", daemon=True)
         self.jobs: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self.written = 0  # bytes taken off the queue, written or discarded; this thread only
+        self.bytes_ok = 0  # bytes of jobs that were written whole
+        self.frames_ok = 0  # frames in those jobs
+        self.data_ok = 0  # their payload bytes
+        self.progress = 0  # bumped after every write, sync and job: a close watches it move
         self.synced = 0  # fdatasync calls made
         self.error: OSError | None = None
         self._on_error = on_error
@@ -198,21 +214,17 @@ class _WriterThread(threading.Thread):
                     os.close(job[1])
             elif head == "active":
                 self._active_fd = job[1]
-            elif head == "dsync":
-                self._guarded(self._sync_directory, job[1])
             else:
-                fd, data, sync = job
+                fd, data, sync, frames, data_bytes = job
                 size = len(data)
                 if self.error is None:
                     self._guarded(self._write_all, fd, data, sync)
+                    if self.error is None:
+                        self.bytes_ok += size
+                        self.frames_ok += frames
+                        self.data_ok += data_bytes
                 self.written += size
-
-    @staticmethod
-    def _sync_directory(fd: int) -> None:
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+            self.progress += 1
 
     def _heartbeat(self) -> None:
         """Keep the file's mtime fresh while nothing is written, so retention sees it as live."""
@@ -234,30 +246,36 @@ class _WriterThread(threading.Thread):
             if count <= 0:
                 raise OSError(errno.EIO, "write made no progress")
             view = view[count:]
+            self.progress += 1
         if sync:
             self._sync(fd)
             self.synced += 1
+            self.progress += 1
 
 
-def create_exclusive(path: Path) -> int:
+def create_exclusive(path: Path, *, part: int = 1) -> int:
     """Create ``path`` (mode 0600) and lock it exclusively; an existing file is never touched.
 
     Where the file system cannot lock (``ENOLCK``, ``EINVAL``, ``EOPNOTSUPP``) the recording goes
-    on unlocked. Raises ``IB-REC-001``.
+    on unlocked. ``part`` only words the error. Raises ``IB-REC-001``.
     """
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    what = "recording" if part == 1 else f"part {part} of the recording"
     try:
         fd = os.open(path, flags, 0o600)
     except FileExistsError as exc:
         raise IronbirdError(
             Code.REC_CREATE,
-            f"{path} already exists; a recording is never overwritten (choose another -o)",
+            f"cannot start part {part}: {path} already exists; the recording stops here "
+            "(move that file away, or use a different name for the next recording)"
+            if part > 1
+            else f"{path} already exists; a recording is never overwritten (choose another -o)",
             cause=exc,
         ) from exc
     except OSError as exc:
         raise IronbirdError(
             Code.REC_CREATE,
-            f"cannot create recording {path}: {exc.strerror or exc}",
+            f"cannot create {what} {path}: {exc.strerror or exc}",
             cause=exc,
         ) from exc
     deadline = time.monotonic() + LOCK_WAIT_S
@@ -271,6 +289,19 @@ def create_exclusive(path: Path) -> int:
             # Unsupported or held past a second: record unlocked (liveness rests on freshness).
         break
     return fd
+
+
+def _discard_partial(fd: int, path: Path) -> bool:
+    """Remove ``path`` if it is still the file ``fd`` denotes (the one this process created
+    with ``O_EXCL``); a name that now denotes anything else is left alone."""
+    try:
+        held, named = os.fstat(fd), os.stat(path, follow_symlinks=False)
+        if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+            return False
+        os.unlink(path)
+    except OSError:
+        return False
+    return True
 
 
 def sync_directory(directory: Path) -> None:
@@ -312,7 +343,9 @@ class Recorder:
         wall_ns: Callable[[], int],
         write: Callable[[int, memoryview], int],
         sync: Callable[[int], None],
+        capture_continues: bool,
     ) -> None:
+        self._capture_continues = capture_continues
         self._base = base_path
         self._meta = dict(meta)
         self._blobs = tuple(blobs)
@@ -341,11 +374,15 @@ class Recorder:
         self._part_frames = 0
         self._part_started = 0
         self._part_last_seq = 0
+        self._head_written = 0  # bytes of part heads, written synchronously
+        self._buf_frames = 0  # frames and payload bytes in ``_buf``, not yet handed over
+        self._buf_data = 0
+        self._dirsync_warned = False
+        self._closing = False
         self._last_seq = 0
         self._previous_last_seq = 0
         self._reset_chunk()
         self._frames = 0
-        self._data_bytes = 0
         self._file_bytes = 0
         self._chunks = 0
         self._gaps = 0
@@ -392,13 +429,16 @@ class Recorder:
         wall_ns: Callable[[], int] = time.time_ns,
         write: Callable[[int, memoryview], int] = os.write,
         sync: Callable[[int], None] = os.fdatasync,
+        capture_continues: bool = True,
     ) -> Recorder:
         """Create the recording at ``path`` and make it durable: preamble, META, definitions and
         streams are synced (file and directory) before this returns.
 
         Raises ``IB-REC-001`` (cannot create; exists), ``IB-REC-010`` (too little free space) or
         ``IB-REC-002`` (the first writes failed). ``loop`` enables the 250 ms timer; without one
-        the recorder flushes only when frames arrive (tests, benchmarks).
+        the recorder flushes only when frames arrive (tests, benchmarks). ``capture_continues``
+        words the failure notice (whether the command keeps capturing without the recording). A
+        start that fails after the file was created removes that file.
         """
         opts = options or RecorderOptions()
         recorder = cls(
@@ -415,6 +455,7 @@ class Recorder:
             wall_ns=wall_ns,
             write=write,
             sync=sync,
+            capture_continues=capture_continues,
         )
         try:
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -476,9 +517,11 @@ class Recorder:
         return b"".join(parts)
 
     def _begin_part(self, *, first: bool) -> None:
-        """Create the file of the current part and write its head (synchronously for part 1)."""
+        """Create the file of the current part and write its head, synced with its directory,
+        before the part is used: a crash leaves a readable head or no file, never half a head.
+        A failure removes the file this call created."""
         path = part_path(self._base, self._part)
-        fd = create_exclusive(path)
+        fd = create_exclusive(path, part=self._part)
         try:
             self._nonce = int.from_bytes(os.urandom(8), "little")
             self._seed = fmt.seed_of(self._nonce)
@@ -487,29 +530,33 @@ class Recorder:
                     if self._accept is None or stream.id in self._accept:
                         self._streams[stream.id] = stream
             head = self._head_bytes()
-            self._parts.append(path)
-            self._fd = fd
-            self._offset = len(head)
-            self._chunk_start = fmt.PREAMBLE_SIZE
-            self._chunk_offsets = []
-            self._part_frames = 0
-            self._part_last_seq = 0
-            self._part_started = self._mono()
-            self._reset_chunk()
-            self._file_bytes += len(head)
-            if first:
-                self._write_head_now(fd, head, path)
-            else:
-                self._enqueued += len(head)
-                self._writer.jobs.put((fd, bytearray(head), True))
-                self._writer.jobs.put(("dsync", self._dir_fd_for_sync()))
-                self._writer.jobs.put(("active", fd))
-        except BaseException:
+            self._write_head_now(fd, head, path)
+        except BaseException as exc:
+            removed = _discard_partial(fd, path)
             os.close(fd)
+            if isinstance(exc, IronbirdError):
+                note = (
+                    "; the partial file was removed"
+                    if removed
+                    else f"; the partial file {path} could not be removed"
+                )
+                raise IronbirdError(
+                    exc.code, exc.summary + note, cause=exc.cause, details=exc.details
+                ) from exc
             raise
-
-    def _dir_fd_for_sync(self) -> int:
-        return os.open(self._base.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        self._parts.append(path)
+        self._fd = fd
+        self._offset = len(head)
+        self._chunk_start = fmt.PREAMBLE_SIZE
+        self._chunk_offsets = []
+        self._part_frames = 0
+        self._part_last_seq = 0
+        self._part_started = self._mono()
+        self._reset_chunk()
+        self._file_bytes += len(head)
+        self._head_written += len(head)
+        if not first:
+            self._writer.jobs.put(("active", fd))
 
     def _write_head_now(self, fd: int, head: bytes, path: Path) -> None:
         try:
@@ -517,13 +564,31 @@ class Recorder:
             while view:
                 view = view[os.write(fd, view) :]
             os.fsync(fd)
-            sync_directory(path.parent)
         except OSError as exc:
             raise IronbirdError(
                 Code.REC_WRITE,
                 f"cannot write the start of recording {path}: {exc.strerror or exc}",
                 cause=exc,
             ) from exc
+        try:
+            sync_directory(path.parent)
+        except OSError as exc:
+            if exc.errno not in _DIRSYNC_UNSUPPORTED:
+                raise IronbirdError(
+                    Code.REC_WRITE,
+                    f"cannot sync the directory of recording {path}: {exc.strerror or exc}",
+                    cause=exc,
+                ) from exc
+            if not self._dirsync_warned:
+                self._dirsync_warned = True
+                self._notify(
+                    IronbirdError(
+                        Code.REC_DIRSYNC,
+                        f"{path.parent} cannot be synced ({exc.strerror or exc}): after a power "
+                        "loss a recording's name may be missing even though its data was written",
+                    ),
+                    Level.WARNING,
+                )
 
     def _reset_chunk(self) -> None:
         self._chunk_frames = 0
@@ -558,7 +623,8 @@ class Recorder:
 
     @property
     def frames(self) -> int:
-        """Frames recorded so far (cheaper than :meth:`stats`)."""
+        """Frames accepted for the recording so far, written or not yet (cheaper than
+        :meth:`stats`, which counts the written ones)."""
         return self._frames
 
     @property
@@ -567,13 +633,18 @@ class Recorder:
 
     def stats(self) -> RecorderStats:
         pending = self._enqueued - self._writer.written + len(self._buf)
+        written = self._writer.frames_ok
+        # While recording, frames not yet written are in flight, not lost; once the recorder has
+        # stopped or closed, whatever was encoded and never written is.
+        unwritten = self._frames - written if self._stopped or self._closed else 0
         return RecorderStats(
-            self._frames,
-            self._data_bytes,
-            self._file_bytes,
+            written,
+            self._writer.data_ok,
+            self._head_written + self._writer.bytes_ok,
             self._overrun_frames,
             self._not_recorded,
             self._after_stop,
+            unwritten,
             self._gaps,
             self._chunks,
             self._part,
@@ -593,7 +664,17 @@ class Recorder:
     # -- the sink --
 
     def append(self, frame: Frame) -> None:
-        """Encode ``frame`` into the recording. Cheap, synchronous, and never raises for data."""
+        """Encode ``frame`` into the recording. Cheap, synchronous, and never raises: a failure
+        stops the recorder (``IB-INT-001``) and the frame is counted as not recorded."""
+        encoded = self._frames
+        try:
+            self._append(frame)
+        except Exception as exc:
+            self._internal_failure(exc)
+            if self._frames == encoded:  # the frame itself never got into the buffer
+                self._after_stop += 1
+
+    def _append(self, frame: Frame) -> None:
         if self._stopped:
             self._after_stop += 1
             return
@@ -661,7 +742,8 @@ class Recorder:
         else:
             self._chunk_nomid += 1
         self._frames += 1
-        self._data_bytes += size
+        self._buf_frames += 1
+        self._buf_data += size
         self._part_frames += 1
         self._part_last_seq = self._last_seq = seq
         self._file_bytes += record
@@ -744,7 +826,23 @@ class Recorder:
         first_seq: int,
         last_seq: int,
     ) -> None:
-        """Frames the engine knows were lost before they were given to this sink (kernel drop)."""
+        """Frames the engine knows were lost before they were given to this sink (kernel drop).
+        Never raises: a failure stops the recorder (``IB-INT-001``)."""
+        try:
+            self._gap(stream, reason, count, first_ns, last_ns, first_seq, last_seq)
+        except Exception as exc:
+            self._internal_failure(exc)
+
+    def _gap(
+        self,
+        stream: Stream,
+        reason: GapReason,
+        count: int,
+        first_ns: int,
+        last_ns: int,
+        first_seq: int,
+        last_seq: int,
+    ) -> None:
         if self._stopped or (self._accept is not None and stream.id not in self._accept):
             return
         if count < 1:
@@ -763,11 +861,15 @@ class Recorder:
         self._head_record(RecordType.GAP, fmt.encode_gap(gap))
 
     def mark(self, kind: MarkKind, text: str = "", time_ns: int | None = None) -> None:
-        """A session event (start, stop, signal, link up or down, clock step, note)."""
+        """A session event (start, stop, signal, link up or down, clock step, note). Never
+        raises: a failure stops the recorder (``IB-INT-001``)."""
         if self._stopped:
             return
-        when = self._wall() if time_ns is None else time_ns
-        self._head_record(RecordType.MARK, fmt.encode_mark(when, kind, text))
+        try:
+            when = self._wall() if time_ns is None else time_ns
+            self._head_record(RecordType.MARK, fmt.encode_mark(when, kind, text))
+        except Exception as exc:
+            self._internal_failure(exc)
 
     # -- chunks and flushing --
 
@@ -828,10 +930,11 @@ class Recorder:
         self._buf = bytearray()
         self._buf_since = self._mono()
         self._enqueued += len(buf)
-        self._writer.jobs.put((self._fd, buf, sync))
+        self._writer.jobs.put((self._fd, buf, sync, self._buf_frames, self._buf_data))
+        self._buf_frames = self._buf_data = 0
         pending = self._enqueued - self._writer.written
         self._peak_pending = max(self._peak_pending, pending)
-        if pending >= self._options.max_buffer_bytes and not self._overrun:
+        if pending >= self._options.max_buffer_bytes and not self._overrun and not self._closing:
             self._begin_overrun(pending)
 
     # -- back-pressure ----------------------------------------------------------------------------
@@ -971,9 +1074,11 @@ class Recorder:
         try:
             self._begin_part(first=False)
         except IronbirdError as exc:
+            self._part -= 1
             self._stop_with(exc)
             return
         except OSError as exc:  # pragma: no cover - create_exclusive wraps what it can
+            self._part -= 1
             self._stop_with(
                 IronbirdError(Code.REC_CREATE, f"cannot start the next part: {exc}", cause=exc)
             )
@@ -1029,12 +1134,18 @@ class Recorder:
             loop.call_soon_threadsafe(self._stop_after_error, exc)
 
     def _stop_after_error(self, exc: OSError) -> None:
+        written = self._writer.frames_ok
+        goes_on = (
+            "the capture continues and later frames are not recorded"
+            if self._capture_continues
+            else "the capture ends"
+        )
         self._stop_with(
             IronbirdError(
                 Code.REC_WRITE,
-                f"recording stopped: writing {self._parts[-1] if self._parts else self._base} "
-                f"failed ({exc.strerror or exc}); free space or record elsewhere - "
-                "the capture continues, frames are no longer recorded",
+                f"recording stopped after {written} frame(s), {self._frames - written} not "
+                f"recorded: writing {self._parts[-1] if self._parts else self._base} failed "
+                f"({exc.strerror or exc}); free space or record elsewhere - {goes_on}",
                 cause=exc,
             )
         )
@@ -1066,12 +1177,15 @@ class Recorder:
     async def close(self) -> RecorderStats:
         """Write the closing records (final chunk, index, trailer), sync, and close the files.
 
-        Bounded to 5 s: a disk that does not answer leaves a file without its trailer, which stays
-        readable up to the last flushed record, and says so.
+        The wait for the disk has no overall limit, because a backlog that is draining must
+        finish (the GAP for dropped frames and the trailer are behind it); it ends when the
+        writer makes no progress for :data:`CLOSE_STALL_S`. A disk that stops answering then
+        leaves a file without its trailer, readable up to the last record that reached it, and
+        the notice says how many frames were not written.
         """
         if self._closed:
             return self.stats()
-        self._closed = True
+        self._closed = self._closing = True
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
@@ -1083,24 +1197,30 @@ class Recorder:
                 self._finish_part()
             except Exception as exc:
                 self._internal_failure(exc)
-        stats = self.stats()
         jobs = self._writer.jobs
         jobs.put(("close", self._fd))
         if self._held_fd >= 0:
             jobs.put(("close", self._held_fd))
         jobs.put(None)
-        deadline = time.monotonic() + CLOSE_BOUND_S
-        while self._writer.is_alive() and time.monotonic() < deadline:
+        seen, moved_at = self._writer.progress, time.monotonic()
+        while self._writer.is_alive():
             await asyncio.sleep(0.005)
+            now = time.monotonic()
+            if self._writer.progress != seen:
+                seen, moved_at = self._writer.progress, now
+            elif now - moved_at >= CLOSE_STALL_S:
+                break
         if self._writer.is_alive():
             self._stop_with(
                 IronbirdError(
                     Code.REC_WRITE,
-                    f"the disk did not finish writing {self._base} within "
-                    f"{CLOSE_BOUND_S:g} s; the recording may lack its trailer "
-                    "(it is readable up to the last record that reached the disk)",
+                    f"the disk made no progress for {CLOSE_STALL_S:g} s while closing "
+                    f"{self._base}: {self._frames - self._writer.frames_ok} frame(s) were not "
+                    "written and the recording may lack its trailer (it is readable up to the "
+                    "last record that reached the disk)",
                 )
             )
+        stats = self.stats()
         if self._ledger is not None:
             self._ledger.record(
                 "state",
@@ -1111,6 +1231,9 @@ class Recorder:
                 file_bytes=stats.file_bytes,
                 overrun_frames=stats.overrun_frames,
                 not_recorded_frames=stats.not_recorded_frames,
+                unwritten_frames=stats.unwritten_frames,
+                after_stop_frames=stats.after_stop_frames,
+                lost_frames=stats.lost_frames,
                 gaps=stats.gaps,
                 chunks=stats.chunks,
                 failed=self._failed.code.value if self._failed else None,

@@ -89,8 +89,9 @@ OTHER_SOURCE: Final = 0xFFFF
 OTHER_SOURCE_TEXT: Final = "(other)"
 NO_STREAM: Final = 0xFFFF
 MAX_TEXT: Final = 256  # the longest text kept from an untrusted string, after sanitizing
+MAX_META_DEPTH: Final = 16  # nesting of the META JSON (the writer's own is 3)
 assert CHUNK_FIXED_SIZE + 8 * MAX_CHUNK_MIDS <= MAX_CHUNK_BODY
-assert MAX_STREAM_ID == 0xFFFF == OTHER_SOURCE == NO_STREAM
+assert MAX_STREAM_ID + 1 == 0xFFFF == OTHER_SOURCE == NO_STREAM  # 0xFFFF names no stream
 
 META_SCHEMA: Final = "ironbird-rec-meta/1"
 CHUNK_FLAG_MID_OVERFLOW: Final = 0x0001
@@ -218,6 +219,25 @@ def _int_field(data: Mapping[str, Any], key: str, low: int, high: int, default: 
     return value
 
 
+def _depth(root: Any) -> int:
+    """Nesting depth of decoded JSON, measured without recursion (the data is untrusted)."""
+    deepest = 0
+    pending: list[tuple[Any, int]] = [(root, 1)]
+    while pending:
+        value, level = pending.pop()
+        if isinstance(value, dict):
+            children: Any = value.values()
+        elif isinstance(value, list):
+            children = value
+        else:
+            continue
+        deepest = max(deepest, level)
+        if deepest > MAX_META_DEPTH:
+            return deepest
+        pending.extend((child, level + 1) for child in children)
+    return deepest
+
+
 def decode_meta(body: bytes | memoryview) -> Meta:
     try:
         data = json.loads(bytes(body).decode("utf-8"))
@@ -225,6 +245,8 @@ def decode_meta(body: bytes | memoryview) -> Meta:
         raise FormatError(f"META is not valid JSON ({type(exc).__name__})") from exc
     if not isinstance(data, dict):
         raise FormatError("META is not a JSON object")
+    if _depth(data) > MAX_META_DEPTH:
+        raise FormatError(f"META is nested deeper than {MAX_META_DEPTH} levels")
     if data.get("schema") != META_SCHEMA:
         raise FormatError("META schema is not " + META_SCHEMA)
     return Meta(
@@ -322,6 +344,7 @@ READABLE_TRANSPORTS: Final = frozenset({"udp", "serial"})
 
 
 def encode_stream(stream: Stream) -> bytes:
+    assert stream.id <= MAX_STREAM_ID, "a stream id never reaches the id that means no stream"
     link, node = stream.link.encode("ascii"), stream.node.encode("ascii")
     transport = stream.transport.encode("ascii")
     endpoint = stream.endpoint.encode("utf-8")[: MAX_TEXT * 2]
@@ -349,6 +372,8 @@ def decode_stream(body: bytes | memoryview) -> Stream:
     if len(body) < _STREAM_HEAD.size:
         raise FormatError("STREAM is too short")
     sid, kind_code, dir_code = _STREAM_HEAD.unpack_from(body, 0)
+    if sid > MAX_STREAM_ID:
+        raise FormatError(f"STREAM id {sid} is reserved (it names no stream in a GAP)")
     kind, direction = _KINDS_BY_CODE.get(kind_code), _DIRECTIONS_BY_CODE.get(dir_code)
     if kind is None or direction is None:
         raise FormatError("STREAM kind or direction is not defined")

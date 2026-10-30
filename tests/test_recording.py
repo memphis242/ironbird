@@ -274,11 +274,13 @@ def test_blobs_are_embedded_verified_and_listed(tmp_path: Path) -> None:
     spec = BlobSpec(BlobKind.CCDD, "fc", "json", content)
     record(path, [frame(1)], blobs=[spec])
     with RecordingReader(path) as reader:
-        list(reader.items())
-        assert [(b.kind, b.node, b.adapter, b.content) for b in reader.blobs] == [
-            (BlobKind.CCDD, "fc", "json", content)
+        blobs = [
+            i.value for i in reader.items() if isinstance(i, Item) and i.rtype == RecordType.BLOB
         ]
-        assert reader.blobs[0].sha256 == hashlib.sha256(content).digest()
+    assert [(b.kind, b.node, b.adapter, b.content) for b in blobs] == [
+        (BlobKind.CCDD, "fc", "json", content)
+    ]
+    assert blobs[0].sha256 == hashlib.sha256(content).digest()
     assert [b.kind for b in rec_inspect.info(path).blobs] == ["ccdd"]
 
 
@@ -556,11 +558,13 @@ def test_split_parts_are_complete_files_with_a_chain(tmp_path: Path) -> None:
     previous_last = 0
     for number, part in enumerate(parts, start=1):
         with RecordingReader(part) as reader:
-            part_frames = list(reader.frames())
+            items = [i for i in reader.items() if isinstance(i, Item)]
+            part_frames = [i.value for i in items if i.rtype == RecordType.FRAME]
             assert reader.meta.part == number
             assert reader.meta.previous_last_seq == previous_last
             assert reader.trailer is not None and reader.trailer.frame_count == len(part_frames)
-            assert [b.node for b in reader.blobs] == ["fc"]  # every part carries its definitions
+            # every part carries its definitions
+            assert [i.value.node for i in items if i.rtype == RecordType.BLOB] == ["fc"]
             nonces.add(reader.nonce)
             if part_frames:
                 assert part_frames[0].seq == previous_last + 1

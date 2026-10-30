@@ -29,7 +29,7 @@ from ironbird.codec import DecodedPacket, Resolved
 
 IDENTITY_FIELDS: Final = 8  # the packet fields of a frame; ``checked`` follows them
 MAX_FRAME_BYTES: Final = 65535  # the largest max_packet_bytes the config accepts
-MAX_STREAM_ID: Final = 0xFFFF
+MAX_STREAM_ID: Final = 0xFFFE  # 0xFFFF means "no stream" in a recording's GAP records
 MAX_MID: Final = 0xFFFFFFFF  # MIDs are 32 bits (the CCDD and the header codec enforce it)
 SERIAL_TRANSPORT: Final = "serial"
 

@@ -12,6 +12,7 @@ never modifies the original.
 from __future__ import annotations
 
 import os
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -25,10 +26,13 @@ from ironbird.recording.reader import Damage, Item, RecordingReader
 from ironbird.sanitize import clean
 
 MAX_FINDINGS: Final = 100
-MAX_HOLES: Final = 1000
+MAX_HOLES: Final = 1000  # holes kept for display; the count covers them all
+MAX_PENDING_HOLES: Final = 65536  # holes awaiting a GAP that may yet explain them
+MAX_GAP_RANGES: Final = 65536  # merged sequence ranges the GAP records explain
 MAX_TRACKED_MIDS: Final = 65536
 MAX_CHUNK_TRACKED_MIDS: Final = fmt.MAX_CHUNK_MIDS + 1
-MAX_LISTED: Final = 200  # gaps and marks kept for display
+MAX_LISTED: Final = 200  # gaps, marks, definitions and damage kept for display
+MAX_TRACKED_BLOBS: Final = 4096  # distinct definition digests remembered to count each once
 COPY_BLOCK: Final = 1 << 20
 _SEQ_GAP_REASONS: Final = frozenset({GapReason.RECORDER_OVERRUN, GapReason.NOT_RECORDED})
 
@@ -64,33 +68,26 @@ class Report:
     mids_dropped: int = 0  # frames of MIDs past the table cap (scan only)
     frames_without_mid: int = 0
     streams: dict[int, Stream] = field(default_factory=dict)
-    gaps: list[fmt.Gap] = field(default_factory=list)
+    gaps: list[fmt.Gap] = field(default_factory=list)  # the first MAX_LISTED
     gap_total: int = 0
-    marks: list[fmt.Mark] = field(default_factory=list)
-    blobs: list[BlobInfo] = field(default_factory=list)
+    lost_by_reason: dict[str, int] = field(default_factory=dict)  # over every GAP record
+    marks: list[fmt.Mark] = field(default_factory=list)  # the first MAX_LISTED
+    mark_total: int = 0
+    blobs: list[BlobInfo] = field(default_factory=list)  # the first MAX_LISTED distinct ones
+    blob_total: int = 0
     trailer: fmt.Trailer | None = None
-    damage: list[Damage] = field(default_factory=list)
+    damage: list[Damage] = field(default_factory=list)  # the first MAX_LISTED stretches
+    damage_total: int = 0
+    damage_bytes: int = 0
     findings: list[str] = field(default_factory=list)
     findings_total: int = 0
-    holes: list[tuple[int, int]] = field(default_factory=list)
-    hole_frames: int = 0
+    holes: list[tuple[int, int]] = field(default_factory=list)  # unexplained, the first MAX_HOLES
+    hole_frames: int = 0  # frames in unexplained holes, all of them
     index: str = "missing"  # "ok" | "missing" | "invalid"
     index_note: str = ""
-
-    @property
-    def lost_by_reason(self) -> dict[str, int]:
-        lost: dict[str, int] = {}
-        for gap in self.gaps:
-            lost[gap.reason.name.lower()] = lost.get(gap.reason.name.lower(), 0) + gap.lost
-        return lost
-
-    @property
-    def torn(self) -> bool:
-        return any(d.torn for d in self.damage)
-
-    @property
-    def mid_file_damage(self) -> bool:
-        return any(not d.torn for d in self.damage)
+    torn: bool = False
+    mid_file_damage: bool = False
+    blob_seen: set[bytes] = field(default_factory=set, repr=False)
 
     @property
     def status(self) -> str:
@@ -111,6 +108,38 @@ class Report:
         self.findings_total += 1
         if len(self.findings) < MAX_FINDINGS:
             self.findings.append(clean(text, 300))
+
+    def add_damage(self, damage: Damage) -> None:
+        self.damage_total += 1
+        self.damage_bytes += damage.span
+        if damage.torn:
+            self.torn = True
+        else:
+            self.mid_file_damage = True
+        if len(self.damage) < MAX_LISTED:
+            self.damage.append(damage)
+
+    def add_gap(self, gap: fmt.Gap) -> None:
+        self.gap_total += 1
+        why = gap.reason.name.lower()
+        self.lost_by_reason[why] = self.lost_by_reason.get(why, 0) + gap.lost
+        if len(self.gaps) < MAX_LISTED:
+            self.gaps.append(gap)
+
+    def add_mark(self, mark: fmt.Mark) -> None:
+        self.mark_total += 1
+        if len(self.marks) < MAX_LISTED:
+            self.marks.append(mark)
+
+    def add_blob(self, blob: fmt.Blob) -> None:
+        """Count a definition once however often the file repeats it."""
+        if blob.sha256 in self.blob_seen:
+            return
+        if len(self.blob_seen) < MAX_TRACKED_BLOBS:
+            self.blob_seen.add(blob.sha256)
+        self.blob_total += 1
+        if len(self.blobs) < MAX_LISTED:
+            self.blobs.append(_blob_info(blob))
 
     def add_mid(self, mid: int, count: int) -> None:
         if mid in self.mids or len(self.mids) < MAX_TRACKED_MIDS:
@@ -235,22 +264,29 @@ def _scan(rd: RecordingReader) -> Report:
     report = _new_report(rd, "scan")
     tally = _ChunkTally(fmt.PREAMBLE_SIZE)
     chunk_offsets: list[int] = []
-    index_item: tuple[int, tuple[int, ...]] | None = None
+    index_item: tuple[int, int, tuple[int, ...]] | None = None
+    trailer_offset = 0
+    index_offset = -1  # an INDEX just read, which only the trailer may follow
+    holes = _Holes()
     after_damage = False
     previous_seq = int(rd.meta.previous_last_seq)
     seen_frame = False
     for item in rd.items():
         if isinstance(item, Damage):
-            report.damage.append(item)
+            report.add_damage(item)
             tally.tainted = True
             after_damage = True
             continue
         rtype, value = item.rtype, item.value
+        if index_offset >= 0:
+            if rtype != RecordType.TRAILER:
+                report.find(f"the INDEX at {index_offset} is followed by more records")
+            index_offset = -1
         match rtype:
             case RecordType.FRAME:
                 seq = value.seq
                 if seq != previous_seq + 1 and not after_damage:
-                    _hole(report, previous_seq + 1, seq - 1)
+                    holes.add_hole(previous_seq + 1, seq - 1)
                 after_damage = False
                 previous_seq = seq
                 if not seen_frame:
@@ -270,42 +306,123 @@ def _scan(rd: RecordingReader) -> Report:
             case RecordType.STREAM:
                 report.streams[value.id] = value
             case RecordType.GAP:
-                report.gap_total += 1
-                if len(report.gaps) < MAX_LISTED:
-                    report.gaps.append(value)
+                report.add_gap(value)
+                if value.reason in _SEQ_GAP_REASONS:
+                    holes.add_gap(value.first_seq, value.last_seq)
             case RecordType.MARK:
-                if len(report.marks) < MAX_LISTED:
-                    report.marks.append(value)
+                report.add_mark(value)
             case RecordType.BLOB:
-                report.blobs.append(_blob_info(value))
+                report.add_blob(value)
             case RecordType.CHUNK:
                 report.chunks += 1
                 tally.verify(value, item.offset, report)
                 chunk_offsets.append(item.offset)
                 tally.reset(item.end)
             case RecordType.INDEX:
-                index_item = (item.offset, value)
+                index_item = (item.offset, item.end, value)
+                index_offset = item.offset
             case RecordType.TRAILER:
                 report.trailer = value
+                trailer_offset = item.offset
             case _:
                 pass
-    _cross_check(report, rd, chunk_offsets, index_item)
+    _cross_check(report, chunk_offsets, index_item, trailer_offset)
+    holes.finish(report)
     return report
 
 
-def _hole(report: Report, first: int, last: int) -> None:
-    report.hole_frames += last - first + 1
-    if len(report.holes) < MAX_HOLES:
-        report.holes.append((first, last))
+class _Holes:
+    """Sequence numbers missing from the file that no GAP record accounts for.
+
+    Holes are found as frames are read, GAP records as they appear (a GAP usually follows the
+    frames it explains), so both are kept as sorted, disjoint intervals: the merged ranges the
+    GAPs account for, and the holes still waiting for a GAP. A hole is tested against the ranges
+    when it appears and a range against the waiting holes when it appears; what is left at the
+    end is the unexplained set. Both sets are bounded, and a file that exceeds either is a
+    finding (check fails) rather than a silent pass.
+    """
+
+    def __init__(self) -> None:
+        self._gap_first: list[int] = []
+        self._gap_last: list[int] = []
+        self._hole_first: list[int] = []
+        self._hole_last: list[int] = []
+        self._overflow_holes = 0
+        self._overflow_frames = 0
+        self._ranges_untracked = 0
+
+    def add_hole(self, first: int, last: int) -> None:
+        """Frames ``first..last`` are missing; keep whatever no GAP seen so far explains."""
+        assert first <= last
+        cursor = first
+        index = bisect_left(self._gap_last, first)
+        while cursor <= last:
+            if index < len(self._gap_first) and self._gap_first[index] <= last:
+                if self._gap_first[index] > cursor:
+                    self._keep(cursor, self._gap_first[index] - 1)
+                cursor = self._gap_last[index] + 1
+                index += 1
+            else:
+                self._keep(cursor, last)
+                break
+
+    def _keep(self, first: int, last: int) -> None:
+        if len(self._hole_first) >= MAX_PENDING_HOLES:
+            self._overflow_holes += 1
+            self._overflow_frames += last - first + 1
+            return
+        self._hole_first.append(first)
+        self._hole_last.append(last)
+
+    def add_gap(self, first: int, last: int) -> None:
+        """A GAP accounts for ``first..last``: merge it in and clear the holes it covers."""
+        first_gap = bisect_left(self._gap_last, first - 1)
+        end_gap = bisect_right(self._gap_first, last + 1)
+        if first_gap < end_gap:
+            first = min(first, self._gap_first[first_gap])
+            last = max(last, self._gap_last[end_gap - 1])
+        elif len(self._gap_first) >= MAX_GAP_RANGES:
+            self._ranges_untracked += 1
+            return
+        self._gap_first[first_gap:end_gap] = [first]
+        self._gap_last[first_gap:end_gap] = [last]
+        start = bisect_left(self._hole_last, first)
+        stop = bisect_right(self._hole_first, last)
+        if start >= stop:
+            return
+        left = (self._hole_first[start], first - 1) if self._hole_first[start] < first else None
+        right = (last + 1, self._hole_last[stop - 1]) if self._hole_last[stop - 1] > last else None
+        left_over = [piece for piece in (left, right) if piece is not None]
+        self._hole_first[start:stop] = [a for a, _ in left_over]
+        self._hole_last[start:stop] = [b for _, b in left_over]
+
+    def finish(self, report: Report) -> None:
+        """Put what is unexplained into ``report`` (``holes``, ``hole_frames``) and say so when
+        a bound was reached."""
+        report.holes = list(zip(self._hole_first, self._hole_last, strict=True))[:MAX_HOLES]
+        report.hole_frames = (
+            sum(b - a + 1 for a, b in zip(self._hole_first, self._hole_last, strict=True))
+            + self._overflow_frames
+        )
+        if self._overflow_holes:
+            report.find(
+                f"{self._overflow_holes} more sequence holes than can be tracked "
+                f"({MAX_PENDING_HOLES}) were left unexplained"
+            )
+        if self._ranges_untracked:
+            report.find(
+                f"{self._ranges_untracked} GAP ranges beyond the {MAX_GAP_RANGES} that can be "
+                "tracked, so sequence holes cannot be fully checked"
+            )
 
 
 def _cross_check(
     report: Report,
-    rd: RecordingReader,
     chunk_offsets: list[int],
-    index_item: tuple[int, tuple[int, ...]] | None,
+    index_item: tuple[int, int, tuple[int, ...]] | None,
+    trailer_offset: int,
 ) -> None:
-    damaged = bool(report.damage)
+    damaged = report.damage_total > 0
     trailer = report.trailer
     if trailer is None:
         report.index = "missing"
@@ -316,9 +433,11 @@ def _cross_check(
             "the trailer names no index" if not trailer.index_offset else "no index record found"
         )
     else:
-        offset, entries = index_item
+        offset, end, entries = index_item
         if trailer.index_offset != offset:
             report.index, report.index_note = "invalid", "the trailer points elsewhere"
+        elif end != trailer_offset:
+            report.index, report.index_note = "invalid", "the index does not end at the trailer"
         elif not damaged and list(entries) != chunk_offsets:
             report.index, report.index_note = "invalid", "the index lists different chunks"
         else:
@@ -335,36 +454,6 @@ def _cross_check(
             )
     if report.index == "invalid" and trailer is not None:
         report.find(f"index: {report.index_note}")
-    _explain_holes(report)
-
-
-def _explain_holes(report: Report) -> None:
-    """Drop the holes that GAP records account for (frames the recorder dropped on purpose)."""
-    ranges = sorted((g.first_seq, g.last_seq) for g in report.gaps if g.reason in _SEQ_GAP_REASONS)
-    merged: list[list[int]] = []
-    for first, last in ranges:
-        if merged and first <= merged[-1][1] + 1:
-            merged[-1][1] = max(merged[-1][1], last)
-        else:
-            merged.append([first, last])
-    unexplained: list[tuple[int, int]] = []
-    lost = 0
-    for first, last in report.holes:
-        cursor = first
-        for gap_first, gap_last in merged:
-            if gap_last < cursor:
-                continue
-            if gap_first > cursor:
-                unexplained.append((cursor, min(last, gap_first - 1)))
-                lost += min(last, gap_first - 1) - cursor + 1
-            cursor = max(cursor, gap_last + 1)
-            if cursor > last:
-                break
-        if cursor <= last:
-            unexplained.append((cursor, last))
-            lost += last - cursor + 1
-    report.holes = unexplained
-    report.hole_frames = lost
 
 
 def info(path: Path | str) -> Report:
@@ -384,6 +473,10 @@ def info(path: Path | str) -> Report:
     report = scan(path)
     if report.index != "ok" and not report.index_note:
         report.index_note = note
+    elif report.index == "ok" and located is not None:
+        # The scan found nothing wrong with the index's own records, but its summaries did not
+        # hold up against the chunks, so info did not use it.
+        report.index, report.index_note = "invalid", note
     return report
 
 
@@ -425,15 +518,11 @@ def _head_item(report: Report, item: Item, seen_streams: set[int]) -> None:
                 seen_streams.add(item.value.id)
                 report.streams[item.value.id] = item.value
         case RecordType.GAP:
-            report.gap_total += 1
-            if len(report.gaps) < MAX_LISTED:
-                report.gaps.append(item.value)
+            report.add_gap(item.value)
         case RecordType.MARK:
-            if len(report.marks) < MAX_LISTED:
-                report.marks.append(item.value)
+            report.add_mark(item.value)
         case RecordType.BLOB:
-            if not any(b.sha256 == item.value.sha256.hex() for b in report.blobs):
-                report.blobs.append(_blob_info(item.value))
+            report.add_blob(item.value)
         case _:
             pass
 
@@ -460,18 +549,26 @@ def repair(source: Path, output: Path, *, force: bool = False) -> RepairResult:
     ``IB-REC-001`` for the refusals and a failed write.
     """
     _refuse_same_file(source, output)
-    if output.exists() and not force:
+    if os.path.lexists(output) and not force:
         raise IronbirdError(Code.REC_CREATE, f"{output} already exists; pass --force to replace it")
     reader = RecordingReader(source)
     try:
         prefix_end, chunk_offsets, frames, last_seq, tail = _valid_prefix(reader)
         damage = reader.damage[0] if reader.damage else None
-        if damage is not None and not damage.torn and not damage.trailing:
-            beyond = _frames_after(source, last_seq)
-        else:
-            beyond = 0
-        suffix = _closing_records(reader, prefix_end, chunk_offsets, frames, last_seq, tail)
         size = reader.size()
+        if damage is None and prefix_end < size and not reader.closes_cleanly_at(prefix_end):
+            # The valid records stop at an INDEX or TRAILER that is not the end of the file: a
+            # stale index, a trailer in mid-file, or another file appended. All of it is left out.
+            damage = Damage(
+                prefix_end,
+                size - prefix_end,
+                False,
+                "an INDEX or TRAILER record is followed by more data",
+                None,
+                True,
+            )
+        beyond = _frames_after(source, last_seq) if damage is not None and not damage.torn else 0
+        suffix = _closing_records(reader, prefix_end, chunk_offsets, frames, last_seq, tail)
         total = prefix_end + len(suffix)
         try:
             with TempOutput(output, force=force) as out:
@@ -481,7 +578,9 @@ def repair(source: Path, output: Path, *, force: bool = False) -> RepairResult:
         except Collision as exc:
             raise IronbirdError(
                 Code.REC_CREATE,
-                f"{output} appeared while repairing; it was not replaced (pass --force)",
+                f"{output} is not a regular file; --force replaces only a regular file"
+                if force
+                else f"{output} appeared while repairing; it was not replaced (pass --force)",
                 cause=exc,
             ) from exc
         except OSError as exc:
@@ -561,6 +660,13 @@ def _closing_records(
     offsets = list(chunk_offsets)
     if tail.records:
         tally = tail.tally
+        counts = (tally.frames, tally.bytes, tally.no_mid, *tally.mids.values())
+        if max(counts) > fmt.MAX_U32:
+            raise IronbirdError(
+                Code.REC_CREATE,
+                f"the {tally.frames} frame(s) after the last chunk summary are too many to "
+                f"summarise in one chunk (limit {fmt.MAX_U32}); repair cannot index this recording",
+            )
         chunk = fmt.Chunk(
             tally.start,
             tally.seq_first,

@@ -8,6 +8,7 @@ builds them, and a test here proves the checked-in bytes are what it builds.
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -27,8 +28,8 @@ from ironbird.recording import format as fmt
 from ironbird.recording import inspect as rec_inspect
 from ironbird.recording.format import RecordType
 from ironbird.recording.reader import Damage, Item, RecordingReader
-from rec_corpus import cases
-from recutil import SERIAL, Builder, flip_bit, sample
+from rec_corpus import EXPECT, cases
+from recutil import SERIAL, Builder, flip_bit, run_ib, sample
 
 FUZZ = settings(
     max_examples=150, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture]
@@ -401,6 +402,34 @@ def test_the_checked_in_corpus_is_what_the_generator_builds() -> None:
 @pytest.mark.parametrize("path", sorted(CORPUS.glob("rec-*.ibrec")), ids=lambda p: p.stem)
 def test_corpus_file_is_handled_by_every_consumer(path: Path, tmp_path: Path) -> None:
     exercise_everything(path, tmp_path)
+
+
+def test_every_corpus_file_has_an_expected_outcome() -> None:
+    assert {p.stem for p in CORPUS.glob("rec-*.ibrec")} == EXPECT.keys()
+
+
+@pytest.mark.parametrize("name", sorted(EXPECT))
+def test_corpus_file_comes_to_its_expected_outcome(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    want, path = EXPECT[name], CORPUS / f"{name}.ibrec"
+    if want.status is None:
+        with pytest.raises(IronbirdError) as caught:
+            rec_inspect.scan(path)
+        assert caught.value.code is want.open_code and want.reason in caught.value.summary
+    else:
+        report = rec_inspect.scan(path)
+        assert report.status == want.status and report.frames == want.frames
+        if want.offset is None:
+            assert not report.damage
+            texts = report.findings
+        else:
+            assert report.damage[0].offset == want.offset
+            texts = [report.damage[0].reason]
+        assert want.reason in "".join(texts)
+    env = {**os.environ, "XDG_STATE_HOME": str(tmp_path / "state")}
+    done = run_ib(tmp_path, ["rec", "check", str(path)], env)
+    assert done.returncode == want.check_exit, done.stderr
 
 
 EXPECT_CODE = {

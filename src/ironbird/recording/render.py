@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import json
+import math
 from collections.abc import Mapping
 from typing import Any, Final
 
+from ironbird.errors import Code
 from ironbird.ledger import format_ts
 from ironbird.recording import format as fmt
 from ironbird.recording.inspect import Report
@@ -13,6 +16,8 @@ from ironbird.render import jtext, term
 
 _MAX_MIDS_SHOWN: Final = 64
 _MAX_ITEMS_SHOWN: Final = 20
+_MAX_STREAMS_JSON: Final = 1000
+_MAX_META_ITEMS: Final = 256  # entries kept of a list or object inside META
 _META_TEXT: Final = ("session", "version", "host", "user", "command", "acts_as", "created")
 
 
@@ -52,6 +57,25 @@ def _stream_line(stream_id: int, report: Report) -> str:
     return (
         f"  {stream_id:>3}  {term(s.link)}  {term(s.node)}  {s.kind.value} {s.direction.value}"
         f"  {term(s.endpoint)}"
+    )
+
+
+def _more(shown: int, total: int, what: str) -> str:
+    return f"  ... {total - shown} more {what}"
+
+
+def damage_summary(report: Report) -> str:
+    """All the damage in one line: the stretch itself when there is one, else a count, the bytes
+    and the first and last (the ledger and ``--verbose`` have each stretch)."""
+    kept = report.damage
+    if not kept:
+        return ""
+    if report.damage_total == 1:
+        return term(kept[0].to_error().summary, 600)
+    return (
+        f"{report.damage_total} damaged stretches, {report.damage_bytes} bytes; first: "
+        f"{term(kept[0].to_error().summary, 400)}"
+        + ("" if report.damage_total > len(kept) else f"; last at offset {kept[-1].offset}")
     )
 
 
@@ -101,7 +125,10 @@ def info_lines(report: Report) -> list[str]:
     )
     if report.streams:
         lines.append("streams:")
-        lines += [_stream_line(i, report) for i in sorted(report.streams)]
+        ids = sorted(report.streams)
+        lines += [_stream_line(i, report) for i in ids[:_MAX_ITEMS_SHOWN]]
+        if len(ids) > _MAX_ITEMS_SHOWN:
+            lines.append(_more(_MAX_ITEMS_SHOWN, len(ids), "stream(s)"))
     if report.mids:
         lines.append("MIDs:")
         shown = sorted(report.mids.items())[:_MAX_MIDS_SHOWN]
@@ -114,6 +141,8 @@ def info_lines(report: Report) -> list[str]:
         lost = ", ".join(f"{why} {count}" for why, count in sorted(report.lost_by_reason.items()))
         lines.append(f"gaps:      {report.gap_total} ({lost})")
         lines += [f"  {_gap_text(g)}" for g in report.gaps[:_MAX_ITEMS_SHOWN]]
+        if report.gap_total > _MAX_ITEMS_SHOWN:
+            lines.append(_more(_MAX_ITEMS_SHOWN, report.gap_total, "gap(s)"))
     else:
         lines.append("gaps:      none")
     if report.marks:
@@ -124,19 +153,26 @@ def info_lines(report: Report) -> list[str]:
             except ValueError:
                 kind = f"kind {mark.kind}"
             lines.append(f"  {format_ts(mark.time_ns)}  {kind}  {term(mark.text)}")
+        if report.mark_total > _MAX_ITEMS_SHOWN:
+            lines.append(_more(_MAX_ITEMS_SHOWN, report.mark_total, "mark(s)"))
     if report.blobs:
         lines.append("embedded definitions:")
         lines += [
             f"  {term(b.node)}  {b.kind}  {b.size} B  sha256 {b.sha256[:16]}..."
-            for b in report.blobs
+            for b in report.blobs[:_MAX_ITEMS_SHOWN]
         ]
+        if report.blob_total > _MAX_ITEMS_SHOWN:
+            lines.append(_more(_MAX_ITEMS_SHOWN, report.blob_total, "definition(s)"))
     if report.hole_frames:
         ranges = ", ".join(f"{a}..{b}" for a, b in report.holes[:_MAX_ITEMS_SHOWN])
+        more = " ..." if len(report.holes) > _MAX_ITEMS_SHOWN else ""
         lines.append(
-            f"missing:   {report.hole_frames} frame(s) in sequence holes no GAP explains: {ranges}"
+            f"missing:   {report.hole_frames} frame(s) in sequence holes no GAP explains: "
+            f"{ranges}{more}"
         )
-    for damage in report.damage:
-        lines.append(f"damage:    {term(damage.to_error().user_line(), 600)}")
+    if report.damage_total:
+        code = Code.REC_DAMAGED if report.mid_file_damage else Code.REC_TORN
+        lines.append(f"damage:    {code.value}: {damage_summary(report)}")
     for finding in report.findings:
         lines.append(f"finding:   {term(finding, 400)}")
     if report.findings_total > len(report.findings):
@@ -144,11 +180,49 @@ def info_lines(report: Report) -> list[str]:
     return lines
 
 
+def _plain(value: Any, depth: int = 0) -> Any:
+    """Untrusted decoded JSON made safe to emit: strings sanitized, non-finite numbers as text,
+    containers and nesting bounded."""
+    if depth > fmt.MAX_META_DEPTH:
+        return "..."
+    match value:
+        case bool() | None | int():
+            return value
+        case float():
+            return value if math.isfinite(value) else str(value)
+        case str():
+            return jtext(value)
+        case list() | tuple():
+            items = [_plain(v, depth + 1) for v in value[:_MAX_META_ITEMS]]
+            if len(value) > _MAX_META_ITEMS:
+                items.append(f"... {len(value) - _MAX_META_ITEMS} more")
+            return items
+        case dict():
+            out = {
+                jtext(str(k)): _plain(v, depth + 1)
+                for k, v in list(value.items())[:_MAX_META_ITEMS]
+            }
+            if len(value) > _MAX_META_ITEMS:
+                out["..."] = f"{len(value) - _MAX_META_ITEMS} more"
+            return out
+        case _:
+            return jtext(str(value))
+
+
+def info_json(report: Report) -> str:
+    """The ``ib rec info --format json`` line: strict JSON, whatever META held."""
+    record = info_record(report)
+    try:
+        return json.dumps(record, allow_nan=False)
+    except (ValueError, RecursionError):  # defence in depth: a value _plain did not make safe
+        return json.dumps(_plain(record), allow_nan=False)
+
+
 def info_record(report: Report) -> dict[str, Any]:
     """The ``ib rec info --format json`` record."""
     meta = report.meta
     safe_meta = {
-        key: jtext(value) if isinstance(value, str) else value
+        key: _plain(value)
         for key, value in meta.items()
         if key
         in {
@@ -180,6 +254,7 @@ def info_record(report: Report) -> dict[str, Any]:
         "duration_s": _duration_s(report),
         "chunks": report.chunks,
         "frames_without_mid": report.frames_without_mid,
+        "streams_total": len(report.streams),
         "streams": [
             {
                 "id": i,
@@ -190,7 +265,7 @@ def info_record(report: Report) -> dict[str, Any]:
                 "transport": s.transport,
                 "endpoint": jtext(s.endpoint),
             }
-            for i, s in sorted(report.streams.items())
+            for i, s in sorted(report.streams.items())[:_MAX_STREAMS_JSON]
         ],
         "mids": [{"mid": mid, "count": count} for mid, count in sorted(report.mids.items())],
         "gaps": {
@@ -209,9 +284,11 @@ def info_record(report: Report) -> dict[str, Any]:
                 for g in report.gaps
             ],
         },
+        "marks_total": report.mark_total,
         "marks": [
             {"time_ns": m.time_ns, "kind": m.kind, "text": jtext(m.text)} for m in report.marks
         ],
+        "definitions_total": report.blob_total,
         "definitions": [
             {
                 "node": b.node,
@@ -225,6 +302,8 @@ def info_record(report: Report) -> dict[str, Any]:
         "holes": [list(h) for h in report.holes],
         "missing_frames": report.hole_frames,
         "index": {"state": report.index, "note": jtext(report.index_note)},
+        "damage_total": report.damage_total,
+        "damage_bytes": report.damage_bytes,
         "damage": [
             {
                 "offset": d.offset,
@@ -235,5 +314,6 @@ def info_record(report: Report) -> dict[str, Any]:
             }
             for d in report.damage
         ],
+        "findings_total": report.findings_total,
         "findings": [jtext(f) for f in report.findings],
     }
