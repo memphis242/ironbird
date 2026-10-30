@@ -116,6 +116,68 @@ ib rec repair /data/run1.ibrec /data/run1.fixed.ibrec [--force]
   naming the session, its part number and the previous part's last sequence number; part 1 stays
   open and locked until the session ends.
 
+## Replay
+
+`ib replay FILE... [--where EXPR] [--from T] [--to T] [--speed X] [--follow] [--follow-idle S]
+[--format line|json|hex] [--defs recording|config] [--skip-damage] [--count N]` reads a recording
+and prints what `ib listen` would have printed for it, plus what `listen` hides. It needs no
+configuration and sends nothing anywhere (replay to the wire is a later stage).
+
+```bash
+ib replay /data/run1.ibrec                                    # every frame, as fast as possible
+ib replay run1.ibrec --where 'msg == SAMPLE_APP_HK and CommandCounter > 0' --format json
+ib replay run1.ibrec --from +90s --to +2m --speed 1           # that minute, at the recorded pace
+ib replay run1.ibrec --where 'status != ok'                   # malformed, unknown and garbage frames
+ib replay run1.ibrec --follow                                 # a recording still being written
+```
+
+- **Definitions.** A recording decodes with the CCDD and header profiles it embeds (decision D1), so
+  it still decodes after the CCDD changes. They are loaded through the same strict loaders as files
+  on disk (labelled `FILE#ccdd/<node>` in errors; the `python:` header escape hatch is refused) with
+  the recording's own packet cap, and each must match the digest its META names. One that cannot be
+  used, or that the recording does not carry (`embed_definitions = false`), is `IB-REC-009` (exit 1)
+  with the way out: `--defs config` decodes with the current configuration's files (`-c PATH`),
+  and `--format hex` needs no definitions at all. When a configuration is found and its files differ
+  from the embedded ones, one `info IB-REC-009` line says so; the recording's still win.
+- **What is shown.** Every frame of both directions, in order, inside the range and the filter. A
+  decoded frame prints exactly as `listen` prints it (`--format line`) or as the same JSON record
+  (`--format json`). A frame that does not decode is printed flagged instead of being dropped:
+  `MALFORMED`, `UNKNOWN` (a MID or function code the CCDD lacks) or `GARBAGE` (serial bytes skipped
+  while resynchronising), with the error code, the failing byte in brackets, the frame number
+  (`frame=`, the recording's `seq`), its flags (`truncated`, `stale`) and its bytes in hex (the first
+  256 bytes; JSON carries 1024 and a `status` key that decoded records lack). `--format hex` dumps
+  every frame's bytes without decoding. `--where` is the `listen` filter language compiled against
+  the recording's definitions, so `status == malformed` selects what `listen` cannot show.
+- **Ranges.** `--from` and `--to` take ISO 8601 with `Z` or an offset (`2026-10-30T12:00:00Z`) or
+  `+90s`, `+1m30s`, `+250ms` from the first frame; the range is half open (`from <= time < to`) on
+  the frames' receive times. Where the file has a usable index, chunks outside the range or without
+  a message the filter can match are skipped from their summaries (the summary line says how many;
+  skipped chunks are not checked for damage). A missing or bad index falls back to reading every
+  record (`info IB-REC-008`).
+- **Pace.** `--speed 0` (default) runs as fast as possible; `--speed 1` follows the recorded time
+  between frames, `--speed 2` twice as fast. A recorded clock step backwards counts as no time.
+- **Split recordings.** Part 1 of a split recording plays all its parts in order; several files
+  play as given (same session, ascending part numbers, else `IB-CLI-001`). A part that is missing
+  is `IB-REC-006` and exit 5.
+- **Damage.** A torn tail, or a recording that was never closed, is a warning (`IB-REC-007`) after
+  everything before it was replayed (exit 0); a recording a recorder still holds open is not called
+  torn. Mid-file damage is `IB-REC-006` with its offset and span: replay stops there (exit 5), or
+  with `--skip-damage` goes on at the next valid record (still exit 5; the lost frames show as a
+  sequence gap). The end-of-run summary on stderr counts frames read, in range, shown, malformed,
+  unknown and garbage, skipped chunks, GAP records (and the frames they say were lost) and damage.
+- **Following.** `--follow` keeps reading a recording that is being written: at the end of the file
+  it polls every 100 ms, treats a partly written last record as pending, and ends at the trailer
+  (next part of a split recording first) or on a signal. A recorder that died would keep it waiting
+  for ever, so when nothing new has arrived it probes the recorder's file lock
+  (`flock(LOCK_SH | LOCK_NB)` on part 1, held until the session ends or the process dies): granted
+  means the recorder is gone, the end of the file is read once more, and a partial record is a torn
+  tail. On a file system without usable locks (some NFS mounts) `--follow` needs `--follow-idle S`,
+  which ends after S seconds without growth; a recorder that ran unlocked looks dead to the probe.
+- **Output.** Replay never drops a line: a reader that stops reading stops replay, unlike a live
+  listener. A reader that goes away (`| head`) ends it quietly (exit 0). `--count N` stops after N
+  frames are shown. The ledger records the start (files, options) and the end (counts, how it
+  ended); malformed frames are not ledgered one by one, the recording is their evidence.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -124,7 +186,7 @@ ib rec repair /data/run1.ibrec /data/run1.fixed.ibrec [--force]
 | 1 | Runtime error (`error IB-...`), `find` with no match; `ib rec check` found damage; a recording failed to write (`IB-REC-002`) |
 | 2 | Usage, configuration, CCDD or header-profile error |
 | 3 | `listen`, `events` or `respond` had `--count N` and `--timeout` elapsed first |
-| 5 | `ib rec repair` produced its output, but the input was damaged mid-file and valid frames after the damage are in the original only |
+| 5 | The output was produced, but the input recording was damaged mid-file: `ib rec repair` left valid frames after the damage out of the copy; `ib replay` stopped at the damage (or, with `--skip-damage`, went past it) or a part of a split recording is missing |
 | 4 | The command otherwise succeeded but stdout lines were lost (`IB-OUT-002`): dropped while stdout was not draining, abandoned when a signal cut the final drain short, or stdout is closed (`>&-`). An error (1, 2), 3 or a signal (128+n) takes precedence. A `send` that exits 4 still went out |
 | 128+n | Ended by signal n: 130 (Ctrl-C), 129 (SIGHUP), 143 (SIGTERM). The ledger is flushed first; an interrupted `send` says whether the command went out |
 

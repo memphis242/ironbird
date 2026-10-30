@@ -445,15 +445,24 @@ class FrameDecoder:
 
     ``report_checked`` says whether a frame that fails ``Codec.check`` is reported here: a live
     consumer passes ``False`` because ingest already reported it, a consumer with no ingest
-    (replay) passes ``True``. Either way the error is returned.
+    (replay) passes ``True``. Either way the error is returned. ``codec_for`` gives the codec of a
+    node and ``reject`` takes a reported frame: the engine's own ledger-and-notice path live, the
+    consumer's tally for replay, which has no engine.
 
     A frame that live ingest accepted carries what its check established, so its fields are
     unpacked without checking the packet a second time; every other frame goes through the whole
     of ``Codec.decode``. A garbage frame is never unpacked: it is malformed by definition.
     """
 
-    def __init__(self, engine: Engine, *, report_checked: bool) -> None:
-        self._engine = engine
+    def __init__(
+        self,
+        codec_for: Callable[[str], Codec],
+        reject: Callable[[Frame, DecodeError], None],
+        *,
+        report_checked: bool,
+    ) -> None:
+        self._codec_for = codec_for
+        self._reject = reject
         self._report_checked = report_checked
         self._codecs: dict[str, Codec] = {}
 
@@ -463,11 +472,11 @@ class FrameDecoder:
         if int(frame.flags) & FLAG_GARBAGE:  # int(): an IntFlag operation is a Python call
             result = garbage_error(len(frame.data))
             if self._report_checked:
-                self._engine.reject(frame, result)
+                self._reject(frame, result)
             return result
         codec = self._codecs.get(stream.node)
         if codec is None:
-            codec = self._codecs[stream.node] = self._engine._codec_for(stream.node)
+            codec = self._codecs[stream.node] = self._codec_for(stream.node)
         checked = frame.checked
         if checked is not None:
             decoded = codec.decode_resolved(stream.kind, checked, frame.data)
@@ -482,7 +491,7 @@ class FrameDecoder:
                 return Decoded(frame, decoded)
             result = decoded
         if self._report_checked:
-            self._engine.reject(frame, result)
+            self._reject(frame, result)
         return result
 
 
@@ -929,6 +938,10 @@ class Engine:
             self._ledger.record("state", "rx.first", mid=mid)
         else:
             self._stats_overflow += 1
+
+    def decoder(self, *, report_checked: bool) -> FrameDecoder:
+        """A decoder through this engine's codecs that reports what it rejects here."""
+        return FrameDecoder(self._codec_for, self.reject, report_checked=report_checked)
 
     def reject(self, frame: Frame, error: DecodeError) -> None:
         """Count, ledger (raw bytes) and report (coalesced) one frame that failed the boundary."""

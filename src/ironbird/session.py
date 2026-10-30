@@ -565,7 +565,7 @@ class Session:
         ``report_checked`` is ``False`` for frames that came through live ingest, which already
         reported what the check found, and ``True`` where nothing did (replay).
         """
-        return FrameDecoder(self._engine, report_checked=report_checked)
+        return self._engine.decoder(report_checked=report_checked)
 
     def compile_filter(self, text: str, nodes: Sequence[str]) -> Filter:
         """Compile the ``--where`` expression ``text`` against the definitions of ``nodes`` (the

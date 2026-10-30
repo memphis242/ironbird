@@ -382,11 +382,18 @@ class JsonAdapter:
             raise IronbirdError(
                 Code.CCD_FILE, f"{path}: cannot read CCDD file ({exc.strerror or exc})", cause=exc
             ) from exc
+        return self.load_bytes(raw, str(path))
+
+    def load_bytes(self, raw: bytes, source: str) -> CcddModel:
+        """The model of a file already read (``source`` labels errors). The size, JSON and schema
+        rules are the ones :meth:`load` applies to a file on disk."""
         if len(raw) > MAX_FILE_BYTES:
-            raise IronbirdError(Code.CCD_FILE, f"{path}: CCDD file larger than 8 MiB")
+            raise IronbirdError(Code.CCD_FILE, f"{source}: CCDD file larger than 8 MiB")
         try:
-            data = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys(str(path)))
+            data = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys(source))
         except (ValueError, RecursionError) as exc:
             # json.JSONDecodeError and UnicodeDecodeError are both ValueError subclasses.
-            raise IronbirdError(Code.CCD_FILE, f"{path}: invalid JSON ({exc})", cause=exc) from exc
-        return parse_model(data, str(path))
+            raise IronbirdError(
+                Code.CCD_FILE, f"{source}: invalid JSON ({exc})", cause=exc
+            ) from exc
+        return parse_model(data, source)

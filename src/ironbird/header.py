@@ -421,15 +421,36 @@ def load_profile(path: Path) -> HeaderProfile:
         raise IronbirdError(
             Code.HDR_FILE, f"{path}: cannot read header profile ({exc.strerror or exc})", cause=exc
         ) from exc
+    return _profile_from_bytes(raw, str(path), trusted=True)
+
+
+def load_profile_bytes(raw: bytes, source: str) -> HeaderProfile:
+    """Parse and validate the content of a header profile read elsewhere (an embedded
+    definition); ``source`` labels errors. The rules are those of :func:`load_profile`, and the
+    ``python:`` escape hatch is refused outright: it is trusted local configuration, and this
+    content is not."""
+    return _profile_from_bytes(raw, source, trusted=False)
+
+
+def _profile_from_bytes(raw: bytes, source: str, *, trusted: bool) -> HeaderProfile:
     if len(raw) > MAX_PROFILE_FILE_BYTES:
-        raise IronbirdError(Code.HDR_FILE, f"{path}: header profile larger than 64 KiB")
+        raise IronbirdError(Code.HDR_FILE, f"{source}: header profile larger than 64 KiB")
     try:
         data = tomllib.loads(raw.decode("utf-8"))
     except (ValueError, RecursionError) as exc:
         # TOMLDecodeError and UnicodeDecodeError are ValueErrors; so is the int-digit limit.
         # RecursionError is deeply nested arrays/tables.
-        raise IronbirdError(Code.HDR_FILE, f"{path}: invalid TOML ({exc})", cause=exc) from exc
-    return parse_profile(data, str(path))
+        raise IronbirdError(Code.HDR_FILE, f"{source}: invalid TOML ({exc})", cause=exc) from exc
+    fields = data.get("fields")
+    for index, entry in enumerate(fields if isinstance(fields, list) and not trusted else []):
+        computed = entry.get("computed") if isinstance(entry, dict) else None
+        if isinstance(computed, str) and computed.startswith("python:"):
+            raise IronbirdError(
+                Code.HDR_SCHEMA,
+                f"{source}: fields[{index}].computed: the 'python:' escape hatch is not allowed "
+                "in a profile that did not come from your own configuration",
+            )
+    return parse_profile(data, source)
 
 
 # ---------------------------------------------------------------------------------------

@@ -68,6 +68,7 @@ class Code(StrEnum):
     REC_DAMAGED = "IB-REC-006"  # damaged record mid-file
     REC_TORN = "IB-REC-007"  # recording ends in an incomplete record (not closed cleanly)
     REC_INDEX = "IB-REC-008"  # index missing or invalid; rebuilt by scanning
+    REC_DEFS = "IB-REC-009"  # embedded definitions differ from the config, or cannot be loaded
     REC_SPACE = "IB-REC-010"  # low disk space for the recording
     REC_DIRSYNC = "IB-REC-011"  # the recording's directory cannot be synced (name not durable)
     # Engine

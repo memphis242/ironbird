@@ -813,9 +813,9 @@ def test_the_frame_decoder_treats_a_garbage_frame_as_malformed() -> None:
     stub._codec_for = lambda node: pytest.fail("a garbage frame needs no codec")  # type: ignore[attr-defined]
     data = (CORPUS / "frame-garbage-flagged-valid-looking-tlm.bin").read_bytes()
     frame = Frame(1, 1, SERIAL_STREAM, "", None, FrameFlag.GARBAGE, len(data), data)
-    quiet = FrameDecoder(stub, report_checked=False)  # type: ignore[arg-type]
+    quiet = FrameDecoder(stub._codec_for, stub.reject, report_checked=False)
     assert isinstance(quiet.decode(frame), DecodeError) and stub.rejected == []
-    loud = FrameDecoder(stub, report_checked=True)  # type: ignore[arg-type]
+    loud = FrameDecoder(stub._codec_for, stub.reject, report_checked=True)
     result = loud.decode(frame)
     assert isinstance(result, DecodeError) and stub.rejected == [result]
 

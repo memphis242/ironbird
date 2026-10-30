@@ -31,6 +31,7 @@ from ironbird.coalesce import Coalescer
 from ironbird.codec import Codec, DecodedPacket
 from ironbird.config import load_config
 from ironbird.errors import Code
+from ironbird.errors import DecodeError as DecodeErrorType
 from ironbird.filter import compile_filter
 from ironbird.frame import Decoded, Direction, Frame, FrameFlag, Stream
 from ironbird.header import load_profile
@@ -736,6 +737,125 @@ def test_record_cli_at_the_target_rate_loses_no_frame(tmp_path: Path) -> None:
     assert report.frames + kernel == sent, f"{sent - report.frames - kernel} frames unaccounted for"
     assert report.frames >= 0.95 * sent  # the host's own datagram loss is tolerated, not hidden
     assert report.lost_by_reason.get("recorder_overrun", 0) == 0
+
+
+# -- replay --
+
+REPLAY_FRAMES = 60_000
+REPLAY_OVERHEAD_RATIO = 1.5  # replay vs. the reader + decode + render it must wrap
+
+
+def _replay_rate(path: Path, **kwargs: Any) -> tuple[int, int, float]:
+    """``(frames shown, frames read, seconds)`` for one in-process replay to a null output."""
+    from replayutil import replay_in_process
+
+    start = time.perf_counter()
+    run = replay_in_process(path, **kwargs)
+    took = time.perf_counter() - start
+    assert run.replay is not None
+    return run.result.shown, run.replay.stats.frames_read, took
+
+
+@pytest.fixture(scope="module")
+def replay_file(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    from ironbird.recording.writer import RecorderOptions
+    from replayutil import codec_status_frames, hk_frames, write_recording
+
+    path = tmp_path_factory.mktemp("replay-bench") / "bench.ibrec"
+    frames = hk_frames(REPLAY_FRAMES - 20_000) + codec_status_frames(20_000, REPLAY_FRAMES - 19_999)
+    write_recording(path, frames, options=RecorderOptions(min_free_bytes=0))
+    return path
+
+
+@needs_a_quiet_host
+def test_replay_decodes_and_renders_at_the_rate_of_the_bare_path(replay_file: Path) -> None:
+    """Replay's own cost on top of reading, decoding and rendering stays small, in every format."""
+    from ironbird.recording.player import OutputFormat
+    from ironbird.recording.reader import RecordingReader
+    from replayutil import mock_codec
+
+    codec = mock_codec()
+    start = time.perf_counter()
+    with RecordingReader(replay_file) as reader:
+        for item in reader.frames():
+            decoded = codec.decode(item.stream.kind, item.data)
+            assert not isinstance(decoded, DecodeErrorType)
+            render.line("fc", item.time_ns, decoded)
+    bare = time.perf_counter() - start
+    rates = {}
+    for fmt_ in OutputFormat:
+        shown, _, took = _replay_rate(replay_file, fmt_=fmt_)
+        assert shown == REPLAY_FRAMES
+        rates[fmt_.value] = REPLAY_FRAMES / took
+    print(
+        f"\nreplay {rates['line']:,.0f} frames/s as lines, {rates['json']:,.0f} as JSON, "
+        f"{rates['hex']:,.0f} as hex dumps; the bare read + decode + render is "
+        f"{REPLAY_FRAMES / bare:,.0f} frames/s"
+    )
+    assert rates["line"] >= TARGET_PPS * 1.5  # the design target leaves most of a core free
+    assert REPLAY_FRAMES / rates["line"] <= bare * REPLAY_OVERHEAD_RATIO
+
+
+@needs_a_quiet_host
+@pytest.mark.parametrize(
+    "where, selected",
+    [
+        ("seq > 59990", 10),
+        ("msg == MOCK_HK and cmd_counter > 250", 780),
+        ("msg == MOCK_STATUS", 20_000),
+    ],
+)
+def test_filtered_replay_is_cheaper_than_showing_everything(
+    replay_file: Path, where: str, selected: int
+) -> None:
+    """A filter that selects little costs less than printing everything, and one the index can
+    answer (a message that is in few chunks) does not read the rest of the file."""
+    _, _, everything = _replay_rate(replay_file)
+    shown, read, took = _replay_rate(replay_file, where=where)
+    print(
+        f"\nreplay --where {where!r}: {shown:,} shown of {REPLAY_FRAMES:,}, {read:,} read, "
+        f"{REPLAY_FRAMES / took:,.0f} frames/s ({took / everything:.2f} of the unfiltered time)"
+    )
+    assert shown == selected
+    assert took < everything * 0.9
+
+
+@needs_a_quiet_host
+def test_a_narrow_time_range_reads_a_fraction_of_the_file(replay_file: Path) -> None:
+    from ironbird.recording.replay import TimeSpec
+    from replayutil import STEP_NS, T0
+
+    start = TimeSpec(absolute_ns=T0 + 30_000 * STEP_NS)
+    end = TimeSpec(absolute_ns=T0 + 30_500 * STEP_NS)
+    shown, read, took = _replay_rate(replay_file, start=start, end=end)
+    _, _, everything = _replay_rate(replay_file)
+    print(f"\nreplay of a 500 frame range: {read:,} read of {REPLAY_FRAMES:,}, {took * 1e3:.1f} ms")
+    assert shown == 500 and read < REPLAY_FRAMES * 0.1
+    assert took < everything * 0.2
+
+
+@needs_a_quiet_host
+def test_replay_cli_writes_every_line_at_the_target_rate(replay_file: Path, tmp_path: Path) -> None:
+    """The whole command (start-up, read, decode, render, the output thread) to a file."""
+    from recutil import CLI_MAIN
+    from replayutil import child_env
+
+    out = tmp_path / "out.txt"
+    start = time.perf_counter()
+    with out.open("wb") as sink:
+        done = subprocess.run(
+            [sys.executable, "-c", CLI_MAIN, "replay", str(replay_file)],
+            stdout=sink,
+            stderr=subprocess.PIPE,
+            env=child_env(tmp_path),
+            check=False,
+            timeout=300,
+        )
+    took = time.perf_counter() - start
+    lines = out.read_bytes().count(b"\n")
+    print(f"\nib replay: {lines:,} lines in {took:.2f} s, {lines / took:,.0f} lines/s")
+    assert done.returncode == 0, done.stderr
+    assert lines == REPLAY_FRAMES and lines / took >= TARGET_PPS
 
 
 # -- the serial run that enforces the guards above --

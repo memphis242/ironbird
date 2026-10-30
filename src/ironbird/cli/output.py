@@ -115,6 +115,7 @@ class BoundedWriter:
         self._chunk_written = 0
         self._closing = False
         self._abandoned = False
+        self._room_waiters = 0  # producers inside write_wait, waiting for the thread to make room
         self._reported = 0
         self.dropped_total = 0  # refused: queue full, or written after the close began
         self.abandoned_total = 0  # accepted, then given up on when a drain was cut short
@@ -172,6 +173,44 @@ class BoundedWriter:
                 self._queue.append(data)
                 self._queued += len(data)
                 self._cond.notify()
+
+    def write_wait(self, text: str) -> bool:
+        """Queue ``text`` as one line, waiting for room instead of dropping it when the queue is
+        full (a reader that stops reading stops the producer, so nothing is lost).
+
+        For a command that reads a file and so has no clock to keep: ``replay`` and the like
+        must not drop lines the way a live listener does. The wait is a timed condition wait on
+        the calling thread, so a shutdown signal's handler still runs and ends it. Returns
+        ``False`` once the output is gone for good (the reader left, the stream failed or was
+        never there, or the close began) and the line was not delivered. A line longer than the
+        queue is accepted into an empty one.
+        """
+        if self._fd is None and not self.unavailable:
+            self.write(text)
+            return not self.reader_gone
+        data = (text + "\n").encode(self._encoding, "backslashreplace")
+        with self._cond:
+            while True:
+                if self.unavailable:
+                    self.undelivered_total += 1
+                    return False
+                if self.reader_gone:
+                    if self.error is not None:
+                        self.undelivered_total += 1
+                    return False
+                if self._closing:
+                    self.dropped_total += 1
+                    return False
+                if self._queued == 0 or self._queued + len(data) <= self._max_bytes:
+                    self._queue.append(data)
+                    self._queued += len(data)
+                    self._cond.notify_all()
+                    return True
+                self._room_waiters += 1
+                try:
+                    self._cond.wait(0.25)
+                finally:
+                    self._room_waiters -= 1
 
     def take_new_drops(self) -> int:
         """Lines dropped since the previous call."""
@@ -278,6 +317,8 @@ class BoundedWriter:
             self._queued -= size
             self._chunk_ends = ends
             self._chunk_written = 0
+            if self._room_waiters:
+                self._cond.notify_all()
         return b"".join(parts)
 
     def _note_written(self, written: int) -> bool:
@@ -300,6 +341,7 @@ class BoundedWriter:
                 self._chunk_ends = []
                 self._chunk_written = 0
             self.reader_gone = True  # before the lock is released: later lines are counted
+            self._cond.notify_all()  # a producer waiting for room learns the output is gone
         self._mark_gone()
 
     def _pump(self) -> None:

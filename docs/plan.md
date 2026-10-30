@@ -2225,6 +2225,103 @@ with and without field filters; real cFS: replay the 2e recording with
 `--where 'event.app == "SAMPLE_APP" and event.id == 3'` yields exactly the K NOOP events
 sent during the capture.
 
+As built (where the build differs from, or settles, the text above)
+- Modules: `recording/replay.py` (`Replay`: the frames of a file or split set, ranges, chunk
+  selection, damage, `Follower`, `Pacer`, `parse_time_spec`), `recording/defs.py` (the head of a
+  recording, codecs from embedded BLOBs or the configuration, comparison with the configuration),
+  `recording/player.py` (`play`: pace, filter, decode, render; `compile_where`), the renderers in
+  `render.py` (`undecoded_line/record`, `hex_line/record`), `ib replay` in `cli/main.py`. Shared
+  pieces gained entry points: `ccdd.loader.load_ccdd_bytes` and `header.load_profile_bytes` (the
+  on-disk loaders now read the file and call the same code), `filter.lexer.parse_time`,
+  `RecordingReader.items(skip=, wait=)` and `skip_chunk`, `BoundedWriter.write_wait`, and
+  `FrameDecoder(codec_for, reject, report_checked=)` (it no longer needs an `Engine`;
+  `Engine.decoder()` builds the live one, so replay needs no `_labels`). `ib rec repair` was
+  already done in 2e.
+- Command: `ib replay FILE... [--where] [--from] [--to] [--speed] [--follow] [--follow-idle S]
+  [--format line|json|hex] [--defs recording|config] [--skip-damage] [--count N]`. Runs offline
+  (no session, no sockets, no ledger requirement beyond the usual); `-c PATH` is read only for
+  `--defs config` and for the one-line comparison below. A decoded frame prints exactly as `listen`
+  does (line and JSON), so replay output equals a live `listen` of the same traffic by record
+  (the E2E test compares them without the receive times). A frame that does not decode prints
+  `MALFORMED`, `UNKNOWN`, `GARBAGE` or `UNDECODED` with its code, the failing byte in brackets,
+  `frame=` (the recording's seq; `seq=` is the packet's), its flags and its hex (256 bytes in
+  lines, 1024 in JSON, which has `status`, `error`, `hex_truncated`); `--format hex` dumps every
+  frame undecoded and, if the recording has no usable definitions, still works, with a `--where`
+  made of frame-level names (a name it cannot check says `IB-REC-009` is why).
+- Definitions: the BLOBs at the head are read with `head_records` (at most 4096 records, 64 MiB,
+  256 nodes), each digest must equal the one META names (`IB-REC-009` if not; a META digest that
+  is not text is ignored), a repeated definition that differs is a problem recorded in the head
+  and refused when definitions are needed, never at open. Loading goes through the strict loaders
+  with the recording's `max_packet_bytes`, and the `python:` header escape hatch is refused in
+  `load_profile_bytes`. Every failure there (any loader, `Codec`, adapter, missing definition) is
+  `IB-REC-009`, exit 1 (a bad file, not the user's configuration), naming `--defs config` and
+  `--format hex`. `--defs config` uses the configuration's files with the recording's cap and its
+  aliases (a node it lacks is `IB-REC-009`). With the default, when a configuration is found and a
+  file's digest differs from the embedded one, one `info IB-REC-009` line lists `node:kind`s and the
+  ledger records them; no configuration is not mentioned (ledger only).
+- Ranges and chunk selection: `--from/--to` are ISO 8601 with a zone or `+<n>h|m|s|ms` offsets
+  (decimals allowed, at most 100 years) from the first frame of the first part; half open on
+  `time_ns`. With a closed file whose index checks out (`read_trailer`, `read_chunks`), a chunk is
+  skipped when its summary shows no time in range, no frames, or (summary not overflowed) none of
+  the filter's candidate MIDs; the reader jumps to the next chunk after learning the skipped chunk's
+  stream and source definitions from its head and restarting the sequence check, because a chunk's
+  frames may use definitions made in an earlier one. The index stays a hint: damage inside a
+  skipped chunk is not seen, and a bad index is `IB-REC-008` (info) and a full read.
+- Pace: `Pacer` anchors a schedule at the first frame and sleeps in 100 ms slices (so a closed output
+  or a signal ends it at once); a backward step counts as zero, a late consumer is not waited for,
+  `--speed` is 0 or 1e-6..1e9. Frames outside the filter still count for time. A forward clock step
+  is not corrected (no `--max-gap`): a recorded hour of silence is an hour.
+- Sets: one file that is part 1 plays `name.p0002.ibrec`, ... in order (found by name; the
+  parts' META must give the same session and cap, part numbers ascending, else `IB-CLI-001`); a
+  part that is missing (a later one exists, or the named parts skip a number) is `IB-REC-006`
+  (error line, exit 5, the rest still plays). Several FILEs play as given. Mid-file damage without
+  `--skip-damage` ends the whole replay; a torn tail ends only its part.
+- Damage and exit codes: 0 normal (including `--count` reached, a closed pipe, a torn tail or a
+  recording never closed: `warning IB-REC-007`; a file a recorder holds open is not torn, it says
+  `--follow` keeps reading); 5 mid-file damage seen (`IB-REC-006`, at most 3 lines printed and 100
+  ledgered, the stop record and the summary count all) or a missing part (not when `--count` ended
+  the run first); 1 `IB-REC-004..009`; 2 usage and `IB-FLT-*`; 4 stdout closed or failing;
+  128+n a signal. 6 (2d) is not produced here.
+- Follow: `Follower` probes `flock(LOCK_SH | LOCK_NB)` on part 1 (the lock the writer holds for the
+  whole session), `Replay` polls every 100 ms for growth, treats an incomplete last record or a bad
+  record with no valid chain yet as pending (`items(wait=)`), reads once more when the probe says
+  the writer is gone, and moves on to the next part when the file ends at its trailer and the writer
+  is still alive. No lock support (probe `ENOLCK`/`EINVAL`/`EOPNOTSUPP`) without `--follow-idle` is
+  `IB-CLI-001` before anything is read; `--follow-idle S` ends after S seconds without growth. A
+  recorder that ran unlocked (`IB-LED-009`, 2d) looks dead to the probe.
+- Output: replay writes with `write_wait`, so a reader that stops reading stops replay and nothing
+  is dropped (`IB-OUT-001` cannot occur); a signal ends the wait, and whatever was queued is
+  abandoned and counted by the existing `IB-OUT-002` path. Per frame costs the ledger nothing; the
+  ledger gets `replay.start`, `replay.stop` (reason, counts, rejects by code, chunks skipped), the
+  first 100 damage records and any definition note.
+- Tests: `test_replay.py` (57: records equal `listen`'s, flagged frames, ranges, chunk skipping
+  against a straight read, pacing with a fake clock, count, split sets, damage, definitions,
+  filter compilation, follow with a partial record, a dead writer, idle and a lockless file system,
+  `write_wait`), `test_replay_malformed.py` (31: the 20-file corpus `rpl-*.ibrec` built by
+  `tests/replay_corpus.py` and run through the CLI, Hypothesis over mutated and arbitrary BLOB
+  contents, over bit flips and cuts of a file with embedded definitions in every format, over any
+  payload in any frame, and over ranges with clock steps equal to a frame-by-frame selection, plus
+  a flip of every 97th bit and a cut every 37 bytes of the head), `test_replay_cli.py` (34 over
+  loopback on ports 58000-58999: the `respond` + `listen --record` round trip against replay by
+  record, nothing sent, exit codes, SIGTERM during pacing and while blocked, closed and slow
+  readers, following a real `ib record` to a clean close and to `kill -9`), a `cfs` acceptance
+  case (record a session with K NOOPs; `--where 'event.app == "SAMPLE_APP" and event.id == 3'`
+  yields K, the last SAMPLE_APP_HK counts K; not run on the dev host), `tools/fuzz/fuzz_replay.py`
+  (atheris, in the nightly fuzz job; atheris is not installed on the dev host, so the target ran
+  only against a stub). A 100 s bit-flip hunt (10270 corrupted files, each in every format and with three filters)
+  and 198610 mutated definition sets in 60 s found nothing beyond coded errors.
+- Benchmarks (4-core dev host, 60k frames of 28 bytes, to a null output): replay as lines 21.8k
+  frames/s (the bare reader + decode + render is 24.0k/s; 5 us decode, 22 us the shared
+  `render.line`, 7 us read), as JSON 30.7k/s, as hex 48k/s; `ib replay` to a file 18.8k lines/s
+  end to end; filtered: `seq > 59990` (no decode) 158k/s, `msg == MOCK_HK and cmd_counter > 250`
+  96k/s with 40k frames read of 60k, `msg == MOCK_STATUS` 64k/s with 20k read; a 500-frame range of
+  60k reads under 10 percent of it. Guards (`needs_a_quiet_host`): at least 15k frames/s, at most
+  1.5x the bare path, a filter that selects little at 0.9x of the unfiltered time or better.
+- Deferred: the index of a recording is read whole for a selection (memory grows with the chunk
+  count, as `rec info`'s does); no `--max-gap` for pacing; `--mid` is not offered (use
+  `--where 'mid in [...]'`); a skipped chunk's GAP records are not counted; the atheris target has
+  not run on a real fuzzer.
+
 ### 2h - Export CSV and text
 
 Deliverables
