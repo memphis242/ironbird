@@ -214,6 +214,21 @@ class FlakySocket:
         return getattr(self._real, name)
 
 
+def _receive_reports(into: list[IronbirdError]) -> Callable[[IronbirdError], None]:
+    """A ``report`` callback that keeps every report except ``IB-TX-005``.
+
+    A host whose ``net.core.rmem_max`` is below the requested receive buffer (GitHub runners:
+    212992) reports ``IB-TX-005`` once at open; that is a property of the host, not of the
+    receive path these tests count reports on.
+    """
+
+    def report(err: IronbirdError) -> None:
+        if err.code is not Code.TX_RCVBUF:
+            into.append(err)
+
+    return report
+
+
 def _flaky(transport: UdpTransport, errors: list[OSError]) -> FlakySocket:
     assert transport._rx is not None
     flaky = FlakySocket(transport._rx, errors)
@@ -229,7 +244,7 @@ def test_a_failed_read_is_counted_reported_and_receiving_continues() -> None:
         got: list[Received] = []
         transport = UdpTransport(
             local=Endpoint("127.0.0.1", 0),
-            report=reports.append,
+            report=_receive_reports(reports),
             failed=failures.append,
         )
         await transport.open(lambda data, _t, _s, orig, flags: got.append((data, orig, flags)))
@@ -256,7 +271,7 @@ def test_an_unusable_socket_fails_the_transport_at_once(number: int) -> None:
 
     async def main() -> None:
         transport = UdpTransport(
-            local=Endpoint("127.0.0.1", 0), report=reports.append, failed=failures.append
+            local=Endpoint("127.0.0.1", 0), report=_receive_reports(reports), failed=failures.append
         )
         await transport.open(lambda *_: None)
         address = transport.local_address
@@ -299,7 +314,7 @@ async def _failing_transport(
 ) -> tuple[UdpTransport, tuple[str, int]]:
     transport = UdpTransport(
         local=Endpoint("127.0.0.1", 0),
-        report=reports.append,
+        report=_receive_reports(reports),
         failed=failures.append,
         clock=clock,
     )
@@ -681,7 +696,12 @@ def test_the_cli_exits_with_the_coded_error_when_the_receive_socket_dies(
         env={**os.environ, "IRONBIRD_STATE_DIR": str(tmp_path / "state")},
     )
     assert done.returncode == 1, done.stderr
-    errors = [line for line in done.stderr.splitlines() if line.startswith("error ")]
+    # IB-TX-005 (a host with a small net.core.rmem_max) is the only other line that may appear.
+    errors = [
+        line
+        for line in done.stderr.splitlines()
+        if line.startswith("error ") and Code.TX_RCVBUF.value not in line
+    ]
     assert len(errors) == 1 and "IB-TX-003" in errors[0] and "EBADF" in errors[0], done.stderr
 
 
