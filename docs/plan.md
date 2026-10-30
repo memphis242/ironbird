@@ -832,13 +832,22 @@ Deliverables
   - When an essential record cannot be written (reserve used up; no ballast, as for a
     short command such as `ib send` or when allocation failed; or any other write error,
     including a ledger that could not open, `IB-LED-002`), the ledger *stalls*: records
-    stay queued (bounded by the queue rule), a write retry runs every 5 s, and with
-    `on_full = "refuse_commands"` (default) every command is refused with `IB-LED-004`
-    (exit 1, nothing sent) until a retry succeeds, because a command must not go out
-    without a trace. With `"continue"` commands go out and are counted as untraced. A
-    successful retry writes `ledger.resumed` (records lost, stall duration) and allows
-    commands again; the ballast is re-allocated once allocation succeeds (tried once a
-    minute). Unlike Stage 1, a failed ledger no longer lets commands through by default.
+    stay queued (bounded by the queue rule) and a write retry runs every 5 s. Commands
+    follow `on_full`:
+    - `"continue"` (default, Stage 1 behaviour): the command is sent, and one coded line
+      per affected command says it was sent but not logged, e.g.
+      `warning IB-LED-004: NOOP sent to fc but not logged (ledger not writable)`. The lines
+      go through the coalescer and are rate-limited by code (repeats fold into
+      `(x12 in 10 s)`), so a burst of commands is never silent and never a wall of text;
+      the command still exits as its send outcome dictates. The command's record is
+      queued with the other essential records and lands once a retry succeeds, unless the
+      process ends first.
+    - `"refuse_commands"` (opt-in, stricter): every command is refused with `IB-LED-004`
+      (exit 1, nothing sent) until a retry succeeds, because a command must not go out
+      without a trace.
+    A successful retry writes `ledger.resumed` (records lost, stall duration, commands sent
+    unlogged) and restores normal operation; the ballast is re-allocated once allocation
+    succeeds (tried once a minute).
   - Capture and recording never stop for ledger reasons; the recorder has its own ENOSPC
     path (`IB-REC-002`).
 - **Queue.** The in-memory queue follows the same rule: when full, the new record is dropped
@@ -850,9 +859,9 @@ Deliverables
 - **Rotation**: at `max_file_bytes` the ledger continues in `<stamp>-<session>.pNNNN.jsonl`,
   each part opening with a `ledger.part` record naming the previous one.
 - **Retention warns; it never deletes.** No ironbird code path deletes a ledger or a
-  recording on its own. The only automatic removals are a session's own ballast and temp
-  files, and the ballast of a dead session (no data), removed at the next session start
-  and ledgered.
+  recording on its own. The only automatic removals are a session's own reserve and temp
+  files, and the leftover reserve file of a crashed session (no data, no live lock),
+  removed at the next session start; that removal is ledgered.
   - *Scope*: files matching our anchored name patterns, `^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}`
     then `(\.p[0-9]{4})?\.jsonl` or `\.reserve` in the state directory and
     `(\.p[0-9]{4})?\.ibrec` in the recording directory (2e); regular files only (`lstat`),
@@ -908,7 +917,9 @@ Deliverables
     `prune.delete` per file, `prune.skip` with its reason.
 - Config `[ledger]`: `event_bytes_per_hour` (64 MiB), `evidence_bytes_per_hour` (32 MiB),
   `essential_reserve_bytes` (32 MiB), `max_file_bytes` (32 MiB), `evidence_rate`
-  (256 KiB/s), `on_full = "refuse_commands" | "continue"`.
+  (256 KiB/s), `on_full = "continue" | "refuse_commands"` (default `"continue"`: commands
+  are sent with a coded warning when the ledger cannot record them; `"refuse_commands"`
+  refuses them instead).
   Config `[retention]`: `max_age` (`"7d"`), `max_total_bytes` (`"2GiB"`), `keep_recent`
   (10), `warn_interval` (`"24h"`).
   - Sizes are positive integers or strings matching `^[0-9]{1,12}(B|KiB|MiB|GiB|TiB)$`
@@ -935,10 +946,18 @@ Verification
   wire-error storm alone never refuse a command.
 - Disk full through the writer's write seam (fault injection of ENOSPC and EDQUOT; no
   privileges needed): ballast released, one `IB-LED-005`, essential records continue,
-  no torn line; reserve used up: `IB-LED-004` and `ib send` refused with nothing on the
-  wire (the mock responder counts zero), the recorder unaffected; seam recovers:
-  `ledger.resumed` and sends accepted. Repeated with both tiers `"unlimited"`, and with
-  `on_full = "continue"` (sends go out, counted untraced).
+  no torn line; reserve used up (default `on_full = "continue"`): `ib send` still reaches
+  the wire (the mock responder counts it), prints one `IB-LED-004` "sent but not logged"
+  line per command, a burst of sends coalesces to a bounded number of lines (never
+  silent, never one per command beyond the rate limit), the recorder unaffected; seam
+  recovers: `ledger.resumed` (with the unlogged-command count) and the queued command
+  records are written. With `on_full = "refuse_commands"`: `IB-LED-004`, `ib send` exits 1
+  with nothing on the wire (the responder counts zero); seam recovers: sends accepted. A
+  ledger that cannot open (`IB-LED-002`) behaves the same under both policies. Repeated
+  with both tiers `"unlimited"`.
+- Leftover reserve: a crashed session's `.reserve` file (no live lock) is removed at the
+  next session start with a ledger record naming it; a live session's reserve, a symlink
+  and a lookalike name are left alone.
 - No automatic deletion: state and recording directories with sessions past `max_age`
   and past `max_total_bytes`; start-up checks, a long session whose projection crosses,
   and three consecutive processes leave every file present and byte-identical (hashes);
@@ -1265,8 +1284,8 @@ Verification
 | `IB-TX-007` | `TX_RESYNC` | serial stream resynchronised, N bytes skipped | 2k |
 | `IB-TX-008` | `TX_DOWN` | link lost, reconnecting | 2k |
 | `IB-LED-003` | `LED_TIER` | event or evidence tier over its allowance; counted only until the allowance grows | 2d |
-| `IB-LED-004` | `LED_FULL` | essential records cannot be written; commands refused (`on_full` policy) until the ledger writes again | 2d |
-| `IB-LED-005` | `LED_DISK` | disk or quota full; reserve released, only essential records written | 2d |
+| `IB-LED-004` | `LED_FULL` | essential records cannot be written (disk full with the reserve used up, write error, or ledger could not open); by default (`on_full = "continue"`) each command is sent with a one-line "sent but not logged" warning, coalesced and rate-limited, with `"refuse_commands"` commands are refused (exit 1, nothing sent); until the ledger writes again | 2d |
+| `IB-LED-005` | `LED_DISK` | disk or quota full; reserve released, only essential records written; commands still sent (warned per `IB-LED-004` once the reserve is also used up) | 2d |
 | `IB-RET-001` | `RET_AGE` | sessions older than `retention.max_age`; review with `ib ledger prune` / `ib rec prune` | 2d |
 | `IB-RET-002` | `RET_TOTAL` | ledger + recordings past, or projected past, `retention.max_total_bytes`; prune or raise the cap | 2d |
 | `IB-RET-003` | `RET_PRUNE` | a listed session was not deleted (became live, changed since listing, unlink failed) | 2d |
@@ -1319,11 +1338,17 @@ Decided by the user (2026-10-30):
   none; most tests short, some 12 h overnight; telemetry goes to recordings, not the
   ledger.
   - Event and evidence tiers have per-hour allowances with a one-hour floor (64 and
-    32 MiB/h; 768 and 384 MiB at 12 h), sized so a 12 h run at those rates never reaches
+    32 MiB/h, `event_bytes_per_hour` = 64 MiB/h confirmed; 768 and 384 MiB at 12 h), sized so a 12 h run at those rates never reaches
     them (2d sizing table). Essential records are uncapped and keep a 32 MiB on-disk
     reserve for when the disk fills.
-  - Commands are refused only when an essential record cannot be written
-    (`on_full = "refuse_commands"`); capture and recording never stop for ledger reasons.
+  - When an essential record cannot be written, commands are still sent by default
+    (`on_full = "continue"`, Stage 1 behaviour), each with a coded "sent but not logged"
+    warning that is coalesced and rate-limited, never silent. `on_full = "refuse_commands"`
+    is the opt-in stricter policy (commands refused, nothing sent). Capture and recording
+    never stop for ledger reasons.
+  - The reserve is a 32 MiB file pre-allocated per long session and released on the first
+    ENOSPC or EDQUOT. The only automatic deletion anywhere is removing a crashed session's
+    leftover reserve file at the next start, and that removal is ledgered.
   - Nothing is deleted automatically, ledger or recording. Retention only warns: sessions
     past `max_age` (7 d), and ledger plus recordings past, or projected past,
     `max_total_bytes` (2 GiB). Deletion is only `ib ledger prune` / `ib rec prune` after an
