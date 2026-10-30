@@ -459,15 +459,20 @@ class Session:
         *,
         sinks: Sequence[FrameSink] = (),
         queue_frames: int | None = None,
+        queue_bytes: int | None = None,
     ) -> Capture:
         """Start receiving on ``routes``: an async iterator of every frame they carry.
 
         ``sinks`` see each frame, synchronously, before any consumer queue (and also the frames
-        this session sends); a consumer that falls behind loses frames from its own queue only.
-        Close the capture when done.
+        this session sends); a consumer that falls behind loses frames from its own queue only
+        (``IB-ENG-001``). The queue is bounded by ``queue_frames`` and ``queue_bytes``. Iterating
+        a capture raises the ``IB-TX-003`` error that ends it if a link end can no longer
+        receive. Close the capture when done.
         """
         ends = [(route.link, link_end(route.side)) for route in routes]
-        return await self._engine.open_capture(ends, sinks=sinks, queue_frames=queue_frames)
+        return await self._engine.open_capture(
+            ends, sinks=sinks, queue_frames=queue_frames, queue_bytes=queue_bytes
+        )
 
     def add_sink(self, sink: FrameSink) -> None:
         """Attach ``sink`` to every frame this session ingests or sends until it is removed.
@@ -698,7 +703,7 @@ class Listener:
             # The user already has drop notices; say what the end adds to them.
             self._session.report(
                 IronbirdError(
-                    Code.TX_OVERRUN,
+                    Code.ENG_LAG,
                     f"listening ended with {stats.unread} frame(s) received but not shown",
                 )
             )

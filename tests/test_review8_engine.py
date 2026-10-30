@@ -383,7 +383,7 @@ def _overflow_notice(
             ground.flush_notices()
 
     _run(main())
-    [notice] = [n for n in notices if n.code is Code.TX_OVERRUN]
+    [notice] = [n for n in notices if n.code is Code.ENG_LAG]
     return notice.summary
 
 

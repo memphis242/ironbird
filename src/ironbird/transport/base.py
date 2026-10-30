@@ -25,7 +25,9 @@ class LinkEnd(StrEnum):
 
 # Called on the event-loop thread for each received frame as (data, time_ns, source, orig_len,
 # flags), where ``flags`` is the transport's ``FrameFlag`` bits as a plain int (0 for none); it
-# must be cheap and must never raise.
+# must be cheap and must never raise. ``data`` is at most the transport's ``max_packet_bytes``
+# long: a transport cuts at the edge (``orig_len`` keeps the size on the wire, ``TRUNCATED`` says
+# it was cut), so no more than that is ever copied out of the OS buffer.
 Receiver = Callable[[bytes, int, str, int, int], None]
 
 NO_FLAGS: Final = 0
@@ -52,10 +54,14 @@ class TransportStats:
     tx_bytes: int = 0
     kernel_dropped: int = 0  # lost to the OS before the transport saw them (buffer overflow)
     unread_at_close: int = 0  # still in the OS buffer when the transport closed, discarded
+    rx_errors: int = 0  # reads that failed with an error (see ``IB-TX-003``)
 
 
 # What a factory may call to surface a problem found away from any caller (e.g. at open time).
 ErrorReporter = Callable[[IronbirdError], None]
+
+# Called once when a transport can no longer receive (``IB-TX-003``): its consumers end with it.
+FailureHandler = Callable[[IronbirdError], None]
 
 
 class Transport(Protocol):
