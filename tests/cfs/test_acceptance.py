@@ -72,6 +72,25 @@ def _wait_for_log(log: Path, needle: str, proc: subprocess.Popen[bytes], timeout
     raise AssertionError(f"cFS never printed {needle!r} (exit={proc.poll()}). Log tail:\n{tail}")
 
 
+# CI uploads the pytest base directory as an artifact when this module fails, and
+# actions/upload-artifact refuses the whole upload if any path holds one of these characters.
+ARTIFACT_UNSAFE_CHARS = frozenset('":<>|*?\r\n')
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _artifact_safe_paths(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """Fail if the tests leave a path CI could not upload, instead of losing the failure logs."""
+    yield
+    base = tmp_path_factory.getbasetemp()
+    unsafe = [
+        str(Path(root, name).relative_to(base))
+        for root, dirs, files in os.walk(base)
+        for name in (*dirs, *files)
+        if not ARTIFACT_UNSAFE_CHARS.isdisjoint(name)
+    ]
+    assert not unsafe, f"paths actions/upload-artifact rejects: {unsafe[:5]}"
+
+
 @pytest.fixture(scope="module")
 def cfs(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
     """A running cFS (tools/cfs/run.sh); returns its console log. Stopped and cleaned after."""
@@ -738,32 +757,48 @@ def _listen_where(
 
 def test_listen_where_selects_one_apps_housekeeping(ground: Ground, tmp_path: Path) -> None:
     """``--where 'msg == SAMPLE_APP_HK and CommandCounter > 0'`` prints only that HK, and only
-    once a NOOP made the counter non-zero; the other apps' telemetry is filtered out."""
+    once a NOOP made the counter non-zero; the other apps' telemetry is filtered out.
+
+    The counter is reset and seen at zero by the unfiltered listener *before* the filtered one
+    starts: earlier tests leave it non-zero, and SCH_LAB's periodic SAMPLE_APP_HK (every 5.4 s)
+    could otherwise be published between the filtered listener starting and the reset being
+    executed, carrying the old counter through the filter legitimately. SB delivers one MID's
+    packets in order, so once a zero-counter HK has arrived no older one is still in flight.
+    """
+    ground.send("SAMPLE_APP_RESET_COUNTERS")
+    zeroed = ground.wait_for(
+        "SAMPLE_APP_HK", lambda f: f["CommandCounter"] == 0, request="SAMPLE_APP_SEND_HK"
+    )
     where = "msg == SAMPLE_APP_HK and CommandCounter > 0"
     with (
         ground.listener_paused(),
         _listen_where(ground, tmp_path / "state", "--where", where) as out,
     ):
-        ground.send("SAMPLE_APP_RESET_COUNTERS")
-        ground.send("SAMPLE_APP_SEND_HK")
-        time.sleep(1.5)  # HK with a zero counter must not appear
+        ground.send("SAMPLE_APP_SEND_HK")  # a zero-counter HK: must not appear
+        time.sleep(1.5)
         assert out.snapshot() == []
         ground.send("SAMPLE_APP_NOOP")
         ground.send("SAMPLE_APP_SEND_HK")
         first = json.loads(out.wait_for(lambda text: '"SAMPLE_APP_HK"' in text))
         time.sleep(5.0)  # other apps publish housekeeping meanwhile (SCH_LAB periods)
         lines = [json.loads(text) for text in out.snapshot()]
-    assert first["fields"]["CommandCounter"] > 0
+    assert first["fields"]["CommandCounter"] == 1  # exactly the one NOOP since the reset
+    # SB numbers each MID's packets (14-bit CCSDS sequence count): at least the requested
+    # zero-counter HK was published between the one seen before the pause and the first one
+    # shown, and the filter dropped it.
+    assert (first["sequence"] - zeroed["sequence"]) % (1 << 14) >= 2
     assert lines and all(
-        r["name"] == "SAMPLE_APP_HK" and r["fields"]["CommandCounter"] > 0 for r in lines
+        r["name"] == "SAMPLE_APP_HK" and r["fields"]["CommandCounter"] == 1 for r in lines
     )
 
 
 def test_events_where_type_matches_min_type(ground: Ground, tmp_path: Path) -> None:
     """``--where 'event.type >= error'`` shows the same events as ``--min-type error``."""
 
-    def error_events(*args: str) -> set[tuple[str, int]]:
-        state = tmp_path / ("state-" + "-".join(a.replace(" ", "_") for a in args))
+    def error_events(label: str, *args: str) -> set[tuple[str, int]]:
+        # A fixed label, not one derived from the arguments: CI uploads this tree as an
+        # artifact on failure, and upload-artifact rejects paths containing " : < > | * ?.
+        state = tmp_path / f"state-{label}"
         with ground.listener_paused(), _events(ground, state, "--format", "json", *args) as events:
             ground.send("SAMPLE_APP_NOOP")  # information event: below the floor
             ground.send("TIME_SET_STCF", "Seconds=7", "MicroSeconds=1000000")  # error event
@@ -771,8 +806,8 @@ def test_events_where_type_matches_min_type(ground: Ground, tmp_path: Path) -> N
             time.sleep(1.0)
             return {(r["app"], r["id"]) for r in map(json.loads, events.snapshot())}
 
-    by_floor = error_events("--min-type", "error")
-    by_where = error_events("--where", "event.type >= error")
+    by_floor = error_events("min-type", "--min-type", "error")
+    by_where = error_events("where", "--where", "event.type >= error")
     assert ("CFE_TIME", 36) in by_where and by_where == by_floor
     assert not [1 for app, _ in by_where if app == "SAMPLE_APP"]
 
