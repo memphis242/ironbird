@@ -12,8 +12,9 @@ import asyncio
 import os
 import traceback
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, Final
 
 from ironbird.ccdd.loader import load_ccdd
@@ -25,6 +26,7 @@ from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
 from ironbird.header import load_profile
 from ironbird.ledger import Ledger
+from ironbird.notice import Level, Notice
 from ironbird.transport import Datagram
 from ironbird.transport.udp import UdpTransport, scan_kernel_drops
 
@@ -77,9 +79,10 @@ class Handled:
     reply: EncodedPacket | None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class TxAttempt:
-    """The most recent command send, updated as it progresses (read by signal handling)."""
+    """The most recent command send. Replaced (never mutated) as the send progresses, so a
+    reader of :attr:`Session.last_tx` sees one consistent value (signal handling reads it)."""
 
     command: str
     went_out: bool = False
@@ -93,7 +96,15 @@ class _DropWatch:
 
 
 @dataclass(slots=True)
-class MidStat:
+class _MidStat:
+    """Mutable counters, owned by the session; the outside sees :class:`MidStatSnapshot`."""
+
+    count: int
+    last_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class MidStatSnapshot:
     count: int
     last_ns: int
 
@@ -116,21 +127,56 @@ class Session:
         *,
         role: str | None = None,
         ledger: Ledger,
-        notify: Callable[[str], None],
+        notify: Callable[[Notice], None],
     ) -> None:
-        self.config: SystemConfig = config
-        self.node: Node = config.resolve(role) if role else config.nodes[config.acts_as]
-        self.ledger: Ledger = ledger
+        self._config: SystemConfig = config
+        self._node: Node = config.resolve(role) if role else config.nodes[config.acts_as]
+        self._ledger: Ledger = ledger
         ledger.set_max_raw_bytes(config.max_packet_bytes)
-        self.coalescer: Coalescer = Coalescer(notify)
+        self._coalescer: Coalescer = Coalescer(notify)
         self._codecs: dict[str, Codec] = {}
         self._tasks: list[asyncio.Task[None]] = []
-        self.stats: dict[int, MidStat] = {}
-        self.stats_overflow = 0
-        self.malformed_total = 0  # unknown-MID and malformed datagrams, filtered or not
-        self.last_tx: TxAttempt | None = None
+        self._stats: dict[int, _MidStat] = {}
+        self._stats_overflow = 0
+        self._malformed_total = 0  # unknown-MID and malformed datagrams, filtered or not
+        self._last_tx: TxAttempt | None = None
         self._watches: dict[UdpTransport, _DropWatch] = {}
         self._rcvbuf_warned = False
+
+    # -- read-only state -----------------------------------------------------------
+
+    @property
+    def config(self) -> SystemConfig:
+        return self._config
+
+    @property
+    def node(self) -> Node:
+        """The node ironbird is acting as."""
+        return self._node
+
+    @property
+    def ledger(self) -> Ledger:
+        return self._ledger
+
+    @property
+    def last_tx(self) -> TxAttempt | None:
+        """The most recent command send; the session updates it as the send progresses."""
+        return self._last_tx
+
+    @property
+    def stats_overflow(self) -> int:
+        """Known-MID packets not counted because the per-MID table was full."""
+        return self._stats_overflow
+
+    @property
+    def malformed_total(self) -> int:
+        return self._malformed_total
+
+    def stats_snapshot(self) -> Mapping[int, MidStatSnapshot]:
+        """Frozen copy of the per-MID statistics, safe to hold while packets keep arriving."""
+        return MappingProxyType(
+            {mid: MidStatSnapshot(s.count, s.last_ns) for mid, s in self._stats.items()}
+        )
 
     # -- lifecycle -----------------------------------------------------------------
 
@@ -163,7 +209,7 @@ class Session:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         finally:
             try:
-                self.coalescer.flush()
+                self.flush_notices()
             finally:
                 self.ledger.flush()
 
@@ -186,7 +232,7 @@ class Session:
     async def _ticker(self) -> None:
         while True:
             await asyncio.sleep(TICK_S)
-            self.coalescer.tick()
+            self._coalescer.tick()
             watched = tuple(self._watches)
             await scan_kernel_drops([t for t in watched if t.kernel_scan_due()])
             for transport in watched:
@@ -194,12 +240,27 @@ class Session:
 
     # -- error reporting ---------------------------------------------------------------
 
+    def flush_notices(self) -> None:
+        """Emit every pending coalesced summary now (shutdown, or before reading the output)."""
+        self._coalescer.flush()
+
     def fatal(self, error: IronbirdError) -> None:
         """Ledger an error that is leaving the session (the caller prints it)."""
         self.ledger.record_error(error, role=self.node.name)
 
-    def report(self, error: IronbirdError | DecodeError, *, context: str = "") -> None:
-        """Ledger in full, notify the user coalesced (one line per key per window)."""
+    def report(
+        self,
+        error: IronbirdError | DecodeError,
+        *,
+        context: str = "",
+        level: Level = Level.ERROR,
+        evidence: bool = False,
+    ) -> None:
+        """Ledger in full, notify the user coalesced (one notice per key per window).
+
+        ``evidence`` marks an error that untrusted wire input can produce at will; its ledger
+        record then shares the capped evidence tier instead of the essential one.
+        """
         if isinstance(error, DecodeError):
             raw_mid = error.mid
             err = error.to_error(context)
@@ -208,9 +269,11 @@ class Session:
             raw_mid = None
             err = error
             offset = None
-        self.ledger.record_error(err, role=self.node.name, mid=raw_mid, offset=offset)
+        ledger_n = self.ledger.record_error(
+            err, evidence=evidence, role=self.node.name, mid=raw_mid, offset=offset
+        )
         key = f"{err.code.value}:{raw_mid}:{context}"
-        self.coalescer.report(key, err.user_line(), group=err.code.value)
+        self._coalescer.report(err.code, level, key, err.summary, ledger_n=ledger_n, group=err.code)
 
     # -- loading -------------------------------------------------------------------
 
@@ -295,11 +358,11 @@ class Session:
 
     # -- search --------------------------------------------------------------------
 
-    def find(self, query: str) -> list[Match]:
+    def find(self, query: str) -> tuple[Match, ...]:
         """Tiered lookup: exact name/MID, then name substring, then description/field text."""
         needle = query.strip().casefold()
         if not needle:
-            return []
+            return ()
         mid: int | None = None
         if needle.startswith("0x") or _is_decimal(needle):
             try:
@@ -333,7 +396,7 @@ class Session:
                 ]
                 if any(needle in text.casefold() for text in haystack):
                     add("description", node, msg)
-        return found
+        return tuple(found)
 
     # -- commander: send -----------------------------------------------------------
 
@@ -360,13 +423,14 @@ class Session:
         )
         encoded = codec.encode_command(command, args, tamper=tamper)
         attempt = TxAttempt(encoded.message.name)
-        self.last_tx = attempt
+        self._last_tx = attempt
         transport = UdpTransport(remote=endpoint)
         result = "not_sent"
         try:
             await transport.open()
             transport.send_nowait(encoded.data)
-            attempt.went_out = True
+            attempt = replace(attempt, went_out=True)
+            self._last_tx = attempt
             result = "sent"
             await transport.confirm()
         except IronbirdError as exc:
@@ -410,20 +474,20 @@ class Session:
 
     def _count(self, mid: int, time_ns: int) -> None:
         """Per-MID statistics; only called for MIDs the CCDD defines, so garbage cannot fill it."""
-        stat = self.stats.get(mid)
+        stat = self._stats.get(mid)
         if stat is not None:
             stat.count += 1
             stat.last_ns = time_ns
-        elif len(self.stats) < MAX_TRACKED_MIDS:
-            self.stats[mid] = MidStat(1, time_ns)
+        elif len(self._stats) < MAX_TRACKED_MIDS:
+            self._stats[mid] = _MidStat(1, time_ns)
             self.ledger.record("state", "rx.first", mid=mid)
         else:
-            self.stats_overflow += 1
+            self._stats_overflow += 1
 
     def _reject(self, error: DecodeError, datagram: Datagram, source_label: str) -> DecodeError:
-        self.malformed_total += 1
+        self._malformed_total += 1
         self.ledger.record("packet", "rx.malformed", raw=datagram.data, source=datagram.source)
-        self.report(error, context=f"from {source_label}")
+        self.report(error, context=f"from {source_label}", evidence=True)
         return error
 
     def _ingest(
@@ -766,9 +830,9 @@ class EventStream:
         ]
 
     @property
-    def endpoints(self) -> list[tuple[str, tuple[str, int] | None]]:
+    def endpoints(self) -> tuple[tuple[str, tuple[str, int] | None], ...]:
         """``(node, bound address)`` per listener."""
-        return [(lst.node, lst.local_address) for lst in self._listeners]
+        return tuple((lst.node, lst.local_address) for lst in self._listeners)
 
     def __aiter__(self) -> AsyncIterator[Event]:
         return self._iterate()
@@ -885,8 +949,16 @@ class Responder:
         self._codec = codec
         self._transport = transport
         self._rules = rules
-        self.accepted = 0
-        self.rejected = 0
+        self._accepted = 0
+        self._rejected = 0
+
+    @property
+    def accepted(self) -> int:
+        return self._accepted
+
+    @property
+    def rejected(self) -> int:
+        return self._rejected
 
     @property
     def local_address(self) -> tuple[str, int] | None:
@@ -904,10 +976,10 @@ class Responder:
             if result is None:  # pragma: no cover - no filter is set
                 continue
             if isinstance(result, DecodeError):
-                self.rejected += 1
+                self._rejected += 1
                 yield Handled(datagram.time_ns, None, result, None)
                 continue
-            self.accepted += 1
+            self._accepted += 1
             session.ledger.record(
                 "command",
                 "rx.command",
@@ -941,8 +1013,8 @@ class Responder:
             values[reply_field] = args[arg]
         reply = self._codec.model.by_name[rule.reply]
         for counter, count in (
-            (rule.accepted_counter, self.accepted),
-            (rule.rejected_counter, self.rejected),
+            (rule.accepted_counter, self._accepted),
+            (rule.rejected_counter, self._rejected),
         ):
             if counter:
                 field = reply.field(counter)
@@ -972,5 +1044,5 @@ class Responder:
         finally:  # drops counted while closing are part of the final report
             self._session._unwatch_drops(self._transport)
         self._session.ledger.record(
-            "action", "respond.stop", accepted=self.accepted, rejected=self.rejected
+            "action", "respond.stop", accepted=self._accepted, rejected=self._rejected
         )

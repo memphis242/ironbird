@@ -278,7 +278,9 @@ async def _main_body(glob: Globals, ledger: Ledger, body: Body, run: _Run) -> in
             config,
             role=glob.role,
             ledger=ledger,
-            notify=lambda line: console.err(term(line, 1000, err=True)),
+            notify=lambda notice: console.err(
+                term(notice.line(verbose=run.verbose), 1000, err=True)
+            ),
         ) as session:
             run.session = session
             watcher = asyncio.ensure_future(_watch_output(session, console))
@@ -523,6 +525,8 @@ def _run(
                 on_failure=lambda exc: _print_error(console, exc, glob.verbose),
             )
             ledger.open()
+            if glob.verbose:  # the `[ledger n=N]` pointers on notices refer to this file
+                console.err(f"ledger: {term(str(ledger.path), 1000, err=True)}")
         except IronbirdError as exc:
             _print_error(console, exc, glob.verbose)
             if transmits:

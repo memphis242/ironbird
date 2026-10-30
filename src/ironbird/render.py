@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import sys
+from collections.abc import Sequence
 from typing import Any
 
 from ironbird.ccdd.model import FieldDef, MessageKind, TypeClass
@@ -146,7 +147,7 @@ def listen_banner(node: str, addr: tuple[str, int] | None) -> str:
     return f"listening for {term(node, err=True)}{_where(addr)}"
 
 
-def events_banner(endpoints: list[tuple[str, tuple[str, int] | None]]) -> str:
+def events_banner(endpoints: Sequence[tuple[str, tuple[str, int] | None]]) -> str:
     where = ", ".join(
         f"{term(name, err=True)} (udp {format_hostport(*addr)})" if addr else term(name, err=True)
         for name, addr in endpoints

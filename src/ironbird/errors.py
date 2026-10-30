@@ -85,12 +85,21 @@ class IronbirdError(Exception):
         summary = clean(summary, MAX_SUMMARY_LEN)
         super().__init__(f"{code.value}: {summary}")
         assert "\n" not in summary
-        self.code: Code = code
-        self.summary: str = summary
+        self._code: Code = code
+        self._summary: str = summary
         self.details: str = details
         self.cause: BaseException | None = cause
         if cause is not None:
             self.__cause__ = cause
+
+    @property
+    def code(self) -> Code:
+        return self._code
+
+    @property
+    def summary(self) -> str:
+        """One sanitized line, fixed at construction."""
+        return self._summary
 
     def user_line(self) -> str:
         """The single line shown to the user (the summary is sanitized at construction)."""

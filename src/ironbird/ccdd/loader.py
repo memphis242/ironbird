@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Protocol
+from types import MappingProxyType
+from typing import Final, Protocol
 
 from ironbird.ccdd.json_adapter import JsonAdapter
 from ironbird.ccdd.model import CcddModel
@@ -18,7 +20,9 @@ class Adapter(Protocol):
     def load(self, path: Path) -> CcddModel: ...
 
 
-ADAPTERS: dict[str, Adapter] = {adapter.name: adapter for adapter in (JsonAdapter(),)}
+ADAPTERS: Final[Mapping[str, Adapter]] = MappingProxyType(
+    {adapter.name: adapter for adapter in (JsonAdapter(),)}
+)
 
 
 def load_ccdd(path: Path, adapter: str = "json") -> CcddModel:
