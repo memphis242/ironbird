@@ -95,6 +95,16 @@ VerboseOption = Annotated[
 ]
 LinkOption = Annotated[str | None, typer.Option("--link", help="Link name, if several match.")]
 CountOption = Annotated[int | None, typer.Option("--count", min=1, help="Stop after N packets.")]
+WhereOption = Annotated[
+    str | None,
+    typer.Option(
+        "--where",
+        help=(
+            "Only frames matching this filter expression, e.g. "
+            "'msg == SAMPLE_APP_HK and CommandCounter > 0' (combines with --mid by and)."
+        ),
+    ),
+]
 
 
 def _check_timeout(value: float | None) -> float | None:
@@ -800,6 +810,7 @@ def listen(
     mid: Annotated[
         list[str] | None, typer.Option("--mid", help="Only these MIDs (number or name).")
     ] = None,
+    where: WhereOption = None,
     fmt: Annotated[Format, typer.Option("--format", help="Output format.")] = Format.LINE,
     count: CountOption = None,
     timeout: TimeoutOption = None,
@@ -812,7 +823,7 @@ def listen(
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
         io = run.console
         mids = _parse_mids(session, node, mid, link)
-        listener = await session.listen(node, mids=mids, link=link)
+        listener = await session.listen(node, mids=mids, link=link, where=where)
         io.err(render.listen_banner(node, listener.local_address))
         shown = 0
         show_hex = session_verbose(ctx, verbose)
@@ -851,6 +862,7 @@ def events(
         MinType | None,
         typer.Option("--min-type", case_sensitive=False, help="Hide events below this type."),
     ] = None,
+    where: WhereOption = None,
     fmt: Annotated[Format, typer.Option("--format", help="Output format.")] = Format.LINE,
     count: Annotated[
         int | None, typer.Option("--count", min=1, help="Stop after N events.")
@@ -864,7 +876,9 @@ def events(
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
         io = run.console
         stream = await session.events(
-            node, min_severity=min_type.severity if min_type is not None else None
+            node,
+            min_severity=min_type.severity if min_type is not None else None,
+            where=where,
         )
         io.err(render.events_banner(stream.endpoints))
         shown = 0

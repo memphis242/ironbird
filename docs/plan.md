@@ -1820,6 +1820,81 @@ real cFS: `ib listen fc --where 'msg == SAMPLE_APP_HK and CommandCounter > 0'` a
 NOOP prints only that HK, and `ib events --where 'event.type >= error'` matches
 `--min-type error`.
 
+As built (where the build differs from, or settles, the text above)
+- Package `ironbird.filter`: `lexer.py` (linear scan, anchored fixed patterns only), `parser.py`
+  (recursive descent; only `not` and parentheses recurse, each counted before it does; `and`/`or`
+  chains, also across parentheses of the same kind, are flat n-ary nodes), `compiler.py` (names,
+  types, closure tree, candidate MIDs), `matcher.py` (`Filter`, `Matcher`, `Cost`), `diag.py`
+  (limits, `FilterError`, suggestions). Public API: `compile_filter(text, codecs, *, links=None) ->
+  Filter(source, mids, needs_decode, match, cost)`; `Filter.bind(decode, codec_for) -> Matcher`;
+  `Matcher.__call__(frame) -> bool`, `Matcher.decoded(frame)` (the decode the filter made, or
+  one on demand: made at most once per frame, so a consumer never decodes a matching frame
+  twice), `Matcher.resolved(frame)`, `Matcher.decodes`. 2g builds its matcher the same way with its
+  own decoder and the codecs of the recording's definitions; the filter is valid only for frames
+  decoded with those same definitions. `Session.compile_filter(text, nodes)` and
+  `Session.matcher(flt, decoder)` wrap it for live use.
+- Deviation: `compile_filter` takes the nodes' **codecs** (node name to `Codec`), not bare CCDD
+  models, because `hdr.<field>` names live in the header profiles. `links` (the config's link
+  names) validates `link == ...`; `None` accepts any name.
+- Grammar as in S4, plus: strings are `"..."` or `'...'` (escapes `\\ \" \'` only; every
+  character printable); keywords (`and or not in contains`) are lower case and cannot be bare
+  literals (quote them); a bare word and a quoted string are interchangeable wherever a name is
+  expected (message, category, enum label, node, link, severity, `dir`, `kind`, `status`,
+  `true`/`false`); `event.app`, `event.text`, `source` and char fields take quoted text only;
+  bytes fields take quoted hex (`==`, `!=`, `in`, `contains`); `HEX` is `[-]0x...`; `TIME` needs
+  seconds (`...T12:00:00[.f]` and `Z`, `+HH`, `+HHMM` or `+HH:MM`), a zone is mandatory.
+- Meaning of the names: `len` is `orig_len` (size on the wire); `msg` and `category` of a telemetry
+  frame come from `frame.mid` alone (so a malformed frame of a known MID still has them); `msg`
+  of a command frame costs a header check (`Codec.resolve`, or the ingest token), not a full
+  decode, so `msg` is MODEL level; `status` is `unknown` when the check says `IB-DEC-006`,
+  `malformed` for every other failure (truncated and garbage frames included), else `ok`;
+  `fc` is the decoded command's function code; `event.type` takes severity names
+  (`debug info information warn warning error critical`, case-insensitive) and an unmapped type
+  value is false; `htime` is reserved and refused (`IB-FLT-002`) until 2i.
+- Field predicates (`MSG.f`, bare `f`): a message is a candidate when it has the field; a literal the
+  field cannot take (wrong kind, a label its enum lacks, bytes of the wrong size, an operator its
+  type lacks) leaves that message out, never matching it even for `!=`; the filter is
+  `IB-FLT-003` only when no message qualifies, or when the integer is outside every
+  qualifying field's range for `==`, `!=` or `in` (`counter == 300` on a uint8 is an error;
+  next to a uint16 `counter` it selects that one, and `counter != 300` on the uint8 is plainly
+  true). Ordering allows a decimal on an integer field (`x > 1.5`), equality does not.
+- Collisions: a bare name that is reserved and is also a CCDD field name, `hdr.x` or `event.x` when a
+  message called `hdr`/`event` exists, and `MSG.x` for a message named like a reserved word fail with
+  `IB-FLT-002` naming both meanings; a field named `hdr` next to `hdr.length` is not ambiguous.
+- Evaluation: `and`/`or` children are sorted by cost (frame, model, check, decode; stable), the
+  root rejects a frame whose MID is outside the candidate set before anything runs, and every
+  decode-level predicate checks its own messages' MIDs (per node) before it asks for a decode, so
+  a frame is decoded only when some message can match, also under an `or` with an unbounded
+  operand. A predicate on `mid` itself sets candidates only for `==`/`in`. No candidate message
+  at all for `msg`, `category`, `fc`, `event.*` is `IB-FLT-003`/`-002` (the filter could never match).
+- Live: `Session.listen(..., where=)` and `Session.events(..., where=)` compile before anything is
+  opened. `ib listen`/`ib events --where EXPR` (`--mid` and `--where` combine by and). `events`
+  decodes every event MID frame for the ledger first and tests the filter on that frame after
+  `--min-type`, so a hidden event is still ledgered in full. `listen` yields decoded packets only
+  (as before): frames a `status` filter selects that do not decode are counted in the
+  `listen.stop` ledger record (`where_undecodable`), not shown; replay/export (2g, 2h) show them.
+  `listen.start` and `events.start` record the expression (`where`, `where_mids`).
+- `IB-FLT-*` is usage (exit 2). One-line message with column and (for names and literals) the best
+  suggestion; `--verbose` and the ledger get the expression window, a caret line and up to three
+  close names. Non-printable characters in the shown expression are `?`, one for one.
+  `RecursionError` cannot occur at the limits and is reported as `IB-FLT-004` if a caller is
+  already deep in the stack.
+- Tests: `tests/test_filter.py` (lexer, parser, limits, names, types, mids, semantics, cost
+  ordering, errors, corpus), `tests/test_filter_fuzz.py` (Hypothesis: arbitrary text, token soup and
+  deep nesting raise only `FilterError` within a time bound; compiled filters equal a naive reference
+  evaluator, `tests/filter_defs.py`, on random expressions and random valid, mutated, truncated,
+  garbage and live-token frames over two nodes with clashing MIDs and names; the candidate set never
+  excludes a match; no frame outside it is decoded), `tests/test_filter_live.py` (loopback sessions
+  and CLI processes on ports 53000-53999), corpus `tests/corpus/malformed/flt-*.txt`,
+  `tools/fuzz/fuzz_filter.py` (atheris), two `cfs` acceptance cases.
+- Benchmarks (`tests/test_benchmarks.py`, 4-core dev host): per frame, frame-level
+  `seq > 0 and node == fc and dir == rx and len >= 16` 1.4-1.6 us (about 650k frames/s); model-level
+  (`msg == MOCK_HK and category == housekeeping`) 0.9-1.0 us (1.1M/s); check-level 0.5-0.8 us; decode-level
+  (`msg == MOCK_HK and cmd_counter >= 0 and mode in [...]`) 7-11 us including the one decode (90-140k/s);
+  a frame outside the candidate MIDs about 0.3 us. Whole listen path with a decode-level filter 22-25 us
+  against 17-21 us for the bare decode and render (guard 1.8x; 1.5x without a filter). End to end
+  `ib listen --where ...` at 10k pkt/s: 30000 of 30000 lines, no `IB-OUT-*`.
+
 ### 2g - Replay
 
 Deliverables

@@ -110,6 +110,43 @@ Telemetry messages carry a `category` in the CCDD, in priority order: `event`,
 also has an `event` mapping naming its app/id/type/message fields; see `docs/plan.md`
 ("Telemetry categories and events") and `examples/ccdd/cfs.json`.
 
+## Filtering with --where
+
+`ib listen NODE --where EXPR` and `ib events --where EXPR` show only the frames the expression
+matches (`--mid` stays and combines with it by `and`). The expression is compiled against the
+CCDD of the nodes in use before anything is opened, so a typo fails at once with a coded one-line
+error (`IB-FLT-001` syntax, `-002` unknown or ambiguous name, `-003` literal or operator that does
+not fit, `-004` over a limit; exit 2); `--verbose` adds the expression with a caret under the
+column and up to three close names.
+
+```bash
+ib listen fc --where 'msg == MOCK_HK and cmd_counter > 0'
+ib listen fc --where 'category in [event, command_response] and not mode == SAFE'
+ib events --where 'event.type >= error and event.app == "SAMPLE_APP"'
+```
+
+Grammar: `expr = term {or term}`, `term = factor {and factor}`, `factor = not factor | (expr) |
+name op literal`; `op` is `== != < <= > >= in [a, b] contains "text"`. Literals: integers (`-1`,
+`0x1f`), decimals (`-0.5`), quoted text (`"..."` or `'...'`), bare words (message, category, enum,
+node and severity names; quote one that is a keyword) and ISO 8601 times with `Z` or an offset
+(`2026-10-29T12:00:00.5Z`; local times are refused).
+
+| Names | Meaning |
+|-------|---------|
+| `seq time len node link dir kind source mid truncated garbage` | the frame itself (`len` is the size on the wire) |
+| `category msg` | from the MID alone (`msg` of a command frame needs its header check) |
+| `status` | `ok`, `malformed` or `unknown` (the ingest check) |
+| `fc hdr.<field> event.app event.id event.type event.text` | decoded (`event.type` orders DEBUG < ... < CRITICAL) |
+| `<MSG>.<field>`, bare `<field>` | a CCDD field (a bare field means any message that has it) |
+
+A predicate on something the frame does not have is false (`not` inverts it). A CCDD message or
+field named like a reserved word is never picked silently: use `MSG.field`, or the expression
+fails naming both meanings. Limits: 4096 characters, 1024 tokens, 32 levels of `not` and
+parentheses, 1024 `in` items, numbers of at most 40 characters. A frame whose MID cannot match is
+never decoded for the filter. Malformed frames are reported at ingest as before and `listen`
+shows decoded packets only, so `--where 'status == malformed'` selects them for replay and
+export, not for `listen`.
+
 ## Configuration
 
 - `examples/ironbird.toml` - ground plus a real cFS flight computer (CI_LAB 1234, TO_LAB 2234).

@@ -707,6 +707,76 @@ def test_events_min_type_shows_only_the_error_but_the_ledger_keeps_the_info(
     assert {("SAMPLE_APP", 3), ("CFE_TIME", 36)} <= logged
 
 
+@contextmanager
+def _listen_where(
+    ground: Ground, state_dir: Path, *args: str
+) -> Generator[EventsProcess, None, None]:
+    """``ib listen fc --format json`` with extra arguments (own ledger directory), started and
+    listening; stopped on exit. Output lines are collected like ``ib events`` lines."""
+    proc = subprocess.Popen(
+        [*Ground._ib(), "listen", "fc", "--format", "json", "--timeout", "90", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**ground.env, "IRONBIRD_STATE_DIR": str(state_dir)},
+    )
+    running = EventsProcess(proc)
+    try:
+        assert proc.stderr is not None
+        seen: list[str] = []
+        for line in iter(proc.stderr.readline, ""):
+            seen.append(line)
+            if "listening for fc" in line:
+                break
+        else:
+            raise AssertionError(f"no listen banner; stderr so far: {seen}")
+        running.start_reading()
+        yield running
+    finally:
+        running.stop()
+
+
+def test_listen_where_selects_one_apps_housekeeping(ground: Ground, tmp_path: Path) -> None:
+    """``--where 'msg == SAMPLE_APP_HK and CommandCounter > 0'`` prints only that HK, and only
+    once a NOOP made the counter non-zero; the other apps' telemetry is filtered out."""
+    where = "msg == SAMPLE_APP_HK and CommandCounter > 0"
+    with (
+        ground.listener_paused(),
+        _listen_where(ground, tmp_path / "state", "--where", where) as out,
+    ):
+        ground.send("SAMPLE_APP_RESET_COUNTERS")
+        ground.send("SAMPLE_APP_SEND_HK")
+        time.sleep(1.5)  # HK with a zero counter must not appear
+        assert out.snapshot() == []
+        ground.send("SAMPLE_APP_NOOP")
+        ground.send("SAMPLE_APP_SEND_HK")
+        first = json.loads(out.wait_for(lambda text: '"SAMPLE_APP_HK"' in text))
+        time.sleep(5.0)  # other apps publish housekeeping meanwhile (SCH_LAB periods)
+        lines = [json.loads(text) for text in out.snapshot()]
+    assert first["fields"]["CommandCounter"] > 0
+    assert lines and all(
+        r["name"] == "SAMPLE_APP_HK" and r["fields"]["CommandCounter"] > 0 for r in lines
+    )
+
+
+def test_events_where_type_matches_min_type(ground: Ground, tmp_path: Path) -> None:
+    """``--where 'event.type >= error'`` shows the same events as ``--min-type error``."""
+
+    def error_events(*args: str) -> set[tuple[str, int]]:
+        state = tmp_path / ("state-" + "-".join(a.replace(" ", "_") for a in args))
+        with ground.listener_paused(), _events(ground, state, "--format", "json", *args) as events:
+            ground.send("SAMPLE_APP_NOOP")  # information event: below the floor
+            ground.send("TIME_SET_STCF", "Seconds=7", "MicroSeconds=1000000")  # error event
+            events.wait_for(lambda text: "CFE_TIME" in text)
+            time.sleep(1.0)
+            return {(r["app"], r["id"]) for r in map(json.loads, events.snapshot())}
+
+    by_floor = error_events("--min-type", "error")
+    by_where = error_events("--where", "event.type >= error")
+    assert ("CFE_TIME", 36) in by_where and by_where == by_floor
+    assert not [1 for app, _ in by_where if app == "SAMPLE_APP"]
+
+
 def test_events_also_appear_in_the_packet_stream_with_their_category(ground: Ground) -> None:
     mark = ground.count()
     ground.send("ES_NOOP")
