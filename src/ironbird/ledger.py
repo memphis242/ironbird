@@ -1,10 +1,15 @@
 """Action ledger: timestamped JSON Lines of actions, commands, state changes and errors.
 
-Producers call :meth:`Ledger.record`, which only appends a tuple to a bounded deque (no
+Producers call :meth:`Ledger.record`, which only appends a tuple to a bounded queue (no
 formatting, no I/O). Formatting and writing happen in :meth:`Ledger.drain_task`, an asyncio
 task that runs only while the loop has been idle, in small slices, with a bounded staleness
 (forced drain at ``FORCE_AGE_S`` age or ``FORCE_COUNT`` entries). :meth:`Ledger.flush` is
 the synchronous path used on error, shutdown and signals.
+
+When the queue is full the *new* record is dropped and counted (its call returns ``None``),
+never an older one: a record number handed out is a record that gets written. Evidence kinds
+(packets, events) are capped below the queue size, so a flood of them cannot crowd out the
+essential records (actions, commands, state changes, errors).
 """
 
 from __future__ import annotations
@@ -30,12 +35,16 @@ IDLE_S: Final = 0.02
 POLL_S: Final = 0.01
 SLICE: Final = 256
 MAX_QUEUE: Final = 200_000
+MAX_EVIDENCE_QUEUE: Final = 150_000  # of MAX_QUEUE; the rest is reserved for essential records
 ERROR_FLUSH_MIN_INTERVAL_S: Final = 0.25
 MAX_DEPTH: Final = 16
 MAX_FALLBACK_REPR: Final = 2000
 
 _RESERVED: Final = frozenset({"ts", "session", "n", "kind", "event"})
 _KINDS: Final = frozenset({"action", "command", "state", "packet", "event", "warning", "error"})
+# Kinds a flood can produce; they share a capped slice of the queue. Everything else is essential.
+_EVIDENCE_KINDS: Final = frozenset({"packet", "event"})
+assert _EVIDENCE_KINDS <= _KINDS and MAX_EVIDENCE_QUEUE < MAX_QUEUE
 
 _Entry = tuple[int, int, str, str, Mapping[str, Any]]
 
@@ -94,6 +103,8 @@ def _make_default(max_raw_bytes: int) -> Callable[[object], object]:
             )
         if isinstance(value, Path):
             return str(value)
+        if isinstance(value, Mapping):  # read-only views (MappingProxyType) are not dicts
+            return dict(value)
         if isinstance(value, BaseException):
             return f"{type(value).__name__}: {value}"
         return _safe_repr(value)
@@ -140,17 +151,25 @@ class Ledger:
         on_failure: Callable[[IronbirdError], None] | None = None,
         enabled: bool = True,
         max_raw_bytes: int = DEFAULT_MAX_PACKET_BYTES,
+        max_queue: int = MAX_QUEUE,
+        max_evidence_queue: int = MAX_EVIDENCE_QUEUE,
     ) -> None:
         assert max_raw_bytes > 0
+        assert 0 < max_evidence_queue < max_queue, "essential records need reserved room"
         self._directory: Path = directory
         self._session_id: str = session_id or uuid.uuid4().hex[:12]
         self._on_failure = on_failure
         self._enabled = enabled
         self._default = _make_default(max_raw_bytes)
         self._urgent = False
-        self._queue: deque[_Entry] = deque(maxlen=MAX_QUEUE)
+        self._max_queue = max_queue
+        self._max_evidence_queue = max_evidence_queue
+        self._queue: deque[_Entry] = deque()
+        self._evidence_queued = 0  # entries of ``_EVIDENCE_KINDS`` in ``_queue``
         self._seq = 0
-        self._dropped = 0
+        # Records refused because the queue was full, by tier, until the next marker is written.
+        self._dropped_evidence = 0
+        self._dropped_essential = 0
         self._last_busy = 0.0
         self._last_flush = float("-inf")  # the first error flushes at once
         self._oldest_mono = 0.0
@@ -183,7 +202,8 @@ class Ledger:
 
     @property
     def dropped(self) -> int:
-        return self._dropped
+        """Records refused (and not yet summarised in the ledger) because the queue was full."""
+        return self._dropped_evidence + self._dropped_essential
 
     def set_max_raw_bytes(self, max_raw_bytes: int) -> None:
         """Keep raw packet evidence up to this many bytes per field (the packet size cap)."""
@@ -197,18 +217,28 @@ class Ledger:
     def record(self, kind: str, event: str, **fields: Any) -> int | None:
         """Queue one record and return its record number (the ``n`` it is written with).
 
-        Cheap by design: no formatting, no I/O. ``None`` means the ledger is disabled or has
-        failed, so there is no record for a notice to point at.
+        Cheap by design: no formatting, no I/O. ``None`` means there is no record for a notice
+        to point at: the ledger is disabled or has failed, or the queue was full and this
+        record was dropped (counted, and summarised by one ``ledger.dropped`` record).
         """
         assert kind in _KINDS, f"unknown ledger kind {kind!r}"
         assert not (fields.keys() & _RESERVED), "field name collides with a ledger envelope key"
         if not self._enabled or self._failed:
             return None
         queue = self._queue
-        if len(queue) == MAX_QUEUE:
-            self._dropped += 1
-        elif not queue:
+        evidence = kind in _EVIDENCE_KINDS
+        if len(queue) >= self._max_queue or (
+            evidence and self._evidence_queued >= self._max_evidence_queue
+        ):
+            if evidence:
+                self._dropped_evidence += 1
+            else:
+                self._dropped_essential += 1
+            return None
+        if not queue:
             self._oldest_mono = time.monotonic()
+        if evidence:
+            self._evidence_queued += 1
         self._seq += 1
         queue.append((time.time_ns(), self._seq, kind, event, fields))
         return self._seq
@@ -216,7 +246,8 @@ class Ledger:
     def record_error(self, error: IronbirdError, **fields: Any) -> int | None:
         """Record an error in full and flush promptly (rate-limited under floods).
 
-        Returns the record number, as :meth:`record` does.
+        Returns the record number as :meth:`record` does; ``None`` also when the prompt flush
+        found the ledger unwritable, since then the record was never written.
         """
         number = self.record(
             "error",
@@ -231,7 +262,7 @@ class Ledger:
             self._drain(SLICE)
             self._last_flush = time.monotonic()
             self._urgent = bool(self._queue)
-        return number
+        return None if self._failed else number
 
     # -- writer side ---------------------------------------------------------------------
 
@@ -303,6 +334,7 @@ class Ledger:
         """Discard everything from now on (the caller has already told the user)."""
         self._failed = True
         self._queue.clear()
+        self._evidence_queued = 0
 
     def _write_lines(self, lines: list[str]) -> bool:
         if self._failed:
@@ -316,21 +348,30 @@ class Ledger:
             return False
         return True
 
+    def _write_dropped_marker(self) -> None:
+        """One record summarising refused records; written only with an empty queue, so its
+        number follows every number already handed out."""
+        assert not self._queue
+        evidence, essential = self._dropped_evidence, self._dropped_essential
+        if not (evidence or essential):
+            return
+        self._dropped_evidence = self._dropped_essential = 0
+        self._seq += 1
+        fields = {"count": evidence + essential, "evidence": evidence, "essential": essential}
+        self._write_lines(
+            [self._format((time.time_ns(), self._seq, "state", "ledger.dropped", fields))]
+        )
+
     def _drain(self, limit: int) -> int:
         count = min(limit, len(self._queue))
         if count == 0:
             return 0
         entries = [self._queue.popleft() for _ in range(count)]
-        lines = [self._format(entry) for entry in entries]
-        if self._dropped:
-            dropped, self._dropped = self._dropped, 0
-            lines.append(
-                self._format(
-                    (time.time_ns(), self._seq + 1, "state", "ledger.dropped", {"count": dropped})
-                )
-            )
-            self._seq += 1
-        self._write_lines(lines)
+        self._evidence_queued -= sum(1 for entry in entries if entry[2] in _EVIDENCE_KINDS)
+        assert self._evidence_queued >= 0
+        self._write_lines([self._format(entry) for entry in entries])
+        if not self._queue:
+            self._write_dropped_marker()
         self._oldest_mono = time.monotonic()
         return count
 
@@ -338,8 +379,7 @@ class Ledger:
         """Synchronously write everything queued."""
         while self._queue:
             self._drain(1024)
-        if self._dropped:
-            self._drain(1)
+        self._write_dropped_marker()
         self._last_flush = time.monotonic()
 
     def close(self) -> None:

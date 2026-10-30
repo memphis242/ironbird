@@ -25,7 +25,14 @@ MAX_NEW_PER_GROUP: Final = 5
 
 @dataclass(slots=True)
 class _Entry:
-    notice: Notice  # the latest occurrence
+    """One open window. Holds raw fields; a :class:`Notice` is built only when one is emitted,
+    so the suppressed path (the flood case) allocates nothing."""
+
+    code: Code
+    level: Level
+    key: str
+    summary: str  # of the latest occurrence
+    ledger_n: int | None  # of the latest occurrence that had one
     started: float
     suppressed: int
 
@@ -50,16 +57,15 @@ class Coalescer:
 
     def _summary(self, entry: _Entry, now: float) -> None:
         if entry.suppressed:
-            last = entry.notice
             self._emit(
                 Notice(
-                    last.code,
-                    last.level,
-                    last.key,
-                    last.summary,
+                    entry.code,
+                    entry.level,
+                    entry.key,
+                    entry.summary,
                     count=entry.suppressed + 1,
                     window_s=max(0.0, now - entry.started),
-                    ledger_n=last.ledger_n,
+                    ledger_n=entry.ledger_n,
                 )
             )
 
@@ -91,11 +97,12 @@ class Coalescer:
                 entry = self._entries.get(key)
             else:
                 self._groups[group] = (started, count + 1)
-        notice = Notice(code, level, key, summary, ledger_n=ledger_n)
         if entry is not None:
             if now - entry.started < self._window:
                 entry.suppressed += 1
-                entry.notice = notice
+                entry.summary = summary
+                if ledger_n is not None:  # a later occurrence without a record keeps the pointer
+                    entry.ledger_n = ledger_n
                 return
             self._summary(entry, now)
             del self._entries[key]
@@ -103,8 +110,8 @@ class Coalescer:
             old_key, old = self._entries.popitem(last=False)
             self._summary(old, now)
             assert old_key not in self._entries
-        self._emit(notice)
-        self._entries[key] = _Entry(notice, now, 0)
+        self._emit(Notice(code, level, key, summary, ledger_n=ledger_n))
+        self._entries[key] = _Entry(code, level, key, summary, ledger_n, now, 0)
 
     def tick(self) -> None:
         """Close expired windows; call about once a second from the owning loop."""

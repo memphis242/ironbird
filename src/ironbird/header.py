@@ -109,6 +109,14 @@ class Header:
     size: int
     sequence: int | None
 
+    # ``values`` is a read-only view, which the copy module cannot copy; the header is
+    # immutable, so sharing it is a faithful copy.
+    def __copy__(self) -> Header:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Header:
+        return self
+
 
 # ---------------------------------------------------------------------------------------
 # Profile loading and validation

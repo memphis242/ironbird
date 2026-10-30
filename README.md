@@ -31,9 +31,15 @@ ib -c examples/mock.toml send fc MOCK_RAISE_EVENT app=DEMO event_id=7 event_type
 
 `ib` is a short alias of `ironbird`. Global options: `--config/-c PATH` (or `$IRONBIRD_CONFIG`),
 `--as NODE`, `--verbose/-v`. Errors are one line, `error IB-XXX-NNN: summary`, on stderr; add
-`--verbose` for detail, including `[ledger n=N]` on repeated-error notices, the number of the
-ledger record (field `n`) holding the full detail. Every action and error is recorded as JSON
-Lines in `$XDG_STATE_HOME/ironbird/` (override with `IRONBIRD_STATE_DIR`).
+`--verbose` for detail: it prints the ledger file path once at start and appends `[ledger n=N]`
+to every notice that has a ledger record, `N` being the record number (field `n`) in that file
+holding the full detail. Every action and error is recorded as JSON Lines in
+`$XDG_STATE_HOME/ironbird/` (override with `IRONBIRD_STATE_DIR`). When the ledger queue is full
+(a flood faster than the disk) new records are dropped and counted, never older ones, and one
+`ledger.dropped` record in the ledger says how many.
+
+Planned (Stage 2e): recordings embed the CCDD and header profiles they were captured with, so a
+recording is exactly as sensitive as those definition files; share it accordingly.
 
 ## Exit codes
 

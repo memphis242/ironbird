@@ -162,20 +162,16 @@ def test_ledger_strings_with_escapes_stay_inert_in_file(tmp_path: Path) -> None:
     assert "\x1b" not in ledger.path.read_text()
 
 
-def test_ledger_queue_is_bounded_and_reports_drops(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import ironbird.ledger as mod
-
-    monkeypatch.setattr(mod, "MAX_QUEUE", 10)
-    ledger = Ledger(tmp_path, session_id="s")
-    ledger._queue = type(ledger._queue)(maxlen=10)
+def test_ledger_queue_is_bounded_and_reports_drops(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path, session_id="s", max_queue=10, max_evidence_queue=5)
     for i in range(25):
         ledger.record("state", "n", i=i)
     assert ledger.pending == 10 and ledger.dropped == 15
     ledger.flush()
-    events = [json.loads(x)["event"] for x in ledger.path.read_text().splitlines()]
-    assert events.count("ledger.dropped") == 1
+    records = [json.loads(x) for x in ledger.path.read_text().splitlines()]
+    assert [r["i"] for r in records if r["event"] == "n"] == list(range(10))  # oldest kept
+    assert [r["event"] for r in records].count("ledger.dropped") == 1
+    assert ledger.dropped == 0
 
 
 def test_ledger_write_failure_is_reported_once(tmp_path: Path) -> None:

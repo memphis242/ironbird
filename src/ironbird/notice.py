@@ -7,8 +7,10 @@ details pane later) and can use ``ledger_n`` to open the full ledger record behi
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import IntEnum
+from types import MappingProxyType
 from typing import Final
 
 from ironbird.errors import Code
@@ -25,7 +27,9 @@ class Level(IntEnum):
         return _LABELS[self]
 
 
-_LABELS: Final = {Level.INFO: "info", Level.WARNING: "warning", Level.ERROR: "error"}
+_LABELS: Final[Mapping[Level, str]] = MappingProxyType(
+    {Level.INFO: "info", Level.WARNING: "warning", Level.ERROR: "error"}
+)
 assert _LABELS.keys() == set(Level), "every level needs a label"
 
 

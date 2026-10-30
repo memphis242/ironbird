@@ -525,6 +525,8 @@ def _run(
                 on_failure=lambda exc: _print_error(console, exc, glob.verbose),
             )
             ledger.open()
+            if glob.verbose:  # the `[ledger n=N]` pointers on notices refer to this file
+                console.err(f"ledger: {term(str(ledger.path), 1000, err=True)}")
         except IronbirdError as exc:
             _print_error(console, exc, glob.verbose)
             if transmits:

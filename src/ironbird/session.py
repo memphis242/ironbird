@@ -12,7 +12,7 @@ import asyncio
 import os
 import traceback
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Final
@@ -79,9 +79,10 @@ class Handled:
     reply: EncodedPacket | None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class TxAttempt:
-    """The most recent command send, updated as it progresses (read by signal handling)."""
+    """The most recent command send. Replaced (never mutated) as the send progresses, so a
+    reader of :attr:`Session.last_tx` sees one consistent value (signal handling reads it)."""
 
     command: str
     went_out: bool = False
@@ -421,7 +422,8 @@ class Session:
         try:
             await transport.open()
             transport.send_nowait(encoded.data)
-            attempt.went_out = True
+            attempt = replace(attempt, went_out=True)
+            self._last_tx = attempt
             result = "sent"
             await transport.confirm()
         except IronbirdError as exc:

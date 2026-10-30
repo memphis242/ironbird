@@ -371,38 +371,45 @@ class Direction(StrEnum):
     RX = "rx"
     TX = "tx"
 
+
 class FrameFlag(IntFlag):
     NONE = 0
-    HAS_MID = 0x01    # mid was peeked from the profile's MID window
+    HAS_MID = 0x01  # mid was peeked from the profile's MID window
     TRUNCATED = 0x02  # data cut at max_packet_bytes; orig_len is the size on the wire
-    GARBAGE = 0x04    # serial: bytes skipped while resynchronising, not a packet
-    STALE = 0x08      # serial: partial packet flushed by the inter-byte timeout
+    GARBAGE = 0x04  # serial: bytes skipped while resynchronising, not a packet
+    STALE = 0x08  # serial: partial packet flushed by the inter-byte timeout
+
 
 @dataclass(frozen=True, slots=True)
-class Stream:          # one direction of one link, as seen by this process
-    id: int            # u16, unique within a session and its recording
+class Stream:  # one direction of one link, as seen by this process
+    id: int  # u16, unique within a session and its recording
     link: str
-    node: str          # node whose CCDD and profiles decode it (link.destination)
+    node: str  # node whose CCDD and profiles decode it (link.destination)
     kind: MessageKind  # what the bytes are: command or telemetry
     direction: Direction
-    transport: str     # "udp" | "serial"
-    endpoint: str      # sanitized display text: "udp 0.0.0.0:2234", "serial /dev/ttyUSB0"
+    transport: str  # "udp" | "serial"
+    endpoint: str  # sanitized display text: "udp 0.0.0.0:2234", "serial /dev/ttyUSB0"
+
 
 @dataclass(frozen=True, slots=True)
 class Frame:
-    seq: int           # u64, session-wide, strictly increasing from 1, assigned at ingest
-    time_ns: int       # CLOCK_REALTIME taken in the transport callback (receive or send)
+    seq: int  # u64, session-wide, strictly increasing from 1, assigned at ingest
+    time_ns: int  # CLOCK_REALTIME taken in the transport callback (receive or send)
     stream: Stream
-    source: str        # interned peer text ("" for serial)
-    mid: int | None    # peeked, used only for routing and filtering, never trusted
+    source: str  # interned peer text ("" for serial)
+    mid: int | None  # peeked, used only for routing and filtering, never trusted
     flags: FrameFlag
-    orig_len: int      # == len(data) unless TRUNCATED
-    data: bytes        # len(data) <= max_packet_bytes
-    # __post_init__ asserts: HAS_MID iff mid is not None; TRUNCATED iff len(data) < orig_len
+    orig_len: int  # == len(data) unless TRUNCATED
+    data: bytes  # len(data) <= max_packet_bytes
+    # __post_init__ asserts: HAS_MID iff mid is not None; TRUNCATED iff orig_len > len(data);
+    # the flag-combination rules of S3 "Reading"; len(data) <= max_packet_bytes
 ```
 
-- `seq` gives total order across links and makes loss visible: within a recording, seq
-  is contiguous except where a GAP record says why.
+- `seq` gives total order across links and makes loss visible. It is session-wide, so a
+  recording that excludes a stream (`--link` subset, a stream with no recorder) is not
+  contiguous: within a recording, seq is contiguous except where a GAP record says why,
+  and the writer emits a GAP with reason `not_recorded` (stream, count, seq range) for
+  frames of streams it was not given, so a hole is never unexplained.
 - MIDs are limited to 32 bits: the codec rejects a profile whose `mid_bits` exceeds 32
   at load (`IB-HDR-002`), matching the CCDD's existing 32-bit MID cap.
 - Decoded results pair with their frame: `Decoded(frame, packet)` replaces Stage 1's
@@ -471,11 +478,17 @@ session and shared by its sends and receives (a serial device can be opened once
 ### S3. Recording file format `.ibrec` v1 (fixed in 2e)
 
 All integers little-endian, explicit (`<` structs), independent of host. The file is a
-16-byte preamble followed by records; everything after the preamble is CRC-checked.
+24-byte preamble followed by records; everything after the preamble is CRC-checked.
 
-**Preamble (16 bytes):** magic `89 49 42 52 0D 0A 1A 0A` (`\x89IBR\r\n\x1a\n`: high bit,
+**Preamble (24 bytes):** magic `89 49 42 52 0D 0A 1A 0A` (`\x89IBR\r\n\x1a\n`: high bit,
 CR-LF and ^Z catch text-mode and 7-bit transfer damage), `u16 major = 1`, `u16 minor = 0`,
-`u32 flags = 0`.
+`u32 flags = 0`, `u64 nonce` (from `os.urandom` when the file is created; each split part
+has its own).
+
+**Why a nonce.** Frame data comes from the wire, so a packet can contain bytes that look
+like a record, and a resync scan over a damaged file could lock onto it. The nonce
+(chosen after the traffic it will hold is unknowable) seeds every CRC, so bytes forged
+before the file existed cannot carry a valid CRC.
 
 **Record envelope (12 bytes)**, record start 8-byte aligned, zero padding after the body:
 
@@ -485,7 +498,7 @@ CR-LF and ^Z catch text-mode and 7-bit transfer damage), `u16 major = 1`, `u16 m
 | 4 | u8 | `type` |
 | 5 | u8 | `flags` (0 in v1) |
 | 6 | u16 | reserved (0) |
-| 8 | u32 | `crc32` (`zlib.crc32`) over envelope bytes 0-7 and the body |
+| 8 | u32 | `crc32`: `zlib.crc32(envelope[0:8] + body, nonce32)` (`nonce32` = low 32 bits of the preamble nonce as the CRC seed) |
 
 **Record types.** Types below 0x80 are *critical* (a reader that does not know one stops
 with `IB-REC-005`); 0x80 and above are *skippable* extensions, so a minor version can add
@@ -498,7 +511,7 @@ them without breaking old readers.
 | 0x03 | STREAM | stream definition (S1 fields), before the stream's first frame | 4 KiB |
 | 0x04 | SOURCE | `u16 id` + peer text, before first use; table capped at 4096, overflow uses id 0xFFFF "(other)" | 256 B |
 | 0x05 | FRAME | frame (below) | 32 + `max_packet_bytes` |
-| 0x06 | GAP | stream, reason (kernel drop, queue drop, recorder overrun, link down), count, first/last time, seq range | 64 B |
+| 0x06 | GAP | stream, reason (kernel drop, queue drop, recorder overrun, link down, not recorded), count, first/last time, seq range | 64 B |
 | 0x07 | CHUNK | chunk summary (below) | 2.2 KiB |
 | 0x08 | MARK | session events (start, stop, signal, link up/down) and, later, user notes | 4 KiB |
 | 0x09 | INDEX | `u32 n` + n x `u64` offsets of CHUNK records | 16 MiB |
@@ -519,14 +532,18 @@ them without breaking old readers.
 | 32 | bytes | `data`, `body_len - 32` bytes |
 
 **CHUNK summary.** The writer closes a chunk every 1 MiB or 1 s, whichever comes first:
-`u64 chunk_start` (offset of the chunk's first record), first/last seq, first/last
-`time_ns`, `u32 frames`, `u32 bytes`, `u32 frames_without_mid`, `u16 flags` (bit 0:
+`u64 chunk_start` (offset of the chunk's first record), first/last seq, **min/max**
+`time_ns` over the chunk's frames (CLOCK_REALTIME can step backwards, so first/last are not
+bounds; a step is also a MARK record), first/last `mono_ns` (CLOCK_MONOTONIC read with the
+frame's `time_ns`, for pacing and for ordering across a clock step), `u32 frames`, `u32 bytes`, `u32 frames_without_mid`, `u16 flags` (bit 0:
 MID table overflowed), `u16 n`, then n x (`u32 mid`, `u32 count`) sorted by MID, n <= 256.
 Summaries let replay and export skip chunks by time range or MID set, give `ib rec info`
 per-MID counts without reading frames, and are the work units for a decode worker pool.
 
 **Writing and crash safety.**
-- Create with `O_CREAT | O_EXCL`, mode 0600, directory 0700; never overwrite. Order on
+- Create with `O_CREAT | O_EXCL`, mode 0600, directory 0700; never overwrite. The writer
+  holds `flock(LOCK_EX)` on the file until it closes or dies (the kernel drops it), which
+  lets `replay --follow` tell a live writer from a dead one (2g). Order on
   open: preamble, META, BLOBs (definitions, see decision D1), STREAMs, then `fsync` the
   file and its directory so the file survives a crash from the first frame on.
 - `Recorder.append(frame)` (a sink) encodes into a `bytearray` with precompiled structs;
@@ -558,9 +575,19 @@ per-MID counts without reading frames, and are the work units for a decode worke
 - Per record, in order: envelope present (else torn), `body_len` within that type's
   maximum and minimum, body present (else torn), CRC (else damaged), type known or
   skippable, then type rules: FRAME stream and source ids already defined, data length
-  <= META `max_packet_bytes` <= 65535, `orig_len >= len(data)`, only known flag bits,
-  seq strictly increasing; BLOB SHA-256 matches its content; INDEX offsets increasing
+  <= META `max_packet_bytes` <= 65535, only known flag bits, seq strictly increasing,
+  and the frame consistency rules below; BLOB SHA-256 matches its content; INDEX offsets increasing
   and inside the file. Every yielded frame passed its CRC.
+- **Frame consistency (so `Frame` asserts are unreachable from a file).** `TRUNCATED` is set
+  iff `orig_len > len(data)` (`orig_len < len(data)` is damage); `mid == 0` when `HAS_MID`
+  is clear (the reader then yields `mid=None`); meaningless flag combinations are damage:
+  `GARBAGE` with `STALE`, `GARBAGE` with `HAS_MID` or `TRUNCATED`, `GARBAGE` or `STALE` on a
+  stream whose transport is not serial. Reserved fields and padding bytes must be zero.
+- **Resync is conservative (untrusted).** After damage the scan to the next valid record
+  accepts a candidate only if it passes every record rule above with the nonce-seeded CRC,
+  its `seq` (FRAME) is greater than the last good `seq`, its padding is zero, **and** it is
+  followed by a second valid record at the offset its length implies (two chained valid
+  records). A lone plausible record never ends damage.
 - **Torn vs. damaged.** Damage reaching end of file with no valid record after it is a
   *torn tail* (the normal result of a crash): warning `IB-REC-007`, playback complete up
   to it. Damage followed by a valid record (found by scanning 8-byte aligned offsets) is
@@ -582,8 +609,8 @@ A small expression language compiled to a closure tree. No `eval`, no regular
 expressions; parsing and evaluation are linear in the input.
 
 ```
-expr      = term { "or" term }
-term      = factor { "and" factor }
+expr      = term { "or" term }          (parsed to one n-ary OR node)
+term      = factor { "and" factor }     (parsed to one n-ary AND node)
 factor    = "not" factor | "(" expr ")" | predicate
 predicate = name cmp literal
           | name "in" "[" literal { "," literal } "]"
@@ -591,6 +618,8 @@ predicate = name cmp literal
 cmp       = "==" | "!=" | "<" | "<=" | ">" | ">="
 name      = IDENT { "." IDENT }
 literal   = INT | HEX | FLOAT | STRING | IDENT | TIME
+INT       = [ "-" ] digits              (the sign belongs to the literal; there is no unary
+FLOAT     = [ "-" ] digits "." digits    minus, so `x == -1` and `x >= -0.5` work)
 ```
 
 `TIME` is ISO 8601 UTC with `Z` or an offset (`2026-10-29T12:00:00.5Z`); naive local
@@ -604,6 +633,12 @@ category names, enum labels, node and link names, severities.
 | check | `status` (ok, malformed, unknown) | `Codec.check` |
 | decode | `msg` (commands), `fc`, `hdr.<field>`, `htime` (header time, 2i), `<MSG>.<field>`, bare `<field>` (any message that has it), `event.app`, `event.id`, `event.type` (DEBUG..CRITICAL, ordered), `event.text` | full decode |
 
+- **Names.** `hdr.` and `event.` are reserved namespaces, as are the frame, model, check and
+  decode names in the table. A CCDD message or field that collides with a reserved name
+  (a message called `event`, a field called `hdr`) is reachable only as `MSG.field` when
+  the message name itself is not reserved; an expression that names a colliding message
+  or uses a bare colliding field fails at compile time (`IB-FLT-002`) naming both
+  meanings. Nothing is picked silently.
 - **Semantics.** A predicate on something a frame does not have (a field of another
   message, a decode-level name on a malformed frame) is false; `not` inverts that, so
   `not X.f == 1` matches other messages. Reserved names win over bare field names; a
@@ -615,9 +650,13 @@ category names, enum labels, node and link names, severities.
   whether non-candidates are decoded at all. Names, types and literals are checked at
   compile time (`IB-FLT-002/003`), so a typo fails before any packet is read.
 - **Limits** (`IB-FLT-004`): 4096 characters, 1024 tokens, depth 32, 1024 `in` items,
-  numeric literals of at most 40 characters. Non-ASCII is allowed only inside strings.
+  numeric literals of at most 40 characters (sign included). Depth counts every nested `not`
+  and every parenthesis; flat `and`/`or` chains are n-ary nodes evaluated iteratively, so
+  they add no depth and cannot recurse deeply. Non-ASCII is allowed only inside strings.
 - **Errors** are one line with the column and a short excerpt; the details carry the
-  expression with a caret line and up to three close-match suggestions (`difflib`).
+  expression with a caret line and up to three close-match suggestions (`difflib`). The
+  query is clipped to 64 characters and at most 256 candidate names are compared (sorted,
+  then cut), so a hostile CCDD or expression cannot make suggestion matching expensive.
   `IB-FLT-*` codes exit 2 like other usage errors.
 - `--mid` stays as sugar for `mid in [...]`; `--where` combines with it by `and`.
 
@@ -629,37 +668,56 @@ class Level(IntEnum):
     WARNING = 2
     ERROR = 3
 
+
 @dataclass(frozen=True, slots=True)
 class Notice:
     code: Code
     level: Level
-    key: str               # coalescing key: code + MID + stream/context
-    summary: str           # sanitized, one line, no count suffix
-    count: int             # occurrences this notice stands for (1 = first)
-    window_s: float        # span the count covers (0.0 for the first)
-    ledger_n: int | None   # ledger record number of the latest occurrence
-    def line(self) -> str: ...  # "error IB-DEC-005: ... (x37 in 10 s)"
+    key: str  # coalescing key: code + MID + stream/context
+    summary: str  # sanitized, one line, no count suffix
+    count: int = 1  # occurrences this notice stands for (1 = first)
+    window_s: float = 0.0  # span the count covers (0.0 for the first)
+    ledger_n: int | None = None  # record number of the latest WRITTEN record, if any
+
+    def line(self, *, verbose: bool = False) -> str:
+        """'error IB-DEC-005: ... (x37 in 10 s)'; verbose appends ' [ledger n=1234]'."""
 ```
 
 The coalescer emits `Notice` values instead of strings; front-ends render them.
 `Ledger.record` returns the record number so a notice can point at its full record
-(`--verbose` appends `[ledger n=1234]`; the TUI details pane opens that record).
+(`--verbose` appends `[ledger n=1234]` to every notice that has one and prints the ledger
+file path once at start; the TUI details pane opens that record).
+- `ledger_n` is the number of the latest occurrence that was **written**, never of one that
+  was not: `record` returns `None` when the ledger is disabled or failed, the queue was
+  full and the record was dropped (counted by `ledger.dropped`), or evidence sampling (2d)
+  skipped that occurrence. The coalescer keeps the last non-`None` pointer of a window.
+- After rotation (2d) `n` stays session-wide, but finding it would mean scanning parts, so
+  the pointer then names the part too: `Notice` gains `ledger_part: int = 1` and the
+  verbose suffix becomes `[ledger n=1234 file=<stamp>-<session>.p0003]` (no `file=` for
+  part 1).
 
 ### S6. Ring compatibility (decided now, built in Stage 3)
 
 The Stage 3 ring carries the S3 envelope plus FRAME body unchanged, with STREAM and
 SOURCE records travelling the same way, so ring readers, recording readers and worker
 pools share one decoder (`frame_codec.py`). Frames are self-delimiting, position
-independent, CRC-checked and at most `12 + 32 + max_packet_bytes` bytes, so they fit
-either a fixed-slot ring (slot = that maximum) or a variable-length byte ring. Which
-shape is Stage 3's call (decision D9); Stage 2 only guarantees the encoding.
+independent, CRC-checked and at most `12 + 32 + max_packet_bytes` bytes (`44 + max_packet_bytes`), so they fit
+either a fixed-slot ring (slot = `round_up(44 + max_packet_bytes, 8)`) or a variable-length
+byte ring. Which shape is Stage 3's call (decision D9); Stage 2 only guarantees the encoding.
+A reader that attaches late has missed the STREAM and SOURCE records it needs to interpret
+FRAMEs, so Stage 3 must give the ring either a side table of live STREAM/SOURCE definitions
+that attachers read first, or periodic re-emission of them in the ring itself (a frame
+whose ids are undefined is skipped and counted, never guessed).
 
 ### 2a - Structured notices, immutable shared data
 
 Deliverables
 - `notice.py` (S5); `Coalescer` emits `Notice`; CLI renders `Notice.line()`, output text
   unchanged from Stage 1 at default verbosity.
-- `Ledger.record` returns its record number.
+- `Ledger.record` returns its record number, or `None` when no record was queued
+  (disabled, failed, or queue full: the new record is dropped and counted, never an older
+  one; evidence kinds have a capped slice of the queue so a flood cannot crowd out
+  essential records). `record_error` also returns `None` when its prompt flush failed.
 - Immutability: `Header.values`, `checksum.REGISTRY`, codec profile and layout tables
   as `MappingProxyType`; `Session.stats` becomes private with
   `stats_snapshot() -> Mapping[int, MidStatSnapshot]` (frozen); public collections
@@ -726,22 +784,38 @@ Deliverables
   token bucket) drops raw bytes, not records, beyond it. Key table bounded (1024, LRU;
   overflow folds into one "other" key). Malformed records carry the frame `seq`, so with
   a recording running the full evidence is one lookup away.
-- Events stay unsampled (decision D3); actions, commands, state changes and errors are
-  never sampled.
-- **Two-tier size cap** per session: evidence tier (packet records, malformed samples)
-  stops at `max_evidence_bytes` (`IB-LED-003`, warning, once); the essential tier
-  continues to `max_session_bytes`. At the hard cap the ledger stops and, by default,
-  commands are refused (`IB-LED-004`) because a command must not go out without a trace;
-  capture and recording continue (decision D2: 128 MiB per session by default).
+- **Tiers.** Every record belongs to one tier, by kind and origin:
+  - *essential*: actions, commands, state changes and errors not caused by wire data
+    (config, transport, I/O, internal). Never sampled, never dropped for another tier.
+  - *evidence*: packet records, malformed samples and **wire-origin decode errors**
+    (`IB-DEC-*` raised from received bytes): an adversary or a fault controls their rate,
+    so they must not be able to spend the essential budget.
+  - *events*: received cFS events, unsampled (decision D3) but in a capped tier of their own.
+- **Budgets** (D2 totals unchanged): `max_session_bytes` 128 MiB for the session, of which
+  evidence may use `max_evidence_bytes` (64 MiB) and events `max_event_bytes` (32 MiB);
+  the remaining 32 MiB is reserved for the essential tier and nothing else can consume it.
+  At a tier cap the ledger stops writing that tier's records and counts them (once over the
+  cap: one `IB-LED-003` warning, then the count appears only in the periodic summary
+  record) and carries on with the others. Essential records continue until the reserved
+  budget is exhausted; only then does the ledger stop and, by default, **commands are
+  refused** (`IB-LED-004`), because a command must not go out without a trace. An event or
+  evidence storm therefore cannot lock out commanding; capture and recording continue
+  either way.
+- **Queue.** The in-memory queue follows the same rule: when full, the new record is dropped
+  (`Ledger.record` returns `None`, counted and summarised by `ledger.dropped`), evidence
+  kinds are capped below the queue size, and essential records are never evicted.
 - **Rotation**: at `max_file_bytes` the ledger continues in `<stamp>-<session>.pNNNN.jsonl`,
   each part opening with a `ledger.part` record naming the previous one.
 - **Retention** at session start, in a worker thread: delete ledger files (our name
   pattern only, regular files only via `lstat`, never symlinks) beyond `retention_days`
-  or `retention_total_bytes`, oldest first, skipping live sessions (each live ledger
-  holds `flock(LOCK_SH)`; the pruner needs `LOCK_EX | LOCK_NB`). Deletions are
+  or `retention_total_bytes`, oldest first, skipping live sessions (each live
+  *session* holds `flock(LOCK_SH)` on its first part for as long as it runs, and the pruner
+  needs `LOCK_EX | LOCK_NB`; files are grouped by session id from the name, so a locked
+  session is skipped with **all** its parts, and an unlocked one is pruned whole or kept
+  whole, never part by part). Deletions are
   ledgered; failures are `IB-LED-005` (warning).
 - Config `[ledger]`: `max_session_bytes` (128 MiB), `max_evidence_bytes` (64 MiB),
-  `max_file_bytes` (32 MiB), `evidence_rate` (256 KiB/s), `retention_days` (7),
+  `max_event_bytes` (32 MiB), `max_file_bytes` (32 MiB), `evidence_rate` (256 KiB/s), `retention_days` (7),
   `retention_total_bytes` (512 MiB), `on_full = "refuse_commands" | "continue"`. Sizes are
   integers or strings matching `^[0-9]{1,12}(B|KiB|MiB|GiB|TiB)$`; anything else is
   `IB-CFG-003`.
@@ -749,7 +823,8 @@ Deliverables
 Verification: unit tests of the sampler with an injected clock (counts exact, samples
 where expected, summary per window); E2E garbage flood at 10k pkt/s for 30 s of unique
 MIDs: ledger growth stays under the evidence budget, notices coalesce, every datagram is
-counted; cap test (tiny caps) shows the tier switch and the command refusal; retention
+counted; cap test (tiny caps) shows the tier switch and the command refusal, and that an event
+storm and a wire-error storm alone never refuse a command; retention
 test with a fake directory including a symlink, a foreign file and a live session.
 
 ### 2e - Recording format and writer
@@ -774,7 +849,9 @@ Untrusted input: the reader is a decode boundary of its own and gets the full tr
 Hypothesis round trip (arbitrary frame sequences written then read are equal),
 truncation at every offset (yields a prefix, reports torn tail at a record boundary,
 never raises), bit flips (never yields a frame that was not written), lying `body_len`
-both ways, undefined stream ids, bad BLOB hashes, oversize META. Corpus
+both ways, undefined stream ids, bad BLOB hashes, oversize META, and forged records: a
+frame whose data is a complete, well-formed record (even with a correct CRC for another
+nonce) never ends damage and is never yielded as a record. Corpus
 `tests/corpus/malformed/rec-*`; an `atheris` target for the reader.
 
 Verification
@@ -819,6 +896,11 @@ Deliverables
   unknown).
 - `--follow` tails a recording being written: at end of file it polls (100 ms) and
   treats a partial last record as pending, not torn; it ends at the TRAILER or a signal.
+  A writer that died without a TRAILER would otherwise keep it waiting forever, so when a
+  poll finds no new bytes it probes the writer's lock (`flock(LOCK_SH | LOCK_NB)`): if it
+  is acquired, the writer is gone; the reader reads to the end once more, reports the
+  partial record as a torn tail (`IB-REC-007`) and ends. Where the filesystem has no
+  reliable `flock` (NFS), `--follow-idle S` (default off) ends after S seconds of no growth.
 - `ib rec repair IN OUT`: valid prefix plus a fresh index and trailer into a new file.
 - End-of-run summary on stderr: frames read, matched, malformed, gaps, damage.
 
@@ -925,7 +1007,8 @@ encode/decode round trip, truncation at every offset); corpus `ccdd-var-*` (coun
 array, missing `max`, signed count field, `remaining` not last) and wire cases; mock E2E
 with a variable-length command and reply through `ib respond`. Real cFS: stock cFS has no
 variable-length packet as far as the Stage 1 survey shows (2j confirms it from source);
-see decision D6.
+see decision D6. The `ib_test` cFS app's variable-length packet (a counted array and a tail
+string) is built here, so these cFS cases run against real FSW.
 
 ### 2k - Serial transport
 
@@ -958,10 +1041,17 @@ Deliverables
   1. Strip to `sync` if configured; bytes before it are garbage.
   2. With `length_window` bytes, `frame_length()`; candidate is sane when header size <=
      total <= `max_packet_bytes`, the fixed-field mask matches, and (by default) the MID
-     is known to the CCDD.
+     is known to the CCDD **and the payload size (total minus header and trailer) lies in
+     that MID's `[min_payload, max_payload]`**; a lying length is rejected here, before it
+     can swallow the packets behind it.
   3. Not sane: one byte joins the current garbage run; rescan from the next byte.
   4. Sane and complete: verify the checksum if the profile has one; failure is treated
-     as a false sync (step 3). Success emits the packet.
+     as a false sync (step 3). Without a checksum, a sane header proves little, so the
+     candidate is **confirmed before it is emitted** by either a sane header immediately
+     after it (at offset `total`) or `max_idle_ms` of silence after it (the cost is that
+     the last packet before a pause waits that long). Success emits the packet. Any
+     rejection, including an unconfirmed candidate, **rescans from candidate+1**, never
+     from candidate+total, so the bytes a false header covered are examined again.
   5. Garbage runs are emitted as GARBAGE frames (split at `max_packet_bytes`) when a
      packet follows, at the cap, or on expiry; each resync episode is one coalesced
      `IB-TX-007` notice with a bounded byte sample in the ledger.
@@ -980,7 +1070,9 @@ Deliverables
 - `pyserial` added to dependencies (already planned).
 
 Untrusted input: Hypothesis on the framer (the concatenation invariant; chunking
-independence without expiry; packets separated by non-sane garbage all recovered; a
+independence without expiry; packets separated by non-sane garbage all recovered; **a
+false header embedded in garbage, including one whose length covers the following real
+packets, does not cost any later packet**; a
 lying length never swallows more than `max_packet_bytes`; adversarial input processed
 within the work budget). Corpus `ser-*` streams. `atheris` target for the framer.
 
@@ -1007,6 +1099,9 @@ Verification
   `SAMPLE_APP_HK` shows the counter rising by K, resetting, rising by K; row counts equal
   `rec info` counts. A second run is killed with SIGKILL mid-capture: torn tail
   reported, replay plays to it, `ib rec repair` output equals the readable prefix.
+- `ib_test` throughput source (D6): the app built in 2j gains a command-enabled generator
+  of up to 10k pkt/s of fixed-size telemetry (2j owns the app and its variable-length
+  packet; 2l owns the generator).
 - Throughput gate (`tests/bench/`): a loopback blaster sends 200-byte valid telemetry at
   10k pkt/s for 60 s into `ib record` (subprocess): recorded frames equal sent, kernel
   and queue drops zero, recorder buffer peak and RSS bounded, CPU share reported. CI
@@ -1027,8 +1122,8 @@ Verification
 | `IB-TX-006` | `TX_BUSY` | serial device locked by another process | 2k |
 | `IB-TX-007` | `TX_RESYNC` | serial stream resynchronised, N bytes skipped | 2k |
 | `IB-TX-008` | `TX_DOWN` | link lost, reconnecting | 2k |
-| `IB-LED-003` | `LED_EVIDENCE` | raw-evidence cap reached; packet evidence now counted only | 2d |
-| `IB-LED-004` | `LED_FULL` | session ledger cap reached; commands refused (policy) | 2d |
+| `IB-LED-003` | `LED_EVIDENCE` | evidence or event tier cap reached; that tier is now counted only | 2d |
+| `IB-LED-004` | `LED_FULL` | reserved essential budget exhausted; commands refused (policy) | 2d |
 | `IB-LED-005` | `LED_PRUNE` | old ledger files could not be pruned | 2d |
 | `IB-REC-001` | `REC_CREATE` | cannot create the recording (exists, permission, directory) | 2e |
 | `IB-REC-002` | `REC_WRITE` | write or sync failed; recording stopped | 2e |
@@ -1071,19 +1166,25 @@ complete up to mid-file damage in an input recording.
 Decided by the user (2026-10-30):
 - **D1 Embed definitions in recordings: yes.** Each recording carries its nodes' CCDD and
   header profiles (8 MiB cap each); replay uses them by default (`--defs config`
-  overrides), so a recording decodes correctly after the CCDD changes.
+  overrides), so a recording decodes correctly after the CCDD changes. A recording is therefore as
+  sensitive as the definition files themselves (the README says so).
 - **D2 Ledger caps: smaller than first proposed.** 128 MiB per session (64 MiB of it raw
   evidence), retention 7 days or 512 MiB per state directory, all configurable. At the
   session hard cap, commands are refused (`on_full = "refuse_commands"`) and capture
-  continues.
+  continues. Refinement adopted (2d): the cap that refuses commands is a *reserved
+  essential budget* (actions, commands, state, non-wire errors), not the session total;
+  evidence and events have their own capped tiers, so storms of either cannot lock out
+  commanding. The caps above are unchanged.
 - **D6 Variable-length and throughput on real cFS: add an `ib_test` cFS app** under
   `tools/cfs`, built with the pinned bundle, that emits a counted-array packet and can
   generate up to 10k pkt/s of telemetry. Used only for acceptance and the throughput gate.
+  Owners: 2j builds the app with the variable-length packet, 2l adds the throughput source.
 - **D7 Serial hardware: none yet.** The pty bridge (mock E2E and pty-to-cFS-UDP) is the
   gate; a real-UART run is added when hardware is available.
 
 Adopted as recommended (revisit on request):
-- **D3** Events are never sampled; the session cap is the only backstop.
+- **D3** Events are never sampled; they have a capped tier of their own (`max_event_bytes`,
+  32 MiB, counted once over the cap), so they cannot starve the essential budget (2d).
 - **D4** Commands from a separate `ib send` are in the ledger but not in a Stage 2
   recording; the Stage 3 engine closes the gap.
 - **D5** Replay to the wire is deferred to Stage 5 send modes.

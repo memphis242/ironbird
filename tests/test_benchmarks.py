@@ -8,8 +8,11 @@ from typing import Any
 import pytest
 
 from ironbird.ccdd.model import MessageKind
+from ironbird.coalesce import Coalescer
 from ironbird.codec import Codec, DecodedPacket
+from ironbird.errors import Code
 from ironbird.ledger import Ledger
+from ironbird.notice import Level
 
 DECODE_CEILING_S = 100e-6
 
@@ -45,3 +48,14 @@ def test_ledger_record_cost(benchmark: Any, tmp_path: Any) -> None:
     benchmark(ledger.record, "state", "tick", mid=1, count=2)
     assert not (tmp_path / "bench").exists()  # record() never touches the disk
     _check_ceiling(benchmark, 20e-6)
+
+
+def test_coalescer_suppressed_report_cost(benchmark: Any) -> None:
+    """The flood path: a repeat inside an open window only bumps a counter (no Notice built)."""
+    emitted: list[object] = []
+    coalescer = Coalescer(emitted.append, window_s=3600.0)
+    args = (Code.DEC_CHECKSUM, Level.ERROR, "k", "bad")
+    coalescer.report(*args, ledger_n=1, group=Code.DEC_CHECKSUM)  # opens the window
+    benchmark(coalescer.report, *args, ledger_n=5, group=Code.DEC_CHECKSUM)
+    assert len(emitted) == 1  # every timed call was suppressed
+    _check_ceiling(benchmark, 2e-6)
