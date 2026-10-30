@@ -348,7 +348,7 @@ interface, later sub-steps build on it unchanged.
 | 2a | Structured notices, immutable shared data | - | `--verbose` notices point at their ledger record |
 | 2b | Frame-yielding engine, transport factory | 2a | none (refactor); malformed frames reach consumers |
 | 2c | Byte-bounded memory, receive errors | 2b | oversize floods cannot exhaust memory; `IB-TX-003`, `IB-ENG-001` |
-| 2d | Ledger under floods: sampling, caps, rotation, retention | 2c | bounded ledger disk use; `[ledger]` config |
+| 2d | Ledger under floods, disk full, retention | 2c | bounded ledger growth, retention warnings, `ib ledger prune`, `ib rec prune`; `[ledger]`, `[retention]` config |
 | 2e | Recording format and writer | 2b | `ib record`, `--record`, `ib rec info/check` |
 | 2f | Filter language, live `--where` | 2b | `ib listen/events --where EXPR` |
 | 2g | Replay | 2e, 2f | `ib replay`, `--follow`, `ib rec repair` |
@@ -691,7 +691,8 @@ file path once at start; the TUI details pane opens that record).
   written unless the ledger fails (reported as `IB-LED-001`) or the process is killed
   before the queue drains. `record` returns `None`, and the occurrence has no pointer,
   when the ledger is disabled or failed, the queue was full and the record was refused
-  (counted by `ledger.dropped`), or evidence sampling (2d) skipped that occurrence. The
+  (counted by `ledger.dropped`), evidence sampling (2d) skipped that occurrence, or the
+  record's tier is counted only (over its allowance, or disk full; 2d). The
   coalescer keeps the last non-`None` pointer of a window.
 - After rotation (2d) `n` stays session-wide, but finding it would mean scanning parts, so
   the pointer then names the part too: `Notice` gains `ledger_part: int = 1` and the
@@ -777,7 +778,7 @@ memory bounded. Verification: E2E flood test with a paused stdout asserting a bo
 shown + not_shown`); unit test of the `MSG_TRUNC` path on loopback; corpus entry for an
 oversize datagram.
 
-### 2d - Ledger under hostile or garbage floods
+### 2d - Ledger under floods, disk full, retention
 
 Deliverables
 - **Evidence sampling** per key (code, MID, stream) and 10 s window: every occurrence
@@ -789,21 +790,57 @@ Deliverables
   a recording running the full evidence is one lookup away.
 - **Tiers.** Every record belongs to one tier, by kind and origin:
   - *essential*: actions, commands, state changes and errors not caused by wire data
-    (config, transport, I/O, internal). Never sampled, never dropped for another tier.
+    (config, transport, I/O, internal). Never sampled, never capped, never dropped for
+    another tier; its growth is driven by the user's own actions.
   - *evidence*: packet records, malformed samples and **wire-origin decode errors**
     (`IB-DEC-*` raised from received bytes): an adversary or a fault controls their rate,
-    so they must not be able to spend the essential budget.
-  - *events*: received cFS events, unsampled (decision D3) but in a capped tier of their own.
-- **Budgets** (D2 totals unchanged): `max_session_bytes` 128 MiB for the session, of which
-  evidence may use `max_evidence_bytes` (64 MiB) and events `max_event_bytes` (32 MiB);
-  the remaining 32 MiB is reserved for the essential tier and nothing else can consume it.
-  At a tier cap the ledger stops writing that tier's records and counts them (once over the
-  cap: one `IB-LED-003` warning, then the count appears only in the periodic summary
-  record) and carries on with the others. Essential records continue until the reserved
-  budget is exhausted; only then does the ledger stop and, by default, **commands are
-  refused** (`IB-LED-004`), because a command must not go out without a trace. An event or
-  evidence storm therefore cannot lock out commanding; capture and recording continue
-  either way.
+    so they must not be able to spend the essential tier's space.
+  - *events*: received cFS events, never sampled (decision D3), in a tier of their own.
+- **Allowances (decision D2).** The event and evidence tiers each have an allowance that
+  grows with the session's run time: `allowance(t) = bytes_per_hour x max(1 h, t)`, `t` on
+  the monotonic clock since session start. The first hour's worth is a floor that absorbs
+  bursts at start, quiet seconds bank credit for later bursts, and only a rate sustained
+  above `bytes_per_hour` reaches the cap. Over its allowance a tier is *counted only*:
+  `Ledger.record` returns `None` and counts the record, one `IB-LED-003` warning per tier
+  per session, counts in the periodic summary record; writing resumes as the allowance
+  grows. `"unlimited"` removes a tier's cap.
+- **Sizing** (defaults; ~400 B per JSON event record; MiB = 2^20 B). Events: 64 MiB/h
+  (768 MiB at 12 h). Evidence: 32 MiB/h (384 MiB at 12 h).
+
+  | Event rate | Bytes/h | 12 h | Against 64 MiB/h |
+  |------------|---------|------|------------------|
+  | 10/s (average) | 13.7 MiB | 165 MiB | never near it |
+  | 30/s (typical active), sustained | 41.2 MiB | 494 MiB | never reached |
+  | 100/s (burst) | 137 MiB | - | reached only if sustained 28 min from a cold start, 41 min after a first hour at 10/s, about 4 h after six such hours |
+
+  Evidence is near zero in a healthy run; under a flood, sampling and the raw budget bound
+  it to about 1 MB/s, so it reaches the first-hour floor within a minute and is then
+  counted, with a trickle of samples as the allowance grows. Telemetry belongs in
+  recordings, not the ledger: 100 pkt/s x 200 B is 72 MB/h (824 MiB per 12 h), so a
+  12 h run at these rates uses about 1 GiB of ledger plus recording, under the 2 GiB
+  retention threshold below. A runaway (1000 events/s) is bounded at 768 MiB per 12 h.
+- **Disk full and the essential reserve.** The same whether tiers are capped or unlimited:
+  - Long-running sessions (`listen`, `events`, `respond`, `record`, `replay`; the Stage 3
+    engine) allocate a ballast file `<stamp>-<session>.reserve` of
+    `essential_reserve_bytes` (32 MiB, `posix_fallocate`) in the state directory at start,
+    held while the session runs. It is not a log and holds no data.
+  - A ledger write failing with ENOSPC or EDQUOT (whatever filled the disk: recordings,
+    other sessions, other programs) releases the ballast, makes the event and evidence
+    tiers counted only, and completes the interrupted line (the writer handles partial
+    writes, so a line is never torn short of a crash): one `IB-LED-005` warning. Essential
+    records continue in the freed space (about 65 000 command records at 32 MiB).
+  - When an essential record cannot be written (reserve used up; no ballast, as for a
+    short command such as `ib send` or when allocation failed; or any other write error,
+    including a ledger that could not open, `IB-LED-002`), the ledger *stalls*: records
+    stay queued (bounded by the queue rule), a write retry runs every 5 s, and with
+    `on_full = "refuse_commands"` (default) every command is refused with `IB-LED-004`
+    (exit 1, nothing sent) until a retry succeeds, because a command must not go out
+    without a trace. With `"continue"` commands go out and are counted as untraced. A
+    successful retry writes `ledger.resumed` (records lost, stall duration) and allows
+    commands again; the ballast is re-allocated once allocation succeeds (tried once a
+    minute). Unlike Stage 1, a failed ledger no longer lets commands through by default.
+  - Capture and recording never stop for ledger reasons; the recorder has its own ENOSPC
+    path (`IB-REC-002`).
 - **Queue.** The in-memory queue follows the same rule: when full, the new record is dropped
   (`Ledger.record` returns `None`, counted and summarised by `ledger.dropped`), evidence
   kinds (and wire-origin errors, via the explicit `evidence` tier parameter of `record` and
@@ -812,26 +849,117 @@ Deliverables
   this bounds memory, it is not a guarantee that every essential record is captured.
 - **Rotation**: at `max_file_bytes` the ledger continues in `<stamp>-<session>.pNNNN.jsonl`,
   each part opening with a `ledger.part` record naming the previous one.
-- **Retention** at session start, in a worker thread: delete ledger files (our name
-  pattern only, regular files only via `lstat`, never symlinks) beyond `retention_days`
-  or `retention_total_bytes`, oldest first, skipping live sessions (each live
-  *session* holds `flock(LOCK_SH)` on its first part for as long as it runs, and the pruner
-  needs `LOCK_EX | LOCK_NB`; files are grouped by session id from the name, so a locked
-  session is skipped with **all** its parts, and an unlocked one is pruned whole or kept
-  whole, never part by part). Deletions are
-  ledgered; failures are `IB-LED-005` (warning).
-- Config `[ledger]`: `max_session_bytes` (128 MiB), `max_evidence_bytes` (64 MiB),
-  `max_event_bytes` (32 MiB), `max_file_bytes` (32 MiB), `evidence_rate` (256 KiB/s), `retention_days` (7),
-  `retention_total_bytes` (512 MiB), `on_full = "refuse_commands" | "continue"`. Sizes are
-  integers or strings matching `^[0-9]{1,12}(B|KiB|MiB|GiB|TiB)$`; anything else is
-  `IB-CFG-003`.
+- **Retention warns; it never deletes.** No ironbird code path deletes a ledger or a
+  recording on its own. The only automatic removals are a session's own ballast and temp
+  files, and the ballast of a dead session (no data), removed at the next session start
+  and ledgered.
+  - *Scope*: files matching our anchored name patterns, `^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}`
+    then `(\.p[0-9]{4})?\.jsonl` or `\.reserve` in the state directory and
+    `(\.p[0-9]{4})?\.ibrec` in the recording directory (2e); regular files only (`lstat`),
+    never symlinks or directories. Files group into sessions by session id. A session is
+    *live* while its first part is locked (the ledger holds `flock(LOCK_SH)`, the recorder
+    `LOCK_EX`); the checker takes `LOCK_EX | LOCK_NB` and releases it at once. Recordings
+    written elsewhere or under another name (`-o`) are outside retention; only
+    `recording.min_free_bytes` guards their disk.
+  - *Scan*: at every session start, in a worker thread, bounded to 100 000 directory
+    entries (beyond that, or if a directory is unreadable, the figures are partial:
+    `IB-RET-004`); one `retention.scan` record (sessions, bytes, oldest, per directory).
+  - *Age warning* `IB-RET-001`: non-live sessions whose newest part's mtime is older than
+    `max_age`, excluding the `keep_recent` most recent per directory (by name stamp, so the
+    warning names only what prune would propose). One line per directory, e.g.
+    `warning IB-RET-001: 23 ledger sessions older than 7d (180 MiB); review with 'ib ledger prune'`.
+  - *Total warning* `IB-RET-002`, on both directories' pattern files: (a) at session start
+    if usage is already past `max_total_bytes`; (b) in a long-running session, every 10 s,
+    when `usage + rate x horizon` passes it, `rate` being this process's ledger and
+    recording bytes/s over the last 60 s and `horizon` the remaining `--duration`, else
+    1 h; usage is re-scanned every 5 min to include other sessions. Shown once per process
+    when the projection first crosses and once when usage itself crosses, e.g.
+    `warning IB-RET-002: ledger + recordings 1.8 GiB, projected past 2 GiB within 1 h; run 'ib rec prune --until-under 1GiB' or raise retention.max_total_bytes`.
+  - *Rate limits*: every check is ledgered in full; display goes through the coalescer, and
+    the start-of-session warnings (age; past the total at start) are shown at most once
+    per `warn_interval` per code and directory across processes, tracked in
+    `retention-notices.json` in the state directory (untrusted on read: at most 4 KiB,
+    strict schema, timestamps not in the future; anything else is ignored and rewritten;
+    written via temp file and rename, mode 0600).
+  - `max_age = "unlimited"` or `max_total_bytes = "unlimited"` turns that warning off.
+- **Prune: deletion only on explicit confirmation.** `ib ledger prune` and `ib rec prune`
+  share `retention.py` (2d builds both; 2e only feeds the recorder's byte rate):
+  `ib ledger prune [--older-than AGE] [--until-under SIZE] [--keep N] [--dry-run] [--yes] [--format line|json]`.
+  - *Proposes*, in this command's directory only: non-live sessions older than AGE
+    (default `max_age`), plus with `--until-under`, oldest first until the combined total
+    of both directories would be at or under SIZE. Never the `keep_recent` (or `--keep N`)
+    most recent sessions, never a live session, never a file outside the name patterns.
+    Nothing selectable (e.g. `max_age = "unlimited"` and no flag): says so, exits 0.
+  - *Lists* every session it would delete: start (UTC), session id, parts, size, age,
+    reason (`age` or `size`), then the total. Names come from the directory and are
+    sanitized before display.
+  - *Confirms*: interactive (stdin and stderr are terminals) asks
+    `delete 14 sessions (310 MiB)? [y/N]`; only `y` or `yes` (any case) confirms;
+    anything else or EOF declines (nothing deleted, exit 0). Non-interactive needs
+    `--yes`; without it the list is printed, then `IB-CLI-001` (exit 2), nothing deleted.
+    `--dry-run` lists and exits 0.
+  - *Deletes exactly what was listed*: per session, take `LOCK_EX | LOCK_NB` on part 1,
+    check every file still matches the listing (device, inode, size, mtime) with `fstat`
+    relative to an open directory fd and no symlink following, then `unlink` relative to
+    that fd, higher parts first and part 1 last under the lock. A session that became
+    live, changed, or fails to unlink is skipped and reported (`IB-RET-003`, coalesced;
+    exit 1).
+  - *Ledgered*: `prune.plan` (the full list), `prune.confirmed` or `prune.declined`, one
+    `prune.delete` per file, `prune.skip` with its reason.
+- Config `[ledger]`: `event_bytes_per_hour` (64 MiB), `evidence_bytes_per_hour` (32 MiB),
+  `essential_reserve_bytes` (32 MiB), `max_file_bytes` (32 MiB), `evidence_rate`
+  (256 KiB/s), `on_full = "refuse_commands" | "continue"`.
+  Config `[retention]`: `max_age` (`"7d"`), `max_total_bytes` (`"2GiB"`), `keep_recent`
+  (10), `warn_interval` (`"24h"`).
+  - Sizes are positive integers or strings matching `^[0-9]{1,12}(B|KiB|MiB|GiB|TiB)$`
+    with a nonzero value; durations match `^[1-9][0-9]{0,5}(s|min|h|d)$`.
+  - The exact lowercase string `"unlimited"` is the one spelling of "no limit", accepted
+    only by `event_bytes_per_hour`, `evidence_bytes_per_hour`, `max_age` and
+    `max_total_bytes`. Zero, negatives, `"inf"`, `"none"`, `"Unlimited"` and any other
+    spelling are `IB-CFG-003`, naming the key and its accepted forms.
+  - Ranges: `essential_reserve_bytes` and `max_file_bytes` 1 MiB to 1 GiB, `keep_recent`
+    0 to 1000, `warn_interval` 1 min to 30 d.
 
-Verification: unit tests of the sampler with an injected clock (counts exact, samples
-where expected, summary per window); E2E garbage flood at 10k pkt/s for 30 s of unique
-MIDs: ledger growth stays under the evidence budget, notices coalesce, every datagram is
-counted; cap test (tiny caps) shows the tier switch and the command refusal, and that an event
-storm and a wire-error storm alone never refuse a command; retention
-test with a fake directory including a symlink, a foreign file and a live session.
+Verification
+- Sampler unit tests with an injected clock (counts exact, samples where expected,
+  summary per window).
+- 12 h event-rate arithmetic, time-compressed: the tier allowance as a pure object with an
+  injected clock, fed a synthetic 12 h profile (each hour: 45 min at about 1/s with idle
+  seconds, 12 min at 30/s, 3 min at 100/s; about 12/s average) and a run that opens with a
+  15 min burst at 100/s: never counted only. A runaway at 1000/s reaches the allowance at
+  the predicted time within 1 %. Under 1 s, no I/O. The real `Ledger` with the same
+  injected clock and the profile scaled 1:64 in bytes and allowance (about 3 MB on disk):
+  no `IB-LED-003`, on-disk tier bytes within the allowance at every simulated minute.
+- E2E garbage flood at 10k pkt/s for 30 s of unique MIDs: ledger growth stays within the
+  evidence allowance, notices coalesce, every datagram is counted; an event storm and a
+  wire-error storm alone never refuse a command.
+- Disk full through the writer's write seam (fault injection of ENOSPC and EDQUOT; no
+  privileges needed): ballast released, one `IB-LED-005`, essential records continue,
+  no torn line; reserve used up: `IB-LED-004` and `ib send` refused with nothing on the
+  wire (the mock responder counts zero), the recorder unaffected; seam recovers:
+  `ledger.resumed` and sends accepted. Repeated with both tiers `"unlimited"`, and with
+  `on_full = "continue"` (sends go out, counted untraced).
+- No automatic deletion: state and recording directories with sessions past `max_age`
+  and past `max_total_bytes`; start-up checks, a long session whose projection crosses,
+  and three consecutive processes leave every file present and byte-identical (hashes);
+  `IB-RET-001` and `IB-RET-002` are shown once within `warn_interval` and ledgered every
+  run. A static guard (AST scan of `src/`) allows file-removal calls (`os.unlink`,
+  `os.remove`, `Path.unlink`, `shutil.rmtree`) only in the prune delete path and the
+  ballast and temp-file handling.
+- Prune: the list is exactly the expected set (age, `--until-under`, `--keep`, default
+  `keep_recent` 10); never a live session (lock held by a subprocess), a symlink, a foreign
+  file or a lookalike (`.jsonl.bak`, uppercase hex, 13-digit id, a directory with a
+  matching name); interactive `y`, `N`, EOF and `yes ` through a pty; non-interactive
+  without `--yes` exits 2 with nothing deleted; `--yes` deletes exactly the listed set; a
+  session that changes between listing and deletion (grown, replaced by a symlink, inode
+  swapped, became live) is skipped with `IB-RET-003` and exit 1; every step ledgered.
+- Config: `"unlimited"` accepted only where allowed; `0`, `-1`, `"inf"`, `"none"`,
+  `"Unlimited"`, `" unlimited"`, `""` rejected with `IB-CFG-003`; unlimited tiers are
+  never counted only; unlimited age and total emit no warnings.
+- Untrusted input: corpus `ret-*` of directory names (control characters, escape
+  sequences, overlong, invalid UTF-8) shown inert by prune and the warnings; malformed
+  `retention-notices.json` (oversize, wrong types, future timestamps) ignored and
+  rewritten.
 
 ### 2e - Recording format and writer
 
@@ -850,6 +978,11 @@ Deliverables
   `<UTC stamp>-<session>.ibrec`; the path is printed and ledgered at start.
 - Config `[recording]`: `dir`, `fsync`, `max_buffer_bytes`, `min_free_bytes`,
   `embed_definitions` (default true, D1).
+- Disk use (D2): recordings are never deleted automatically. Default-named recordings in
+  the recording directory count toward `retention.max_total_bytes` and are removed only by
+  `ib rec prune` (2d); the recorder feeds its byte rate into the `IB-RET-002` projection. A
+  split recording keeps part 1 open and locked until the session ends, so retention sees
+  the whole session as live.
 
 Untrusted input: the reader is a decode boundary of its own and gets the full treatment:
 Hypothesis round trip (arbitrary frame sequences written then read are equal),
@@ -865,6 +998,9 @@ Verification
   injected), fsync policy calls (mocked), signal-path close.
 - Crash test: `kill -9` the recorder mid-capture; `ib rec info` reports a torn tail and
   every frame flushed before the kill is readable.
+- Retention: with a fake clock, a recording whose rate crosses the projected total raises
+  `IB-RET-002` once, at the predicted time; a split recording is skipped whole by
+  `ib rec prune` while running.
 - Benchmark: writer throughput (MB/s, frames/s) and per-frame `append` cost.
 - Real cFS: record 60 s after TO_LAB enable; `rec info` shows each HK MID at its
   SCH_LAB period (`tools/cfs/NOTES.md`: ES 4.0 s, EVS 4.2 s, ...) within one packet, seq
@@ -1128,9 +1264,13 @@ Verification
 | `IB-TX-006` | `TX_BUSY` | serial device locked by another process | 2k |
 | `IB-TX-007` | `TX_RESYNC` | serial stream resynchronised, N bytes skipped | 2k |
 | `IB-TX-008` | `TX_DOWN` | link lost, reconnecting | 2k |
-| `IB-LED-003` | `LED_EVIDENCE` | evidence or event tier cap reached; that tier is now counted only | 2d |
-| `IB-LED-004` | `LED_FULL` | reserved essential budget exhausted; commands refused (policy) | 2d |
-| `IB-LED-005` | `LED_PRUNE` | old ledger files could not be pruned | 2d |
+| `IB-LED-003` | `LED_TIER` | event or evidence tier over its allowance; counted only until the allowance grows | 2d |
+| `IB-LED-004` | `LED_FULL` | essential records cannot be written; commands refused (`on_full` policy) until the ledger writes again | 2d |
+| `IB-LED-005` | `LED_DISK` | disk or quota full; reserve released, only essential records written | 2d |
+| `IB-RET-001` | `RET_AGE` | sessions older than `retention.max_age`; review with `ib ledger prune` / `ib rec prune` | 2d |
+| `IB-RET-002` | `RET_TOTAL` | ledger + recordings past, or projected past, `retention.max_total_bytes`; prune or raise the cap | 2d |
+| `IB-RET-003` | `RET_PRUNE` | a listed session was not deleted (became live, changed since listing, unlink failed) | 2d |
+| `IB-RET-004` | `RET_SCAN` | retention scan partial (directory unreadable or over 100 000 entries) | 2d |
 | `IB-REC-001` | `REC_CREATE` | cannot create the recording (exists, permission, directory) | 2e |
 | `IB-REC-002` | `REC_WRITE` | write or sync failed; recording stopped | 2e |
 | `IB-REC-003` | `REC_OVERRUN` | recorder buffer full; frames dropped (GAP recorded) | 2e |
@@ -1164,7 +1304,7 @@ complete up to mid-file damage in an input recording.
 | Coalesced `TX_RECV` | 2c |
 | Header profiles: endianness, trailer/partial checksums, msgid_v2, per-message/per-send values, epoch, `frame_length()` | 2i |
 | Immutable shared data | 2a, then every step |
-| Ledger growth: sampling, caps, rotation, retention, send policy | 2d |
+| Ledger growth: sampling, tier allowances, rotation, retention warnings and prune, send policy | 2d |
 | Output and signals equivalence | Stage 3; Stage 2's new commands keep Stage 1's exit codes, bounded writer and signal path |
 
 ### Decisions
@@ -1174,13 +1314,22 @@ Decided by the user (2026-10-30):
   header profiles (8 MiB cap each); replay uses them by default (`--defs config`
   overrides), so a recording decodes correctly after the CCDD changes. A recording is therefore as
   sensitive as the definition files themselves (the README says so).
-- **D2 Ledger caps: smaller than first proposed.** 128 MiB per session (64 MiB of it raw
-  evidence), retention 7 days or 512 MiB per state directory, all configurable. At the
-  session hard cap, commands are refused (`on_full = "refuse_commands"`) and capture
-  continues. Refinement adopted (2d): the cap that refuses commands is a *reserved
-  essential budget* (actions, commands, state, non-wire errors), not the session total;
-  evidence and events have their own capped tiers, so storms of either cannot lock out
-  commanding. The caps above are unchanged.
+- **D2 Ledger budgets and retention: scale with run time, warn, never delete.** Expected
+  load: events ~10/s average, ~30/s when active, bursts of 50-100/s, many seconds with
+  none; most tests short, some 12 h overnight; telemetry goes to recordings, not the
+  ledger.
+  - Event and evidence tiers have per-hour allowances with a one-hour floor (64 and
+    32 MiB/h; 768 and 384 MiB at 12 h), sized so a 12 h run at those rates never reaches
+    them (2d sizing table). Essential records are uncapped and keep a 32 MiB on-disk
+    reserve for when the disk fills.
+  - Commands are refused only when an essential record cannot be written
+    (`on_full = "refuse_commands"`); capture and recording never stop for ledger reasons.
+  - Nothing is deleted automatically, ledger or recording. Retention only warns: sessions
+    past `max_age` (7 d), and ledger plus recordings past, or projected past,
+    `max_total_bytes` (2 GiB). Deletion is only `ib ledger prune` / `ib rec prune` after an
+    explicit confirmation, never of the `keep_recent` (10) most recent sessions or a live one.
+  - Every limit but the reserve accepts `"unlimited"` (the one spelling, strictly
+    validated) for users who do not want to monitor.
 - **D6 Variable-length and throughput on real cFS: add an `ib_test` cFS app** under
   `tools/cfs`, built with the pinned bundle, that emits a counted-array packet and can
   generate up to 10k pkt/s of telemetry. Used only for acceptance and the throughput gate.
@@ -1189,8 +1338,9 @@ Decided by the user (2026-10-30):
   gate; a real-UART run is added when hardware is available.
 
 Adopted as recommended (revisit on request):
-- **D3** Events are never sampled; they have a capped tier of their own (`max_event_bytes`,
-  32 MiB, counted once over the cap), so they cannot starve the essential budget (2d).
+- **D3** Events are never sampled; they have a tier of their own with a per-hour allowance
+  (64 MiB/h, one-hour floor; counted, not written, past it), so they cannot take the
+  essential tier's space and a 12 h run at the expected rates never reaches it (2d).
 - **D4** Commands from a separate `ib send` are in the ledger but not in a Stage 2
   recording; the Stage 3 engine closes the gap.
 - **D5** Replay to the wire is deferred to Stage 5 send modes.
@@ -1226,10 +1376,10 @@ Adopted as recommended (revisit on request):
      implemented in Stage 1: the ledger keeps every malformed datagram in full, so a flood can
      write on the order of 1 GB in 10 s). Stage 2 decides and builds: raw-evidence sampling
      per key and window (every packet counted, the first N and a periodic sample kept raw,
-     the rest reduced to a per-key count record); a ledger size cap per session and per state
-     directory with a coded error when reached (and a defined "stop sending or keep going"
-     policy for transmitting commands); and rotation plus retention (age and total size) of
-     old ledger files.
+     the rest reduced to a per-key count record); per-session ledger budgets with a coded
+     notice when reached (and a defined "stop sending or keep going" policy for transmitting
+     commands); and rotation plus retention (age and total size) of old ledger files, which
+     warns and leaves deletion to a confirmed `ib ledger prune` (D2).
    - Output and signals: the bounded stdout/stderr writer, the signal-to-cancel path and the
      exit codes (0 normal, 1 error, 2 usage/config, 3 `--count` not reached before `--timeout`,
      4 command succeeded but stdout lines were lost,
