@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Final, NamedTuple
+from typing import Final, NamedTuple, cast
 
 from ironbird import header as hdr
 from ironbird.ccdd.model import (
@@ -348,10 +348,23 @@ class Codec:
             ) from exc
 
     @staticmethod
-    def _check_header_values(profile: HeaderProfile, values: Mapping[str, int], what: str) -> None:
-        """Every name in ``values`` is a header field the caller may set and its value fits."""
+    def _check_header_values(profile: HeaderProfile, header_values: object, what: str) -> None:
+        """Every name in ``values`` is a header field the caller may set and its value fits.
+        The argument comes from a public API, so its shape is checked too."""
+        if not isinstance(header_values, Mapping):
+            raise IronbirdError(
+                Code.HDR_PACK,
+                f"{what} must be a mapping of field name to value, "
+                f"not a {type(header_values).__name__}",
+            )
+        values = cast("Mapping[object, object]", header_values)
         settable = [f.name for f in profile.input_fields if f.name != profile.function_code_field]
         for name, value in values.items():
+            if type(name) is not str:
+                raise IronbirdError(
+                    Code.HDR_PACK,
+                    f"{what} field names must be strings, not {type(name).__name__}",
+                )
             f = profile.by_name.get(name)
             if name == profile.function_code_field:
                 raise IronbirdError(

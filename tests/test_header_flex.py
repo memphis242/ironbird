@@ -288,6 +288,21 @@ def test_the_crc16_check_value_through_a_payload_span() -> None:
     assert checksum.REGISTRY["crc16_ccitt"].compute(b"123456789") == 0x29B1
 
 
+@given(st.binary(min_size=1, max_size=300), st.data())
+def test_xor8_without_a_copy_equals_xor8_of_the_packet_with_the_byte_zeroed(
+    data: bytes, draw: st.DataObject
+) -> None:
+    algorithm = checksum.REGISTRY["xor8_cfs"]
+    assert algorithm.compute_zeroed is not None
+    assert checksum.REGISTRY["crc16_ccitt"].compute_zeroed is None
+    at = draw.draw(st.integers(0, len(data) - 1))
+    zeroed = bytearray(data)
+    zeroed[at] = 0
+    want = algorithm.compute(zeroed)
+    for buffer in (data, bytearray(data), memoryview(data)):
+        assert algorithm.compute_zeroed(buffer, at) == want
+
+
 def test_crc16_is_the_same_function_as_the_table_driven_one_it_replaced() -> None:
     compute = checksum.REGISTRY["crc16_ccitt"].compute
     for data in (b"", b"\x00", b"\xff" * 300, bytes(range(256)) * 3, b"123456789"):
@@ -474,7 +489,9 @@ def test_cfe_msgid_v2_builds_the_mid_from_three_places() -> None:
     packet = header.pack(cmd, b"", mid=0x2A85, inputs={"function_code": 3})
     # version 0, type 1, secondary header 1, apid high 0 | apid low 5 | seq | length 9
     assert packet[:6] == bytes.fromhex("1805c0000009")
-    assert packet[6:8] == b"\x00\x2a"  # eds/endian/playback/subsystem high, subsystem low
+    # cFE defaults: EDS version 1 (0x08), little-endian flag (0x04), subsystem low byte 0x2A, then
+    # the system id 0x0042 (the sample spacecraft id)
+    assert packet[6:10] == bytes.fromhex("0c2a0042")
     assert packet[10] == 3  # function code
     parsed = header.unpack(cmd, packet)
     assert isinstance(parsed, Header) and parsed.mid == 0x2A85 == header.peek_mid(cmd, packet)
@@ -670,6 +687,13 @@ def test_telemetry_takes_message_and_send_header_values_too() -> None:
         ({"priority": True}, "does not fit"),
         ({"priority": 1.5}, "does not fit"),
         ({"priority": "3"}, "does not fit"),
+        ({"priority": None}, "does not fit"),
+        ({1: 2}, "field names must be strings, not int"),
+        ({None: 1}, "field names must be strings, not NoneType"),
+        ({b"priority": 1}, "field names must be strings, not bytes"),
+        ({("priority",): 1}, "field names must be strings, not tuple"),
+        ([("priority", 1)], "must be a mapping of field name to value, not a list"),
+        ("priority=1", "must be a mapping of field name to value, not a str"),
     ],
 )
 def test_per_send_header_values_are_checked_against_the_profile(bad: Any, needle: str) -> None:
@@ -903,6 +927,8 @@ def test_a_toml_date_time_works_as_the_epoch() -> None:
         ({"epoch": "yesterday"}, "is not an ISO 8601 time"),
         ({"epoch": 5}, "must be an ISO 8601 time string"),
         ({"epoch": "1980-01-01T00:00:00.5Z"}, "must be a whole second"),
+        ({"epoch": "1980-01-01T00:00:00+00:00:30"}, "whole number of minutes"),
+        ({"epoch": "1980-01-01T00:00:00-05:30:15"}, "whole number of minutes"),
         ({"epoch": "1899-12-31T23:59:59Z"}, "between the years 1900 and 2200"),
         ({"epoch": "2200-01-01T00:00:01Z"}, "between the years 1900 and 2200"),
         ({"epoch": "0001-01-01T00:00:00+23:59"}, "between the years 1900 and 2200"),
@@ -968,6 +994,23 @@ def test_frame_length_with_a_bit_aligned_length_field_and_a_bias() -> None:
     assert profile.frame_length(packet[:1]) is None
     assert profile.frame_length(packet[:2]) == 7
     assert header.check(profile, packet) is None
+
+
+def test_frame_length_returns_negative_and_implausible_values_unjudged() -> None:
+    """The framer (2k) must range-check the result: it is the field minus the bias, as claimed."""
+    biased = prof(
+        [
+            {"name": "a", "bits": 4, "value": 0xA},
+            {"name": "n", "bits": 12, "computed": "length", "bias": 3},
+            {"name": "mid", "bits": 8, "computed": "from_mid"},
+        ]
+    )
+    assert biased.frame_length(b"\xa0\x00") == -3  # a field smaller than the bias
+    assert biased.frame_length(b"\xa0\x02") == -1
+    assert biased.frame_length(b"\xaf\xff") == 0xFFF - 3
+    shipped = header.load_profile(HEADERS / "ccsds_v1_cfs_tlm.toml")  # bias -7
+    assert shipped.frame_length(bytes(6)) == 7 < shipped.min_bytes  # shorter than its header
+    assert shipped.frame_length(b"\x00" * 4 + b"\xff\xff") == 0xFFFF + 7  # past any cap
 
 
 def test_a_profile_without_a_length_field_cannot_frame() -> None:
@@ -1193,6 +1236,7 @@ NEW_CORPUS = [
     "hdr-two-checksums.toml",
     "hdr-time-without-seconds.toml",
     "hdr-time-epoch-naive.toml",
+    "hdr-time-epoch-offset-seconds.toml",
     "hdr-time-epoch-year-3000.toml",
     "hdr-time-leap-huge.toml",
 ]

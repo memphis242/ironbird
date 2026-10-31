@@ -97,12 +97,17 @@ The packet's time is `CFE_TIME_GetTime()` = MET + STCF, a TAI count of seconds s
 So a header seconds value S is the UTC instant `1980-01-01T00:00:00Z + S - 37 s`, and a fresh
 `run.sh` (STCF 1000000, MET from 1000) should stamp packets with S near 1001000 = about
 **1980-01-12T14:00Z**, in line with the simulated `1980-...` console lines (derived from the
-defaults; the acceptance case below checks it against the live build). The profile
+defaults; the acceptance cases below check it against the live build). The profile
 `examples/headers/ccsds_v1_cfs_tlm_cfe_time.toml` carries `[time] epoch = "1980-01-01T00:00:00Z"`
-and `leap_seconds = 37`; `ccsds_v1_cfs_tlm.toml` keeps the Unix epoch the mock vehicle stamps
-its own telemetry with. The `cfs` acceptance case
-`test_time_hk_header_time_decodes_with_the_cfe_epoch` selects TIME HK with
-`htime >= 1980-01-01T00:00:00Z and htime < 1981-01-01T00:00:00Z` using the first profile.
+and `leap_seconds = 37`, and **`examples/ironbird.toml` (the real-cFS ground config) uses it**, so
+`htime` is right without any edit. `ccsds_v1_cfs_tlm.toml` keeps the Unix epoch, which is what the
+mock vehicle (`ib respond`) stamps its own telemetry with, and `examples/mock.toml` uses that one.
+HK carries MET (`CurrentMET`), STCF (`AtToneSTCF`) and `AtToneLeapSeconds` of the same reference
+as the stamp (`cfe_time_utils.c:391-397`), DIAG its own `CurrentTAI` and `CurrentUTC`
+(`cfe_time_utils.c:444-447`). The `cfs` acceptance cases:
+`test_listen_where_htime_selects_time_hk_in_the_cfe_epoch` (`--where` with a 1980 window) and
+`test_header_time_equals_the_cfe_time_in_the_time_packets` (decoded `htime` of a TIME HK and a DIAG
+equals `epoch + MET + STCF - leaps` / `epoch + CurrentUTC` of that same packet within 2 s).
 If the mission configuration changes `EPOCH_*`, `CFG_DEFAULT_TAI` or `DEF_LEAPS`, edit the
 `[time]` table to match; a UTC-scale mission uses `leap_seconds = 0`.
 
@@ -113,7 +118,12 @@ header `cfe/modules/msg/fsw/inc/ccsds_hdr.h:55-87`) builds the 16-bit MID from t
 APID low 7 bits (primary header byte 1), the command/telemetry bit (primary header bit 3)
 and the Subsystem low byte (extended header byte 7): `MID = subsystem << 8 | type << 7 | apid`.
 `examples/headers/cfe_msgid_v2_{cmd,tlm}.toml` express it with
-`mid_fields = ["subsystem_lo", "packet_type", "apid_lo"]`; unit tests only.
+`mid_fields = ["subsystem_lo", "packet_type", "apid_lo"]`; unit tests only. Their input-field
+defaults are the cFE ones (`CFE_MSG_SetDefaultCCSDSExt`, `cfe_msg_ccsdsext.c:41-54`): EDS version 1
+(`CFE_PLATFORM_EDSVER`, `cfe_msg_defaults.h:56`), endian flag 1 = little (`CFE_PLATFORM_ENDIAN` is
+`CCSDS_LITTLE_ENDIAN`, `default_cfe_core_private_internal_cfg.h:44`; the `#if` at `ccsdsext.c:45`
+compares two names that no header in this checkout defines (both read as 0), so it is true either way), system id 0x42 (the spacecraft id
+above, stored from `CFE_PSP_GetSpacecraftId()`, `ccsdsext.c:53`), playback 0.
 
 ### Byte order
 

@@ -191,6 +191,9 @@ class HeaderProfile:
         init=False, repr=False, compare=False
     )
     checksum_compute: Callable[[Buffer], int] | None = field(init=False, repr=False, compare=False)
+    checksum_zeroed: Callable[[Buffer, int], int] | None = field(
+        init=False, repr=False, compare=False
+    )  # the algorithm's no-copy "field read as zero" form, when it has one
     checksum_whole: bool = field(init=False, repr=False, compare=False)  # span is the packet
     checksum_zero: bytes = field(init=False, repr=False, compare=False)  # an empty field's bytes
 
@@ -213,11 +216,13 @@ class HeaderProfile:
             )
         set_(self, "mid_flat", flat)
         cf = self.checksum_field
-        compute = None
+        compute = zeroed = None
         if cf is not None:
             assert cf.algorithm is not None
-            compute = checksum.REGISTRY[cf.algorithm].compute
+            algorithm = checksum.REGISTRY[cf.algorithm]
+            compute, zeroed = algorithm.compute, algorithm.compute_zeroed
         set_(self, "checksum_compute", compute)
+        set_(self, "checksum_zeroed", zeroed)
         set_(self, "checksum_whole", cf is not None and cf.span.kind is SpanKind.PACKET)
         set_(self, "checksum_zero", bytes(cf.bits // 8) if cf is not None else b"")
 
@@ -234,8 +239,11 @@ class HeaderProfile:
 
         ``prefix`` starts at the first byte of a candidate packet. ``None`` means too few bytes
         to read the field yet (fewer than :attr:`length_window`); otherwise the total packet
-        bytes the field claims, which untrusted input may make smaller than the header and
-        trailer or larger than any cap: the caller judges it. Needs a length field.
+        bytes the field claims (field value minus ``bias``). Untrusted input can make that
+        negative (a positive ``bias`` with a small field), smaller than the header and trailer,
+        or larger than any cap: this method does not judge it, and the caller must reject
+        anything outside ``min_bytes`` .. its packet cap before it sizes a read. Needs a length
+        field.
         """
         window = self.length_window
         assert window is not None and self.length_field is not None, "profile has no length field"
@@ -522,8 +530,11 @@ def _parse_epoch(ctx: _Ctx, value: object, path: str) -> int:
             ) from None
     else:
         raise ctx.fail(path, "must be an ISO 8601 time string such as 1980-01-01T00:00:00Z")
-    if moment.tzinfo is None or moment.utcoffset() is None:
+    offset = moment.utcoffset()
+    if moment.tzinfo is None or offset is None:
         raise ctx.fail(path, "needs a zone (Z or +HH:MM): a naive time names no instant")
+    if offset.total_seconds() % 60:
+        raise ctx.fail(path, "zone offset must be a whole number of minutes (Z or +HH:MM)")
     if moment.microsecond:
         raise ctx.fail(path, "must be a whole second")
     try:
@@ -1126,10 +1137,15 @@ def check_word(
         at = cf.offset + n - tsize if cf.trailer else cf.offset
         expected: int | str
         if profile.checksum_whole:
-            covered = bytearray(data)
             zero = profile.checksum_zero
-            covered[at : at + len(zero)] = zero
-            expected = compute(covered)
+            zeroed = profile.checksum_zeroed
+            if zeroed is not None:
+                assert len(zero) == 1  # only the 8-bit XOR has a no-copy form
+                expected = zeroed(data, at)
+            else:
+                covered = bytearray(data)
+                covered[at : at + len(zero)] = zero
+                expected = compute(covered)
         else:
             expected = _checksum_of(profile, cf, data, n)
         if isinstance(expected, str):

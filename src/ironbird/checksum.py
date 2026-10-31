@@ -23,6 +23,11 @@ class ChecksumAlgorithm:
     width_bits: int
     description: str
     compute: Callable[[bytes | bytearray | memoryview], int]
+    # ``compute_zeroed(data, at)``: the value of ``compute`` over ``data`` with the
+    # ``width_bits // 8`` bytes at ``at`` read as zero, without copying ``data``. Only for an
+    # algorithm that can cancel those bytes out of its result (XOR); ``None`` means the caller
+    # zeroes a copy.
+    compute_zeroed: Callable[[bytes | bytearray | memoryview, int], int] | None = None
 
     def __post_init__(self) -> None:
         assert self.width_bits in (8, 16, 32)
@@ -31,6 +36,13 @@ class ChecksumAlgorithm:
 def _xor8_cfs(data: bytes | bytearray | memoryview) -> int:
     """cFE command checksum: stored byte makes the XOR of the covered bytes equal 0xFF."""
     return reduce(xor, data, 0xFF)
+
+
+def _xor8_cfs_zeroed(data: bytes | bytearray | memoryview, at: int) -> int:
+    """:func:`_xor8_cfs` of ``data`` with the byte at ``at`` zeroed: XOR is its own inverse, so
+    XORing that byte out of the total is the same as zeroing it first."""
+    assert 0 <= at < len(data)
+    return reduce(xor, data, 0xFF) ^ data[at]
 
 
 def _crc16_ccitt(data: bytes | bytearray | memoryview) -> int:
@@ -48,6 +60,7 @@ REGISTRY: Final[Mapping[str, ChecksumAlgorithm]] = MappingProxyType(
                 8,
                 "8-bit XOR of the covered bytes equals 0xFF (cFE commands)",
                 _xor8_cfs,
+                _xor8_cfs_zeroed,
             ),
             ChecksumAlgorithm(
                 "crc16_ccitt", 16, "CRC-16/CCITT-FALSE over the covered bytes", _crc16_ccitt
@@ -58,3 +71,4 @@ REGISTRY: Final[Mapping[str, ChecksumAlgorithm]] = MappingProxyType(
 
 assert _crc16_ccitt(b"123456789") == 0x29B1  # standard check value
 assert _xor8_cfs(b"") == 0xFF
+assert _xor8_cfs_zeroed(b"\x01\x02\x03\x04", 1) == _xor8_cfs(b"\x01\x00\x03\x04")

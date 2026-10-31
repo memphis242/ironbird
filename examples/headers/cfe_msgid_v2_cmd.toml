@@ -55,17 +55,20 @@ bias = -7
 [[fields]]
 name = "eds_version"
 bits = 5
-default = 0
+default = 1          # CFE_PLATFORM_EDSVER 1 (cfe_msg_defaults.h:56), set by cfe_msg_ccsdsext.c:43
 
 [[fields]]
 name = "endian_flag"
 bits = 1
-default = 0
+default = 1          # 1 = little-endian payload: CFE_PLATFORM_ENDIAN is CCSDS_LITTLE_ENDIAN
+                     # (default_cfe_core_private_internal_cfg.h:44, example_platform_cfg.h:60),
+                     # which cfe_msg_ccsdsext.c:45-46 turns into this bit (mask 0x0400, :31).
+                     # A big-endian flight CPU sends 0.
 
 [[fields]]
 name = "playback"
 bits = 1
-default = 0
+default = 0          # original, not playback (cleared by CFE_MSG_Init memset, cfe_msg_init.c:45)
 
 [[fields]]
 name = "subsystem_hi"
@@ -81,7 +84,8 @@ computed = "from_mid"
 [[fields]]
 name = "system_id"
 bits = 16
-default = 0
+default = 0x42       # the spacecraft id (cfe_msg_ccsdsext.c:53 stores CFE_PSP_GetSpacecraftId());
+                     # SPACECRAFT_ID 0x42 in sample_defs/targets.cmake:77
 
 [[fields]]
 name = "reserved"

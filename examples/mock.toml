@@ -1,6 +1,9 @@
 # ironbird-vs-ironbird mock: no hardware, no cFS. Distinct ports so it can run next to a
 # real cFS setup (examples/ironbird.toml).
 #
+# The telemetry profile keeps the Unix time epoch because `ib respond` stamps its replies in Unix
+# seconds; examples/ironbird.toml reads real cFS telemetry with the cFE epoch instead.
+#
 #   shell 1:  ib -c examples/mock.toml respond --as fc
 #   shell 2:  ib -c examples/mock.toml listen fc
 #   shell 3:  ib -c examples/mock.toml send fc MOCK_NOOP

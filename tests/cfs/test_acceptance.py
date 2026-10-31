@@ -26,10 +26,17 @@ import time
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from ironbird.ccdd.loader import load_ccdd
+from ironbird.ccdd.model import MessageKind
+from ironbird.codec import Codec, DecodedPacket
+from ironbird.config import load_config
+from ironbird.header import load_profile
 
 pytestmark = pytest.mark.cfs
 
@@ -792,48 +799,107 @@ def test_listen_where_selects_one_apps_housekeeping(ground: Ground, tmp_path: Pa
     )
 
 
-def test_time_hk_header_time_decodes_with_the_cfe_epoch(ground: Ground, tmp_path: Path) -> None:
-    """The telemetry header time of TIME HK read with the cFE mission epoch (1980-01-01, TAI,
-    37 leap seconds: tools/cfs/NOTES.md) lands in 1980, which only that epoch can do: the
-    default stamp is a few million seconds since 1980, a few days after the epoch."""
-    examples = REPO / "examples"
-    config = tmp_path / "cfe-time.toml"
-    text = CONFIG.read_text().replace('"ccdd/', f'"{examples}/ccdd/')
-    text = text.replace('"headers/', f'"{examples}/headers/')
-    text = text.replace("ccsds_v1_cfs_tlm.toml", "ccsds_v1_cfs_tlm_cfe_time.toml")
-    assert "cfe_time" in text
-    config.write_text(text)
+def test_listen_where_htime_selects_time_hk_in_the_cfe_epoch(
+    ground: Ground, tmp_path: Path
+) -> None:
+    """The shipped ground config reads the telemetry header time with the cFE mission epoch
+    (1980-01-01, TAI, 37 leap seconds: tools/cfs/NOTES.md), so ``htime`` of TIME HK is a
+    1980 date, which the Unix epoch (1970 plus a million seconds) cannot be."""
     where = "msg == TIME_HK and htime >= 1980-01-01T00:00:00Z and htime < 1981-01-01T00:00:00Z"
-    ib = [sys.executable, "-m", "ironbird.cli.main", "-c", str(config)]
-    env = {**ground.env, "IRONBIRD_STATE_DIR": str(tmp_path / "state")}
-    fmt = ["--format", "json"]
-    with ground.listener_paused():  # one process owns UDP 2234
-        proc = subprocess.Popen(
-            [*ib, "listen", "fc", "--where", where, "--count", "1", "--timeout", "40", *fmt],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-        )
-        try:
-            assert proc.stderr is not None
-            for line in iter(proc.stderr.readline, ""):
-                if "listening for fc" in line:
-                    break
-            else:
-                raise AssertionError("no listen banner")
-            deadline = time.monotonic() + 30
-            while proc.poll() is None and time.monotonic() < deadline:
-                ground.send("TIME_SEND_HK")
-                time.sleep(1.0)
-            out, err = proc.communicate(timeout=15)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.communicate()
-    assert proc.returncode == 0, err
-    record = json.loads(out.splitlines()[0])
-    assert record["name"] == "TIME_HK"
+    with (
+        ground.listener_paused(),  # one process owns UDP 2234
+        _listen_where(ground, tmp_path / "state", "--where", where, "--count", "1") as out,
+    ):
+        deadline = time.monotonic() + 30
+        while not out.snapshot() and time.monotonic() < deadline:
+            ground.send("TIME_SEND_HK")
+            time.sleep(1.0)
+        lines = out.snapshot()
+    assert lines, "no TIME_HK passed the htime filter"
+    assert json.loads(lines[0])["name"] == "TIME_HK"
+
+
+CFE_EPOCH = datetime(1980, 1, 1, tzinfo=UTC)  # CFE_MISSION_TIME_EPOCH_* (tools/cfs/NOTES.md)
+HTIME_TOLERANCE_S = 2.0  # the packet is stamped a few ms after its fields are sampled
+
+
+def _fc_codec() -> Codec:
+    """The ``fc`` codec exactly as the shipped ground config builds it."""
+    node = load_config(CONFIG).nodes["fc"]
+    assert node.ccdd is not None
+    assert node.command_header is not None and node.telemetry_header is not None
+    return Codec(
+        load_ccdd(node.ccdd, node.ccdd_adapter),
+        load_profile(node.command_header),
+        load_profile(node.telemetry_header),
+    )
+
+
+def _capture(ground: Ground, codec: Codec, requests: dict[str, str]) -> dict[str, DecodedPacket]:
+    """Raw TO_LAB datagrams decoded in-process: one packet per message of ``requests``
+    (message name -> the command that makes cFS send it), asked for about once a second."""
+    found: dict[str, DecodedPacket] = {}
+    with ground.listener_paused(), socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.bind(("127.0.0.1", TO_LAB_PORT))
+        sock.settimeout(0.2)
+        deadline = time.monotonic() + 30
+        next_request = 0.0
+        while len(found) < len(requests) and time.monotonic() < deadline:
+            if time.monotonic() >= next_request:
+                for command in requests.values():
+                    ground.send(command)
+                next_request = time.monotonic() + 1.0
+            try:
+                data, _ = sock.recvfrom(4096)
+            except TimeoutError:
+                continue
+            packet = codec.decode(MessageKind.TELEMETRY, data)
+            if isinstance(packet, DecodedPacket) and packet.message.name in requests:
+                found[packet.message.name] = packet
+    assert found.keys() == requests.keys(), f"no packet of {requests.keys() - found.keys()}"
+    return found
+
+
+def _seconds(fields: dict[str, object], name: str) -> float:
+    """Seconds plus 2^-32 s subseconds of the ``<name>_Seconds`` / ``<name>_Subseconds`` pair."""
+    whole, sub = fields[f"{name}_Seconds"], fields[f"{name}_Subseconds"]
+    assert isinstance(whole, int) and isinstance(sub, int)
+    return whole + sub / SUBSEC
+
+
+def _htime_error_s(packet: DecodedPacket, cfe_utc_s: float) -> float:
+    """Decoded header time minus the UTC instant ``CFE_EPOCH + cfe_utc_s``, in seconds."""
+    htime_ns = packet.header.time_ns
+    assert htime_ns is not None, "the telemetry profile has no header time"
+    expected_ns = round((CFE_EPOCH.timestamp() + cfe_utc_s) * 1e9)
+    return (htime_ns - expected_ns) / 1e9
+
+
+def test_header_time_equals_the_cfe_time_in_the_time_packets(ground: Ground) -> None:
+    """The decoded ``htime`` of TIME HK and DIAG, with the shipped config, is the cFE time the
+    same packet reports in its payload: HK carries MET, STCF and the leap seconds (time =
+    MET + STCF, a TAI count since the epoch, UTC = time - leaps); DIAG carries cFE's own UTC.
+    A wrong epoch (the GPS 1980-01-06 or Unix 1970) or zero leap seconds is days or 37 s off."""
+    packets = _capture(
+        ground,
+        _fc_codec(),
+        {"TIME_HK": "TIME_SEND_HK", "TIME_DIAG": "TIME_SEND_DIAGNOSTIC"},
+    )
+
+    hk = packets["TIME_HK"].as_dict()
+    assert hk["LeapSeconds"] == 37  # CFE_MISSION_TIME_DEF_LEAPS, nothing in this suite changes it
+    leaps = hk["LeapSeconds"]
+    assert isinstance(leaps, int)
+    hk_utc_s = _seconds(hk, "MET") + _seconds(hk, "STCF") - leaps
+    assert abs(_htime_error_s(packets["TIME_HK"], hk_utc_s)) < HTIME_TOLERANCE_S
+
+    diag = packets["TIME_DIAG"].as_dict()
+    assert diag["AtToneLeapSeconds"] == 37
+    tai_s = _seconds(diag, "CurrentTAI")
+    assert abs(tai_s - 37 - _seconds(diag, "CurrentUTC")) < 1e-3  # cFE's own TAI -> UTC
+    assert abs(_htime_error_s(packets["TIME_DIAG"], _seconds(diag, "CurrentUTC"))) < (
+        HTIME_TOLERANCE_S
+    )
 
 
 def test_events_where_type_matches_min_type(ground: Ground, tmp_path: Path) -> None:

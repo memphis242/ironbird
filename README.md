@@ -373,8 +373,11 @@ big-endian bitfields packed MSB-first. What a profile can say beyond a field's w
 `crc16_ccitt` (CRC-16/CCITT-FALSE) is the CCSDS packet error control code; with the PEC as a trailer
 it covers `{ start = 0, end = -2 }` (`examples/headers/ccsds_pec_tlm.toml`). At most one checksum per
 profile. `ccsds_v1_cfs_tlm_cfe_time.toml` is `ccsds_v1_cfs_tlm.toml` with the cFE mission epoch
-(1980-01-01, TAI, 37 leap seconds; `tools/cfs/NOTES.md`), for reading the header time of real cFS
-telemetry; `cfe_msgid_v2_{cmd,tlm}.toml` are the cFE MsgId V2 headers.
+(1980-01-01, TAI, 37 leap seconds; `tools/cfs/NOTES.md`): `examples/ironbird.toml` (real cFS) uses
+it, so `htime` is the right UTC instant. `ccsds_v1_cfs_tlm.toml` counts Unix seconds, which is what
+the mock vehicle (`ib respond`, `examples/mock.toml`) stamps. `cfe_msgid_v2_{cmd,tlm}.toml` are the
+cFE MsgId V2 headers, with the cFE defaults for the extended header (EDS version 1, little-endian
+flag, system id 0x42 = the sample spacecraft id).
 
 The decoded header time is `htime` in a filter (`--where 'htime >= 2026-10-29T12:00:00Z'`, UTC, with
 the same time literals as `time`); it is false for a packet whose profile has no seconds field.
@@ -393,8 +396,8 @@ field path; a span that does not fit one particular packet is `IB-ENC-004` for a
 
 ## Configuration
 
-- `examples/ironbird.toml` - ground plus a real cFS flight computer (CI_LAB 1234, TO_LAB 2234).
-- `examples/mock.toml` - ironbird-vs-ironbird on distinct ports, with response rules.
+- `examples/ironbird.toml` - ground plus a real cFS flight computer (CI_LAB 1234, TO_LAB 2234), telemetry header time in the cFE epoch.
+- `examples/mock.toml` - ironbird-vs-ironbird on distinct ports, with response rules, telemetry header time in Unix seconds.
 - `examples/headers/*.toml` - header profiles (bit widths, fixed/computed fields, checksum).
 - `examples/ccdd/*.json` - placeholder CCDD JSON (`ironbird-ccdd/0`).
 
