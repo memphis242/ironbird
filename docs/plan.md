@@ -3088,12 +3088,20 @@ As built (where the build differs from, or settles, the text above)
      scope opened since the block began is still open, so an inner scope can never lift it.
   3. What a signal replaced. When a held scope ends while an exception leaves it (its body raised,
      or a cleanup passes `unwinding=` the exception its `__exit__` runs for), the `Interrupted` that
-     the handler raises records that exception in `replaced`. `_run` ledgers and shows that one
-     failure besides the interruption (an `IronbirdError` as it is, anything else as `IB-INT-001`
-     with its traceback) and nothing from the `__context__` chain, so an error handled on purpose
-     when the signal arrived (the `replay --follow` head-wait retry) is not reported, and nothing is
-     reported twice. `ib export` records `export.stop` with reason `error` when the replaced failure
-     is an `IronbirdError`.
+     the handler raises records that exception in `replaced`. A plain step scope (a temporary
+     created, a rename) raises a raw `OSError`, `Collision` or `SyncAfterCommit` that the code one
+     level up maps to its error, so that code wraps itself in `sigmask.naming_replaced(mapper)`,
+     which passes `replaced` through the same mapping: `write_to_file` and `write_to_directory` name
+     `IB-EXP-001` or `IB-EXP-002`, `repair` `IB-REC-001`, and a committed output whose only trouble
+     was the directory sync (a warning without a signal) names nothing; the recovery steps of
+     retention (the prune command runs them in the main thread) handle such a failure themselves
+     (the session is protected, a message says so) and name nothing. `_run` ledgers and shows the
+     one failure that is named besides the interruption (an `IronbirdError` as it is, anything else
+     as `IB-INT-001` with its traceback) and nothing from the `__context__` chain, so an error
+     handled on purpose when the signal arrived (the `replay --follow` head-wait retry) is not
+     reported, and nothing is reported twice. `ib export` records `export.stop` with reason `error`
+     whenever a failure is shown that way, `interrupted` otherwise. `signals_held` restores the mask
+     before it asserts the scope order.
   On NFS, which has no `RENAME_NOREPLACE`, a regular file takes the hard-link path (link, then unlink
   of the old name); the placeholder path applies to directory exports and to file systems without
   hard links, and a held signal never leaves the empty placeholder at the final name. `ENOENT` from
@@ -3118,7 +3126,9 @@ As built (where the build differs from, or settles, the text above)
   (`test_replay_cli.py`), the replaced, unexpected and handled failure under a signal in `_run`, the
   in-process rename with a signal and the directory sync after it, the lost and the failed unlink of
   a link commit, the leftover paths of retirement, recovery and salvage (`test_ledger_store.py`,
-  `test_ledger_recovery.py`), and `test_sigmask.py` (`replaced`, `unwinding`, `Hold`).
+  `test_ledger_recovery.py`), and `test_sigmask.py` (`replaced`, `unwinding`, `Hold`, `naming_replaced`, the order assert), and
+  `test_signal_replaced.py` (the replaced failure of each step named as the error without a signal, for
+  export, repair and recovery) with the CLI cases in `test_export_cli.py`.
 - Deferred: arrays of structs (D11); a filter operator over number arrays (`contains`, indexing); TOML
   arrays in response rules; `--allow-count-mismatch` has no counterpart in `respond` (a reply rule with a wrong count is refused); a real-cFS case
   against MD's dwell packet; the `ib_test` gcc 8 (EL8) build is covered by CI only. Signals: the
@@ -3127,6 +3137,13 @@ As built (where the build differs from, or settles, the text above)
   but a held scope inside a running loop does not stop the handler from running in it. An `fstat`
   failure on a held temporary inside `TempOutput._discard` at `__exit__` raises a bare `OSError` and
   keeps the file unreported (`TempOutput` has no `leftover` like `TempDirOutput`).
+- Deferred (signals): in the failed-cleanup case the ledger has `export.stop` with reason `error` before
+  the `IB-EXP-001` record (the replaced failure is ledgered by `_run` after the command's `finally`).
+- Deferred (signals): `test_replay_cli.py::test_a_signal_ends_a_replay_that_is_blocked_on_a_reader_that_never_reads`
+  fails under extreme load (40 CPU burners) with exit -15, also on `main`.
+- Deferred (signals): a signal acted on in a main-thread prune recovery after a rename committed loses the
+  `ledger.recovered` record of that step (the scan is abandoned with the exception); the next scan finds the
+  part under its new name.
 
 ### 2k - Serial transport
 

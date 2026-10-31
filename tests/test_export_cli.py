@@ -1045,6 +1045,83 @@ def test_a_signal_in_the_cleanup_does_not_hide_the_error_that_caused_it(
     assert [e["reason"] for e in _stops(tmp_path)] == ["error"]
 
 
+# Child-side hooks that fail a step that runs in a held scope and not yet in the export's
+# cleanup: ``open_dir``: the directory of the output cannot be opened; ``member_enospc``: the
+# disk is full as the first table is created. Each waits first, so the signal lands as the
+# failure leaves the scope.
+_STEP_FAILURE_HOOKS = """
+import errno, os, time
+from pathlib import Path
+from ironbird import fsops
+WHERE, MARK = os.environ["IB_TEST_WINDOW"], Path(os.environ["IB_TEST_MARK"])
+FS = fsops.FileSystem
+real_dir, real_open = FS.open_dir, FS.open_at
+
+def open_dir(self, path):
+    if WHERE == "open_dir" and "missing" in str(path):
+        MARK.touch()
+        time.sleep(0.5)
+    return real_dir(self, path)
+
+def open_at(self, dir_fd, name, flags, mode=0o600):
+    if WHERE == "member_enospc" and name.endswith(".csv") and flags & os.O_CREAT:
+        MARK.touch()
+        time.sleep(0.5)
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), name)
+    return real_open(self, dir_fd, name, flags, mode)
+
+FS.open_dir, FS.open_at = open_dir, open_at
+"""
+
+
+@pytest.mark.parametrize("signalled", [True, False])
+@pytest.mark.parametrize(("where", "fmt"), [("open_dir", "text"), ("member_enospc", "csv")])
+def test_a_step_that_fails_is_reported_as_the_export_failure_with_or_without_a_signal(
+    tmp_path: Path, env: dict[str, str], where: str, fmt: str, signalled: bool
+) -> None:
+    """A step of the write that fails (the output's directory is missing, the disk is full) is
+    IB-EXP-001 with the advice of that error. A signal that lands as the step's scope ends
+    takes the raw ``OSError`` out of the code that would have mapped it; the user is still
+    shown IB-EXP-001, never an unexpected-exception report, and the ledger agrees."""
+    hk_and_status(tmp_path / "in.ibrec", 3, 2)
+    out, mark = tmp_path / ("missing/out" if where == "open_dir" else "out"), tmp_path / "mark"
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _STEP_FAILURE_HOOKS + CLI_MAIN,
+            "export",
+            str(tmp_path / "in.ibrec"),
+            "--format",
+            fmt,
+            "-o",
+            str(out),
+        ],
+        env={**env, "IB_TEST_WINDOW": where, "IB_TEST_MARK": str(mark)},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        if signalled:
+            deadline = time.monotonic() + 60
+            while not mark.exists():
+                assert proc.poll() is None, "the export ended without reaching the step"
+                assert time.monotonic() < deadline
+                time.sleep(0.002)
+            proc.send_signal(signal.SIGTERM)
+        _, err = proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == (143 if signalled else 1), err
+    assert Code.EXP_WRITE.value in err and Code.INTERNAL.value not in err, err
+    assert ("interrupted" in err) is signalled
+    assert len(_errors(tmp_path, Code.EXP_WRITE)) == 1 and not _errors(tmp_path, Code.INTERNAL)
+    assert [e["reason"] for e in _stops(tmp_path)] == ["error"]
+    assert not out.exists() and temporaries(tmp_path) == []
+
+
 class _Raised(BaseException):
     pass
 
@@ -1201,6 +1278,9 @@ def test_only_a_failure_that_a_signal_replaced_is_reported_with_the_interruption
     for code in (Code.EXP_WRITE, Code.INTERNAL):
         assert bool(_errors(tmp_path, code)) is (code is reported), ledger_events(tmp_path)
         assert (code.value in result.output) is (code is reported)
+    assert [e["reason"] for e in _stops(tmp_path)] == [
+        "interrupted" if reported is None else "error"
+    ]
 
 
 def test_a_reader_that_goes_away_ends_a_stdout_export_quietly(

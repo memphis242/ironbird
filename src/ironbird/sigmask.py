@@ -16,7 +16,8 @@ A held signal that is acted on as a scope ends, while an exception is leaving th
 that exception's place: :attr:`Interrupted.replaced` names it, so the failure can still be
 reported. That is the one way a signal replaces an error here; an exception that code was
 handling on purpose when a signal arrived (a retry that waits in its ``except`` block) is not
-named, because it was not leaving a held scope.
+named, because it was not leaving a held scope. A step's raw failure that code one level up maps
+to its own error is named as that error: that code wraps itself in :func:`naming_replaced`.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from __future__ import annotations
 import contextlib
 import signal
 import threading
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from types import TracebackType
 from typing import Final
 
@@ -87,9 +88,12 @@ def signals_held(*, unwinding: BaseException | None = None) -> Generator[None]:
             replacing = exc
             raise
     finally:
-        assert _DEPTH.open in (outer, outer + 1), "held scopes end in the reverse order they began"
+        ordered = _DEPTH.open in (outer, outer + 1)
         _DEPTH.open = outer
-        _restore(previous, replacing)
+        try:
+            _restore(previous, replacing)  # the mask first, so a failed assert leaves it right
+        finally:
+            assert ordered, "held scopes end in the reverse order they began"
 
 
 def _restore(previous: Iterable[int], replacing: BaseException | None) -> None:
@@ -100,6 +104,28 @@ def _restore(previous: Iterable[int], replacing: BaseException | None) -> None:
     except Interrupted as raised:
         if raised.replaced is None and replacing is not raised:
             raised.replaced = replacing
+        raise
+
+
+@contextlib.contextmanager
+def naming_replaced(
+    name: Callable[[BaseException], BaseException | None],
+) -> Generator[None]:
+    """Let the code that maps a raw failure to its error name it for a signal too.
+
+    A step that runs in a held scope raises its raw failure (an ``OSError``) out of the scope,
+    and the code one level up maps it to the error the user is shown. A signal acted on as the
+    scope ends takes the failure's place before that code sees it, so an :class:`Interrupted`
+    leaving this block has its :attr:`~Interrupted.replaced` passed through ``name``, which
+    returns the exception the failure would have become without the signal (``None``: it would
+    not have been an error, or none to report). ``name`` returns an exception it does not
+    know unchanged, and does not raise.
+    """
+    try:
+        yield
+    except Interrupted as stop:
+        if stop.replaced is not None:
+            stop.replaced = name(stop.replaced)
         raise
 
 

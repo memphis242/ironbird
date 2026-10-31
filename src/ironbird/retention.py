@@ -47,6 +47,7 @@ from ironbird.fsops import (
     try_stat_at,
 )
 from ironbird.ledgerstore import NAME_TRIES, part_name
+from ironbird.sigmask import naming_replaced
 from ironbird.units import MIB, format_size
 
 MAX_ENTRIES: Final = 100_000
@@ -793,18 +794,29 @@ def recover_directory(
         return False
     changed = False
     try:
-        for session in sorted(scan.sessions.values(), key=lambda s: s.id):
-            if control is not None and control.stop.is_set():
-                break
-            if session.id in live or session.id == own_session:
-                continue
-            if not (session.reserves or session.damaged):
-                continue
-            ctx = RecoveryContext(fs, dir_fd, scan, session, control=control, on_record=on_record)
-            changed |= _recover_session(ctx)
+        with naming_replaced(_not_a_failure):
+            for session in sorted(scan.sessions.values(), key=lambda s: s.id):
+                if control is not None and control.stop.is_set():
+                    break
+                if session.id in live or session.id == own_session:
+                    continue
+                if not (session.reserves or session.damaged):
+                    continue
+                ctx = RecoveryContext(
+                    fs, dir_fd, scan, session, control=control, on_record=on_record
+                )
+                changed |= _recover_session(ctx)
     finally:
         close_quietly(fs, dir_fd)
     return changed
+
+
+def _not_a_failure(replaced: BaseException) -> BaseException | None:
+    """What a signal that took the place of a raw file-system failure of a recovery step is
+    reported as: nothing. Each step handles such a failure itself (the session is protected and
+    a message says so) and the scan ends with the signal; the reserve is either untouched or
+    renamed whole, and the next scan finds it as it is."""
+    return None if isinstance(replaced, OSError) else replaced
 
 
 def _recover_session(ctx: RecoveryContext) -> bool:

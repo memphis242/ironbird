@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Final
 
@@ -26,7 +27,7 @@ from ironbird.recording.format import RecordType
 from ironbird.recording.reader import Damage, Item, RecordingReader
 from ironbird.retention import is_managed_name
 from ironbird.sanitize import clean
-from ironbird.sigmask import Hold
+from ironbird.sigmask import Hold, naming_replaced
 
 MAX_FINDINGS: Final = 100
 MAX_HOLES: Final = 1000  # holes kept for display; the count covers them all
@@ -592,7 +593,10 @@ def repair(
         sync_warning: str | None = None
         leftover: str | None = None
         try:
-            with TempOutput(output, force=force, fs=fs) as out:
+            with (
+                naming_replaced(partial(_replaced_repair_failure, output, force)),
+                TempOutput(output, force=force, fs=fs) as out,
+            ):
                 _copy(reader, out, prefix_end)
                 out.write(suffix)
                 try:
@@ -602,33 +606,51 @@ def repair(
                     sync_warning = left.sync_error
                 except SyncAfterCommit as sync:
                     sync_warning = sync.strerror or "directory sync failed"  # renamed all the same
-        except Locked as exc:
-            raise IronbirdError(
-                Code.REC_CREATE,
-                f"{output} is in use by another process (it holds a lock on it); it was not "
-                "replaced, choose another output",
-                cause=exc,
-            ) from exc
-        except Collision as exc:
-            raise IronbirdError(
-                Code.REC_CREATE,
-                f"{output} is not a regular file; --force replaces only a regular file"
-                if force
-                else f"{output} appeared while repairing; it was not replaced (pass --force)",
-                cause=exc,
-            ) from exc
         except OSError as exc:
-            raise IronbirdError(
-                Code.REC_CREATE,
-                f"cannot write the repaired recording {output}: {exc.strerror or exc}",
-                cause=exc,
-            ) from exc
+            raise _repair_failure(output, exc, force) from exc
         dropped = size - prefix_end if damage is not None else 0  # a clean file's index is rebuilt
         return RepairResult(
             output, frames, prefix_end, total, dropped, damage, beyond, sync_warning, leftover
         )
     finally:
         reader.close()
+
+
+def _repair_failure(output: Path, exc: OSError, force: bool) -> IronbirdError:
+    """The ``IB-REC-001`` for a failed write of the repaired recording."""
+    if isinstance(exc, Locked):
+        return IronbirdError(
+            Code.REC_CREATE,
+            f"{output} is in use by another process (it holds a lock on it); it was not "
+            "replaced, choose another output",
+            cause=exc,
+        )
+    if isinstance(exc, Collision):
+        return IronbirdError(
+            Code.REC_CREATE,
+            f"{output} is not a regular file; --force replaces only a regular file"
+            if force
+            else f"{output} appeared while repairing; it was not replaced (pass --force)",
+            cause=exc,
+        )
+    return IronbirdError(
+        Code.REC_CREATE,
+        f"cannot write the repaired recording {output}: {exc.strerror or exc}",
+        cause=exc,
+    )
+
+
+def _replaced_repair_failure(
+    output: Path, force: bool, replaced: BaseException
+) -> BaseException | None:
+    """What the failure ``replaced`` (raw, from a held step of the write) is reported as when a
+    signal took its place: what :func:`repair` raises for it without the signal, ``None`` for a
+    committed output whose only trouble is a warning."""
+    if isinstance(replaced, SyncAfterCommit):
+        return None
+    if isinstance(replaced, OSError):
+        return _repair_failure(output, replaced, force)
+    return replaced
 
 
 def _refuse_same_file(source: Path, output: Path) -> None:

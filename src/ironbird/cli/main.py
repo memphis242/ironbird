@@ -692,6 +692,15 @@ def _usage_error(
     return None
 
 
+def _shown_replacement(stop: BaseException) -> Exception | None:
+    """The failure that ``stop`` (a signal's exception) replaced and that is reported with the
+    interruption (see :func:`_report_replaced`), if any."""
+    replaced = stop.replaced if isinstance(stop, Interrupted) else None
+    if isinstance(replaced, Exception) and not isinstance(replaced, typer.Exit):
+        return replaced
+    return None
+
+
 def _report_replaced(stop: BaseException, ledger: Ledger, console: Console, verbose: bool) -> None:
     """Ledger and show the failure that a signal's exception replaced, if it replaced one.
 
@@ -701,8 +710,8 @@ def _report_replaced(stop: BaseException, ledger: Ledger, console: Console, verb
     arrived is not one, and neither is anything on the ``__context__`` chain. An
     :class:`IronbirdError` is reported as it is; any other exception as ``IB-INT-001`` with its
     traceback, as it would have been without the signal."""
-    replaced = stop.replaced if isinstance(stop, Interrupted) else None
-    if replaced is None or not isinstance(replaced, Exception) or isinstance(replaced, typer.Exit):
+    replaced = _shown_replacement(stop)
+    if replaced is None:
         return
     if isinstance(replaced, IronbirdError):
         error = replaced
@@ -2553,8 +2562,8 @@ def export_command(
             ending = "error"
             return _rec_failure(ledger, console, run, exc)
         except Interrupted as stop:
-            if isinstance(stop.replaced, IronbirdError):
-                ending = "error"  # the signal landed in the cleanup of a failure; _run reports it
+            if _shown_replacement(stop) is not None:
+                ending = "error"  # a failure the signal replaced; _run reports it
             raise
         finally:
             if replaying is not None:

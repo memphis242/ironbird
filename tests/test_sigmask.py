@@ -10,7 +10,8 @@ from collections.abc import Iterable, Iterator
 
 import pytest
 
-from ironbird.sigmask import HANDLED_SIGNALS, Hold, Interrupted, signals_held
+from ironbird import sigmask
+from ironbird.sigmask import HANDLED_SIGNALS, Hold, Interrupted, naming_replaced, signals_held
 
 pytestmark = pytest.mark.skipif(
     threading.current_thread() is not threading.main_thread(),
@@ -148,3 +149,45 @@ def test_a_hold_is_never_begun_inside_an_inner_held_scope() -> None:
     with Hold() as hold, signals_held(), pytest.raises(AssertionError):
         hold.begin()  # the inner scope would end first and lift the hold
     assert not hold.begun and _mask() == before
+
+
+@pytest.mark.skipif(not __debug__, reason="the order is asserted")
+def test_scopes_ended_out_of_order_restore_the_mask_before_the_assertion_fails() -> None:
+    before = _mask()
+    with pytest.raises(AssertionError, match="reverse order"), signals_held():
+        sigmask._DEPTH.open += 2  # as if scopes opened inside this one were still open
+    assert _mask() == before, "restored first: a failed assertion does not leave signals blocked"
+    assert sigmask._DEPTH.open == 0
+
+
+def test_a_signal_that_replaces_a_failure_is_named_as_the_error_its_mapper_makes_of_it(
+    raising_hup: list[int],
+) -> None:
+    raw = OSError("raw")
+    mapped = ValueError("mapped")
+
+    def name(replaced: BaseException) -> BaseException | None:
+        return mapped if replaced is raw else None
+
+    with pytest.raises(_Raised) as caught, naming_replaced(name), signals_held():
+        _hup()
+        raise raw
+    assert caught.value.replaced is mapped
+
+    with pytest.raises(_Raised) as caught, naming_replaced(name), signals_held():
+        _hup()
+        raise ValueError("another")
+    assert caught.value.replaced is None  # the mapper's answer: nothing to report
+
+
+def test_naming_replaced_leaves_alone_what_replaced_nothing_and_ordinary_failures(
+    raising_hup: list[int],
+) -> None:
+    def name(_replaced: BaseException) -> BaseException | None:
+        raise AssertionError("asked about a signal that replaced nothing")
+
+    with pytest.raises(_Raised) as caught, naming_replaced(name), signals_held():
+        _hup()
+    assert caught.value.replaced is None
+    with pytest.raises(KeyError), naming_replaced(name):
+        raise KeyError("not a signal")
