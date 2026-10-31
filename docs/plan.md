@@ -3453,6 +3453,13 @@ Decided by the user (2026-10-30, later):
    category priority, with category filter presets), a dedicated **Events** page showing
    only events from all nodes (node, time, app, event id, type/severity, message), hold /
    pause / stop, error status line + details pane, ledger viewer.
+   **UI design comes before feature work and is led by the user.** When Stage 3 is about
+   to begin, stop and bring the UI design to the user. The process: the user proposes a
+   starting point; Claude designs three variants, shown as screenshots, an HTML page or a
+   Claude artifact; the user picks and refines; repeat. Order of passes: (1) base colors,
+   highlights and rough layout; (2) individual UI elements and their behaviour;
+   (3) navigational flow; (4) final touches. Follow the `gui-principles` skill. TUI feature
+   work starts only after the user signs off the design.
 4. TUI command composer with tiered search and argument entry.
 5. Send modes: scheduled at T, repeat N, every M ms/s until T or for duration.
 6. xlsx export, optional semantic search (local sentence-transformer as an extra),
