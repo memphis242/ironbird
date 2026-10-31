@@ -858,6 +858,71 @@ def test_replay_cli_writes_every_line_at_the_target_rate(replay_file: Path, tmp_
     assert lines == REPLAY_FRAMES and lines / took >= TARGET_PPS
 
 
+# -- export --
+
+EXPORT_OVERHEAD_RATIO = 2.5  # export (decode + format + write) vs. the bare reader + decode
+
+
+@needs_a_quiet_host
+def test_export_writes_every_row_at_the_target_rate_in_every_format(
+    replay_file: Path, tmp_path: Path
+) -> None:
+    """Reading, decoding, formatting and writing a file: CSV tables, text lines and JSON records,
+    each to a real temporary file that is committed at the end."""
+    from exportutil import export_in_process
+    from ironbird.recording.export import ExportFormat
+    from ironbird.recording.reader import RecordingReader
+    from replayutil import mock_codec
+
+    codec = mock_codec()
+    start = time.perf_counter()
+    with RecordingReader(replay_file) as reader:
+        for item in reader.frames():
+            assert not isinstance(codec.decode(item.stream.kind, item.data), DecodeErrorType)
+    bare = time.perf_counter() - start
+    rates = {}
+    for fmt_ in ExportFormat:
+        out = tmp_path / f"out-{fmt_.value}"
+        start = time.perf_counter()
+        result, _ = export_in_process(replay_file, out, fmt_)
+        took = time.perf_counter() - start
+        assert result.rows == REPLAY_FRAMES
+        rates[fmt_.value] = REPLAY_FRAMES / took
+        if fmt_ is ExportFormat.CSV:
+            assert took <= bare * EXPORT_OVERHEAD_RATIO
+    print(
+        f"\nexport {rates['csv']:,.0f} rows/s as CSV tables, {rates['text']:,.0f} as text, "
+        f"{rates['jsonl']:,.0f} as JSON Lines; the bare read + decode is "
+        f"{REPLAY_FRAMES / bare:,.0f} frames/s"
+    )
+    assert min(rates.values()) >= TARGET_PPS * 1.5  # the design target leaves most of a core free
+
+
+@needs_a_quiet_host
+def test_export_cli_writes_a_csv_directory_at_the_target_rate(
+    replay_file: Path, tmp_path: Path
+) -> None:
+    """The whole command: start-up, definitions, read, decode, CSV, sync and commit."""
+    from recutil import CLI_MAIN
+    from replayutil import child_env
+
+    out = tmp_path / "tables"
+    start = time.perf_counter()
+    done = subprocess.run(
+        [sys.executable, "-c", CLI_MAIN, "export", str(replay_file), "-o", str(out)],
+        capture_output=True,
+        text=True,
+        env=child_env(tmp_path),
+        check=False,
+        timeout=300,
+    )
+    took = time.perf_counter() - start
+    rows = sum(p.read_bytes().count(b"\n") - 1 for p in out.iterdir())
+    print(f"\nib export: {rows:,} rows in {took:.2f} s, {rows / took:,.0f} rows/s")
+    assert done.returncode == 0, done.stderr
+    assert rows == REPLAY_FRAMES and rows / took >= TARGET_PPS
+
+
 # -- the serial run that enforces the guards above --
 
 WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"

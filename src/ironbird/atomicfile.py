@@ -2,7 +2,7 @@
 
 :func:`rename_noreplace` is the one rename of the ledger (a retired reserve), of reserve
 recovery and of the temporary commit below: an existing file is never replaced. An output file
-(a repaired recording, later an export) is first written to ``.<final name>.<16 hex>.tmp`` in
+(a repaired recording, an export) is first written to ``.<final name>.<16 hex>.tmp`` in
 the final name's directory, created ``O_EXCL``, then synced and committed by
 :func:`rename_noreplace`, so a final name that appeared meanwhile is never overwritten. The only
 replacement is an explicit ``force`` over an existing regular file owned by the caller. A failure
@@ -20,12 +20,15 @@ import errno
 import fcntl
 import os
 import stat
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
 from ironbird.fsops import (
     INSPECT_FLAGS,
+    OPEN_DIR_FLAGS,
     REAL_FS,
     FileSystem,
     close_quietly,
@@ -299,3 +302,190 @@ class TempOutput:
         finally:
             close_quietly(fs, self.fd)
             close_quietly(fs, self._dir_fd)
+
+
+@dataclass(slots=True)
+class _Member:
+    name: str
+    ident: tuple[int, int]  # (st_dev, st_ino) of the file this process created
+    fd: int = -1  # -1: closed (evicted, or never needed again)
+
+
+class TempDirOutput:
+    """A directory of files being written under a temporary name, to be committed to ``final``.
+
+    Use as ``with TempDirOutput(final) as out:``, ``member = out.create("a.csv")``,
+    ``out.write(member, data)``, then ``out.commit()``. The directory is created as
+    ``.<final name>.<16 hex>.tmp`` (mode 0700) beside ``final`` and every member inside it is
+    created ``O_EXCL``; ``commit`` syncs the members and the directory and renames the directory
+    to ``final`` without replacing anything, so a ``final`` that appeared meanwhile is refused
+    (:class:`Collision`) and an existing directory is never replaced, ``--force`` or not.
+
+    Only ``max_open`` members hold a descriptor at a time; a member whose descriptor was given up
+    is appended to again through a descriptor that is checked to denote the file this process
+    created. Leaving the block without a commit removes the members this process created (by
+    name, after checking that the name still denotes the file created) and then the directory
+    with ``rmdir``; anything else inside is left alone, and the directory with it
+    (:attr:`leftover` names it).
+    """
+
+    def __init__(self, final: Path, *, fs: FileSystem = REAL_FS, max_open: int = 64) -> None:
+        assert max_open >= 1
+        self.final = final
+        self.name = ""
+        self.leftover: str | None = None  # the temporary directory, when it could not be removed
+        self._fs = fs
+        self._max_open = max_open
+        self._parent_fd = -1
+        self._dir_fd = -1
+        self._members: list[_Member] = []
+        self._by_name: set[str] = set()
+        self._open: OrderedDict[int, None] = OrderedDict()  # members with a descriptor, LRU first
+        self._committed = False
+
+    def __enter__(self) -> TempDirOutput:
+        fs = self._fs
+        self._parent_fd = fs.open_dir(self.final.parent)
+        try:
+            for _ in range(8):
+                name = f".{self.final.name}.{os.urandom(8).hex()}.tmp"
+                try:
+                    fs.mkdir_at(self._parent_fd, name, 0o700)
+                except FileExistsError:
+                    continue
+                self.name = name
+                break
+            else:
+                raise OSError(errno.EEXIST, "no free temporary name", str(self.final.parent))
+            self._dir_fd = fs.open_at(self._parent_fd, name, OPEN_DIR_FLAGS | os.O_NOFOLLOW)
+            named = try_stat_at(fs, self._parent_fd, name)
+            if named is None or not same_file(fs.fstat(self._dir_fd), named):
+                raise OSError(errno.EIO, "the temporary directory was replaced", name)
+        except BaseException:
+            self._discard()
+            close_quietly(fs, self._dir_fd)
+            close_quietly(fs, self._parent_fd)
+            raise
+        return self
+
+    @property
+    def path(self) -> Path:
+        return self.final.parent / self.name
+
+    def create(self, name: str) -> int:
+        """Create the member ``name`` (a bare file name) exclusively and return its handle."""
+        assert name and "/" not in name and name not in (".", "..")
+        assert name not in self._by_name, "a member is created once"
+        fs = self._fs
+        self._make_room()
+        fd = fs.open_at(self._dir_fd, name, _NAME_FLAGS, 0o600)
+        try:
+            made = fs.fstat(fd)
+        except OSError:
+            close_quietly(fs, fd)
+            raise
+        member = _Member(name, (made.st_dev, made.st_ino), fd)
+        self._members.append(member)
+        self._by_name.add(name)
+        handle = len(self._members) - 1
+        self._open[handle] = None
+        return handle
+
+    def write(self, handle: int, data: bytes | bytearray | memoryview) -> None:
+        member = self._members[handle]
+        if member.fd < 0:
+            self._reopen(handle)
+        else:
+            self._open.move_to_end(handle)
+        view = memoryview(data)
+        while view:
+            written = self._fs.write(member.fd, view)
+            if written <= 0:
+                raise OSError(errno.EIO, "write made no progress", member.name)
+            view = view[written:]
+
+    def _make_room(self) -> None:
+        while len(self._open) >= self._max_open:
+            oldest, _ = self._open.popitem(last=False)
+            member = self._members[oldest]
+            close_quietly(self._fs, member.fd)
+            member.fd = -1
+
+    def _reopen(self, handle: int) -> None:
+        fs, member = self._fs, self._members[handle]
+        self._make_room()
+        flags = (
+            os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+        )
+        fd = fs.open_at(self._dir_fd, member.name, flags)  # append to a file this process made
+        try:
+            now = fs.fstat(fd)
+            if (now.st_dev, now.st_ino) != member.ident or not stat.S_ISREG(now.st_mode):
+                raise OSError(
+                    errno.EIO, "the member no longer denotes the file created", member.name
+                )
+        except OSError:
+            close_quietly(fs, fd)
+            raise
+        member.fd = fd
+        self._open[handle] = None
+
+    def commit(self) -> None:
+        """Sync every member and the directory, then give the directory its final name. An
+        existing name is refused (:class:`Collision`), whatever it is."""
+        fs = self._fs
+        for member in self._members:
+            if member.fd >= 0:
+                fs.fdatasync(member.fd)
+                continue
+            fd = fs.open_at(self._dir_fd, member.name, INSPECT_FLAGS)
+            try:
+                now = fs.fstat(fd)
+                if (now.st_dev, now.st_ino) != member.ident:
+                    raise OSError(errno.EIO, "the member changed", member.name)
+                fs.fdatasync(fd)
+            finally:
+                close_quietly(fs, fd)
+        for member in self._members:
+            close_quietly(fs, member.fd)
+            member.fd = -1
+        self._open.clear()
+        fs.fsync(self._dir_fd)
+        try:
+            rename_noreplace(self._parent_fd, self.name, self.final.name, self._dir_fd, fs=fs)
+        except SyncAfterCommit:
+            self._committed = True  # renamed; only the directory sync failed
+            raise
+        self._committed = True
+
+    def _discard(self) -> None:
+        """Remove what this process created: its members, then the (then empty) directory."""
+        fs = self._fs
+        if not self.name:
+            return
+        if self._dir_fd >= 0:
+            named = try_stat_at(fs, self._parent_fd, self.name)
+            if named is None or not same_file(fs.fstat(self._dir_fd), named):
+                return  # the name no longer denotes the directory made; not ours to remove
+            for member in self._members:
+                found = try_stat_at(fs, self._dir_fd, member.name)
+                if found is not None and (found.st_dev, found.st_ino) == member.ident:
+                    with contextlib.suppress(OSError):
+                        fs.unlink_at(self._dir_fd, member.name)  # a file this process created
+        try:
+            fs.rmdir_at(self._parent_fd, self.name)  # fails, harmlessly, if anything is left
+        except FileNotFoundError:
+            pass
+        except OSError:
+            self.leftover = self.name
+
+    def __exit__(self, *exc_info: object) -> None:
+        fs = self._fs
+        try:
+            if not self._committed:
+                self._discard()
+        finally:
+            for member in self._members:
+                close_quietly(fs, member.fd)
+            close_quietly(fs, self._dir_fd)
+            close_quietly(fs, self._parent_fd)

@@ -40,7 +40,13 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
     # the confirmed prune
     ("prune.py", "removal"): {"_delete_session"},
     # a process's own temporary file on its failure path; the second step of rename_noreplace
-    ("atomicfile.py", "removal"): {"_link", "_placeholder_rename", "TempOutput.__exit__"},
+    # (a directory export's own members and temporary directory, by name after an inode check)
+    ("atomicfile.py", "removal"): {
+        "_link",
+        "_placeholder_rename",
+        "TempOutput.__exit__",
+        "TempDirOutput._discard",
+    },
     ("atomicfile.py", "rename"): {"_link", "_placeholder_rename", "TempOutput.commit"},
     # recovery: completing an interrupted rename, cutting a reserve at its last record
     ("retention.py", "removal"): {"_complete_interrupted_rename"},
@@ -67,8 +73,10 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
     ("ledgerstore.py", "overwrite"): {"LedgerStore._pwrite_all"},
     ("retnotices.py", "overwrite"): {"Notices._transaction"},
     ("ledger.py", "overwrite"): {"Ledger._append_final"},
-    # a salvage's own leftover temporary file, picked up again and appended to (checked first)
-    ("atomicfile.py", "overwrite"): {"TempOutput._adopt"},
+    # a salvage's own leftover temporary file, picked up again and appended to (checked first);
+    # a directory export's member whose descriptor was given up, appended to again (the inode is
+    # checked against the one created)
+    ("atomicfile.py", "overwrite"): {"TempOutput._adopt", "TempDirOutput._reopen"},
     # attribute lookups by a computed name on the program's own record types
     ("config.py", "dynamic"): {"parse_config"},
     ("frame.py", "dynamic"): {"Frame._replace"},

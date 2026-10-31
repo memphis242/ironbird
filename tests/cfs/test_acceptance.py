@@ -978,3 +978,83 @@ def test_replaying_a_live_recording_selects_exactly_what_was_sent(
     assert len(everything.stdout.splitlines()) == json.loads(info.stdout)["frames"] > 0
     undecoded = replay("--where", "status != ok")  # what a live listen would have hidden
     assert undecoded.returncode == 0, undecoded.stderr
+
+
+# -- stage 2h: export a recording of a live session -----------------------------------------
+
+EXPORT_NOOPS = 3
+
+
+def test_exporting_a_live_recording_counts_the_noops_and_matches_rec_info(
+    ground: Ground, tmp_path: Path
+) -> None:
+    """Record a session in which SAMPLE_APP is reset, sent K NOOPs (each followed by a housekeeping
+    request) and reset again, then export it to CSV: in ``SAMPLE_APP_HK.csv`` the CommandCounter
+    rises by exactly K across the NOOPs and is back to 0 after the second reset, and the table has
+    as many rows as ``ib rec info`` counts for the MID."""
+    import csv
+
+    config = tmp_path / "ironbird.toml"
+    examples = REPO / "examples"
+    text = CONFIG.read_text().replace('"ccdd/', f'"{examples}/ccdd/')
+    text = text.replace('"headers/', f'"{examples}/headers/')
+    config.write_text(text + "\n[recording]\nmin_free_bytes = 0\n")
+    out = tmp_path / "export-live.ibrec"
+    env = {**ground.env, "IRONBIRD_CONFIG": str(config), "IRONBIRD_STATE_DIR": str(tmp_path / "s")}
+    ib = [sys.executable, "-m", "ironbird.cli.main"]
+    err_path = tmp_path / "record.stderr"
+    with ground.listener_paused(), err_path.open("w") as err:  # one process owns UDP 2234
+        recorder = subprocess.Popen([*ib, "record", "-o", str(out), "--quiet"], stderr=err, env=env)
+        try:
+            deadline = time.monotonic() + 15
+            while "listening" not in err_path.read_text():
+                assert recorder.poll() is None, err_path.read_text()
+                assert time.monotonic() < deadline, "ib record never reported it was listening"
+                time.sleep(0.05)
+            ground.send("SAMPLE_APP_RESET_COUNTERS")
+            time.sleep(0.5)
+            ground.send("SAMPLE_APP_SEND_HK")
+            time.sleep(0.5)
+            for _ in range(EXPORT_NOOPS):
+                ground.send("SAMPLE_APP_NOOP")
+                time.sleep(0.5)
+                ground.send("SAMPLE_APP_SEND_HK")
+                time.sleep(0.5)
+            ground.send("SAMPLE_APP_RESET_COUNTERS")
+            time.sleep(0.5)
+            ground.send("SAMPLE_APP_SEND_HK")
+            time.sleep(1.0)
+        finally:
+            recorder.send_signal(signal.SIGINT)
+            code = recorder.wait(timeout=20)
+    assert code == 128 + signal.SIGINT, err_path.read_text()
+
+    tables = tmp_path / "tables"
+    done = subprocess.run(
+        [*ib, "export", str(out), "-o", str(tables)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    with (tables / "SAMPLE_APP_HK.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    counters = [int(r["CommandCounter"]) for r in rows]
+    assert max(counters) == EXPORT_NOOPS and counters[-1] == 0, counters
+    first_seen = [counters.index(n) for n in range(EXPORT_NOOPS + 1)]  # 0, 1, ..., K in order
+    assert first_seen == sorted(first_seen), counters
+    info = subprocess.run(
+        [*ib, "rec", "info", str(out), "--format", "json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert info.returncode == 0, info.stderr
+    by_mid = {m["mid"]: m["count"] for m in json.loads(info.stdout)["mids"]}
+    assert len(rows) == by_mid[int(rows[0]["mid"], 16)] > 0
+    # every decoded frame of the recording is in exactly one table
+    total = sum(sum(1 for _ in csv.reader(p.open(newline=""))) - 1 for p in tables.iterdir())
+    assert total == json.loads(info.stdout)["frames"]
