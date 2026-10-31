@@ -65,6 +65,7 @@ def test_a_salvage_whose_set_aside_name_is_taken_copies_nothing_on_any_scan(stat
     reserve = damaged_reserve(state)
     taken = state / f"{reserve.name}.damaged"
     taken.write_bytes(b"user data")
+    os.utime(taken, (NOW - 3 * DAY, NOW - 3 * DAY))  # idle: the session is not live
     for i in range(3):
         result = scan(state)
         assert result.messages and "already exists" in result.messages[0], i
@@ -82,16 +83,16 @@ def test_a_salvage_on_a_full_disk_sets_the_original_aside_once_and_ledgers_it(
     first = scan(state, fs)
     damaged = state / f"{reserve.name}.damaged"
     assert damaged.read_bytes() == before and not reserve.exists()
-    (recovery,) = first.recoveries  # ledger.recovered is written even when the copy failed
+    (recovery,) = first.incompletes  # ledger.recovery_incomplete is written when the copy fails
     assert recovery["old"] == reserve.name and recovery["new"] is None
     assert recovery["kept"] == 0 and recovery["cut"] == len(before) and recovery["error"]
     assert first.messages and "could not be saved" in first.messages[0]
-    # no torn part, no temporary file left behind, and nothing repeats on later scans
+    # no torn part and no temporary file left behind
     assert not any(n.startswith(".") or ".p0002." in n for n in names(state))
-    for _ in range(2):
-        later = scan(state)
-        assert later.recoveries == [] and later.messages == []
-    assert not any(".p0002." in n for n in names(state))
+    later = scan(state)  # the disk has room again: the copy is finished, once
+    (done,) = later.recoveries
+    assert done["new"] is not None and damaged.read_bytes() == before
+    assert scan(state).recoveries == [] and len([n for n in names(state) if ".p0002." in n]) == 1
 
 
 class Crash(BaseException):
@@ -112,10 +113,14 @@ def test_a_crash_mid_copy_leaves_only_a_dot_temporary_and_the_intact_original(
     (temporary,) = [n for n in found if n.startswith(".")]
     assert temporary.endswith(".tmp") and ".p0002." in temporary
     assert (state / f"{reserve.name}.damaged").read_bytes() == before
-    again = scan(state)  # the next scan: nothing to salvage, nothing is made twice
-    assert again.recoveries == [] and not any(
-        n.endswith(".jsonl") and ".p0002." in n and not n.startswith(".") for n in names(state)
-    )
+    assert scan(state).recoveries == []  # the dead copy's temporary is fresh: the session is live
+    for path in state.iterdir():
+        os.utime(path, (NOW - 3 * DAY, NOW - 3 * DAY))
+    again = scan(state)  # later: the copy is finished from the intact original, once
+    assert len(again.recoveries) == 1
+    assert len([n for n in names(state) if ".p0002." in n and not n.startswith(".")]) == 1
+    assert not any(n.startswith(".") for n in names(state))
+    assert scan(state).recoveries == []
 
 
 def test_a_salvage_copies_the_prefix_through_a_temporary_and_commits_it_once(state: Path) -> None:

@@ -176,9 +176,10 @@ class ConfigFailure(Exception):
 class _Stall(Exception):
     """Internal: an essential record cannot be written right now."""
 
-    def __init__(self, cause: OSError | None, text: str = "") -> None:
+    def __init__(self, cause: OSError | None, text: str = "", *, internal: bool = False) -> None:
         super().__init__(text or str(cause))
         self.cause = cause
+        self.internal = internal  # a bug in ironbird, not a failing disk
         self.text = text or (cause.strerror if cause is not None else "") or "write failed"
         self.errno = cause.errno if cause is not None else None
 
@@ -252,6 +253,7 @@ class LedgerStore:
         self.stalled = False
         self.stall_text = ""
         self.stall_errno: int | None = None
+        self.stall_internal = False  # the stall is a bug in ironbird, not the disk
         self.stall_start = 0.0
         self.in_reserve = False
         self.call_started: float | None = None
@@ -502,7 +504,7 @@ class LedgerStore:
         active = self._active
         if active is not None and not active.is_reserve and active.fd >= 0:
             self._cut_back(active)
-        self._enter_stall(_Stall(None, f"internal error {type(exc).__name__}"))
+        self._enter_stall(_Stall(None, f"internal error {type(exc).__name__}", internal=True))
         self._emit("internal", error=repr(exc))
 
     # -- the write path ----------------------------------------------------------------------
@@ -644,6 +646,7 @@ class LedgerStore:
         self.stalled = True
         self.stall_text = stall.text
         self.stall_errno = stall.errno
+        self.stall_internal = stall.internal
         self._last_attempt = self.clock()
         if first:
             self.stall_start = self.clock()
@@ -697,15 +700,19 @@ class LedgerStore:
             return
         try:
             self._call(self.fs.fdatasync, active.fd)
-        except OSError as exc:
+        except Exception as exc:  # an OSError, or a bug: either way what was written is unconfirmed
             with self._state_lock:
                 self.possibly_lost_tx.merge(self._unsynced_tx)
                 self._unsynced_tx = TxTally()
             self.possibly_lost_records += self._unsynced_records
             self._unsynced_records = 0
             self._dirty = False
-            self._emit("sync_error", errno=exc.errno, text=exc.strerror or str(exc))
-            raise _Stall(exc) from exc
+            if isinstance(exc, OSError):
+                self._emit("sync_error", errno=exc.errno, text=exc.strerror or str(exc))
+                raise _Stall(exc) from exc
+            self._emit("sync_error", errno=None, text=f"internal error {type(exc).__name__}")
+            self._emit("internal", error=repr(exc))
+            raise _Stall(None, f"internal error {type(exc).__name__}", internal=True) from exc
         with self._state_lock:
             self._unsynced_tx = TxTally()
         self._unsynced_records = 0

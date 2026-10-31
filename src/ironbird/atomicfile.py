@@ -20,6 +20,7 @@ import errno
 import fcntl
 import os
 import stat
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Final
 
@@ -34,6 +35,11 @@ from ironbird.fsops import (
 
 _NO_HARD_LINKS: Final = frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV})
 _NAME_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+# An earlier attempt's temporary file, picked up again: read to check it, appended to, never
+# truncated.
+_ADOPT_FLAGS: Final = (
+    os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+)
 
 
 class Collision(OSError):
@@ -145,9 +151,24 @@ class TempOutput:
 
     Use as ``with TempOutput(final, force=...) as out:`` write to ``out.fd``, then
     ``out.commit()``. Leaving the block without a commit removes the temporary file.
+
+    ``reuse`` names temporary files of an earlier, interrupted attempt in the same directory:
+    the first that is a regular file of this user with one link and that ``accept(fd)`` approves
+    (the caller checks its content) is continued instead of creating a new one - appended to
+    through ``out.fd``, committed like any other. A reused file is not ours to delete: leaving
+    the block without a commit keeps it for the next attempt.
     """
 
-    def __init__(self, final: Path, *, force: bool = False, fs: FileSystem = REAL_FS) -> None:
+    def __init__(
+        self,
+        final: Path,
+        *,
+        force: bool = False,
+        fs: FileSystem = REAL_FS,
+        reuse: Sequence[str] = (),
+        accept: Callable[[int], bool] | None = None,
+    ) -> None:
+        assert not reuse or accept is not None, "a reused temporary needs a judge of its content"
         self.final = final
         self.force = force
         self.fd = -1
@@ -155,12 +176,18 @@ class TempOutput:
         self._fs = fs
         self._dir_fd = -1
         self._committed = False
+        self._reuse = tuple(reuse)
+        self._accept = accept
+        self._reused = False
 
     def __enter__(self) -> TempOutput:
         fs = self._fs
         directory = self.final.parent
         self._dir_fd = fs.open_dir(directory)
         try:
+            for candidate in self._reuse:
+                if self._adopt(candidate):
+                    return self
             for _ in range(8):
                 name = f".{self.final.name}.{os.urandom(8).hex()}.tmp"
                 try:
@@ -173,6 +200,30 @@ class TempOutput:
         except BaseException:
             close_quietly(fs, self._dir_fd)
             raise
+
+    def _adopt(self, name: str) -> bool:
+        """Take over ``name`` if it is a plain file of ours that the caller accepts."""
+        fs, accept = self._fs, self._accept
+        assert accept is not None
+        try:
+            fd = fs.open_at(self._dir_fd, name, _ADOPT_FLAGS)
+        except OSError:
+            return False
+        try:
+            st = fs.fstat(fd)
+            usable = (
+                stat.S_ISREG(st.st_mode)
+                and st.st_uid == os.getuid()
+                and st.st_nlink == 1
+                and accept(fd)
+            )
+        except OSError:
+            usable = False
+        if not usable:
+            close_quietly(fs, fd)
+            return False
+        self.fd, self.name, self._reused = fd, name, True
+        return True
 
     @property
     def path(self) -> Path:
@@ -243,7 +294,7 @@ class TempOutput:
     def __exit__(self, *exc_info: object) -> None:
         fs = self._fs
         try:
-            if not self._committed and self.name:
+            if not self._committed and self.name and not self._reused:
                 held, named = fs.fstat(self.fd), try_stat_at(fs, self._dir_fd, self.name)
                 if named is not None and same_file(held, named):
                     with contextlib.suppress(OSError):

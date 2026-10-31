@@ -38,33 +38,55 @@ class WaitBudget:
 
     ``abort`` (when given) is asked every :data:`SLICE_S` during a wait; a true answer ends the
     wait at once (the caller treats it as not finished) and leaves the budget as it was spent.
+    Once it has answered true it keeps answering true (:attr:`aborted`): one signal ends every
+    wait of the exit, not just the one it interrupted.
+
+    A wait may name ``keep`` seconds that it leaves unspent, for the waits that come after it
+    (the ledger's last write and close must not be starved by a scan or a rate limit).
     """
 
     def __init__(self, total_s: float, abort: Callable[[], bool] | None = None) -> None:
         assert total_s >= 0
+        self._total = total_s
         self._left = total_s
         self._abort = abort
+        self.aborted = False
+
+    @property
+    def total(self) -> float:
+        return self._total
 
     @property
     def left(self) -> float:
         return self._left
 
-    def wait(self, event: threading.Event, cap: float | None = None) -> bool:
-        """Wait for ``event`` (at most ``cap`` seconds, if given); ``True`` when it was set."""
-        return self._wait(event.wait, cap)
+    def wait(self, event: threading.Event, cap: float | None = None, keep: float = 0.0) -> bool:
+        """Wait for ``event`` (at most ``cap`` seconds, if given, and leaving ``keep`` seconds of
+        the budget); ``True`` when it was set."""
+        return self._wait(event.wait, cap, keep)
 
-    def join(self, thread: threading.Thread, cap: float | None = None) -> bool:
-        """Wait for ``thread`` to end (at most ``cap`` seconds, if given); ``True`` when it has."""
+    def join(self, thread: threading.Thread, cap: float | None = None, keep: float = 0.0) -> bool:
+        """Wait for ``thread`` to end (at most ``cap`` seconds, if given, and leaving ``keep``
+        seconds of the budget); ``True`` when it has."""
 
         def poll(timeout: float) -> bool:
             thread.join(timeout)
             return not thread.is_alive()
 
-        return self._wait(poll, cap)
+        return self._wait(poll, cap, keep)
 
-    def _wait(self, poll: Callable[[float], bool], cap: float | None = None) -> bool:
+    def _asked_to_stop(self) -> bool:
+        if not self.aborted and self._abort is not None and self._abort():
+            self.aborted = True
+        return self.aborted
+
+    def _wait(
+        self, poll: Callable[[float], bool], cap: float | None = None, keep: float = 0.0
+    ) -> bool:
         start = time.monotonic()
-        limit = self._left if cap is None else min(cap, self._left)
+        limit = 0.0 if self.aborted else max(0.0, self._left - keep)
+        if cap is not None:
+            limit = min(cap, limit)
         try:
             while True:
                 left = limit - (time.monotonic() - start)
@@ -72,7 +94,7 @@ class WaitBudget:
                     return True
                 if left <= 0:
                     return False
-                if self._abort is not None and self._abort():
+                if self._asked_to_stop():
                     return False
         finally:
             self._left = max(0.0, self._left - (time.monotonic() - start))

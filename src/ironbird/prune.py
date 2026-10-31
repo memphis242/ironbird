@@ -205,7 +205,7 @@ def _delete_session(
                 skip("it became live (its lock is held)")
                 return
             # Locks unsupported: freshness and the fstat checks below are what is left.
-        files = sorted(session.files, key=lambda f: (f.number == 1 and not f.is_reserve, -f.number))
+        files = sorted(session.files, key=lambda f: (f.is_part and f.number == 1, -f.number))
         present: list[FileEntry] = []
         for entry in files:
             try:

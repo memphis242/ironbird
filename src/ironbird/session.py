@@ -633,11 +633,25 @@ class Session:
     ) -> Listener:
         """Open a listener for ``peer``. ``where`` is a filter expression (S4) that frames must
         match to be yielded; it is compiled first, so a bad one fails before any socket opens."""
+        route, flt = self.plan_listen(peer, mids=mids, link=link, where=where)
+        return await self._open_listener(route, mids, flt)
+
+    def plan_listen(
+        self,
+        peer: str,
+        *,
+        mids: frozenset[int] | None = None,
+        link: str | None = None,
+        where: str | None = None,
+    ) -> tuple[Route, Filter | None]:
+        """Everything :meth:`listen` decides before it opens a socket: the route and the compiled
+        filter. Raises the usage errors (``IB-CFG-*``, ``IB-FLT-*``) without opening anything or
+        writing a ledger record, so a front end can refuse a bad invocation up front."""
         route = self.route(peer, link_name=link)
         flt = self.compile_filter(where, [route.server.name]) if where is not None else None
         if flt is not None:
             self._require_overlap(flt, mids, "--mid allows")
-        return await self._open_listener(route, mids, flt)
+        return route, flt
 
     def _listen_endpoint(self, route: Route) -> str:
         link = route.link
@@ -726,20 +740,12 @@ class Session:
             if self.codec_for(route.server.name).model.event_messages()
         ]
 
-    async def events(
-        self,
-        nodes: Sequence[str] | None = None,
-        *,
-        min_severity: EventSeverity | None = None,
-        where: str | None = None,
-    ) -> EventStream:
-        """Listen on every telemetry link of ``nodes`` (default: all) for event packets.
-
-        Every received event is ledgered in full; ``min_severity`` and ``where`` (a filter
-        expression, S4, tested on the event's frame) only limit what the stream yields. Nodes
-        whose CCDD defines no event messages are skipped with a notice; if none is left, that
-        is an error.
-        """
+    def plan_events(
+        self, nodes: Sequence[str] | None = None, *, where: str | None = None
+    ) -> tuple[list[Route], dict[str, frozenset[int]], Filter | None]:
+        """Everything :meth:`events` decides before it opens a socket: the routes that carry
+        event telemetry, their event MIDs and the compiled filter. Raises the usage errors
+        without opening anything (see :meth:`plan_listen`)."""
         routes: list[Route] = []
         event_mids: dict[str, frozenset[int]] = {}
         for route in self._event_routes(nodes):
@@ -769,6 +775,23 @@ class Session:
         )
         if flt is not None:
             self._require_overlap(flt, frozenset().union(*event_mids.values()), "events carry")
+        return routes, event_mids, flt
+
+    async def events(
+        self,
+        nodes: Sequence[str] | None = None,
+        *,
+        min_severity: EventSeverity | None = None,
+        where: str | None = None,
+    ) -> EventStream:
+        """Listen on every telemetry link of ``nodes`` (default: all) for event packets.
+
+        Every received event is ledgered in full; ``min_severity`` and ``where`` (a filter
+        expression, S4, tested on the event's frame) only limit what the stream yields. Nodes
+        whose CCDD defines no event messages are skipped with a notice; if none is left, that
+        is an error.
+        """
+        routes, event_mids, flt = self.plan_events(nodes, where=where)
         capture = await self.capture(routes)
         for route in routes:
             self._record_listen_start(route, event_mids[route.server.name], flt)

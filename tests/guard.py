@@ -6,9 +6,13 @@ named.
 Categories: ``removal``, ``rename`` (also link, copy-over, ``Path.replace``, rotating log
 handlers), ``truncation`` (``open`` in a write mode or with a mode the analysis cannot read,
 ``O_TRUNC``, ``ftruncate``), ``overwrite`` (in-place modes such as ``r+``, ``O_RDWR`` or
-``O_WRONLY`` without ``O_EXCL``, ``pwrite``), ``subprocess`` (another program may touch files),
-``dynamic`` (an attribute of ``os``/``shutil``/``pathlib``/``io`` looked up by a computed name,
-``vars()``, ``importlib``, ``__import__``), ``ctypes`` and ``tempfile``.
+``O_WRONLY`` without ``O_EXCL``, ``pwrite``, ``copy_file_range``, ``sendfile``, ``mmap``),
+``subprocess`` (another program may touch files: ``subprocess``, ``multiprocessing``, ``pty``,
+the asyncio subprocess calls, ``exec*``/``spawn*``/``posix_spawn*``, ``fork``), ``dynamic`` (a
+name the analysis cannot follow: an attribute looked up by a computed name on any object,
+``getattr`` of a removal or rename name, ``vars()``, ``__dict__`` of a file module, ``from m import
+*``, ``eval``/``exec``/``compile``/``globals``, ``sys.modules``, ``importlib``, ``__import__``),
+``ctypes`` and ``tempfile``.
 
 Known gaps, reviewed by hand instead (see the plan): a function passed in as a value from outside
 the analysed file, C extensions and third-party code (pyserial in 2k). Nothing here replaces the
@@ -50,6 +54,8 @@ RENAME_ATTRS = {
     "RotatingFileHandler",
     "TimedRotatingFileHandler",
 }
+#: Attributes generic enough to name a field or a method of anything: judged only when called.
+CALL_ONLY_ATTRS = {"rename"}
 TRUNCATE_FUNCS = {"os.truncate", "os.ftruncate"}
 TRUNCATE_ATTRS = {"truncate", "ftruncate", "write_text", "write_bytes"}
 TEMPFILE_NAMES = {"tempfile.NamedTemporaryFile", "tempfile.TemporaryDirectory"}
@@ -63,6 +69,8 @@ OPEN_LIKE = {
     "lzma.open",
     "codecs.open",
     "tarfile.open",
+    "builtins.open",
+    "os.fdopen",
     "zipfile.ZipFile",
     "logging.FileHandler",
     "logging.handlers.WatchedFileHandler",
@@ -70,17 +78,45 @@ OPEN_LIKE = {
 SUBPROCESS_FUNCS = {
     "os.system",
     "os.popen",
-    "os.execv",
-    "os.execve",
-    "os.execvp",
-    "os.execl",
-    "os.execlp",
-    "os.spawnv",
-    "os.spawnl",
-    "os.posix_spawn",
     "os.fork",
     "os.forkpty",
+    "pty.spawn",
+    "pty.fork",
+    "asyncio.create_subprocess_exec",
+    "asyncio.create_subprocess_shell",
+    "concurrent.futures.ProcessPoolExecutor",
+    *(
+        f"os.{name}"
+        for name in (
+            "execl",
+            "execle",
+            "execlp",
+            "execlpe",
+            "execv",
+            "execve",
+            "execvp",
+            "execvpe",
+            "spawnl",
+            "spawnle",
+            "spawnlp",
+            "spawnlpe",
+            "spawnv",
+            "spawnve",
+            "spawnvp",
+            "spawnvpe",
+            "posix_spawn",
+            "posix_spawnp",
+        )
+    ),
 }
+#: Attributes that start a program whatever the object (an event loop's ``subprocess_exec``).
+SUBPROCESS_ATTRS = {"subprocess_exec", "subprocess_shell", "create_subprocess_exec"}
+#: Modules whose import is itself the risk: they start other processes.
+SUBPROCESS_MODULES = {"subprocess", "multiprocessing", "pty"}
+#: Calls that write into a file through a descriptor without a write-mode ``open`` here.
+OVERWRITE_FUNCS = {"os.copy_file_range", "os.sendfile", "os.splice", "mmap.mmap"}
+#: Builtins that run or look up code by a string.
+DYNAMIC_BUILTINS = {"eval", "exec", "compile", "globals", "__import__"}
 DYNAMIC_MODULES = {"os", "shutil", "pathlib", "io", "ctypes", "tempfile"}
 WRITE_FLAGS = {"O_RDWR", "O_WRONLY"}
 PATH_CLASSES = {"pathlib.Path", "pathlib.PurePath", "pathlib.PosixPath", "Path"}
@@ -102,6 +138,7 @@ class _Visitor(ast.NodeVisitor):
         self.stack: list[str] = []
         self.findings: list[Finding] = []
         self._flag_exprs: set[int] = set()  # ids of ``a | b`` nodes already judged as a whole
+        self._callees: set[int] = set()  # ids of the expressions that are being called
 
     # -- imports ----
 
@@ -113,7 +150,7 @@ class _Visitor(ast.NodeVisitor):
             top = alias.name.split(".")[0]
             if top == "ctypes":
                 self.add("ctypes", f"import {alias.name}")
-            if top == "subprocess":
+            if top in SUBPROCESS_MODULES:
                 self.add("subprocess", f"import {alias.name}")
             if alias.name == "importlib" or top == "importlib":
                 self.add("dynamic", f"import {alias.name}")
@@ -123,11 +160,13 @@ class _Visitor(ast.NodeVisitor):
         top = module.split(".")[0]
         if top == "ctypes":
             self.add("ctypes", f"from {module} import ...")
-        if top == "subprocess":
+        if top in SUBPROCESS_MODULES:
             self.add("subprocess", f"from {module} import ...")
         if top == "importlib":
             self.add("dynamic", f"from {module} import ...")
         for alias in node.names:
+            if alias.name == "*":
+                self.add("dynamic", f"from {module} import *")
             self.aliases[alias.asname or alias.name] = f"{module}.{alias.name}"
 
     # -- scopes ----
@@ -172,9 +211,13 @@ class _Visitor(ast.NodeVisitor):
             return "truncation"
         if target in TEMPFILE_NAMES:
             return "tempfile"
-        if target in SUBPROCESS_FUNCS or (target or "").startswith("subprocess."):
+        if (
+            target in SUBPROCESS_FUNCS
+            or attr in SUBPROCESS_ATTRS
+            or (target or "").startswith(("subprocess.", "multiprocessing.", "asyncio.subprocess."))
+        ):
             return "subprocess"
-        if attr == "pwrite" or target == "os.pwrite":
+        if attr == "pwrite" or target in ("os.pwrite", *OVERWRITE_FUNCS):
             return "overwrite"
         return None
 
@@ -184,7 +227,14 @@ class _Visitor(ast.NodeVisitor):
         # References count as well as calls: ``self._call(fs.ftruncate, ...)`` passes the
         # function as a value, and must not escape the guard.
         target = self.dotted(node)
-        if node.attr == "O_TRUNC":
+        if node.attr in CALL_ONLY_ATTRS and id(node) not in self._callees:
+            pass  # a field or a method of some other object, until it is called
+        elif target == "sys.modules" or (
+            node.attr in ("__dict__", "__builtins__")
+            and (target or "").split(".")[0] in DYNAMIC_MODULES
+        ):
+            self.add("dynamic", target or node.attr)
+        elif node.attr == "O_TRUNC":
             self.add("truncation", "O_TRUNC")
         elif node.attr in WRITE_FLAGS and target is not None and target.startswith("os."):
             self._judge_flags(node, {node.attr})
@@ -245,6 +295,7 @@ class _Visitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
+        self._callees.add(id(func))
         target = self.dotted(func)
         attr = func.attr if isinstance(func, ast.Attribute) else None
         if target == "os.open":
@@ -300,6 +351,8 @@ class _Visitor(ast.NodeVisitor):
 
     def _check_dynamic(self, call: ast.Call, target: str | None) -> None:
         func = call.func
+        if isinstance(func, ast.Name) and func.id in DYNAMIC_BUILTINS and func.id != "__import__":
+            self.add("dynamic", func.id)
         if isinstance(func, ast.Name) and func.id in ("getattr", "vars", "__import__"):
             if func.id == "__import__":
                 self.add("dynamic", "__import__")
@@ -308,16 +361,19 @@ class _Visitor(ast.NodeVisitor):
                 module = (origin or "").split(".")[0]
                 if func.id == "vars" and module in DYNAMIC_MODULES:
                     self.add("dynamic", f"vars({origin})")
-                elif func.id == "getattr" and module in DYNAMIC_MODULES:
-                    name = call.args[1] if len(call.args) > 1 else None
-                    constant = isinstance(name, ast.Constant) and isinstance(name.value, str)
-                    if not constant:
-                        self.add("dynamic", f"getattr({origin}, <computed>)")
+                elif func.id == "getattr" and len(call.args) > 1:
+                    # on any object: a name that removes, renames or truncates is judged by what
+                    # it names, a name computed at run time needs a human
+                    name = call.args[1]
+                    shown = origin or "<expression>"
+                    if not (isinstance(name, ast.Constant) and isinstance(name.value, str)):
+                        self.add("dynamic", f"getattr({shown}, <computed>)")
                     else:
-                        assert isinstance(name, ast.Constant)
-                        category = self._classify(f"{origin}.{name.value}", str(name.value))
+                        category = self._classify(
+                            f"{origin}.{name.value}" if origin else None, name.value
+                        )
                         if category is not None:
-                            self.add(category, f"getattr({origin}, {name.value!r})")
+                            self.add(category, f"getattr({shown}, {name.value!r})")
         if target is not None and target.startswith("importlib."):
             self.add("dynamic", target)
 

@@ -42,6 +42,7 @@ from ironbird.errors import Code, IronbirdError
 from ironbird.filter import Filter
 from ironbird.fsops import REAL_FS
 from ironbird.ledger import ExitReport, Ledger, default_state_dir
+from ironbird.notice import Notice
 from ironbird.recording import inspect as rec_inspect
 from ironbird.recording.defs import (
     config_codecs,
@@ -549,6 +550,13 @@ def _apply_ledger_report(code: int, report: ExitReport) -> int:
     return code
 
 
+def _closing_news(report: ExitReport, closing: ExitReport) -> tuple[Notice, ...]:
+    """The exit lines of the final close that the earlier account did not already print (the
+    close may find more unwritten, or fail where the last write attempt did not)."""
+    seen = {notice.summary for notice in report.notices}
+    return tuple(notice for notice in closing.notices if notice.summary not in seen)
+
+
 def _report_ledger(report: ExitReport, run: _Run, console: Console, code: int) -> int:
     """Print the ledger's exit lines (and, with ``--verbose``, the unwritten transmission
     records as JSON lines, so their trace survives in the terminal or CI log)."""
@@ -630,15 +638,37 @@ def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -
             )
         closing = ledger.close()
         ledger.set_notifier(None)
-        if closing.unlogged > report.unlogged or closing.withheld > report.withheld:
-            code = _apply_ledger_report(code, closing)  # a sync error at close; the exit says so
-            for notice in closing.notices:  # and never without its line
-                _late_err(ledger, term(notice.line(verbose=run.verbose), 1000, err=True))
+        code = _apply_ledger_report(code, closing)  # a sync error at close; the exit says so
+        for notice in _closing_news(report, closing):  # and never without its line
+            _late_err(ledger, term(notice.line(verbose=run.verbose), 1000, err=True))
         if not signum and (got := _poll_signal(0)):  # arrived while the ledger was closing
             code = _record_signal(name, got, run, ledger, console, direct=True)
             ledger.close()
         _STATE.restore_default()  # a later signal ends the process by that signal, not silently
     return code
+
+
+def _usage_error(
+    run: _Run, role: str | None, precheck: Callable[[Session], None] | None
+) -> IronbirdError | None:
+    """The usage error (exit 2) that ``precheck`` finds in the invocation, else ``None``.
+
+    The check runs on a session with no ledger and no sockets; any other kind of error is left
+    to the command, which reports and ledgers it."""
+    if precheck is None or run.config is None:
+        return None
+    try:
+        precheck(
+            Session(
+                run.config,
+                role=role,
+                ledger=Ledger(Path("/nonexistent"), enabled=False),
+                notify=lambda _notice: None,
+            )
+        )
+    except IronbirdError as exc:
+        return exc if exc.exit_code == 2 else None
+    return None
 
 
 def _run(
@@ -651,8 +681,13 @@ def _run(
     transmits: bool = False,
     offline: OfflineBody | None = None,
     scan: bool = True,
+    precheck: Callable[[Session], None] | None = None,
 ) -> None:
     """Open the ledger, run ``body`` in an event loop, flush everything, exit with its code.
+
+    ``precheck`` validates the invocation against the configuration before anything is opened: a
+    usage error (exit 2) it raises is reported alone, with no ledger, reserve or retention
+    scan opened for it.
 
     ``transmits`` commands (they put packets on a link) refuse to run without a ledger.
     ``offline`` runs instead of ``body``, synchronously and with no configuration or session: it
@@ -680,6 +715,10 @@ def _run(
     ledger = Ledger(Path("/nonexistent"), enabled=False)
     code = 1
     try:
+        usage = _usage_error(run, glob.role, precheck)
+        if usage is not None:  # nothing was opened for this invocation, so nothing else is said
+            _print_error(console, usage, glob.verbose)
+            raise typer.Exit(usage.exit_code)
         try:
             state_dir = default_state_dir()
             notices = Notices(state_dir, fs=fs)
@@ -1116,7 +1155,11 @@ def listen(
             await listener.close()
         return _exit_for(reason, count, shown)
 
-    _run(ctx, as_node, verbose, body, "listen")
+    def check(session: Session) -> None:
+        mids = _parse_mids(session, node, mid, link)
+        session.plan_listen(node, mids=mids, link=link, where=where)
+
+    _run(ctx, as_node, verbose, body, "listen", precheck=check)
 
 
 @app.command()
@@ -1185,7 +1228,10 @@ def events(
             await stream.close()
         return _exit_for(reason, count, shown)
 
-    _run(ctx, as_node, verbose, body, "events")
+    def check(session: Session) -> None:
+        session.plan_events(node, where=where)
+
+    _run(ctx, as_node, verbose, body, "events", precheck=check)
 
 
 @app.command()

@@ -48,14 +48,25 @@ HEAD_BYTES: Final = 4096
 MAX_RESERVE_BYTES: Final = 1 << 30
 READ_BLOCK: Final = MIB
 MAX_CLASS_READS: Final = 10_000  # head reads per scan; a session past it counts as long
+MAX_DAMAGED_CHECK_BYTES: Final = 256 * MIB  # bytes read per scan to tell whether a salvage ended
 FRESH_S: Final = 600.0  # a session whose newest file is younger than this is live
 _N: Final = r"(?:[0-9]{4}|[1-9][0-9]{4,8})"
 _STAMP: Final = r"([0-9]{8}T[0-9]{6}Z)-([0-9a-f]{12})"
 LEDGER_RE: Final = re.compile(_STAMP + rf"(?:\.p({_N}))?\.jsonl")
 RESERVE_RE: Final = re.compile(_STAMP + rf"\.r({_N})\.reserve")
 RECORDING_RE: Final = re.compile(_STAMP + rf"(?:\.p({_N}))?\.ibrec")
+# A reserve set aside by a salvage, and the dot-temporary file a salvage copies into (the
+# temporary name is ``.<part name>.<16 hex>.tmp``, as the temporary-file helper makes it).
+DAMAGED_RE: Final = re.compile(_STAMP + rf"\.r({_N})\.reserve\.damaged")
+SALVAGE_TMP_RE: Final = re.compile(r"\." + _STAMP + rf"\.p({_N})\.jsonl\.([0-9a-f]{{16}})\.tmp")
 LONG_COMMANDS: Final = frozenset({"listen", "events", "respond", "record", "replay"})
 NO_LOCK_ERRNOS: Final = frozenset({errno.ENOLCK, errno.EINVAL, errno.EOPNOTSUPP, errno.EBADF})
+
+# What a file of a ledger directory is (``FileEntry.role``).
+PART: Final = "part"  # a ledger part or a recording (part 1 has no number in its name)
+RESERVE: Final = "reserve"  # ``.rNNNN.reserve``
+DAMAGED: Final = "damaged"  # ``.rNNNN.reserve.damaged``, the original of a salvaged reserve
+TEMP: Final = "temp"  # a salvage's dot-temporary file; ``number`` is the part it would become
 
 # Protection reasons, in the order they are attributed to a session's bytes.
 LIVE: Final = "live"
@@ -63,6 +74,8 @@ FUTURE: Final = "future mtime"
 INCOMPLETE: Final = "incomplete"
 HARDLINKED: Final = "hard-linked"
 UNRECOVERABLE: Final = "unrecoverable reserve"
+DAMAGED_KEPT: Final = "damaged reserve kept"
+UNREADABLE: Final = "unreadable file"
 KEEP_RECENT: Final = "keep_recent"
 INSIDE_LONG: Final = "inside a long session"
 HAS_RECORDING: Final = "recording present"
@@ -72,9 +85,20 @@ REASON_GROUPS: Final = {
 }
 
 
+LEDGER_PATTERNS: Final = (LEDGER_RE, RESERVE_RE, DAMAGED_RE, SALVAGE_TMP_RE)
+ROLE_OF: Final = {
+    LEDGER_RE: PART,
+    RESERVE_RE: RESERVE,
+    DAMAGED_RE: DAMAGED,
+    SALVAGE_TMP_RE: TEMP,
+    RECORDING_RE: PART,
+}
+
+
 def is_managed_name(name: str) -> bool:
-    """Whether ``name`` is one retention manages: a ledger part, a reserve or a recording."""
-    return any(p.fullmatch(name) for p in (LEDGER_RE, RESERVE_RE, RECORDING_RE))
+    """Whether ``name`` is one retention manages: a ledger part, a reserve (or its set-aside
+    original) or a recording."""
+    return any(p.fullmatch(name) for p in (LEDGER_RE, RESERVE_RE, DAMAGED_RE, RECORDING_RE))
 
 
 def _valid_stamp(stamp: str) -> float | None:
@@ -93,12 +117,20 @@ def _valid_stamp(stamp: str) -> float | None:
 class FileEntry:
     name: str
     number: int  # part number (1 for the unnumbered first part); a reserve: its rNNNN
-    is_reserve: bool
+    role: str  # PART, RESERVE, DAMAGED or TEMP
     dev: int
     ino: int
     size: int
     mtime: float
     nlink: int
+
+    @property
+    def is_part(self) -> bool:
+        return self.role == PART
+
+    @property
+    def is_reserve(self) -> bool:
+        return self.role == RESERVE
 
 
 @dataclass(slots=True)
@@ -111,7 +143,7 @@ class Session:
 
     @property
     def has_part1(self) -> bool:
-        return any(not f.is_reserve and f.number == 1 for f in self.files)
+        return any(f.is_part and f.number == 1 for f in self.files)
 
     @property
     def newest_mtime(self) -> float:
@@ -130,11 +162,21 @@ class Session:
 
     @property
     def parts(self) -> int:
-        return sum(1 for f in self.files if not f.is_reserve)
+        return sum(1 for f in self.files if f.is_part)
 
     @property
     def reserves(self) -> list[FileEntry]:
         return sorted((f for f in self.files if f.is_reserve), key=lambda f: f.number)
+
+    @property
+    def damaged(self) -> list[FileEntry]:
+        """The originals of salvaged reserves (``.damaged``), by reserve number."""
+        return sorted((f for f in self.files if f.role == DAMAGED), key=lambda f: f.number)
+
+    @property
+    def temps(self) -> list[FileEntry]:
+        """The dot-temporary files of salvages that did not finish."""
+        return [f for f in self.files if f.role == TEMP]
 
     @property
     def hard_linked(self) -> bool:
@@ -142,7 +184,7 @@ class Session:
 
     def part1(self) -> FileEntry | None:
         for f in self.files:
-            if not f.is_reserve and f.number == 1:
+            if f.is_part and f.number == 1:
                 return f
         return None
 
@@ -161,12 +203,37 @@ class DirScan:
     unparseable: int = 0
     entries: int = 0
     partial: str | None = None  # why the figures are partial (over the entry bound, unreadable)
+    unreadable_files: int = 0
+    unreadable_why: str = ""
     unsafe: bool = False  # writable by group or others without the sticky bit
     unlocked: bool = False  # a lock probe was unsupported here
     recovered: int = 0
     unrecoverable: set[str] = field(default_factory=set)
+    damaged_kept: set[str] = field(default_factory=set)  # saved, original kept as .damaged
+    unreadable: set[str] = field(default_factory=set)  # a file that could not be examined
+    handled: set[str] = field(default_factory=set)  # .damaged files this scan produced or ended
+    check_budget: int = MAX_DAMAGED_CHECK_BYTES
     messages: list[str] = field(default_factory=list)  # IB-RET-004 lines, ready to show
-    recoveries: list[dict[str, Any]] = field(default_factory=list)
+    recoveries: list[dict[str, Any]] = field(default_factory=list)  # ledger.recovered
+    incompletes: list[dict[str, Any]] = field(default_factory=list)  # ledger.recovery_incomplete
+
+    def carry_to(self, other: DirScan) -> None:
+        """Hand what recovery established to a fresh listing of the same directory."""
+        other.recovered, other.recoveries, other.incompletes = (
+            self.recovered,
+            self.recoveries,
+            self.incompletes,
+        )
+        other.unrecoverable, other.messages, other.unlocked = (
+            self.unrecoverable,
+            self.messages,
+            self.unlocked,
+        )
+        other.damaged_kept, other.handled, other.check_budget = (
+            self.damaged_kept,
+            self.handled,
+            self.check_budget,
+        )
 
     def total_bytes(self) -> int:
         """Bytes of all pattern files, hard links counted once."""
@@ -194,6 +261,7 @@ class ScanControl:
 
     stop: threading.Event = field(default_factory=threading.Event)
     stepping: threading.Event = field(default_factory=threading.Event)
+    step: dict[str, Any] | None = None  # what the step under way is (read by the waiter)
 
 
 def directory_unsafe(mode: int) -> bool:
@@ -234,7 +302,7 @@ def scan_directory(
         except OSError as exc:
             scan.partial = f"{path} cannot be listed ({exc.strerror or exc})"
             return scan
-        patterns = (LEDGER_RE, RESERVE_RE) if kind == "ledger" else (RECORDING_RE,)
+        patterns = LEDGER_PATTERNS if kind == "ledger" else (RECORDING_RE,)
         for entry in entries:
             scan.entries += 1
             if scan.entries > entry_limit:
@@ -245,6 +313,11 @@ def scan_directory(
             _take_entry(fs, dir_fd, entry.name, patterns, scan)
     finally:
         close_quietly(fs, dir_fd)
+    if scan.unreadable_files and scan.partial is None:
+        scan.partial = (
+            f"{scan.unreadable_files} file(s) in {path} could not be examined "
+            f"({scan.unreadable_why}); the figures are partial and their sessions are protected"
+        )
     return scan
 
 
@@ -255,38 +328,54 @@ def _take_entry(
         found = pattern.fullmatch(name)
         if found is None:
             continue
-        is_reserve = pattern is RESERVE_RE
+        role = ROLE_OF[pattern]
         start = _valid_stamp(found.group(1))
         number_text = found.group(3)
         number = int(number_text) if number_text else 1
-        if start is None or (number_text and not is_reserve and number < 2):
+        if start is None or (number_text and role in (PART, TEMP) and number < 2):
             scan.unparseable += 1
             return
-        st = _regular_owned_stat(fs, dir_fd, name)
-        if st is None:
-            scan.foreign += 1  # a symbolic link, a vanished or unreadable name, not ours
-            return
         session_id = found.group(2)
+        try:
+            st = _regular_owned_stat(fs, dir_fd, name)
+        except OSError as exc:  # the file system failed: not "not ours", so not "foreign"
+            scan.unreadable.add(session_id)
+            scan.unreadable_files += 1
+            scan.unreadable_why = exc.strerror or str(exc)
+            return
+        if st is None:
+            scan.foreign += 1  # a symbolic link, a vanished name, not ours
+            return
         session = scan.sessions.get(session_id)
         if session is None:
             session = scan.sessions[session_id] = Session(session_id, start)
         else:
             session.start = min(session.start, start)
-        session.files.append(_file_entry(name, number, is_reserve, st))
+        session.files.append(_file_entry(name, number, role, st))
         return
+
+
+# An open that fails this way says the name is not a file of ours (gone, a symbolic link, a
+# directory, someone else's); any other failure says nothing about the file.
+_NOT_OURS_ERRNOS: Final = frozenset(
+    {errno.ENOENT, errno.ELOOP, errno.ENXIO, errno.EISDIR, errno.ENOTDIR, errno.EACCES, errno.EPERM}
+)
 
 
 def _regular_owned_stat(fs: FileSystem, dir_fd: int, name: str) -> os.stat_result | None:
     """``fstat`` of ``name`` opened the inspection way; ``None`` unless it is a regular file of
-    this user (a symbolic link, a FIFO, someone else's file, a vanished name)."""
+    this user (a symbolic link, a FIFO, someone else's file, a vanished name).
+
+    Raises ``OSError`` when the file system failed in a way that says nothing about the file (an
+    I/O error, a stale handle, no descriptors left): the caller must not count it as foreign."""
     try:
         fd = fs.open_at(dir_fd, name, INSPECT_FLAGS)
-    except OSError:
-        return None
+    except OSError as exc:
+        if exc.errno in _NOT_OURS_ERRNOS:
+            return None
+        raise
     try:
         st = fs.fstat(fd)
-    except OSError:
-        return None
     finally:
         close_quietly(fs, fd)
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
@@ -294,27 +383,27 @@ def _regular_owned_stat(fs: FileSystem, dir_fd: int, name: str) -> os.stat_resul
     return st
 
 
-def _file_entry(name: str, number: int, is_reserve: bool, st: os.stat_result) -> FileEntry:
-    return FileEntry(
-        name, number, is_reserve, st.st_dev, st.st_ino, st.st_size, st.st_mtime, st.st_nlink
-    )
+def _file_entry(name: str, number: int, role: str, st: os.stat_result) -> FileEntry:
+    return FileEntry(name, number, role, st.st_dev, st.st_ino, st.st_size, st.st_mtime, st.st_nlink)
 
 
 def _relist(fs: FileSystem, dir_fd: int, session: Session) -> list[FileEntry]:
     """The session's pattern files as the directory holds them right now (a scan's listing can
-    be stale by the time a recovery holds the session's lock)."""
+    be stale by the time a recovery holds the session's lock). Raises ``OSError`` when the
+    directory or a file cannot be examined."""
     files: list[FileEntry] = []
     for entry in fs.scandir(dir_fd):
-        for pattern in (LEDGER_RE, RESERVE_RE):
+        for pattern in LEDGER_PATTERNS:
             found = pattern.fullmatch(entry.name)
-            if found is None or found.group(2) != session.id:
+            if found is None:
                 continue
-            is_reserve = pattern is RESERVE_RE
-            number_text = found.group(3)
-            number = int(number_text) if number_text else 1
-            st = _regular_owned_stat(fs, dir_fd, entry.name)
-            if st is not None and not (number_text and not is_reserve and number < 2):
-                files.append(_file_entry(entry.name, number, is_reserve, st))
+            if found.group(2) == session.id:
+                role = ROLE_OF[pattern]
+                number_text = found.group(3)
+                number = int(number_text) if number_text else 1
+                st = _regular_owned_stat(fs, dir_fd, entry.name)
+                if st is not None and not (number_text and role in (PART, TEMP) and number < 2):
+                    files.append(_file_entry(entry.name, number, role, st))
             break
     return files
 
@@ -361,7 +450,9 @@ def liveness(
                 continue
             held = False
             for f in session.files:
-                if (f.is_reserve or f.number == 1) and probe_lock(fs, dir_fd, f.name) == "held":
+                if (f.is_reserve or (f.is_part and f.number == 1)) and probe_lock(
+                    fs, dir_fd, f.name
+                ) == "held":
                     held = True
                     break
             newest = session.newest_mtime
@@ -484,7 +575,8 @@ def apply_protection(
     """Fill ``Session.protected`` for every session of the directory (see the module notes).
 
     A session is protected when it is live, incomplete, hard-linked, holds an unrecoverable
-    reserve, has its recording, is among the ``keep_recent`` most recent (of any class, and of
+    reserve, a salvaged reserve's original (``.damaged``) or a file that could not be examined,
+    has its recording, is among the ``keep_recent`` most recent (of any class, and of
     the long ones), or is a short session that started inside the span (start to newest file
     time) of any protected long session.
     """
@@ -505,6 +597,10 @@ def apply_protection(
                 session.protected.append(HARDLINKED)
             if session.id in scan.unrecoverable:
                 session.protected.append(UNRECOVERABLE)
+            if session.id in scan.damaged_kept:
+                session.protected.append(DAMAGED_KEPT)
+            if session.id in scan.unreadable:
+                session.protected.append(UNREADABLE)
             if has_recording is not None and has_recording(session.id):
                 session.protected.append(HAS_RECORDING)
         # keep_recent: the most recent of any class, and the most recent long ones. A session
@@ -592,6 +688,7 @@ class _Facts:
     first_nul: int | None
     last_newline: int  # before the first NUL (or in the whole file); -1 when there is none
     junk_after_nul: int | None  # offset of the first non-NUL byte after the first NUL
+    read: int = 0  # bytes read to find these out
 
 
 def _read_facts(fs: FileSystem, fd: int, size: int) -> _Facts:
@@ -599,10 +696,12 @@ def _read_facts(fs: FileSystem, fd: int, size: int) -> _Facts:
     last_nl = -1
     junk: int | None = None
     offset = 0
+    read = 0
     while offset < size:
         block = fs.pread(fd, min(READ_BLOCK, size - offset), offset)
         if not block:
             break
+        read += len(block)
         if first_nul is None:
             nul = block.find(b"\x00")
             head = block if nul < 0 else block[:nul]
@@ -621,7 +720,7 @@ def _read_facts(fs: FileSystem, fd: int, size: int) -> _Facts:
         if junk is not None and first_nul is not None:
             break
         offset += len(block)
-    return _Facts(size, first_nul, last_nl, junk)
+    return _Facts(size, first_nul, last_nl, junk, read)
 
 
 @dataclass(slots=True)
@@ -632,10 +731,18 @@ class RecoveryContext:
     session: Session
     next_part: int = 2
     control: ScanControl | None = None
+    on_record: Callable[[str, dict[str, Any]], None] | None = None
+    dirty: bool = False  # a file was renamed: the listing is stale
 
     @property
     def stopping(self) -> bool:
         return self.control is not None and self.control.stop.is_set()
+
+    def report(self, event: str, fields: dict[str, Any]) -> None:
+        """Hand a ledger record to whoever wants it, now - not when the scan's result is
+        collected, which a process that is already exiting never does."""
+        if self.on_record is not None:
+            self.on_record(event, dict(fields))
 
 
 def _unrecoverable(scan: DirScan, session: Session, name: str, why: str) -> None:
@@ -652,12 +759,15 @@ def recover_directory(
     live: dict[str, str],
     own_session: str | None,
     control: ScanControl | None = None,
+    on_record: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> bool:
     """Recover the leftover reserves of every non-live session of a ledger directory (cut at the
-    last complete record and renamed to the next part, never deleted). A directory writable by
-    others without the sticky bit is not touched. Returns whether any file changed.
+    last complete record and renamed to the next part, never deleted) and finish the salvages
+    that were cut short (a ``.damaged`` original whose records are in no part). A directory
+    writable by others without the sticky bit is not touched. Returns whether any file changed.
 
-    ``control.stop`` ends the pass between sessions: no recovery step begins after it is set."""
+    ``control.stop`` ends the pass between sessions: no recovery step begins after it is set.
+    ``on_record(event, fields)`` is called as each step ends, from the calling thread."""
     if scan.kind != "ledger" or scan.unsafe or not scan.exists:
         return False
     try:
@@ -669,9 +779,11 @@ def recover_directory(
         for session in sorted(scan.sessions.values(), key=lambda s: s.id):
             if control is not None and control.stop.is_set():
                 break
-            if session.id in live or session.id == own_session or not session.reserves:
+            if session.id in live or session.id == own_session:
                 continue
-            ctx = RecoveryContext(fs, dir_fd, scan, session, control=control)
+            if not (session.reserves or session.damaged):
+                continue
+            ctx = RecoveryContext(fs, dir_fd, scan, session, control=control, on_record=on_record)
             changed |= _recover_session(ctx)
     finally:
         close_quietly(fs, dir_fd)
@@ -679,16 +791,17 @@ def recover_directory(
 
 
 def _recover_session(ctx: RecoveryContext) -> bool:
+    """Lock the session and do its recovery steps; ``True`` when a file was renamed."""
     fs, scan, session = ctx.fs, ctx.scan, ctx.session
     part1 = session.part1()
-    reserves = session.reserves
+    named = (session.reserves or session.damaged)[0].name
     if part1 is None:
-        _unrecoverable(scan, session, reserves[0].name, "its session has no part 1")
+        _unrecoverable(scan, session, named, "its session has no part 1")
         return False
     try:
         fd1 = fs.open_at(ctx.dir_fd, part1.name, INSPECT_FLAGS)
     except OSError as exc:
-        _unrecoverable(scan, session, reserves[0].name, f"part 1 cannot be opened: {exc.strerror}")
+        _unrecoverable(scan, session, named, f"part 1 cannot be opened: {exc.strerror}")
         return False
     held: list[int] = [fd1]
     changed = False
@@ -699,7 +812,7 @@ def _recover_session(ctx: RecoveryContext) -> bool:
             if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
                 return False  # a writer, or another scan recovering the session: try next scan
             scan.unlocked = True
-            _unrecoverable(scan, session, reserves[0].name, "file locks are unavailable here")
+            _unrecoverable(scan, session, named, "file locks are unavailable here")
             return False
         # The listing is from before the lock: another scan may have recovered the session
         # meanwhile, so what is left to do is what the directory holds now.
@@ -707,35 +820,58 @@ def _recover_session(ctx: RecoveryContext) -> bool:
             session.files = _relist(fs, ctx.dir_fd, session)
         except OSError as exc:
             _unrecoverable(
-                scan, session, reserves[0].name, f"the directory cannot be listed: {exc.strerror}"
+                scan, session, named, f"the directory cannot be listed: {exc.strerror or exc}"
             )
             return False
-        reserves = session.reserves
-        if not reserves:
+        if not (session.reserves or session.damaged):
             return False  # the session was recovered by another scan: nothing left, nothing to say
+        named = (session.reserves or session.damaged)[0].name
         if session.part1() is None:
-            _unrecoverable(scan, session, reserves[0].name, "its session has no part 1")
+            _unrecoverable(scan, session, named, "its session has no part 1")
             return False
-        numbers = [f.number for f in session.files if not f.is_reserve]
-        ctx.next_part = max(numbers, default=1) + 1
-        for reserve in reserves:
-            if ctx.stopping:
-                return changed
-            try:
-                outcome = _recover_reserve(ctx, reserve, held)
-            except OSError as exc:  # the file system failed mid-way: nothing more is touched
-                _unrecoverable(
-                    scan, session, reserve.name, f"the file system failed: {exc.strerror or exc}"
-                )
-                return changed
-            if outcome == "skip":
-                return changed
-            changed |= outcome == "changed"
-            if outcome == "stop":
-                return changed
+        ctx.next_part = max((f.number for f in session.files if f.is_part), default=1) + 1
+        changed = _recover_locked(ctx, held)
     finally:
         for fd in held:
             close_quietly(fs, fd)
+    return changed or ctx.dirty
+
+
+def _recover_locked(ctx: RecoveryContext, held: list[int]) -> bool:
+    """The steps for one session whose part 1 this scan has locked: its reserves in order, then
+    the salvages that were cut short."""
+    scan, session = ctx.scan, ctx.session
+    changed = False
+    for reserve in session.reserves:
+        if ctx.stopping:
+            return changed
+        try:
+            outcome = _recover_reserve(ctx, reserve, held)
+        except OSError as exc:  # the file system failed mid-way: nothing more is touched
+            _unrecoverable(
+                scan, session, reserve.name, f"the file system failed: {exc.strerror or exc}"
+            )
+            return changed
+        if outcome == "skip":
+            return changed
+        changed |= outcome == "changed"
+        if outcome == "stop":
+            break
+    for entry in session.damaged:
+        if ctx.stopping:
+            break
+        if entry.name in scan.handled:
+            continue
+        try:
+            outcome = _resume_salvage(ctx, entry)
+        except OSError as exc:
+            _unrecoverable(
+                scan, session, entry.name, f"the file system failed: {exc.strerror or exc}"
+            )
+            break
+        changed |= outcome == "changed"
+        if outcome == "stop":
+            break
     return changed
 
 
@@ -796,7 +932,7 @@ def _complete_interrupted_rename(
     listing cannot make this unlink a name that is not a second name of the file."""
     fs, scan, session, name = ctx.fs, ctx.scan, ctx.session, reserve.name
     for other in session.files:
-        if other.is_reserve or (other.dev, other.ino) != (st.st_dev, st.st_ino):
+        if not other.is_part or (other.dev, other.ino) != (st.st_dev, st.st_ino):
             continue
         held = fs.fstat(fd)
         current = try_stat_at(fs, ctx.dir_fd, other.name)
@@ -845,11 +981,12 @@ def _salvage(
     """A valid prefix followed by damage.
 
     The damaged original is set aside first, byte-identical, as ``<name>.damaged`` (one atomic
-    non-replacing rename): that name is outside the retention patterns, so no later scan finds
-    the reserve again, whatever happens next. Then the prefix's complete lines are copied from
-    the held descriptor to a temporary file and committed to the session's next part name; a
-    crash or a full disk leaves only a dot-temporary file and the intact ``.damaged`` file,
-    never a torn or a duplicate part. ``ledger.recovered`` is always written."""
+    non-replacing rename): that name is outside the reserve pattern, so no later scan treats it as
+    a reserve again, whatever happens next. Then the prefix's complete lines are copied from the
+    held descriptor to a temporary file and committed to the session's next part name; a crash or
+    a full disk leaves only a dot-temporary file and the intact ``.damaged`` file, never a torn or
+    a duplicate part, and a later long session or prune finishes the copy
+    (:func:`_resume_salvage`)."""
     fs, scan, session, name = ctx.fs, ctx.scan, ctx.session, reserve.name
     damaged = f"{name}.damaged"
     if ctx.stopping:
@@ -866,32 +1003,51 @@ def _salvage(
             scan, session, name, f"it could not be set aside as .damaged: {exc.strerror}"
         )
         return "stop"
+    ctx.dirty = True
+    return _finish_salvage(ctx, fd, name, damaged, st.st_size, cut)
+
+
+def _finish_salvage(
+    ctx: RecoveryContext, fd: int, name: str, damaged: str, size: int, cut: int
+) -> str:
+    """Copy the first ``cut`` bytes of the set-aside original (``fd``) into the session's next
+    part, and say how it ended: ``ledger.recovered`` when the part is committed,
+    ``ledger.recovery_incomplete`` when it is not. Either record is handed out here, by whoever
+    ends the step, so a scan that outlives the process's exit wait still leaves its trace."""
+    scan, session = ctx.scan, ctx.session
+    scan.handled.add(damaged)
     control = ctx.control
     if control is not None:
+        control.step = {"old": name, "damaged": damaged, "cut": size - cut, "kept": 0}
         control.stepping.set()  # from here the copy runs to its end
     try:
         new, error = _copy_prefix(ctx, fd, cut)
     finally:
         if control is not None:
             control.stepping.clear()
+            control.step = None
     record: dict[str, Any] = {
         "old": name,
         "new": new,
         "kept": cut if new else 0,
-        "cut": st.st_size - (cut if new else 0),
+        "cut": size - (cut if new else 0),
         "damaged": damaged,
     }
-    scan.recovered += 1
     if new is None:
         record["error"] = error
-        scan.recoveries.append(record)
+        scan.incompletes.append(record)
+        ctx.report("ledger.recovery_incomplete", record)
         scan.unrecoverable.add(session.id)
         scan.messages.append(
             f"reserve {name} was damaged and its records could not be saved ({error}); "
-            f"the whole file is kept as {damaged}; inspect or delete that file"
+            f"the whole file is kept as {damaged}; the next long session or 'ib ledger prune' "
+            "tries again, or inspect that file"
         )
         return "stop"
+    scan.recovered += 1
     scan.recoveries.append(record)
+    ctx.report("ledger.recovered", record)
+    scan.damaged_kept.add(session.id)
     scan.messages.append(
         f"reserve {name} was damaged: {format_size(cut)} saved as part "
         f"p{ctx.next_part:04d}, the rest kept as {damaged}; inspect or delete that file"
@@ -900,9 +1056,203 @@ def _salvage(
     return "changed"
 
 
+@dataclass(slots=True)
+class _Check:
+    """What a ``.damaged`` file turned out to be: ``saved`` (its records are in a part, or it
+    holds none), ``pending`` (records only in it), or ``unverified`` (``why``)."""
+
+    state: str = "unverified"
+    why: str = ""
+    cut: int = 0
+    size: int = 0
+    part: str = ""
+    fd: int = -1  # open on the file when pending and the caller asked to keep it
+
+
+def _check_damaged(
+    fs: FileSystem, dir_fd: int, scan: DirScan, session: Session, entry: FileEntry, *, keep: bool
+) -> _Check:
+    """Decide whether the records of a ``.damaged`` original are in a part of its session.
+
+    A salvage commits its copy by one rename, so a part exists only when the copy is whole: the
+    file is ``saved`` when some part of the session has exactly the bytes of its prefix (up to
+    the last complete line before the damage). Reads are charged to the scan's budget."""
+    check = _Check()
+    if scan.check_budget <= 0:
+        check.why = "too many bytes to check in one scan"
+        return check
+    try:
+        fd = fs.open_at(dir_fd, entry.name, INSPECT_FLAGS)
+    except OSError as exc:
+        check.why = f"cannot be opened: {exc.strerror or exc}"
+        return check
+    keep_fd = False
+    try:
+        st = fs.fstat(fd)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or st.st_uid != os.getuid()
+            or st.st_size > MAX_RESERVE_BYTES
+        ):
+            check.why = "it is not a regular file of yours, or over 1 GiB"
+            return check
+        first = fs.pread(fd, HEAD_BYTES + 1, 0)
+        head = parse_head(first)
+        if (
+            head is None
+            or head.get("event") != "ledger.reserve"
+            or head.get("session") != session.id
+        ):
+            check.why = "it does not start with a ledger.reserve record of its session"
+            return check
+        header_len = first.find(b"\n") + 1
+        facts = _read_facts(fs, fd, st.st_size)
+        scan.check_budget -= facts.read
+        check.size = st.st_size
+        check.cut = facts.last_newline + 1
+        if check.cut <= header_len:
+            check.state = "saved"  # no record after the header: nothing to save
+            return check
+        part = _saved_part(fs, dir_fd, scan, session, fd, check.cut)
+        if part:
+            check.state, check.part = "saved", part
+            return check
+        check.state = "pending"
+        keep_fd = keep
+        check.fd = fd if keep else -1
+        return check
+    except OSError as exc:
+        check.state, check.why = "unverified", f"cannot be read: {exc.strerror or exc}"
+        return check
+    finally:
+        if not keep_fd:
+            close_quietly(fs, fd)
+
+
+MAX_PART_CANDIDATES: Final = 8  # parts of the right size compared per file
+
+
+def _saved_part(
+    fs: FileSystem, dir_fd: int, scan: DirScan, session: Session, fd: int, cut: int
+) -> str:
+    """The part of ``session`` that holds exactly the first ``cut`` bytes of ``fd``, else ``""``."""
+    candidates = [f for f in session.files if f.is_part and f.number >= 2 and f.size == cut]
+    for candidate in candidates[:MAX_PART_CANDIDATES]:
+        if scan.check_budget <= 0:
+            break
+        try:
+            other = fs.open_at(dir_fd, candidate.name, INSPECT_FLAGS)
+        except OSError:
+            continue
+        try:
+            if _same_prefix(fs, other, fd, cut, scan):
+                return candidate.name
+        except OSError:
+            continue
+        finally:
+            close_quietly(fs, other)
+    return ""
+
+
+def _same_prefix(fs: FileSystem, a: int, b: int, length: int, scan: DirScan | None = None) -> bool:
+    """Whether the first ``length`` bytes of ``a`` and ``b`` are equal (``OSError`` propagates)."""
+    offset = 0
+    while offset < length:
+        want = min(READ_BLOCK, length - offset)
+        left, right = fs.pread(a, want, offset), fs.pread(b, want, offset)
+        if scan is not None:
+            scan.check_budget -= len(left)
+        if not left or left != right:
+            return False
+        offset += len(left)
+    return True
+
+
+def _resume_salvage(ctx: RecoveryContext, entry: FileEntry) -> str:
+    """Finish the copy of a ``.damaged`` original whose records are in no part (a salvage that was
+    cut short by the process's exit, a kill, or a failing disk). The original is only read."""
+    fs, scan, session = ctx.fs, ctx.scan, ctx.session
+    check = _check_damaged(fs, ctx.dir_fd, scan, session, entry, keep=True)
+    if check.state != "pending":
+        return "unchanged"  # saved already, or not judgeable: the report says which
+    try:
+        name = entry.name.removesuffix(".damaged")
+        return _finish_salvage(ctx, check.fd, name, entry.name, check.size, check.cut)
+    finally:
+        close_quietly(fs, check.fd)
+
+
+def classify_damaged(fs: FileSystem, scan: DirScan) -> None:
+    """Account for the ``.damaged`` originals and salvage temporaries a listing holds.
+
+    A session with a ``.damaged`` file is protected: ``saved`` ones (their records are in a part)
+    keep the file for the user to inspect or delete, with the session; a ``pending`` or
+    ``unverified`` one holds records that are in no part, so its session is protected as holding
+    an unrecovered reserve, and an ``IB-RET-004`` line names the file and the action - at every
+    scan, so the display rate limit (not this function) decides how often it is shown. A
+    dot-temporary salvage file with nothing to resume is reported and protects its session too.
+    Read-only: finishing a salvage is :func:`recover_directory`'s step."""
+    if scan.kind != "ledger" or not scan.exists:
+        return
+    sessions = sorted(
+        (s for s in scan.sessions.values() if s.damaged or s.temps), key=lambda s: s.id
+    )
+    if not sessions:
+        return
+    try:
+        dir_fd = fs.open_dir(scan.path)
+    except OSError as exc:
+        for session in sessions:
+            scan.unrecoverable.add(session.id)
+        scan.messages.append(
+            f"{scan.path} cannot be opened to check salvaged reserves ({exc.strerror or exc}); "
+            "their sessions are protected"
+        )
+        return
+    try:
+        for session in sessions:
+            unfinished = False
+            for entry in session.damaged:
+                if entry.name in scan.handled:
+                    continue
+                check = _check_damaged(fs, dir_fd, scan, session, entry, keep=False)
+                if check.state == "saved":
+                    scan.damaged_kept.add(session.id)
+                    continue
+                unfinished = True
+                scan.unrecoverable.add(session.id)
+                scan.messages.append(_unfinished_message(entry, check))
+            if session.temps and not unfinished:
+                scan.unrecoverable.add(session.id)
+                first = session.temps[0]
+                scan.messages.append(
+                    f"{first.name} ({format_size(first.size)}) is left over from an interrupted "
+                    "salvage and nothing is waiting for it; inspect it and delete it; "
+                    "its session is protected"
+                )
+    finally:
+        close_quietly(fs, dir_fd)
+
+
+def _unfinished_message(entry: FileEntry, check: _Check) -> str:
+    if check.state == "pending":
+        return (
+            f"{entry.name} holds {format_size(check.cut)} of records that are in no part (a "
+            "salvage was cut short); the next long session or 'ib ledger prune' saves them, or "
+            "inspect that file; its session is protected"
+        )
+    return (
+        f"{entry.name} could not be checked ({check.why}); inspect it and keep it or move it "
+        "away; its session is protected"
+    )
+
+
 def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, str]:
     """Copy the first ``cut`` bytes of ``fd`` to the session's next free part name through a
-    temporary file. Returns ``(part name, "")``, or ``(None, why)``."""
+    temporary file. Returns ``(part name, "")``, or ``(None, why)``.
+
+    A temporary file an earlier attempt of this session left for that part is continued when its
+    content is exactly the start of the source; any other file is left alone."""
     fs, session = ctx.fs, ctx.session
     new = ""
     for _ in range(NAME_TRIES):
@@ -912,9 +1262,26 @@ def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, s
         ctx.next_part += 1
     else:
         return None, "no free part name"
+    reusable = sorted(
+        (t for t in session.temps if t.number == ctx.next_part), key=lambda t: -t.size
+    )
+    resume_at = [0]
+
+    def starts_the_source(tmp_fd: int) -> bool:
+        have = fs.fstat(tmp_fd).st_size
+        if have > cut or not _same_prefix(fs, tmp_fd, fd, have):
+            return False
+        resume_at[0] = have
+        return True
+
     try:
-        with TempOutput(ctx.scan.path / new, fs=fs) as out:
-            offset = 0
+        with TempOutput(
+            ctx.scan.path / new,
+            fs=fs,
+            reuse=[t.name for t in reusable],
+            accept=starts_the_source,
+        ) as out:
+            offset = resume_at[0]
             while offset < cut:
                 block = fs.pread(fd, min(READ_BLOCK, cut - offset), offset)
                 if not block:
@@ -945,18 +1312,19 @@ def full_scan(
     has_recording: Callable[[str], bool] | None = None,
     recover: bool = True,
     control: ScanControl | None = None,
+    on_record: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> DirScan:
     """Scan, probe liveness, recover leftover reserves (a ledger directory; ``recover=False``
-    leaves them for a scan that may), then decide the protections - the one pass a warning check
-    and a prune both start from."""
+    leaves them for a scan that may), account for the salvaged originals, then decide the
+    protections - the one pass a warning check and a prune both start from."""
     scan = scan_directory(fs, path, kind)
     live = liveness(fs, path, scan, now, own_session)
-    if kind == "ledger" and recover and recover_directory(fs, scan, live, own_session, control):
-        again = scan_directory(fs, path, kind)
-        again.recovered, again.recoveries = scan.recovered, scan.recoveries
-        again.unrecoverable, again.messages = scan.unrecoverable, scan.messages
-        again.unlocked = scan.unlocked
-        scan = again
-        live = liveness(fs, path, scan, now, own_session)
+    if kind == "ledger":
+        if recover and recover_directory(fs, scan, live, own_session, control, on_record):
+            again = scan_directory(fs, path, kind)
+            scan.carry_to(again)
+            scan = again
+            live = liveness(fs, path, scan, now, own_session)
+        classify_damaged(fs, scan)
     apply_protection(fs, scan, keep_recent=keep_recent, live=live, has_recording=has_recording)
     return scan

@@ -1323,12 +1323,25 @@ Deliverables
        next free part name by `rename_noreplace` (directory synced). A crash, or a full disk, in
        (b) leaves the intact `.damaged` file and at most a dot-temporary file, which no pattern
        matches: never a torn part and never a duplicate. A prefix with no record after the header
-       is not salvaged (treated as below). `ledger.recovered` is always written (old name, new
-       name or none, bytes kept and cut, the `.damaged` name, the error if the copy failed), and
-       `IB-RET-004` is shown once:
+       is not salvaged (treated as below). The step that ends it writes its record, from the scan's
+       own thread when the step ends (not when someone collects the result): `ledger.recovered`
+       (old name, new part, bytes kept and cut, the `.damaged` name) when the part is committed,
+       `ledger.recovery_incomplete` (the same, with the error) when it is not or when the exit
+       gave up waiting for it (`abandoned`), and `IB-RET-004` is shown once:
        `warning IB-RET-004: reserve 20261030T120000Z-0123456789ab.r0001.reserve was damaged: 812 KiB saved as part p0004, the rest kept as r0001.reserve.damaged; inspect or delete that file`.
        When (b) fails, the line says the records could not be saved and that the whole file is kept
-       as `.damaged`.
+       as `.damaged`. A `.damaged` file, and a salvage's dot-temporary file, are states every scan
+       recognises: both are listed with their session, their bytes count in the usage figures, and
+       the session is protected (`unrecoverable reserve` while the records are in no part,
+       `damaged reserve kept` once a part holds exactly the prefix; the file is never deleted, so
+       the session stays until the user deletes or moves it). While the records are in no part,
+       every scan re-reports `IB-RET-004` naming the file and the action (shown at most once per
+       `warn_interval`), and the next long session or `ib ledger prune` finishes the copy from the
+       `.damaged` file under the session's lock: a leftover temporary of that session and part
+       that is a regular file of the user, with one link, whose bytes are exactly the start of the
+       source is continued and committed; any other file is left alone and reported. A scan
+       reads at most 256 MiB to tell whether a salvage ended; past that a file counts as
+       unchecked, which protects and reports it too.
     6. Anything else (another session's header, no valid header, larger than 1 GiB, not
        ours, a collision, a salvage that fails) is left untouched and reported
        (`IB-RET-004`) with a message that names the file and the action:
@@ -1809,7 +1822,10 @@ Verification
   scan recovers it. A valid prefix followed by damage (a non-NUL byte after the first
   NUL, a NUL inside a line, two partial lines) is salvaged: the prefix lines parse in the
   next part, the original is kept byte-identical as `.damaged` (outside the retention
-  patterns), one `IB-RET-004` names both files, and a second scan does nothing. Left
+  patterns for reserves but listed with the session), one `IB-RET-004` names both files, and a
+  second scan does nothing; a salvage cut short after the set-aside (write error, process
+  ended) is finished by the next long scan from the `.damaged` file, once, continuing an
+  own temporary and leaving any other file alone. Left
   untouched and reported (`IB-RET-004`) with a message naming the file and the action,
   the session then protected: a foreign file already at the next part name (it stays
   byte-identical), a header with no records and damage after it, a session without part
@@ -1851,8 +1867,7 @@ Verification
   - `ctypes` only in `rename_noreplace` (`renameat2`) and the `fstatfs` helper, and
     `tempfile` deleting helpers (`NamedTemporaryFile`, `TemporaryDirectory`) nowhere in
     `src/`.
-  Its known gaps, reviewed by hand instead: dynamic access (`getattr(os, name)`, a
-  function passed in as a value), C extensions and third-party code (pyserial in 2k),
+  Its known gaps, reviewed by hand instead: a function passed in as a value, C extensions and third-party code (pyserial in 2k),
   and child processes (`src/` runs none that touch files). A change that adds any of
   these to `src/` names it in its review.
 - Prune with `IB-LED-002` (state directory through a regular file; `ib rec prune` with a
@@ -2014,9 +2029,26 @@ As built (where the build differs from, or settles, the text above)
   one consistent snapshot of the store (`LedgerStore.unconfirmed`); a second prune of an already
   deleted session counts its files as gone; the first-hour `IB-LED-009` rate limit holds for any
   lock errno.
-- **Deferred.** A salvage whose copy could not be made (full disk) is not retried: the original
-  stays intact as `.damaged` and the user is told. The stderr line for exit 6 found only at the
-  final close is written through a bounded late writer. The 1000-run `ib send` loops against a no-lock file system are covered by the
+- **PR #10 review, round 2 (fixed).** A cut-short salvage (exit budget, kill after the set-aside,
+  a failing disk) is finished by a later long session or prune (rule 5): `.damaged` and the
+  salvage's dot-temporary file are listed, counted, protect their session and are re-reported;
+  `ledger.recovered` / `ledger.recovery_incomplete` are posted by the scan thread through
+  `Ledger.post` (a mailbox taken by the owner, or an append to the final file after the close);
+  a file that fails `fstat` with a transient error marks its session unreadable and the listing
+  partial instead of counting it foreign. The exit budget keeps half of itself for the ledger's
+  last write and close (retention may not spend it), the rate limit of gated warnings has its own
+  cap (a tenth of the budget, at most 0.5 s) and its warnings are ledgered when raised, a close
+  that did not finish prints its line, one signal ends every wait of the exit, a non-`OSError`
+  from `fdatasync` leaves the written transmissions unconfirmed (exit 6, with a remedy that
+  names a bug), the dropped-records marker handed over by `flush` is in the exit account, and a
+  `listen` / `events` usage error is reported before the ledger, reserve or scan is opened. The
+  guard also flags star imports, `os.__dict__`, `sys.modules`, `eval` / `exec`, computed or
+  removal-named `getattr` on any object, the asyncio subprocess calls, `multiprocessing`, `pty`,
+  `exec*` / `spawn*` / `posix_spawn*`, `copy_file_range`, `sendfile`, `mmap`, `builtins.open`
+  and `os.fdopen` write modes, and no longer flags a `.rename` that is not called.
+- **Deferred.** The stderr line for exit 6 found only at the final close is written through a
+  bounded late writer. A `.damaged` file keeps its session protected until the user deletes it:
+  there is no command that does that for them. The 1000-run `ib send` loops against a no-lock file system are covered by the
   in-process 1000-caller test of the notices file and the per-process warnings, not by 1000
   subprocesses. The `IB-RET-002` projection is tested with an injected clock and rate source, not
   against a real recorder. A 100 000-entry directory is tested at a lowered bound.
@@ -2721,7 +2753,7 @@ Verification
 | `IB-RET-001` | `RET_AGE` | non-protected sessions older than `retention.max_age`; review with `ib ledger prune` / `ib rec prune` | 2d |
 | `IB-RET-002` | `RET_TOTAL` | ledger + recordings past, or projected past, `retention.max_total_bytes` (protected bytes named); prune the named directory or raise the cap | 2d |
 | `IB-RET-003` | `RET_PRUNE` | a listed session was not deleted (became live, changed since listing, unlink failed) | 2d |
-| `IB-RET-004` | `RET_SCAN` | retention scan partial (directory unreadable, over 100 000 entries, a leftover reserve that could not be recovered: no valid header, other session's header, name collision, no part 1, locks unsupported; its session is then protected; or one salvaged only in part, the damaged original kept as `.damaged`; the message names the file and the action) | 2d |
+| `IB-RET-004` | `RET_SCAN` | retention scan partial (directory unreadable, over 100 000 entries, a file that could not be examined; a leftover reserve that could not be recovered: no valid header, other session's header, name collision, no part 1, locks unsupported; its session is then protected; a salvage cut short, its records only in the `.damaged` original or a dot-temporary file left over, finished by the next long session or prune; the message names the file and the action) | 2d |
 | `IB-RET-005` | `RET_TARGET` | `--until-under` cannot be reached in this directory: the rest is protected (bytes by reason, `future mtime` and `unrecoverable reserve` included) | 2d |
 | `IB-RET-006` | `RET_UNSAFE` | directory writable by group or others without the sticky bit; prune refused there | 2d |
 | `IB-REC-001` | `REC_CREATE` | cannot create the recording or the `rec repair` output (exists, permission, directory) | 2e |

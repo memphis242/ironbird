@@ -84,7 +84,7 @@ def test_only_anchored_names_count_and_lookalikes_are_ignored(state: Path) -> No
         f"{start}-{sid(3)}0.jsonl",  # a 13-digit id
         f"{start}-{sid(4)}.p00005.jsonl",  # a leading zero beyond the padding
         f"{start}-{sid(5)}.p0001.jsonl",  # part 1 has no number
-        f"{start}-{sid(6)}.r0001.reserve.damaged",
+        f"{start}-{sid(6)}.r0001.reserve.damaged.bak",
         f".{start}-{sid(7)}.jsonl.0123456789abcdef.tmp",
         "retention-notices.json",
     ):

@@ -104,6 +104,8 @@ TICK_MIN_S: Final = 0.5
 MAX_EARLY_NOTICES: Final = 32
 REFRESH_EVERY: Final = 256  # records of a capped tier between allowance checks
 JOIN_TIMEOUT_S: Final = 5.0
+GATE_WAIT_S: Final = 0.5  # the most the exit waits for a rate limit that has not answered
+GATE_SHARE: Final = 0.1  # ... and never more than this share of the exit budget
 MAX_REPLY_MESSAGES: Final = 64
 
 _RESERVED: Final = frozenset({"ts", "session", "n", "kind", "event"})
@@ -177,6 +179,7 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "ledger.warning": Tier.ESSENTIAL,
         "ledger.note": Tier.ESSENTIAL,
         "ledger.recovered": Tier.ESSENTIAL,
+        "ledger.recovery_incomplete": Tier.ESSENTIAL,
         "retention.scan": Tier.ESSENTIAL,
         "retention.warning": Tier.ESSENTIAL,
         "prune.plan": Tier.ESSENTIAL,
@@ -451,6 +454,10 @@ class Ledger:
         self._gate_tokens = itertools.count(1)
         self._pending_warns: dict[int, Callable[[bool], None]] = {}
         self._budget: WaitBudget | None = None
+        # Records posted by helper threads (a retention scan's recovery results), taken into the
+        # queue by the owning thread; after the close they are appended to the final file.
+        self._mailbox: deque[tuple[str, str, dict[str, Any]]] = deque()
+        self._mailbox_lock = threading.Lock()
         # tiers
         self._budgets: list[TierBudget | None] = [
             None,
@@ -627,11 +634,12 @@ class Ledger:
     def join_timeout_s(self) -> float:
         return self._join_timeout_s
 
-    def _wait(self, event: threading.Event) -> bool:
-        """Wait for a writer job: against the exit budget when it is armed, else on its own."""
+    def _wait(self, event: threading.Event, cap: float | None = None) -> bool:
+        """Wait for a writer job: against the exit budget when it is armed, else on its own
+        (``cap`` seconds at most)."""
         if self._budget is not None:
-            return self._budget.wait(event)
-        return event.wait(self._join_timeout_s)
+            return self._budget.wait(event, cap)
+        return event.wait(self._join_timeout_s if cap is None else min(cap, self._join_timeout_s))
 
     def set_warn_gate(self, gate: Callable[[Code], bool]) -> None:
         """Cross-process rate limit of the start-of-session warnings (``IB-LED-006/008/009``):
@@ -646,6 +654,56 @@ class Ledger:
     def add_ticker(self, func: Callable[[], None]) -> None:
         """Run ``func`` from :meth:`tick` (retention's periodic scan)."""
         self._tickers.append(func)
+
+    def post(self, kind: str, event: str, **fields: Any) -> None:
+        """Make a record from any thread (a helper thread's result that must not wait for
+        someone to collect it).
+
+        Until the ledger is closed the record goes into a mailbox that the owning thread turns
+        into a normal record at its next upkeep, :meth:`flush`, :meth:`finish` or :meth:`close`;
+        once closed, the calling thread appends it to the file the session ended in, best
+        effort. Either way the record is the helper's own, written when its step ends."""
+        if self._dead:
+            return
+        with self._mailbox_lock:
+            if self._exit_report is None:
+                self._mailbox.append((kind, event, fields))
+                return
+        self._write_posted(kind, event, fields)
+
+    def _take_posted(self) -> None:
+        """Turn the helper threads' posted records into queued records (owning thread)."""
+        while self._mailbox:
+            try:
+                kind, event, fields = self._mailbox.popleft()
+            except IndexError:
+                return
+            self.record(kind, event, **fields)
+
+    def _seal(self, report: ExitReport) -> None:
+        """Record the exit report, and write what helper threads posted until now."""
+        with self._mailbox_lock:
+            self._exit_report = report
+            late = list(self._mailbox)
+            self._mailbox.clear()
+        for kind, event, fields in late:
+            self.record(kind, event, **fields)
+        if late:
+            self._write_late()
+
+    def _write_posted(self, kind: str, event: str, fields: dict[str, Any]) -> None:
+        name = self._store.final_name
+        if name is None:
+            return
+        line = Line(
+            0,
+            Tier.ESSENTIAL,
+            self._format_line(
+                self.session_id, next(self._numbers), time.time_ns(), kind, event, fields
+            ),
+            None,
+        )
+        self._append_final(name, [line])
 
     # -- producer side --------------------------------------------------------------------------
 
@@ -846,6 +904,8 @@ class Ledger:
     def remedy(self, *, hung: bool | None = None) -> str:
         if self._hung(hung):
             return f"check the disk or file server of {self._directory}"
+        if self._store.stall_internal:
+            return "this is a bug in ironbird: report it with the ledger file and --verbose output"
         return f"free space in {self._directory} or set IRONBIRD_STATE_DIR"
 
     def _hung(self, hung: bool | None) -> bool:
@@ -1041,38 +1101,52 @@ class Ledger:
     ) -> None:
         """Ledger a warning in full and display it (coalesced).
 
-        A ``gated`` warning (or one with its own ``gate``) goes through the cross-process rate
-        limit, which is asked on a worker thread, never here: the warning is ledgered and
-        displayed when the answer is in (at the latest at :meth:`finish` or :meth:`close`),
-        ledgered whatever the answer is. ``display=False`` only ledgers."""
-        finish = functools.partial(self._warn_now, code, summary, level, slow, key, event, fields)
-        if display and (gate is not None or (gated and not self._default_gate)):
-            token = next(self._gate_tokens)
-            self._pending_warns[token] = finish
-            self._gates.submit(token, gate or functools.partial(self._warn_gate, code))
+        The record is written when the warning is raised, whatever any rate limit says: only the
+        display is gated. A ``gated`` warning (or one with its own ``gate``) is displayed
+        through the cross-process rate limit, which is asked on a worker thread, never here: the
+        display follows when the answer is in (at the latest at :meth:`finish` or :meth:`close`).
+        ``display=False`` only ledgers."""
+        asked: Callable[[], bool] | None = gate
+        if asked is None and gated and not self._default_gate:
+            asked = functools.partial(self._warn_gate, code)
+        if not display or asked is None:
+            number = self._record_warning(code, summary, event, fields, shown=display)
+            if display:
+                self._display_warning(code, level, slow, key, summary, number, True)
             return
-        finish(display)
+        number = self._record_warning(code, summary, event, fields, shown=None)
+        token = next(self._gate_tokens)
+        self._pending_warns[token] = functools.partial(
+            self._display_warning, code, level, slow, key, summary, number
+        )
+        self._gates.submit(token, asked)
 
-    def _warn_now(
-        self,
-        code: Code,
-        summary: str,
-        level: Level,
-        slow: bool,
-        key: str | None,
-        event: str,
-        fields: dict[str, Any],
-        allowed: bool,
-    ) -> None:
-        number = self.record(
+    def _record_warning(
+        self, code: Code, summary: str, event: str, fields: dict[str, Any], *, shown: bool | None
+    ) -> int | None:
+        """The ledger record of a warning; ``shown`` is whether it is displayed, ``None`` when
+        that is up to a rate limit that has not answered."""
+        decided = {} if shown is None else {"shown": shown}
+        return self.record(
             "warning",
             event,
             tier=Tier.ESSENTIAL,
             code=code.value,
             summary=summary,
-            shown=allowed,
+            **decided,
             **fields,
         )
+
+    def _display_warning(
+        self,
+        code: Code,
+        level: Level,
+        slow: bool,
+        key: str | None,
+        summary: str,
+        number: int | None,
+        allowed: bool,
+    ) -> None:
         if not allowed:
             return
         self._coalescer.report(
@@ -1094,13 +1168,16 @@ class Ledger:
                 finish(allowed)
 
     def settle_warnings(self) -> None:
-        """Wait (within the exit budget, when armed) for the gated warnings still undecided,
-        then complete what is left as displayed: a rate limit that cannot be consulted never
-        causes silence."""
+        """Wait for the gated warnings still undecided - at most :data:`GATE_WAIT_S` (a tenth of
+        the exit budget at the most), whatever the budget holds, so a rate limit that hangs
+        cannot starve the ledger's own last write - then display what is left: a rate limit that
+        cannot be consulted never causes silence. Every such warning is in the ledger already."""
+        deadline = time.monotonic() + min(GATE_WAIT_S, self._join_timeout_s * GATE_SHARE)
         while self._pending_warns:
             self._gates.progress.clear()
             self._pump_gates()
-            if not self._pending_warns or not self._wait(self._gates.progress):
+            left = deadline - time.monotonic()
+            if not self._pending_warns or left <= 0 or not self._wait(self._gates.progress, left):
                 break
         self._pump_gates()
         for token in list(self._pending_warns):
@@ -1374,6 +1451,7 @@ class Ledger:
         if self._exit_report is not None:
             self._write_late()
             return
+        self._take_posted()
         self._tick_records(final=False)
         while self._queue and self._hand_over(1024, force=True):
             pass
@@ -1381,6 +1459,7 @@ class Ledger:
             tail: list[Line] = []
             self._queue_dropped_marker(tail)
             if tail:
+                self._jobs_lines.append(tail)  # in the writer's hands: the exit account counts it
                 self._writer.submit("write", (tail, True))
         self._last_flush = time.monotonic()
         self._wait(self._writer.barrier())
@@ -1400,6 +1479,7 @@ class Ledger:
         self._coalescer.tick()
         if self._dead:
             return
+        self._take_posted()
         self._pump_events()
         hung = self._hung_now()
         if hung and not self._hung_reported:
@@ -1499,6 +1579,7 @@ class Ledger:
         blocked then is left alone and everything it had not confirmed counts as not written.
         """
         self.settle_warnings()
+        self._take_posted()
         if self._dead or not (self._any or self._opened_by_caller):
             return self._build_report(finished=True)
         self._ensure_opened()
@@ -1528,9 +1609,10 @@ class Ledger:
             self._write_late()
             return self._exit_report
         self.settle_warnings()
+        self._take_posted()
         if self._dead or not (self._any or self._opened_by_caller):
             report = self._build_report(finished=True)
-            self._exit_report = report
+            self._seal(report)
             return report
         self._ensure_opened()
         self._pump_events()
@@ -1547,7 +1629,7 @@ class Ledger:
         self._check_config_failure()
         self._pump_events()
         report = self._build_report(finished=finished)
-        self._exit_report = report
+        self._seal(report)
         return report
 
     def _write_late(self) -> None:
@@ -1559,6 +1641,11 @@ class Ledger:
         name = self._store.final_name
         if not lines or name is None:
             return
+        self._append_final(name, lines)
+
+    def _append_final(self, name: str, lines: list[Line]) -> None:
+        """Append ``lines`` to the file ``name`` the session ended in (best effort: a
+        transmission among lines that cannot be written is counted as lost)."""
         fs = self._fs
         try:
             dir_fd = fs.open_dir(self._directory)

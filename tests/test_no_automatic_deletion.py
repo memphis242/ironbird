@@ -66,7 +66,12 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
     },
     ("ledgerstore.py", "overwrite"): {"LedgerStore._pwrite_all"},
     ("retnotices.py", "overwrite"): {"Notices._transaction"},
-    ("ledger.py", "overwrite"): {"Ledger._write_late"},
+    ("ledger.py", "overwrite"): {"Ledger._append_final"},
+    # a salvage's own leftover temporary file, picked up again and appended to (checked first)
+    ("atomicfile.py", "overwrite"): {""},
+    # attribute lookups by a computed name on the program's own record types
+    ("config.py", "dynamic"): {"parse_config"},
+    ("frame.py", "dynamic"): {"Frame._replace"},
     ("cli/main.py", "overwrite"): {"_fill_standard_descriptors"},
     ("recording/writer.py", "overwrite"): {"create_exclusive"},
     # the recorder removes the partial file it created itself when a start fails
@@ -202,6 +207,39 @@ def test_every_allowlist_entry_is_still_used() -> None:
         ("def f():\n    __import__('ctypes')", "dynamic"),
         ("def f(fs, fd):\n    fs.pwrite(fd, b'x', 0)", "overwrite"),
         ("import os\ndef f(fd):\n    os.pwrite(fd, b'x', 0)", "overwrite"),
+        # second review: forms that still escaped
+        ("from os import *\ndef f(p):\n    unlink(p)", "dynamic"),
+        ("import os\ndef f(p):\n    os.__dict__['unlink'](p)", "dynamic"),
+        (
+            "import asyncio\nasync def f(p):\n    await asyncio.create_subprocess_exec('rm', p)",
+            "subprocess",
+        ),
+        (
+            "import asyncio\nasync def f(p):\n"
+            "    await asyncio.get_running_loop().subprocess_exec(None, 'rm', p)",
+            "subprocess",
+        ),
+        ("import multiprocessing\ndef f():\n    multiprocessing.Process(target=f)", "subprocess"),
+        ("from multiprocessing import Pool\ndef f():\n    Pool(2)", "subprocess"),
+        ("import pty\ndef f(p):\n    pty.spawn(['rm', p])", "subprocess"),
+        ("import os\ndef f(p):\n    os.posix_spawnp('rm', ['rm', p], {})", "subprocess"),
+        ("import os\ndef f(p):\n    os.posix_spawn('/bin/rm', ['rm', p], {})", "subprocess"),
+        ("import os\ndef f(p):\n    os.execvpe('rm', ['rm', p], {})", "subprocess"),
+        ("import os\ndef f(p):\n    os.execl('/bin/rm', 'rm', p)", "subprocess"),
+        ("import os\ndef f(p):\n    os.spawnvp(os.P_WAIT, 'rm', ['rm', p])", "subprocess"),
+        ("import os\ndef f(a, b):\n    os.copy_file_range(a, b, 10, 0, 0)", "overwrite"),
+        ("import os\ndef f(a, b):\n    os.sendfile(b, a, 0, 10)", "overwrite"),
+        ("import mmap\ndef f(fd):\n    mmap.mmap(fd, 10)", "overwrite"),
+        ("from mmap import mmap\ndef f(fd):\n    mmap(fd, 10)", "overwrite"),
+        ("import builtins\ndef f(p):\n    builtins.open(p, 'w')", "truncation"),
+        ("import os\ndef f(fd):\n    os.fdopen(fd, 'w')", "truncation"),
+        ("import os\ndef f(fd):\n    os.fdopen(fd, 'r+')", "overwrite"),
+        ("from pathlib import Path\ndef f(p):\n    getattr(Path(p), 'unlink')()", "removal"),
+        ("def f(p):\n    getattr(p, 'rename')('x')", "rename"),
+        ("def f(fs, name):\n    getattr(fs, name)(1)", "dynamic"),
+        ("def f(p):\n    eval('__import__(\"os\").unlink(p)')", "dynamic"),
+        ("def f(p):\n    exec('import os; os.unlink(p)')", "dynamic"),
+        ("import sys\ndef f(p):\n    sys.modules['os'].remove(p)", "dynamic"),
     ],
 )
 def test_the_guard_flags_every_removal_form_with_aliases_resolved(
@@ -226,6 +264,10 @@ def test_the_guard_flags_every_removal_form_with_aliases_resolved(
         "import os\ndef f(p):\n    os.stat(p)",
         "def f(text):\n    return text.replace('a', 'b', 1)",
         "import os\ndef f(p):\n    return getattr(os, 'sep')",
+        "def f(s):\n    return s.rename",  # a field called rename is not a call
+        "def f(d):\n    return d.replace(tzinfo=None)",
+        "def f(cfg):\n    return getattr(cfg, 'name')",
+        "import os\ndef f(fd):\n    return os.fdopen(fd, 'rb')",
     ],
 )
 def test_the_guard_leaves_harmless_calls_alone(source: str) -> None:

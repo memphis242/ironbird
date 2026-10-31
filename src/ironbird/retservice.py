@@ -45,6 +45,9 @@ PROJECTION_INTERVAL_S: Final = 10.0
 RATE_WINDOW_S: Final = 60.0
 DEFAULT_HORIZON_S: Final = 3600.0
 JOIN_S: Final = 2.0  # a scan still running at exit gets this long to report
+LEDGER_KEEP: Final = (
+    0.5  # share of the exit budget a scan may not spend: the ledger's own last writes
+)
 
 
 def size_argument(size: int) -> str:
@@ -182,8 +185,14 @@ class Retention:
             has_recording=has_recording,
             recover=recover,
             control=self._control,
+            on_record=self._post_record,
         )
         return ScanResult(ledger_scan, recordings, now)
+
+    def _post_record(self, event: str, fields: dict[str, Any]) -> None:
+        """A recovery step ended (scan thread): the ledger takes the record from here, even when
+        the process has stopped waiting for this scan."""
+        self._ledger.post("state", event, **fields)
 
     def poll(self) -> None:
         """Handle a finished scan, start the next when due, and check the projection. Called
@@ -208,20 +217,40 @@ class Retention:
         """Wait (bounded) for a scan in flight and report its result before the command ends.
 
         No new recovery step begins once the exit has started, but one under way (a salvage
-        copying a reserve) is given the exit's whole waiting budget to end rather than being
-        cut off half done; a scan that is only reading gets :data:`JOIN_S`."""
+        copying a reserve) is given the exit's waiting budget to end rather than being cut off
+        half done - all of it but the share the ledger needs for its own last writes and close
+        (:data:`LEDGER_KEEP`); a scan that is only reading gets :data:`JOIN_S`. A step still
+        running when the wait ends is abandoned: the ledger says so (``ledger.recovery_incomplete``
+        with ``abandoned``), and the thread writes its own record if it finishes after all."""
         thread = self._thread
         if thread is not None and thread.is_alive():
             self._control.stop.set()
             budget = self._ledger.wait_budget
             if budget is not None:
-                if not budget.join(thread, cap=JOIN_S) and self._control.stepping.is_set():
-                    budget.join(thread)
+                keep = budget.total * LEDGER_KEEP
+                if (
+                    not budget.join(thread, cap=JOIN_S, keep=keep)
+                    and self._control.stepping.is_set()
+                ):
+                    budget.join(thread, keep=keep)
             else:
                 thread.join(JOIN_S)
                 if self._control.stepping.is_set():
-                    thread.join(self._ledger.join_timeout_s)
+                    thread.join(self._ledger.join_timeout_s * (1 - LEDGER_KEEP))
+            self._note_abandoned(thread)
         self.poll()
+
+    def _note_abandoned(self, thread: threading.Thread) -> None:
+        step = self._control.step
+        if thread.is_alive() and step is not None and self._control.stepping.is_set():
+            self._ledger.record(
+                "state",
+                "ledger.recovery_incomplete",
+                **step,
+                abandoned=True,
+                error="the process ended before the copy did; the next long session or prune "
+                "finishes it from the .damaged file",
+            )
 
     # -- results ----------------------------------------------------------------------------------
 
@@ -233,7 +262,6 @@ class Retention:
             self._report_failure(result)
             return
         self._last_ledger, self._last_recordings = result.ledger, result.recordings
-        ledger = self._ledger
         usage = result.ledger.total_bytes() + (
             result.recordings.total_bytes() if result.recordings else 0
         )
@@ -243,8 +271,8 @@ class Retention:
             if scan is None:
                 continue
             self._record_scan(scan, result.finished)
-            for recovery in scan.recoveries:
-                ledger.record("state", "ledger.recovered", **recovery)
+            # ledger.recovered / ledger.recovery_incomplete were handed to the ledger by the scan
+            # thread as each step ended; nothing is left to collect here.
             if scan.partial:
                 self._warn(Code.RET_SCAN, f"retention scan is partial: {scan.partial}", scan.path)
             for message in scan.messages:
@@ -288,6 +316,8 @@ class Retention:
             hard_linked=sum(1 for s in sessions if s.hard_linked),
             recovered=scan.recovered,
             unrecoverable=len(scan.unrecoverable),
+            damaged_files=sum(len(s.damaged) for s in sessions),
+            unreadable=len(scan.unreadable),
             entries=scan.entries,
             partial=scan.partial,
             unsafe=scan.unsafe,

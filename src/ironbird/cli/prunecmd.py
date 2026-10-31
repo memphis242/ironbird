@@ -160,6 +160,8 @@ def work(
     )
     for recovery in scan.recoveries:
         ledger.record("state", "ledger.recovered", **recovery)
+    for incomplete in scan.incompletes:
+        ledger.record("state", "ledger.recovery_incomplete", **incomplete)
     for message in scan.messages:
         console.err(f"warning {Code.RET_SCAN.value}: {term(message, 1000, err=True)}")
     if scan.partial:
