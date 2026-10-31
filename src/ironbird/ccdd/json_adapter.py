@@ -42,6 +42,8 @@ _NAME_RE: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 _ENUM_NAME_RE: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_.\-]{0,63}")
 _MID_RE: Final = re.compile(r"0[xX][0-9a-fA-F]{1,8}|[0-9]{1,10}")
 MAX_MID: Final = 0xFFFFFFFF
+MAX_HEADER_VALUES: Final = 64
+MAX_HEADER_VALUE: Final = (1 << 64) - 1  # the widest header field
 
 
 def _no_duplicate_keys(source: str) -> Callable[[list[tuple[str, Any]]], dict[str, Any]]:
@@ -104,6 +106,21 @@ def _parse_mid(ctx: _Ctx, value: object, path: str) -> int:
         number = int(value, 0) if value.lower().startswith("0x") else int(value, 10)
         return _int(ctx, number, path, 0, MAX_MID)
     return _int(ctx, value, path, 0, MAX_MID)
+
+
+def _parse_header_values(ctx: _Ctx, raw: object, path: str) -> Mapping[str, int]:
+    """``"header": {"field": N}``: values for the header profile's input fields. Which fields
+    exist and what fits them is the header profile's to say, so the codec checks that."""
+    if not isinstance(raw, dict):
+        raise ctx.fail(path, "must be an object of header field name: integer")
+    if len(raw) > MAX_HEADER_VALUES:
+        raise ctx.fail(path, f"more than {MAX_HEADER_VALUES} header values")
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        if not _NAME_RE.fullmatch(key):
+            raise ctx.fail(f"{path}.{key[:40]}", "must be a header field name (an identifier)")
+        out[key] = _int(ctx, value, f"{path}.{key}", 0, MAX_HEADER_VALUE)
+    return MappingProxyType(out)
 
 
 def _parse_enum(ctx: _Ctx, raw: object, path: str, ftype: FieldType) -> Mapping[str, int]:
@@ -276,6 +293,7 @@ def _parse_message(ctx: _Ctx, raw: object, index: int) -> Message:
             "payload_size",
             "category",
             "event",
+            "header",
         },
         {"name", "kind", "mid"},
     )
@@ -346,6 +364,9 @@ def _parse_message(ctx: _Ctx, raw: object, index: int) -> Message:
         payload_size=payload_size,
         category=category,
         event=event,
+        header=_parse_header_values(ctx, raw["header"], f"{path}.header")
+        if "header" in raw
+        else MappingProxyType({}),
     )
 
 

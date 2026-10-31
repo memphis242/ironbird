@@ -80,6 +80,51 @@ origination action (`cfe_msg_integrity.c:41`). Payload starts
 at packet offset **16, not 12**: this 4-byte spare is the one surprise versus the common
 "6 + 6" expectation. Verified live: ES HK is 184 bytes = 16 + 168.
 
+### Telemetry header time: epoch, scale and leap seconds
+
+Read from the checked-out source (bundle v7.0.1, cFE `c5fb2b4`), not from memory. The native
+build sets none of these in `sample_defs`, so the cFE defaults apply:
+
+| Setting | Value | Where |
+|---------|-------|-------|
+| Epoch | 1980, day 1, 00:00:00.000000 = **1980-01-01T00:00:00** (not the GPS epoch 1980-01-06) | `CFE_MISSION_TIME_EPOCH_YEAR/DAY/HOUR/MINUTE/SECOND/MICROS` (`cfe/modules/time/fsw/inc/cfe_time_interface_cfg.h:186-202`, same in `cfe/cmake/sample_defs/example_mission_cfg.h:543-548`) |
+| Epoch as Unix seconds | 315532800 | `CFE_MISSION_TIME_EPOCH_SECONDS` (`cfe_time_interface_cfg.h:205-206`); `CFE_TIME_Print` adds it to the seconds (`cfe_time_api.c:579`) |
+| Time scale | TAI by default (`CFE_MISSION_TIME_CFG_DEFAULT_TAI true`) | `cfe_time_interface_cfg.h:53-54` |
+| Leap seconds | 37 (`CFE_MISSION_TIME_DEF_LEAPS`); UTC = TAI - leap seconds (`CFE_TIME_GetUTC`) | `cfe_time_interface_cfg.h:162-163` |
+| Initial MET / STCF | 1000 s / 1000000 s | `CFE_MISSION_TIME_DEF_MET_SECS`, `..._DEF_STCF_SECS` (`:150`, `:156`) |
+
+The packet's time is `CFE_TIME_GetTime()` = MET + STCF, a TAI count of seconds since the epoch.
+So a header seconds value S is the UTC instant `1980-01-01T00:00:00Z + S - 37 s`, and a fresh
+`run.sh` (STCF 1000000, MET from 1000) should stamp packets with S near 1001000 = about
+**1980-01-12T14:00Z**, in line with the simulated `1980-...` console lines (derived from the
+defaults; the acceptance cases below check it against the live build). The profile
+`examples/headers/ccsds_v1_cfs_tlm_cfe_time.toml` carries `[time] epoch = "1980-01-01T00:00:00Z"`
+and `leap_seconds = 37`, and **`examples/ironbird.toml` (the real-cFS ground config) uses it**, so
+`htime` is right without any edit. `ccsds_v1_cfs_tlm.toml` keeps the Unix epoch, which is what the
+mock vehicle (`ib respond`) stamps its own telemetry with, and `examples/mock.toml` uses that one.
+HK carries MET (`CurrentMET`), STCF (`AtToneSTCF`) and `AtToneLeapSeconds` of the same reference
+as the stamp (`cfe_time_utils.c:391-397`), DIAG its own `CurrentTAI` and `CurrentUTC`
+(`cfe_time_utils.c:444-447`). The `cfs` acceptance cases:
+`test_listen_where_htime_selects_time_hk_in_the_cfe_epoch` (`--where` with a 1980 window) and
+`test_header_time_equals_the_cfe_time_in_the_time_packets` (decoded `htime` of a TIME HK and a DIAG
+equals `epoch + MET + STCF - leaps` / `epoch + CurrentUTC` of that same packet within 2 s).
+If the mission configuration changes `EPOCH_*`, `CFG_DEFAULT_TAI` or `DEF_LEAPS`, edit the
+`[time]` table to match; a UTC-scale mission uses `leap_seconds = 0`.
+
+### MsgId V2 layout (not exercised by this build)
+
+This build uses MsgId V1 (`cfe_msg_msgid_v1.c`). The V2 layout (`cfe_msg_msgid_v2.c:20-47`,
+header `cfe/modules/msg/fsw/inc/ccsds_hdr.h:55-87`) builds the 16-bit MID from three places:
+APID low 7 bits (primary header byte 1), the command/telemetry bit (primary header bit 3)
+and the Subsystem low byte (extended header byte 7): `MID = subsystem << 8 | type << 7 | apid`.
+`examples/headers/cfe_msgid_v2_{cmd,tlm}.toml` express it with
+`mid_fields = ["subsystem_lo", "packet_type", "apid_lo"]`; unit tests only. Their input-field
+defaults are the cFE ones (`CFE_MSG_SetDefaultCCSDSExt`, `cfe_msg_ccsdsext.c:41-54`): EDS version 1
+(`CFE_PLATFORM_EDSVER`, `cfe_msg_defaults.h:56`), endian flag 1 = little (`CFE_PLATFORM_ENDIAN` is
+`CCSDS_LITTLE_ENDIAN`, `default_cfe_core_private_internal_cfg.h:44`; the `#if` at `ccsdsext.c:45`
+compares two names that no header in this checkout defines (both read as 0), so it is true either way), system id 0x42 (the spacecraft id
+above, stored from `CFE_PSP_GetSpacecraftId()`, `ccsdsext.c:53`), playback 0.
+
 ### Byte order
 
 - Primary header and telemetry time: **big-endian** (network order).

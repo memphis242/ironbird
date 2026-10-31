@@ -429,10 +429,12 @@ class Session:
         *,
         tamper: Mapping[str, int] | None = None,
         link: str | None = None,
+        header: Mapping[str, int] | None = None,
     ) -> SentCommand:
         route = self.route(peer, require=Side.COMMANDER, link_name=link)
         codec = self.codec_for(route.server.name)
         endpoint = route.link.command_endpoint
+        extra: dict[str, Any] = {"header": dict(header)} if header else {}
         self.ledger.record(
             "action",
             "send.request",
@@ -441,8 +443,9 @@ class Session:
             args=dict(args or {}),
             tamper=dict(tamper or {}),
             link=route.link.name,
+            **extra,
         )
-        encoded = codec.encode_command(command, args, tamper=tamper)
+        encoded = codec.encode_command(command, args, tamper=tamper, header=header)
         self.ledger.check_transmit(encoded.message.name, route.server.name)
         attempt = TxAttempt(encoded.message.name)
         self._last_tx = attempt

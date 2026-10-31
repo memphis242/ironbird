@@ -1,0 +1,12 @@
+# A [time] table needs a time_seconds field to apply to.
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+[time]
+epoch = "1980-01-01T00:00:00Z"
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"

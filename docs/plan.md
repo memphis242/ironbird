@@ -2734,6 +2734,163 @@ TIME HK decodes with the epoch from the checked-out cFE mission config (read fro
 recorded in `tools/cfs/NOTES.md`). msgid_v2 and trailer CRCs have no cFS case in this
 build (MsgId V1); unit tests only.
 
+As built (where the build differs from, or settles, the text above)
+- Modules: `header.py` (schema, MID windows, spans, trailer, time, `frame_length`), `checksum.py`
+  (`crc16_ccitt` is `binascii.crc_hqx(data, 0xFFFF)`, pinned by the existing `0x29B1` assert),
+  `codec.py` (trailer in the payload arithmetic, per-message and per-send header values),
+  `ccdd/json_adapter.py` + `ccdd/model.py` (`Message.header`), `filter/compiler.py` (`htime`,
+  trailer fields as `hdr.*`), `session.py` + `cli/main.py` (`ib send --header`). No new error code:
+  profile problems are `IB-HDR-002` with the field path, a bad `--header` name or width
+  `IB-HDR-003`, a CCDD `header` of the wrong shape `IB-CCD-002`, a CCDD message whose header values
+  or checksum span do not fit its profile `IB-ENC-004` (at codec load), a received packet whose span
+  does not fit it `IB-DEC-005` (offset of the checksum field), a short packet `IB-DEC-001` (the
+  message names the trailer when there is one), a `--header` usage mistake `IB-CLI-001`.
+- Profile schema, all optional and all validated at load (`HeaderField` and `HeaderProfile` carry the
+  compiled form; a pre-2i profile loads to the same fields, masks and windows):
+  - `endian = "big" | "little"` on a field. Little needs a field that starts on a byte boundary and
+    fills whole bytes (any width 8..64 in whole bytes; one byte is the same either way). The profile
+    level `byte_order` still accepts only `"big"` (it names the bitfield order) and says to use `endian`.
+    Applies to every kind of field: fixed (checked in wire form), input, length, sequence, MID parts,
+    time, checksum. `HeaderField.swap` (little and more than one byte) is the one flag the hot path
+    tests; `Header.values` always holds the logical value.
+  - `[trailer]` with `[[trailer.fields]]` (a table, so it has room for keys later). Trailer fields are
+    fixed (checked like header fixed fields, one mask compare) or the one checksum; no inputs and no
+    other computed kinds, at most 64 fields and bytes; names are unique across header and trailer.
+    `HeaderField.trailer`, `HeaderProfile.trailer_size`, `min_bytes` (header plus trailer). `hdr.<name>`
+    in a filter and `Header.values` include trailer fields. `Codec` checks payload as total minus
+    header minus trailer (`IB-DEC-007`, offset at the header end, message says "payload is N bytes");
+    the length field still counts the whole packet.
+  - `span` on the checksum field: `"packet"` (default, the former behaviour), `"header"`, `"payload"`,
+    `{ start = N, end = -M }` (both keys required; `start` 0..65535, `end` -65535..0, so `end = 0`
+    is the packet end; start plus distance from the end at most 65535). One checksum per profile,
+    in the header or the trailer, byte aligned, 8 or 16 bits (`xor8_cfs`, `crc16_ccitt`; little-endian
+    allowed). The field is zeroed when it lies inside the span, left alone when outside; a span
+    boundary through it is refused at load where the profile alone decides it (a header checksum with
+    `start` inside it, a trailer checksum with `end` inside it) and as a coded error per packet
+    otherwise (`checksum_plan`: `IB-ENC-004` at codec load for each CCDD message, `IB-DEC-005` on the
+    wire, `IB-ENC-004` from `pack`). Verification works on one copy of the covered bytes with the
+    field zeroed; a whole-packet `xor8_cfs` copies nothing (it XORs the stored byte back out).
+  - `mid_fields` in any order and position, no repeats, header fixed/`from_mid` fields only, sum at
+    most 64 bits (the codec still refuses more than 32: `IB-HDR-002` "N-bit message ID", corpus
+    `codec-hdr-mid-wider-than-32*.toml`). `HeaderProfile.mid_windows` holds 6-tuples
+    `(byte offset, count, shift, mask, output shift, order)`; the plan's five-tuple gained the byte
+    order for little-endian parts. Wire-contiguous big-endian neighbours in list order merge into one
+    window, which keeps the cFS profiles at the single window they had; `peek_mid` has three paths:
+    one window (`mid_single`), several big-endian windows read through one integer (`mid_flat`), and
+    the general loop. Replaces `mid_window`.
+  - `[time]`: `epoch` (ISO 8601 string or TOML date-time, a zone required whose offset is a whole number of
+    minutes, whole second, 1900..2200; `+00:00:30` is `IB-HDR-002`, corpus `hdr-time-epoch-offset-seconds.toml`)
+    and `leap_seconds` (-1000..1000), counter = UTC - epoch + leap_seconds. It needs a
+    `computed = "time_seconds"` field; `time_subseconds` is the fraction of a second in the field's
+    width. A profile with a seconds field and no `[time]` counts Unix seconds (epoch 0, leap 0), the
+    way `pack` always stamped it, so the shipped profiles gain `Header.time_ns` and `htime` without
+    any byte changing. `Header.time_ns` is a property computed from `values` and a reference to the
+    profile (no per-decode cost); `None` without a seconds field. `pack` writes the counter from the
+    send time and refuses (`IB-HDR-003`) a send time before the epoch instead of wrapping.
+  - `frame_length(prefix)` and `length_window` (the bytes through the end of the length field, also for
+    a bit-aligned, biased or little-endian one). It returns the total the field claims (field value minus
+    `bias`), which untrusted bytes can make negative (a positive `bias` with a small field), smaller than
+    `min_bytes` or larger than any cap: it does not judge the value, so 2k's framer must range-check it
+    (`min_bytes` .. its packet cap) before it sizes a read or a buffer; `test_frame_length_returns_negative_
+    and_implausible_values_unjudged` pins that behaviour. A profile without a length field has
+    `length_window = None` and `frame_length` asserts (2k validates at config load).
+- Header values: `Message.header` (CCDD key `"header": {field: N}`, an object of at most 64
+  non-negative integers; no schema bump, `ironbird-ccdd/0` still); `Codec` checks every name and value
+  against the profile of the message's kind when it is built. A name must be an input field and not the
+  function code field (it comes from the command: refused with that reason). `Codec.encode_command/
+  encode_telemetry(header=)`, `Session.send_command(header=)`, `ib send --header FIELD=N` (repeatable,
+  `int(x, 0)`); precedence send > message > profile default. A per-send `header` that is not a mapping,
+  has a key that is not a string, or a value that is not an int is `IB-HDR-003` (never a `TypeError`).
+  The ledger's `send.request` record carries `header` when one was given. Responder replies take the
+  message's values.
+- `htime` is live in the filter: a decode-level name that takes the same time literals as `time`
+  (UTC), false for a frame that does not decode or whose profile has no seconds field, `IB-FLT-002` when
+  no profile in use has one, `IB-FLT-003` for a non-time literal. The reference evaluators were not
+  extended: `htime` is covered by `test_header_flex.py`.
+- cFE epoch, read from the checked-out source (v7.0.1, `cfe` `c5fb2b4`) and recorded in
+  `tools/cfs/NOTES.md`: 1980, day 1 = **1980-01-01T00:00:00** (not the GPS epoch 1980-01-06 of this
+  section's example), `CFE_MISSION_TIME_EPOCH_SECONDS = 315532800`, TAI by default with
+  `CFE_MISSION_TIME_DEF_LEAPS = 37`, so `epoch = "1980-01-01T00:00:00Z"`, `leap_seconds = 37`.
+- Decision (Unix epoch versus cFE epoch): the two telemetry profiles differ in one `[time]` table and
+  each system description uses the one that matches who stamps the packets. `ccsds_v1_cfs_tlm.toml`
+  has no `[time]` (Unix seconds): `examples/mock.toml` uses it, because `ib respond` (the mock vehicle)
+  stamps its replies with the Unix clock, and a `[time]` table there would change bytes the 2i
+  acceptance rules out. `ccsds_v1_cfs_tlm_cfe_time.toml` carries the cFE epoch: `examples/ironbird.toml`
+  (ground plus a real cFS, the config the `cfs` acceptance suite uses) names it, so `htime` and 2h's
+  `pkt_time_utc` are the right UTC instant for real telemetry without any user edit. A system that
+  mixes a mock and a real vehicle in one file gives each node its own profile. Also new:
+  `cfe_msgid_v2_{cmd,tlm}.toml` (layout from `ccsds_hdr.h` and `cfe_msg_msgid_v2.c`: `mid_fields =
+  ["subsystem_lo", "packet_type", "apid_lo"]`) and `ccsds_pec_tlm.toml` (PEC trailer, span
+  `{ start = 0, end = -2 }`). The MsgId V2 profiles default the extended header to what
+  `CFE_MSG_SetDefaultCCSDSExt` writes (`cfe_msg_ccsdsext.c:41-54`): `eds_version = 1`
+  (`CFE_PLATFORM_EDSVER`, `cfe_msg_defaults.h:56`), `endian_flag = 1` (little-endian payload:
+  `CFE_PLATFORM_ENDIAN` is `CCSDS_LITTLE_ENDIAN`, `default_cfe_core_private_internal_cfg.h:44`; a
+  big-endian flight CPU sends 0), `system_id = 0x42` (the spacecraft id, `sample_defs/targets.cmake:77`,
+  stored by `cfe_msg_ccsdsext.c:53`), `playback = 0`; the source lines are cited in the profile files.
+- Check order is now: over the cap, shorter than header plus trailer, MID not in the CCDD, length
+  field, header fixed fields, trailer fixed fields, checksum, function code, payload size.
+  `Resolved.word` is still the header word (wire form); the trailer word is read from the data
+  when fields are unpacked. `header.read_field` applies a field's byte order (the codec uses it for the
+  function code).
+- Compatibility with `main` was also checked from the outside: `tests/golden_2i.py` run against
+  `main`'s tree (`PYTHONPATH=<main>/src`) writes the same bytes as against this branch and as
+  `pre2i_header_vectors.json`, and a differential of 20000 seeded random pre-2i-style profiles
+  (pack, unpack, check and `peek_mid` of valid, truncated, extended and bit-flipped packets, 202252
+  result lines on `main`) gives identical results for all 19940 profiles both trees treat alike; the other
+  60 are profiles `main` refused with `IB-HDR-002` that 2i accepts (a MID over fields in another order),
+  and none changed behaviour. `tools/dev/diff_vs_main.py <main checkout> [--profiles N]` repeats both
+  checks (dev script, not CI).
+- Proof that nothing shipped changed: `tests/golden/pre2i_header_vectors.json`, made by
+  `python tests/golden_2i.py` on the tree before any 2i edit, holds the hex of every message of both
+  shipped CCDD files encoded twice and a digest of 21876 result lines (decode, check, `header.unpack`,
+  `header.check`, `peek_mid` of valid packets, every truncation to 40 bytes, extensions, 40 seeded
+  mutants per message and the `packet-*.bin` corpus, in both directions): `test_header_flex.py` regenerates
+  them and compares (equal). `tests/header_ref_pre2i.py` keeps the pre-2i `check_word`, `peek_mid` and
+  `pack` as a differential oracle; Hypothesis runs it against the new code on generated profiles that use
+  nothing new (`legacy=True`), on the two shipped ones, and on mutated packets.
+- Tests: `test_header_flex.py` (149 cases: byte order, trailer, PEC against a bit-by-bit CRC, the CRC
+  check value through a payload span, each span form, spans that cut or do not fit, MsgId V2 against
+  hand-built bytes, header values and their precedence, `--header` through the CLI onto a socket, epochs
+  and the cFE time, `frame_length` on every prefix, `htime`, the corpus), `test_header_props.py` (23:
+  `headergen.py` builds valid profiles - bitfield groups and whole-byte fields in either order,
+  trailers, every checksum span, MIDs of up to 32 bits over any fields in any order, epochs and leap
+  seconds, command and telemetry - with a model of the wire that does not use the code under test; pack
+  equals the model, unpack returns every field, `peek_mid` equals the MID, a bit flipped under a
+  checksum is caught, arbitrary bytes and mutated packets never raise, `frame_length` is right on every
+  prefix, the codec round-trips both kinds with header values, and a `find` per feature proves the
+  generator reaches it), 20 `hdr-*.toml`, 1 `codec-hdr-*.toml`, 6 `ccdd-header-*.json` and 4
+  `codec-ccdd-header-*.json` corpus entries (little-endian bitfield and unaligned field, bad and
+  contradictory byte order, spans that cut their checksum or cannot fit, a MID field twice or in the
+  trailer, trailer input and duplicate names and odd width, two checksums, `[time]` without seconds,
+  naive, far and bad epochs and leap seconds, a 40-bit MID over two fields, bad `header` values), mutation
+  fuzz of the four new example profiles and of arbitrary `header` values in the mock CCDD. The `cfs`
+  acceptance gained two cases that run `examples/ironbird.toml` as shipped (cFE-epoch profile, no config
+  rewrite): `test_listen_where_htime_selects_time_hk_in_the_cfe_epoch` (TIME HK through `htime >=
+  1980-01-01 and htime < 1981-01-01`) and `test_header_time_equals_the_cfe_time_in_the_time_packets`,
+  which decodes raw TO_LAB datagrams in-process and compares each TIME HK and DIAG `htime` with the
+  time the same packet reports (HK: MET + STCF - leap seconds since 1980-01-01; DIAG: its own
+  `CurrentUTC`) within 2 s, so the GPS epoch 1980-01-06 or 37 leap seconds missing both fail; neither
+  was run on the dev host (no real cFS run in this stage's review loop).
+- Benchmarks (4-core dev host, `test_benchmarks.py`; best of 7 x 200k calls against the tree before 2i):
+  check of a telemetry frame 1.0-1.2 us before and after; decode of `MOCK_HK` 4.1-4.8 us before,
+  4.4-4.9 us after; decode of a command with its checksum 4.8-5.4 us before, 5.3-5.8 us after (the
+  checksum copied the packet once and zeroed the field in the copy; `xor8_cfs` over the whole packet now
+  XORs the stored byte out of the running XOR instead, `ChecksumAlgorithm.compute_zeroed`, which
+  brought the ES_NOOP `Codec.check` from 2.0-2.4 us to 1.8 us and `decode` from 4.3-4.5 us to 4.1-4.2 us
+  against 1.7-2.1 us and 3.8-4.0 us on `main`, `timeit` best of 15 x 100k on the noisy 4-core host;
+  CRC-16 still copies); `peek_mid` 0.24 us either way. Serial `-n0` run (best-of-rounds means): msgid-V2 telemetry decode 6.6 us, command decode with
+  checksum 7.3 us, check 1.6 us, `peek_mid` of three windows 0.39 us (0.7 us before the one-integer
+  path), CRC-trailer decode 5.8 us; 44 benchmarks pass.
+  Ceilings are unchanged (100 us a decode or check); new: msgid-V2 telemetry and command decode, check,
+  `peek_mid` (5 us) and a CRC-trailer decode, and a relative guard that a three-window MID and a CRC
+  trailer check a frame in at most 2.5x the plain header's time.
+- Deferred: a second checksum per profile and trailer inputs; other algorithms (CRC-32, additive sums);
+  header values in `ib respond` rules (a reply takes its message's CCDD values); the filter's reference
+  evaluators know no `htime`; `listen` and replay output do not show the header time (2h's
+  `pkt_time_utc` reads `Header.time_ns`; a 64-bit counter plus an epoch can pass year 9999, so the
+  export must clamp its formatting); a profile whose length field is not in the first
+  `length_window` bytes of a stream is 2k's concern when it validates links.
+
 ### 2j - Variable-length payloads
 
 CCDD (placeholder schema `ironbird-ccdd/1`; `/0` still loads, decision D10):

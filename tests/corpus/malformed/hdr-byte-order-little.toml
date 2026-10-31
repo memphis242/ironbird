@@ -1,0 +1,12 @@
+# Contradictory: the profile-level byte_order is the bitfield order and only big exists; a field says little.
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+byte_order = "little"
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+endian = "little"

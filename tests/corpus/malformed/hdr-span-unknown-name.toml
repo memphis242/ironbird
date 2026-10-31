@@ -1,0 +1,16 @@
+# span is packet, header, payload or a table.
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+
+[[fields]]
+name = "ck"
+bits = 8
+computed = "checksum"
+algorithm = "xor8_cfs"
+span = "everything"

@@ -1,0 +1,54 @@
+# CCSDS space packet with the 16-bit packet error control (PEC) as a trailer, the form used on
+# serial links. The PEC is CRC-16/CCITT-FALSE over every byte of the packet before it, so its
+# span stops 2 bytes short of the packet end and the PEC field is outside it (nothing to zero).
+# Primary header only; the length field counts the whole packet minus 7 (PEC included).
+
+name = "ccsds_pec_tlm"
+kind = "telemetry"
+description = "CCSDS primary header + packet error control trailer"
+byte_order = "big"
+mid_fields = ["version", "packet_type", "sec_hdr_flag", "apid"]
+
+[[fields]]
+name = "version"
+bits = 3
+value = 0
+
+[[fields]]
+name = "packet_type"
+bits = 1
+value = 0
+
+[[fields]]
+name = "sec_hdr_flag"
+bits = 1
+value = 0
+
+[[fields]]
+name = "apid"
+bits = 11
+computed = "from_mid"
+
+[[fields]]
+name = "seq_flags"
+bits = 2
+value = 3
+check = false
+
+[[fields]]
+name = "sequence"
+bits = 14
+computed = "sequence"
+
+[[fields]]
+name = "length"
+bits = 16
+computed = "length"
+bias = -7
+
+[[trailer.fields]]
+name = "pec"
+bits = 16
+computed = "checksum"
+algorithm = "crc16_ccitt"
+span = { start = 0, end = -2 }

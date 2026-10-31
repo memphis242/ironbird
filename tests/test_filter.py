@@ -308,7 +308,7 @@ def test_literal_suggestions(codecs: dict[str, Codec]) -> None:
 
 
 def test_reserved_and_unavailable_names(codecs: dict[str, Codec]) -> None:
-    assert error_of(codecs, "htime > 1").code is Code.FLT_NAME
+    assert error_of(codecs, "htime > 1").code is Code.FLT_TYPE  # the header time wants a time
     assert error_of(codecs, "hdr == 1").code is Code.FLT_NAME  # a namespace on its own
     assert error_of(codecs, "event == 1").code is Code.FLT_NAME
 

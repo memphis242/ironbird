@@ -4,6 +4,10 @@
 # Real cFS over UDP on one host: commands go to CI_LAB (default 127.0.0.1:1234); TO_LAB
 # sends telemetry to the host address it was given by its enable-output command, on
 # UDP port 2234, which ground listens on.
+#
+# Telemetry is read with the cFE mission time epoch (1980-01-01, TAI, 37 leap seconds), so the
+# header time (`htime`) decodes to the right UTC instant. examples/mock.toml keeps the Unix-epoch
+# profile instead, because the mock vehicle (`ib respond`) stamps its telemetry in Unix seconds.
 
 [ironbird]
 acts_as = "ground"          # node this invocation acts as unless --as says otherwise
@@ -18,7 +22,7 @@ alias = "flight"
 description = "cFS flight computer (CI_LAB / TO_LAB)"
 ccdd = "ccdd/cfs.json"
 command_header = "headers/ccsds_v1_cfs_cmd.toml"
-telemetry_header = "headers/ccsds_v1_cfs_tlm.toml"
+telemetry_header = "headers/ccsds_v1_cfs_tlm_cfe_time.toml"   # cFE time epoch: htime is UTC
 
 # Commands flow from -> to. The 'to' node owns the CCDD and header profiles.
 [[links]]

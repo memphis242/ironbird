@@ -1,0 +1,25 @@
+# Loads as a profile (the MID is 40 bits over two fields that are not next to each other,
+# listed high part first), but a frame carries the MID as a u32: the codec refuses it.
+name = "p"
+kind = "telemetry"
+mid_fields = ["hi", "lo"]
+
+[[fields]]
+name = "lo"
+bits = 20
+computed = "from_mid"
+
+[[fields]]
+name = "gap"
+bits = 8
+value = 0
+
+[[fields]]
+name = "hi"
+bits = 20
+computed = "from_mid"
+
+[[fields]]
+name = "pad"
+bits = 8
+value = 0
