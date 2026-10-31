@@ -40,7 +40,9 @@ class Filter:
     hand-made matcher. ``mids`` is the candidate MID set: a frame whose MID is outside it can
     never match, ``match`` rejects it before anything else runs, and so it is never decoded on
     this filter's behalf (``None``: any MID may match). ``needs_decode`` says whether matching
-    can decode a frame at all.
+    can decode a frame at all. ``nodes`` is the candidate node set in the same way (``None``: a
+    frame of any node may match); it is derived from ``node == X`` and ``node in [...]`` through
+    ``and`` and ``or``, and is ``None`` wherever the expression does not pin the node down.
     """
 
     source: str
@@ -48,6 +50,7 @@ class Filter:
     needs_decode: bool
     match: MatchFn
     cost: Cost
+    nodes: frozenset[str] | None = None
 
     def bind(self, decode: FrameDecode, codec_for: Callable[[str], Codec]) -> Matcher:
         """A matcher for one consumer. ``decode`` turns a frame into a packet (or the error that

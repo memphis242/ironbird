@@ -2566,13 +2566,141 @@ Deliverables
   until a 2l benchmark shows a one-hour recording exports in over 60 s.
 
 Untrusted input: string cells sanitized (control characters escaped) and formula-leading
-cells (`=`, `+`, `-`, `@`, tab, CR) prefixed with `'`, string fields only (numbers are
-typed); `csv` module quoting (RFC 4180). Test: a telemetry string starting with `=` and
+cells (`=`, `+`, `-`, `@`, their fullwidth forms, tab, CR, LF, behind any leading whitespace)
+prefixed with `'`, string fields only (numbers are typed); `csv` module quoting (RFC 4180). Test: a telemetry string starting with `=` and
 holding a newline and an escape sequence exports inert.
 
 Verification: unit tests per column type; real cFS: export the 2e recording's
 `SAMPLE_APP_HK`: `CommandCounter` rises by exactly K across the NOOPs and returns to 0
 after RESET_COUNTERS, and the row count equals the MID's count in `ib rec info`.
+
+As built (where the build differs from, or settles, the text above)
+- Modules: `recording/export.py` (cells, tables, the export loop, the destinations, `refuse_unsafe_output`,
+  `write_to_file`, `write_to_directory`), `atomicfile.TempDirOutput` (the directory form of
+  `TempOutput`), `ib export` in `cli/main.py`. The replay command's pieces that export shares moved into
+  helpers (`_damage_reporter`, `_note_reporter`, `_report_missing_parts`, `_report_unclosed`,
+  `_replay_definitions(command=, records=)`), and `embedded_codecs(hint=)` / `config_codecs(command=)`
+  word their advice for the command that failed (`export with --defs config ...`, no `--format hex`).
+  New codes `IB-EXP-001` (`EXP_WRITE`) and `IB-EXP-002` (`EXP_EXISTS`); ledger records `export.start`,
+  `export.stop` (counts per table, how it ended), `export.note`, `export.no_definitions`,
+  `export.defs_compare_skipped`, `export.defs_differ`, all essential tier.
+- Command: `ib export FILE... [--format csv|text|jsonl] [-o OUT] [--message NAME]... [--where] [--from]
+  [--to] [--header-fields] [--raw-enums] [--defs recording|config] [--skip-damage] [--force]`. Runs offline
+  like `replay` (no session, no sockets), always needs definitions (an unusable embedded set is
+  `IB-REC-009`, exit 1, with `--defs config` as the way out), reads one file or a split set exactly as
+  replay does (a missing part is `IB-REC-006`, exit 5; several files as given), and shares replay's
+  damage reporting (3 lines shown, 100 ledgered, the total in the stop record). Without `-o`, text,
+  jsonl and a one-message CSV go to stdout through `write_wait` (a reader that goes away ends the
+  export quietly); a CSV directory needs `-o`. `--header-fields` and `--raw-enums` with another format,
+  and `--force` without `-o`, are `IB-CLI-001` (exit 2), so no option is silently ignored. There is
+  no `--count`.
+- Tables. The first column group is `rx_time_utc` (the second's date and time are cached, the text
+  equals `ledger.format_ts`), `rx_time_ns`, `seq`, `node`, `link`, `mid`; then `hdr.<name>` for every
+  field of the message kind's header profile in profile order (`--header-fields`; `pkt_time_utc`
+  comes with the epochs of 2i), then the payload fields in CCDD order. `seq` is the recording's frame
+  number (it joins to `malformed.csv` and to `replay`'s `frame=`); the packet's own sequence counter
+  is the header field `hdr.sequence` of the shipped profiles. A payload field named like a column
+  already taken becomes `<MESSAGE>.<field>`. Cells: ints as numbers; enum fields their label, or the
+  number when the enum lacks the value or with `--raw-enums`; floats `repr` of the decoded double
+  (a float32 shows its exact value, e.g. 0.10000000149011612, as `listen` does); a non-finite float is
+  a text cell (`nan`, `inf`, `'-inf`); `char` text; `bytes` hex with a `0x` prefix. Lines end in LF (cells never hold a
+  newline), quoting is the `csv` module's `QUOTE_MINIMAL`.
+- Files. One distinct `--message` is one table (file or stdout); otherwise a directory with the
+  `malformed` table opened first and a table per (message name, column list) the first time the
+  message appears. The same name with another column list (another node's CCDD) is `<NAME>.2.csv`; a
+  message called `malformed` is `malformed.1.csv`; stems that differ only by case are told apart, so no
+  two files of a directory collide on a case-insensitive file system. A single-file CSV
+  (stdout or `-o`) of a message with more than one layout across the recording's nodes is refused
+  with `IB-CLI-001` before the first row is written (`check_single_layout`: `table_columns` over
+  `replay.nodes`; a `--where` that pins the node, through `Filter.nodes`, narrows the nodes compared,
+  so `node == fc` leaves one layout; `node ==`, `node in`, `node !=`, `and` and `or` are understood,
+  `not` or a non-node expression leaves every node in). The loop keeps the same check as a backstop. `malformed.csv`
+  holds `rx_time_utc, rx_time_ns, seq, node, link, dir, mid, status, code, offset, reason, len,
+  orig_len, flags, hex` (the whole frame as hex; a recording with a large `max_packet_bytes` can
+  exceed a spreadsheet's cell limit, which truncates on load; the file is not cut). A single-file CSV
+  has no malformed table: those frames are counted in `ExportResult.not_written` and a warning says
+  so. text and jsonl show them flagged, exactly as replay prints them. `--message` is checked against
+  the definitions of the recording (`IB-CLI-001` with close names), narrows the chunk selection to the
+  MIDs of the named messages together with `--where`'s candidates, and selects decoded frames by
+  message name; a frame that did not decode is kept when it is telemetry with the MID of a named
+  message (so it reaches `malformed.csv` or the flagged text line), never by guessing otherwise.
+  A frame of a node with no definitions is `undecoded` (a malformed row) unless the filter itself
+  needs the definitions, when it is counted and warned about as replay does.
+- Cells are untrusted (decision on top of the plan text): `safe_cell` escapes with `sanitize.clean` (no
+  truncation; an all-printable-ASCII string takes a fast path), then prefixes `'` when the first
+  character that is not whitespace (`str.isspace`; NBSP, U+3000 and the like are escaped by `clean`
+  already, the ASCII space and the fullwidth forms are not) is `=`, `+`, `-`, `@`, the fullwidth
+  `\uff1d \uff0b \uff0d \uff20`, tab, CR or LF (the last three cannot survive the escaping; the rule
+  is kept anyway). A LibreOffice integration test (skipped without `soffice`) imports hostile cells
+  with trimming and formula evaluation on and checks that none is evaluated. Every string cell goes through it: names, links, labels, text, hex, the code, reason
+  and flags of the malformed table, and the column names. Hypothesis over arbitrary strings pins that a
+  cell is one inert line that no spreadsheet reads as a formula and that parses back.
+- Output (as the text says, with these settlements). `refuse_unsafe_output` runs before anything is
+  read and again after the set's parts are known: OUT the same device and inode as any input part
+  (`os.stat` follows symbolic links and `..`; a hard link counts), OUT anywhere inside the state
+  directory (any name: it holds the ledger and its bookkeeping), and OUT named like a retention file
+  (`retention.is_managed_name`, which includes a salvage's `.<part>.<16 hex>.tmp`) inside the
+  recording directory (same device and inode as OUT's parent, so a symlinked path does not hide it)
+  are `IB-EXP-002` with or without `--force` (refusing without `--force` too, because a new file
+  with such a name would be pruned as if it were a ledger part or recording). `input_guard` repeats
+  the input test just before the commit, against the `(device, inode)` of every part the replay
+  opened and the parts' paths, for a name that became the recording during a long export; an existing OUT is refused without `--force`, and with it only a
+  regular file that is not a symbolic link is replaced (`TempOutput.commit`: not one another process
+  holds `flock`ed); a directory export refuses any existing OUT. The commit is the non-replacing
+  rename, so an OUT that appeared while exporting is refused too (`IB-EXP-002`, the file untouched).
+  `TempDirOutput` creates `.<name>.<16 hex>.tmp` (0700) and its members `O_EXCL` (0600); at most
+  `default_max_open()` members hold a descriptor (64, or the soft `RLIMIT_NOFILE` less the descriptors
+  in use and a margin of 48, never below 1), the least recently written one is closed and, when
+  written again, reopened with `O_APPEND` after its inode is compared with the one created (a swapped
+  member is an error, not a write; evicted members are compared again at the commit). On `EMFILE` or
+  `ENFILE` anyway, one more descriptor is given up, the budget follows, and the open is retried;
+  with none to give up the error is `IB-EXP-001` and says to raise `ulimit -n`; writes are buffered per destination (256 KiB for a file, 4 MiB across a
+  directory), so memory stays constant. `commit` syncs every member, the directory, and renames. Any
+  failure, `KeyboardInterrupt` or signal removes the members this process created (by name, after an
+  inode check) and the directory with `rmdir`; a foreign file inside leaves the directory, named in the
+  error (`TempDirOutput.leftover`). A failed directory sync after the rename is a warning
+  (`IB-EXP-001`: the export exists, its name may not survive a power loss; ledgered), like repair's. Write
+  errors are wrapped as `OutputError` at the destination so a read error of the recording is never
+  called a write error.
+- Guard. `test_no_automatic_deletion.py` gained two entries, both in `atomicfile.py`: the removal in
+  `TempDirOutput._discard` (the process's own temporary members and directory, the analogue of
+  `TempOutput.__exit__`) and the in-place append in `TempDirOutput._reopen` (a file created by the same
+  process, inode-checked). No other deletion, rename or truncation path was added. The directory
+  form of the non-replacing commit (`mkdir` placeholder, then rename) that 2e left unexercised is now
+  tested through `TempDirOutput`.
+- Tests. `test_export.py` (cells, Hypothesis over arbitrary strings and over payload bytes of a CCDD
+  with every field type: round trip to the decoded values, enum labels and raw numbers, non-finite
+  floats, header fields, naming collisions, text and jsonl equal to `replay` by line for six
+  filter/range combinations, selection, hostile event text), `test_export_cli.py` (output rules:
+  existing, same file by five spellings, managed names in both directories with and without
+  `--force`, directories, symbolic links, locked files, races, `FaultFs` faults at every step, a
+  descriptor budget of 3 for 12 members, SIGTERM leaving no temporary, damaged and torn input, a missing
+  part, exit codes), `test_export_malformed.py` (both recording corpora through the exporters, arbitrary
+  frames landing in exactly one row, corrupted recordings, the `exp-*` corpus built by
+  `tests/export_corpus.py`: formula leads, newlines, escapes, bidi, NULs and non-finite floats in
+  well-formed recordings), two benchmarks, and a `cfs` case (record a session with K NOOPs, export,
+  `CommandCounter` rises by K and returns to 0, row count equals `rec info`'s; not run on the dev
+  host). Export adds no parser: the reader and the definitions loaders keep their own corpora, which
+  the exporters now also run through.
+- Benchmarks (4-core dev host, 60k frames): 40-49k rows/s as CSV tables, 33k as JSON Lines, 23k as text
+  lines (replay prints 22k lines/s); `ib export -o DIR` end to end 34k rows/s. Guards
+  (`needs_a_quiet_host`): at least 15k rows/s in every format, CSV within 2.5x of the bare reader and
+  decode.
+- Spreadsheets (documented in the README, not fixable in a CSV). Excel and LibreOffice guess types:
+  an integer over 15 significant digits (`uint64`, `rx_time_ns`) is rounded, a digit string loses
+  its leading zeros, `1e30` is a number. Hex cells (`bytes` fields and the `hex` of `malformed.csv`)
+  therefore carry a `0x` prefix (decision; `mid` already did), so they stay text; `text` and `jsonl`
+  stay identical to `replay`. The advice for the numbers is to import the columns as text. `--force`
+  detects a file in use by `flock` only (the lock `ib record` and the other tools take): a writer
+  that takes no lock, or only POSIX `fcntl` locks, is not seen, and its file can be replaced.
+- Smaller settlements. `IB-EXP-001` for a missing OUT directory says so and that nothing was created
+  (`mkdir -p`, or another `-o`); a killed export's `.<name>.<16 hex>.tmp` siblings of OUT are warned
+  about once per run (`IB-EXP-001` warning, the first three named) and never deleted; the count of
+  rows (summary, `export.stop`, per table) excludes the row the output refused (a stdout reader that
+  went away).
+- Deferred: the decode worker pool (nothing near 60 s for an hour of recording); `pkt_time_utc` (2i);
+  xlsx (Stage 6, where the 32767-character cell limit and the sheet row limit matter); an `exp-*`
+  entry per future export bug.
 
 ### 2i - Header profile flexibility
 

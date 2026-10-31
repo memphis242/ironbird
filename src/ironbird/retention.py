@@ -97,8 +97,10 @@ ROLE_OF: Final = {
 
 def is_managed_name(name: str) -> bool:
     """Whether ``name`` is one retention manages: a ledger part, a reserve (or its set-aside
-    original) or a recording."""
-    return any(p.fullmatch(name) for p in (LEDGER_RE, RESERVE_RE, DAMAGED_RE, RECORDING_RE))
+    original), a salvage's temporary file or a recording."""
+    return any(
+        p.fullmatch(name) for p in (LEDGER_RE, RESERVE_RE, DAMAGED_RE, SALVAGE_TMP_RE, RECORDING_RE)
+    )
 
 
 def _valid_stamp(stamp: str) -> float | None:

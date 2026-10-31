@@ -906,6 +906,84 @@ def test_a_live_session_records_to_a_clean_recording_with_the_periodic_housekeep
 # -- stage 2g: replay a recording of a live session -----------------------------------------
 
 REPLAY_NOOPS = 3
+RECORDED_TIMEOUT_S = 30.0
+NOOP_EVENT = 'event.app == "SAMPLE_APP" and event.id == 3'  # SAMPLE_APP's NOOP information event
+
+
+def _replayed(
+    ib: list[str], recording: Path, env: dict[str, str], where: str
+) -> list[dict[str, Any]]:
+    """The records ``ib replay --format json --where WHERE`` shows for ``recording``.
+
+    The recording may still be being written: replay then reads what the recorder has handed
+    to the disk so far (its flush interval is 250 ms) and says the file is still open."""
+    done = subprocess.run(
+        [*ib, "replay", str(recording), "--format", "json", "--where", where],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    return [json.loads(line) for line in done.stdout.splitlines()]
+
+
+def _await_recorded(
+    ground: Ground,
+    ib: list[str],
+    recording: Path,
+    env: dict[str, str],
+    where: str,
+    predicate: Callable[[list[dict[str, Any]]], bool],
+    *,
+    request: str,
+) -> None:
+    """Re-send ``request`` about once a second until the records of the live ``recording``
+    selected by ``where`` satisfy ``predicate``.
+
+    A recording session cannot watch ``ib listen`` (the recorder owns UDP 2234), so each step
+    of the session waits on what the recording itself holds rather than on a fixed sleep: under
+    load a requested packet can take longer than any sleep to arrive, and a recorder stopped
+    before it arrives leaves it out of the recording."""
+    deadline = time.monotonic() + RECORDED_TIMEOUT_S
+    next_request = 0.0
+    seen: list[dict[str, Any]] = []
+    while time.monotonic() < deadline:
+        if time.monotonic() >= next_request:
+            ground.send(request)
+            next_request = time.monotonic() + 1.0
+        seen = _replayed(ib, recording, env, where)
+        if predicate(seen):
+            return
+        time.sleep(0.2)
+    shown = [(r["name"], r["fields"]) for r in seen[-6:]]
+    raise AssertionError(
+        f"the recording never held the expected records for {where!r} within "
+        f"{RECORDED_TIMEOUT_S} s; last recorded: {shown}"
+    )
+
+
+def _zero_sample_app_counters(ground: Ground) -> None:
+    """Reset SAMPLE_APP's counters and see the zero on the running listener.
+
+    Earlier tests leave the counter non-zero, and SCH_LAB publishes SAMPLE_APP_HK on its own
+    every 5.4 s: one published between a recorder starting and a reset sent after it being
+    executed carries the old counter into the recording legitimately. SB delivers one MID's
+    packets in order, so once a zero-counter HK has arrived no older one is still in flight,
+    and every SAMPLE_APP_HK recorded afterwards counts from zero."""
+    ground.send("SAMPLE_APP_RESET_COUNTERS")
+    ground.wait_for(
+        "SAMPLE_APP_HK", lambda f: f["CommandCounter"] == 0, request="SAMPLE_APP_SEND_HK"
+    )
+
+
+def _runs(values: list[int]) -> list[int]:
+    """``values`` with consecutive repeats collapsed: ``[0, 0, 1, 2, 2, 0]`` -> ``[0, 1, 2, 0]``.
+
+    SCH_LAB's periodic housekeeping repeats whatever the counter holds at the time, so what a
+    command sequence fixes is the order of distinct values, not how often each is seen."""
+    return [v for i, v in enumerate(values) if i == 0 or values[i - 1] != v]
 
 
 def test_replaying_a_live_recording_selects_exactly_what_was_sent(
@@ -924,6 +1002,16 @@ def test_replaying_a_live_recording_selects_exactly_what_was_sent(
     env = {**ground.env, "IRONBIRD_CONFIG": str(config), "IRONBIRD_STATE_DIR": str(tmp_path / "s")}
     ib = [sys.executable, "-m", "ironbird.cli.main"]
     err_path = tmp_path / "record.stderr"
+
+    def all_sent_is_recorded(records: list[dict[str, Any]]) -> bool:
+        # The K-th NOOP event, then an HK counting it (SAMPLE_APP answers in pipe order).
+        events = [i for i, r in enumerate(records) if r["category"] == "event"]
+        return len(events) >= REPLAY_NOOPS and any(
+            r["name"] == "SAMPLE_APP_HK" and r["fields"]["CommandCounter"] == REPLAY_NOOPS
+            for r in records[events[-1] :]
+        )
+
+    _zero_sample_app_counters(ground)  # no recorded HK can count NOOPs from before the reset
     with ground.listener_paused(), err_path.open("w") as err:  # one process owns UDP 2234
         recorder = subprocess.Popen([*ib, "record", "-o", str(out), "--quiet"], stderr=err, env=env)
         try:
@@ -935,9 +1023,15 @@ def test_replaying_a_live_recording_selects_exactly_what_was_sent(
             ground.send("SAMPLE_APP_RESET_COUNTERS")
             for _ in range(REPLAY_NOOPS):
                 ground.send("SAMPLE_APP_NOOP")
-                time.sleep(0.5)
-            ground.send("SAMPLE_APP_SEND_HK")
-            time.sleep(2.0)
+            _await_recorded(
+                ground,
+                ib,
+                out,
+                env,
+                f"msg == SAMPLE_APP_HK or ({NOOP_EVENT})",
+                all_sent_is_recorded,
+                request="SAMPLE_APP_SEND_HK",
+            )
         finally:
             recorder.send_signal(signal.SIGINT)
             code = recorder.wait(timeout=20)
@@ -953,7 +1047,7 @@ def test_replaying_a_live_recording_selects_exactly_what_was_sent(
             timeout=60,
         )
 
-    events = replay("--format", "json", "--where", 'event.app == "SAMPLE_APP" and event.id == 3')
+    events = replay("--format", "json", "--where", NOOP_EVENT)
     assert events.returncode == 0, events.stderr
     event_records = [json.loads(line) for line in events.stdout.splitlines()]
     assert len(event_records) == REPLAY_NOOPS, events.stdout
@@ -965,6 +1059,7 @@ def test_replaying_a_live_recording_selects_exactly_what_was_sent(
         json.loads(line)["fields"]["CommandCounter"] for line in housekeeping.stdout.splitlines()
     ]
     assert counters and counters[-1] == REPLAY_NOOPS, counters
+    assert counters == sorted(counters), counters  # counted up from the reset, never back
 
     everything = replay("--format", "hex")
     info = subprocess.run(
@@ -978,3 +1073,91 @@ def test_replaying_a_live_recording_selects_exactly_what_was_sent(
     assert len(everything.stdout.splitlines()) == json.loads(info.stdout)["frames"] > 0
     undecoded = replay("--where", "status != ok")  # what a live listen would have hidden
     assert undecoded.returncode == 0, undecoded.stderr
+
+
+# -- stage 2h: export a recording of a live session -----------------------------------------
+
+EXPORT_NOOPS = 3
+
+
+def test_exporting_a_live_recording_counts_the_noops_and_matches_rec_info(
+    ground: Ground, tmp_path: Path
+) -> None:
+    """Record a session in which SAMPLE_APP is reset, sent K NOOPs (each followed by a housekeeping
+    request) and reset again, then export it to CSV: in ``SAMPLE_APP_HK.csv`` the CommandCounter
+    rises by exactly K across the NOOPs and is back to 0 after the second reset, and the table has
+    as many rows as ``ib rec info`` counts for the MID."""
+    import csv
+
+    config = tmp_path / "ironbird.toml"
+    examples = REPO / "examples"
+    text = CONFIG.read_text().replace('"ccdd/', f'"{examples}/ccdd/')
+    text = text.replace('"headers/', f'"{examples}/headers/')
+    config.write_text(text + "\n[recording]\nmin_free_bytes = 0\n")
+    out = tmp_path / "export-live.ibrec"
+    env = {**ground.env, "IRONBIRD_CONFIG": str(config), "IRONBIRD_STATE_DIR": str(tmp_path / "s")}
+    ib = [sys.executable, "-m", "ironbird.cli.main"]
+    err_path = tmp_path / "record.stderr"
+    expected = [*range(EXPORT_NOOPS + 1), 0]  # the distinct counter values, in order
+
+    def recorded(*values: int) -> None:
+        """Request housekeeping until the recording's SAMPLE_APP_HK counters are ``values``."""
+        _await_recorded(
+            ground,
+            ib,
+            out,
+            env,
+            "msg == SAMPLE_APP_HK",
+            lambda hk: _runs([r["fields"]["CommandCounter"] for r in hk]) == list(values),
+            request="SAMPLE_APP_SEND_HK",
+        )
+
+    _zero_sample_app_counters(ground)  # no recorded HK can count NOOPs from before the reset
+    with ground.listener_paused(), err_path.open("w") as err:  # one process owns UDP 2234
+        recorder = subprocess.Popen([*ib, "record", "-o", str(out), "--quiet"], stderr=err, env=env)
+        try:
+            deadline = time.monotonic() + 15
+            while "listening" not in err_path.read_text():
+                assert recorder.poll() is None, err_path.read_text()
+                assert time.monotonic() < deadline, "ib record never reported it was listening"
+                time.sleep(0.05)
+            ground.send("SAMPLE_APP_RESET_COUNTERS")
+            recorded(*expected[:1])
+            for n in range(1, EXPORT_NOOPS + 1):
+                ground.send("SAMPLE_APP_NOOP")
+                recorded(*expected[: n + 1])  # this NOOP counted before the next is sent
+            ground.send("SAMPLE_APP_RESET_COUNTERS")
+            recorded(*expected)  # the zero after the reset is in before the recorder stops
+        finally:
+            recorder.send_signal(signal.SIGINT)
+            code = recorder.wait(timeout=20)
+    assert code == 128 + signal.SIGINT, err_path.read_text()
+
+    tables = tmp_path / "tables"
+    done = subprocess.run(
+        [*ib, "export", str(out), "-o", str(tables)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    with (tables / "SAMPLE_APP_HK.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    counters = [int(r["CommandCounter"]) for r in rows]
+    # 0, up by one per NOOP to K, back to 0: nothing skipped, repeated out of order or left over
+    assert _runs(counters) == expected, counters
+    info = subprocess.run(
+        [*ib, "rec", "info", str(out), "--format", "json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert info.returncode == 0, info.stderr
+    by_mid = {m["mid"]: m["count"] for m in json.loads(info.stdout)["mids"]}
+    assert len(rows) == by_mid[int(rows[0]["mid"], 16)] > 0
+    # every decoded frame of the recording is in exactly one table
+    total = sum(sum(1 for _ in csv.reader(p.open(newline=""))) - 1 for p in tables.iterdir())
+    assert total == json.loads(info.stdout)["frames"]
