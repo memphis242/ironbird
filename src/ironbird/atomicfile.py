@@ -7,7 +7,11 @@ the final name's directory, created ``O_EXCL``, then synced and committed by
 :func:`rename_noreplace`, so a final name that appeared meanwhile is never overwritten. The only
 replacement is an explicit ``force`` over an existing regular file owned by the caller. A failure
 removes the temporary file, and only that: by directory descriptor and name, after checking that
-the name still denotes the descriptor this process holds open.
+the name still denotes the descriptor this process holds open. Each temporary is created and
+recorded for that removal with the termination signals held
+(:func:`~ironbird.sigmask.signals_held`), so a signal handler that raises cannot leave one
+behind; a caller that registers the cleanup apart from a ``with`` statement (an
+:class:`contextlib.ExitStack`) holds them across the registration too.
 
 Nothing here deletes a file this process did not create in the same call. Every system call goes
 through a :class:`~ironbird.fsops.FileSystem`, so tests can fail any step.
@@ -36,6 +40,7 @@ from ironbird.fsops import (
     same_file,
     try_stat_at,
 )
+from ironbird.sigmask import signals_held
 
 _NO_HARD_LINKS: Final = frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV})
 _NAME_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -191,15 +196,25 @@ class TempOutput:
                     return self
             for _ in range(8):
                 name = f".{self.final.name}.{os.urandom(8).hex()}.tmp"
-                try:
-                    self.fd = fs.open_at(self._dir_fd, name, _NAME_FLAGS, 0o600)
-                except FileExistsError:
-                    continue
-                self.name = name
+                # The file is created and recorded as ours in one step no signal handler can
+                # split; a handler that raises runs as the step ends, and the cleanup below
+                # removes the file.
+                with signals_held():
+                    try:
+                        fd = fs.open_at(self._dir_fd, name, _NAME_FLAGS, 0o600)
+                    except FileExistsError:
+                        continue
+                    self.fd, self.name = fd, name
                 return self
             raise OSError(errno.EEXIST, "no free temporary name", str(directory))
         except BaseException:
-            close_quietly(fs, self._dir_fd)
+            try:
+                with contextlib.suppress(OSError):  # the reason it failed is what is raised
+                    self._discard()
+            finally:
+                close_quietly(fs, self.fd)
+                close_quietly(fs, self._dir_fd)
+                self.fd = self._dir_fd = -1
             raise
 
     def _adopt(self, name: str) -> bool:
@@ -294,14 +309,22 @@ class TempOutput:
         finally:
             close_quietly(fs, probe)
 
+    def _discard(self) -> None:
+        """Remove the temporary file this process created, unless it was committed, reused, or
+        its name no longer denotes the file held open."""
+        if self._committed or not self.name or self._reused:
+            return
+        assert self.fd >= 0 and self._dir_fd >= 0, "a named temporary is held open"
+        fs = self._fs
+        held, named = fs.fstat(self.fd), try_stat_at(fs, self._dir_fd, self.name)
+        if named is not None and same_file(held, named):
+            with contextlib.suppress(OSError):
+                fs.unlink_at(self._dir_fd, self.name)  # our own uncommitted temporary
+
     def __exit__(self, *exc_info: object) -> None:
         fs = self._fs
         try:
-            if not self._committed and self.name and not self._reused:
-                held, named = fs.fstat(self.fd), try_stat_at(fs, self._dir_fd, self.name)
-                if named is not None and same_file(held, named):
-                    with contextlib.suppress(OSError):
-                        fs.unlink_at(self._dir_fd, self.name)  # our own uncommitted temporary
+            self._discard()
         finally:
             close_quietly(fs, self.fd)
             close_quietly(fs, self._dir_fd)
@@ -355,11 +378,14 @@ class TempDirOutput:
         try:
             for _ in range(8):
                 name = f".{self.final.name}.{os.urandom(8).hex()}.tmp"
-                try:
-                    fs.mkdir_at(self._parent_fd, name, 0o700)
-                except FileExistsError:
-                    continue
-                self.name = name
+                # created and recorded as ours in one step no signal handler can split (see
+                # TempOutput); the cleanup below removes the directory
+                with signals_held():
+                    try:
+                        fs.mkdir_at(self._parent_fd, name, 0o700)
+                    except FileExistsError:
+                        continue
+                    self.name = name
                 break
             else:
                 raise OSError(errno.EEXIST, "no free temporary name", str(self.final.parent))
@@ -383,17 +409,20 @@ class TempDirOutput:
         assert name and "/" not in name and name not in (".", "..")
         assert name not in self._by_name, "a member is created once"
         fs = self._fs
-        fd = self._with_room(lambda: fs.open_at(self._dir_fd, name, _NAME_FLAGS, 0o600))
-        try:
-            made = fs.fstat(fd)
-        except OSError:
-            close_quietly(fs, fd)
-            raise
-        member = _Member(name, (made.st_dev, made.st_ino), fd)
-        self._members.append(member)
-        self._by_name.add(name)
-        handle = len(self._members) - 1
-        self._open[handle] = None
+        # created and recorded as a member in one step no signal handler can split, so leaving
+        # the block removes it (see TempOutput)
+        with signals_held():
+            fd = self._with_room(lambda: fs.open_at(self._dir_fd, name, _NAME_FLAGS, 0o600))
+            try:
+                made = fs.fstat(fd)
+            except OSError:
+                close_quietly(fs, fd)
+                raise
+            member = _Member(name, (made.st_dev, made.st_ino), fd)
+            self._members.append(member)
+            self._by_name.add(name)
+            handle = len(self._members) - 1
+            self._open[handle] = None
         return handle
 
     def write(self, handle: int, data: bytes | bytearray | memoryview) -> None:

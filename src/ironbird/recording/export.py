@@ -56,6 +56,7 @@ from ironbird.recording.player import Ending
 from ironbird.recording.replay import Replay
 from ironbird.retention import is_managed_name
 from ironbird.sanitize import clean
+from ironbird.sigmask import signals_held
 
 #: A text cell is never cut: the longest field is a ``char[]`` of up to 65535 characters, each
 #: of which may escape to ten.
@@ -915,7 +916,9 @@ def write_to_file(
     sync: str | None = None
     with contextlib.ExitStack() as stack:
         try:
-            temp = stack.enter_context(TempOutput(output, force=force, fs=fs))
+            # held until the stack holds the cleanup: a signal cannot leave the file behind
+            with signals_held():
+                temp = stack.enter_context(TempOutput(output, force=force, fs=fs))
         except OSError as exc:
             raise _write_error(output, exc, created=False) from exc
         try:
@@ -967,7 +970,8 @@ def write_to_directory(
     try:
         with contextlib.ExitStack() as stack:
             try:
-                stack.enter_context(temp)
+                with signals_held():  # until the stack holds the cleanup (see write_to_file)
+                    stack.enter_context(temp)
             except OSError as exc:
                 raise _write_error(output, exc, created=False) from exc
             try:

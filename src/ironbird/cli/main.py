@@ -29,13 +29,7 @@ import typer
 from ironbird import render
 from ironbird.ccdd.model import EventSeverity, MessageKind
 from ironbird.cli import prunecmd
-from ironbird.cli.output import (
-    CLOSE_WAIT_S,
-    HANDLED_SIGNALS,
-    BoundedWriter,
-    Console,
-    signals_held,
-)
+from ironbird.cli.output import CLOSE_WAIT_S, BoundedWriter, Console
 from ironbird.codec import Codec
 from ironbird.config import RecordingConfig, RetentionConfig, SystemConfig, find_config, load_config
 from ironbird.errors import Code, IronbirdError
@@ -87,6 +81,7 @@ from ironbird.retention import LONG_COMMANDS
 from ironbird.retnotices import Notices
 from ironbird.retservice import Retention
 from ironbird.session import Route, Session, Side
+from ironbird.sigmask import HANDLED_SIGNALS, signals_held
 
 EXIT_TIMEOUT: Final = 3  # --count was given and not reached before --timeout
 EXIT_OUTPUT_LOST: Final = 4  # the command completed but stdout lines were lost

@@ -684,6 +684,100 @@ def test_sigterm_during_an_export_leaves_no_temporary_file(
     assert not out.exists() and temporaries(tmp_path) == []
 
 
+# Child-side hooks that stop the export for a moment at one point where a temporary has just
+# been made: the file or directory created, a table created in it, or the context manager
+# entered but its cleanup not yet registered (an ExitStack). A process descheduled there on a
+# loaded host is what the signal of the test above can hit; the mark tells the parent to send
+# it now.
+_WINDOW_HOOKS = """
+import os, time
+from pathlib import Path
+from ironbird import atomicfile, fsops
+WHERE, MARK = os.environ["IB_TEST_WINDOW"], Path(os.environ["IB_TEST_MARK"])
+
+def window():
+    MARK.touch()
+    time.sleep(0.5)
+
+def hook_open(real):
+    def open_at(self, dir_fd, name, flags, mode=0o600):
+        fd = real(self, dir_fd, name, flags, mode)
+        if flags & os.O_CREAT and name.endswith({"file": ".tmp", "member": ".csv"}.get(WHERE, "/")):
+            window()
+        return fd
+    return open_at
+
+def hook_mkdir(real):
+    def mkdir_at(self, dir_fd, name, mode=0o700):
+        real(self, dir_fd, name, mode)
+        if WHERE == "dir" and name.endswith(".tmp"):
+            window()
+    return mkdir_at
+
+def hook_enter(real, where):
+    def enter(self):
+        entered = real(self)
+        if WHERE == where:
+            window()
+        return entered
+    return enter
+
+fsops.FileSystem.open_at = hook_open(fsops.FileSystem.open_at)
+fsops.FileSystem.mkdir_at = hook_mkdir(fsops.FileSystem.mkdir_at)
+atomicfile.TempOutput.__enter__ = hook_enter(atomicfile.TempOutput.__enter__, "entered")
+atomicfile.TempDirOutput.__enter__ = hook_enter(atomicfile.TempDirOutput.__enter__, "dir_entered")
+"""
+
+
+@pytest.mark.parametrize(
+    ("where", "fmt"),
+    [
+        ("file", "text"),
+        ("entered", "text"),
+        ("dir", "csv"),
+        ("member", "csv"),
+        ("dir_entered", "csv"),
+    ],
+)
+def test_a_signal_just_as_a_temporary_is_made_leaves_nothing_behind(
+    tmp_path: Path, env: dict[str, str], where: str, fmt: str
+) -> None:
+    """The signal lands right after the temporary file, directory or table is created, before
+    the code that made it has recorded it for removal: it is removed all the same."""
+    hk_and_status(tmp_path / "in.ibrec", 6, 4)
+    out, mark = tmp_path / "out", tmp_path / "window-reached"
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _WINDOW_HOOKS + CLI_MAIN,
+            "export",
+            str(tmp_path / "in.ibrec"),
+            "--format",
+            fmt,
+            "-o",
+            str(out),
+        ],
+        env={**env, "IB_TEST_WINDOW": where, "IB_TEST_MARK": str(mark)},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not mark.exists():
+            assert proc.poll() is None, "the export ended without reaching the window"
+            assert time.monotonic() < deadline
+            time.sleep(0.002)
+        proc.send_signal(signal.SIGTERM)
+        _, err = proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 143, err
+    assert not out.exists() and temporaries(tmp_path) == [], err
+
+
 def test_a_reader_that_goes_away_ends_a_stdout_export_quietly(
     tmp_path: Path, env: dict[str, str]
 ) -> None:

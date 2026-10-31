@@ -29,8 +29,10 @@ import signal
 import stat
 import threading
 from collections import deque
-from collections.abc import Callable, Generator
+from collections.abc import Callable
 from typing import Final, TextIO
+
+from ironbird.sigmask import HANDLED_SIGNALS, signals_held
 
 MAX_QUEUED_BYTES: Final = 512 * 1024
 CHUNK_BYTES: Final = 64 * 1024
@@ -44,24 +46,6 @@ CLOSE_WAIT_S: Final = 1.0
 # a whole chunk per write.
 WRITE_SLICE: Final = getattr(select, "PIPE_BUF", 512)
 _GONE: Final = frozenset({errno.EPIPE, errno.ECONNRESET, errno.EBADF})
-HANDLED_SIGNALS: Final = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
-
-
-@contextlib.contextmanager
-def signals_held() -> Generator[None]:
-    """Block :data:`HANDLED_SIGNALS` in this thread; threads started inside inherit the mask.
-
-    A blocked signal waits as pending (see ``signal.sigtimedwait``) instead of running a handler
-    at an arbitrary line. The previous mask is restored on exit, so uses nest.
-    """
-    if not hasattr(signal, "pthread_sigmask"):  # pragma: no cover - not POSIX
-        yield
-        return
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
-    try:
-        yield
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def write_slice_for(fd: int) -> int:

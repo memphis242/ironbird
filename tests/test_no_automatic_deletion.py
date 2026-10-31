@@ -44,7 +44,7 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
     ("atomicfile.py", "removal"): {
         "_link",
         "_placeholder_rename",
-        "TempOutput.__exit__",
+        "TempOutput._discard",
         "TempDirOutput._discard",
     },
     ("atomicfile.py", "rename"): {"_link", "_placeholder_rename", "TempOutput.commit"},
