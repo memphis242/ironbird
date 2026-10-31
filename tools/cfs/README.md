@@ -22,7 +22,7 @@ belong to the invoking user, derive from the run directory's key files, and have
 | `CFS_REF` / `CFS_COMMIT` | `v7.0.1` / its commit | build |
 | `CFS_CONFIG` | `native_std` | both |
 | `JOBS` | `nproc` | build |
-| `CFS_APPS` | `sch_lab ci_lab to_lab sample_app` (`ALL` = stock startup script; add `ib_test` to start ironbird's own app) | run |
+| `CFS_APPS` | `sch_lab ci_lab to_lab sample_app` (the token `ALL` keeps the stock startup script; add `ib_test` to start ironbird's own app, e.g. `ALL ib_test`) | run |
 | `CFS_RUN_UID` | `65534` (only used when started as root) | run |
 
 EL8: CI also builds and runs this on `oraclelinux:8` (gcc 8.5, cmake and git from the EL8

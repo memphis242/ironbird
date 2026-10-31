@@ -2986,25 +2986,45 @@ As built (where the build differs from, or settles, the text above)
   (`IB-ENC-002`, which names `--allow-count-mismatch`) unless the flag is given, which lets a value
   that fits the count field go out as given (the data itself must still satisfy `min`/`max`, so
   the packet fits the cap and the length field). The ledger's `send.request` carries
-  `allow_count_mismatch: true` for such a send and nothing otherwise. A telemetry field that is not
+  `allow_count_mismatch: true` for such a send and nothing otherwise, and a `send.fault` record
+  (essential) follows the encode with the `given` and `implied` value and unit of each count that went
+  out wrong; a flag whose values agree with the data records no fault. `ib send --allow-count-mismatch`
+  on a command with no count or length field is a usage error (like `--bad-checksum` without a checksum
+  field), before anything is sent. `IB-ENC-002` names the flag only for a command; the same refusal for
+  a telemetry reply (`respond`, which has no such flag) does not. `char[]` text with a NUL is refused
+  (`IB-ENC-002`) since a decode ends text at a NUL and the
+  tail would come back shorter. A telemetry field that is not
   given is the smallest array the CCDD allows, zero-filled; a command's is a missing argument
   (`IB-ENC-003`, the count field is not asked for). Lists are `1,2,3`, `[1, 2, 3]` or `1 2 3` (or a
   Python list or tuple), at most 1 MiB of text; an element error names the position
   (`Items[1]`); `char[]` is ASCII, `bytes[]` hex. A response rule can fill a variable field from a
   string (`fields = { Entries = "1,2,3" }`) or echo a command's; TOML arrays are not accepted in
   rules.
-- Load-time fit. A message is checked at its smallest and its largest size against the cap, the length
-  field and each checksum span (`IB-ENC-004` as before), because a span or a length that fits one size
-  can fail at another.
+- Load-time fit. A message is checked at its smallest and its largest size against the cap and the
+  length field, and its checksum span at every size where the span's answer can change (the two ends and
+  the sizes where the span start, span end, checksum field and packet bounds cross, with their
+  neighbours; `header.checksum_probe_sizes`), so a span such as `end = -10` that cuts the checksum field
+  only at a size in between is `IB-ENC-004` at load, not on the wire. A fixed field named `remaining` in
+  a message that uses the `"remaining"` keyword is `IB-CCD-*` (layout) at load: the name and the keyword
+  cannot be told apart.
+- Decode token. `decode_resolved` believes a `Resolved` only when its message, MID, packet size and
+  variable-length counts agree with the bytes (the counts are re-read, a few integer reads); any other
+  token takes the whole `decode`, so a forged token gives a `DecodeError` or the right values, never an
+  assertion or wrong values.
 - Filter. `char[]` and `bytes[]` filter like the fixed ones (a `bytes[]` comparison takes any length up
-  to the maximum); a number array has no operator and is `IB-FLT-003` ("an array of numbers cannot be
+  to the maximum, the empty value `""` included; `contains ""` is refused); a number array has no operator and is `IB-FLT-003` ("an array of numbers cannot be
   filtered"). Event mappings may name a `char[]` field (`message`), which `events` and `listen` show.
 - `ib_test` (decision D6). `tools/cfs/apps/ib_test` is a small cFS app: `IB_TEST_SET_DATA` (fc 2) carries
   `u16 Count`, `u32 Entries[Count]` and a tail string and is checked byte for byte by the flight code;
   a good one is stored and published as `IB_TEST_VAR`, `IB_TEST_SEND_VAR` republishes it,
-  `IB_TEST_SEND_HK` gives counters. `build.sh` copies each `tools/cfs/apps/*` into the checkout and
+  `IB_TEST_SEND_HK` gives counters and `hk_counter`, the HK packets sent so far (each answers one
+  request), which the cFS tests use to take only a reply to a request sent after the command, never a
+  late reply to an older one. The app's rejection event says `got N, limit M`, and `ib_test.h` asserts
+  the header and payload sizes the CCDD relies on at compile time (a negative-size typedef: the build is
+  `-std=c99 -pedantic`). `build.sh` copies each `tools/cfs/apps/*` into the checkout and
   lists it in `sample_defs/targets.cmake` once (repeatable), and fails if `cf/<app>.so` is missing
-  afterwards; `run.sh` adds `ib_test` to the startup script when `CFS_APPS` names it; CI's cache key
+  afterwards; `run.sh` adds `ib_test` to the startup script when `CFS_APPS` names it, and `ALL` is a token of
+  `CFS_APPS` (`ALL ib_test` keeps the stock script and adds `ib_test`); CI's cache key
   includes `tools/cfs/apps/**`. An existing build must run `tools/cfs/build.sh` again to get it.
   `tools/cfs/NOTES.md` section 8 records the layouts and the source check: the stock apps in the
   verification set have no variable-length packet, but the bundle's MD app does (the dwell packet:
@@ -3017,7 +3037,7 @@ As built (where the build differs from, or settles, the text above)
   messages the golden file recorded (the new ones would shift the seeded mutants), so the 2i proof is
   unchanged; the replay corpus was rebuilt (`python tests/replay_corpus.py`) because it embeds the
   shipped mock CCDD.
-- Tests: `test_variable_length.py` (91 cases: model and schema, 27 `ccdd-var-*` corpus files each
+- Tests: `test_variable_length.py` (96 cases: model and schema, 28 `ccdd-var-*` corpus files each
   refused with its reason, encode and every error spelling, decode of each error class with its
   offset, truncation at every offset of a packet and of its payload under a right header, Hypothesis
   (arbitrary and header-shaped payloads: no raise, `check` equals `decode`, decode-encode-decode
@@ -3035,7 +3055,7 @@ As built (where the build differs from, or settles, the text above)
   marking the injected fault, no `IB-DEC-*` report from the listener) pass with the 28 earlier cFS
   cases on the dev host.
 - Deferred: arrays of structs (D11); a filter operator over number arrays (`contains`, indexing); TOML
-  arrays in response rules; `--allow-count-mismatch` has no counterpart in `respond`; a real-cFS case
+  arrays in response rules; `--allow-count-mismatch` has no counterpart in `respond` (a reply rule with a wrong count is refused); a real-cFS case
   against MD's dwell packet; the `ib_test` gcc 8 (EL8) build is covered by CI only.
 
 ### 2k - Serial transport

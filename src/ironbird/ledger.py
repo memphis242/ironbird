@@ -137,6 +137,7 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "session.end": Tier.ESSENTIAL,
         "find": Tier.ESSENTIAL,
         "send.request": Tier.ESSENTIAL,
+        "send.fault": Tier.ESSENTIAL,
         "tx.command": Tier.ESSENTIAL,
         "tx.telemetry": Tier.ESSENTIAL,
         "respond.replies": Tier.ESSENTIAL,

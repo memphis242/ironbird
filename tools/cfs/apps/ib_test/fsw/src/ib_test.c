@@ -13,11 +13,12 @@ IB_TEST_Data_t IB_TEST_Data;
 
 static void IB_TEST_PublishHk(void)
 {
+    IB_TEST_Data.HkCounter++;
     IB_TEST_Data.HkTlm.Payload.CmdCounter = IB_TEST_Data.CmdCounter;
     IB_TEST_Data.HkTlm.Payload.ErrCounter = IB_TEST_Data.ErrCounter;
     IB_TEST_Data.HkTlm.Payload.Entries    = IB_TEST_Data.Entries;
     IB_TEST_Data.HkTlm.Payload.TextLen    = IB_TEST_Data.TextLen;
-    IB_TEST_Data.HkTlm.Payload.Spare      = 0;
+    IB_TEST_Data.HkTlm.Payload.HkCounter  = IB_TEST_Data.HkCounter;
     CFE_SB_TimeStampMsg(CFE_MSG_PTR(IB_TEST_Data.HkTlm.TelemetryHeader));
     CFE_SB_TransmitMsg(CFE_MSG_PTR(IB_TEST_Data.HkTlm.TelemetryHeader), true);
 }
@@ -26,9 +27,9 @@ static void IB_TEST_PublishHk(void)
  * send it. */
 static void IB_TEST_PublishVar(void)
 {
-    uint8   *out  = IB_TEST_Data.VarTlm.Payload;
-    size_t   size = 0;
-    uint16   count = IB_TEST_Data.Entries;
+    uint8 *out   = IB_TEST_Data.VarTlm.Payload;
+    size_t size  = 0;
+    uint16 count = IB_TEST_Data.Entries;
 
     memcpy(out, &count, sizeof(count));
     size += sizeof(count);
@@ -43,12 +44,14 @@ static void IB_TEST_PublishVar(void)
     CFE_SB_TransmitMsg(CFE_MSG_PTR(IB_TEST_Data.VarTlm.TelemetryHeader), true);
 }
 
-static void IB_TEST_Reject(const char *what, CFE_MSG_FcnCode_t cc, size_t actual, size_t expected)
+/* A command refused: "what" says which check failed, "got" is the offending value and "limit" the
+ * value it was held to (the exact packet size, or the bound it had to stay within). */
+static void IB_TEST_Reject(const char *what, CFE_MSG_FcnCode_t cc, size_t got, size_t limit)
 {
     IB_TEST_Data.ErrCounter++;
     CFE_EVS_SendEvent(IB_TEST_LEN_ERR_EID, CFE_EVS_EventType_ERROR,
-                      "IB_TEST: %s rejected: CC = %u, size %u, expected %u", what, (unsigned int)cc,
-                      (unsigned int)actual, (unsigned int)expected);
+                      "IB_TEST: %s rejected: CC = %u, got %u, limit %u", what, (unsigned int)cc,
+                      (unsigned int)got, (unsigned int)limit);
 }
 
 static bool IB_TEST_HasSize(const CFE_MSG_Message_t *msg, CFE_MSG_FcnCode_t cc, const char *what,
@@ -71,31 +74,31 @@ static void IB_TEST_SetData(const CFE_SB_Buffer_t *buf, CFE_MSG_FcnCode_t cc)
     const size_t header = sizeof(CFE_MSG_CommandHeader_t);
     size_t       actual = 0;
     uint16       count  = 0;
-    size_t       tail;
+    size_t       tail   = 0;
     const uint8 *in = (const uint8 *)buf;
 
     CFE_MSG_GetSize(&buf->Msg, &actual);
     if (actual < header + sizeof(count))
     {
-        IB_TEST_Reject("SET_DATA", cc, actual, header + sizeof(count));
+        IB_TEST_Reject("SET_DATA size below its fixed part", cc, actual, header + sizeof(count));
         return;
     }
     memcpy(&count, in + header, sizeof(count));
     if (count > IB_TEST_MAX_ENTRIES)
     {
-        IB_TEST_Reject("SET_DATA count above maximum", cc, count, IB_TEST_MAX_ENTRIES);
+        IB_TEST_Reject("SET_DATA count above its maximum", cc, count, IB_TEST_MAX_ENTRIES);
         return;
     }
     if (actual < header + sizeof(count) + (size_t)count * sizeof(uint32))
     {
-        IB_TEST_Reject("SET_DATA count beyond packet", cc, actual,
+        IB_TEST_Reject("SET_DATA size below what its count needs", cc, actual,
                        header + sizeof(count) + (size_t)count * sizeof(uint32));
         return;
     }
     tail = actual - header - sizeof(count) - (size_t)count * sizeof(uint32);
     if (tail > IB_TEST_MAX_TEXT)
     {
-        IB_TEST_Reject("SET_DATA text above maximum", cc, tail, IB_TEST_MAX_TEXT);
+        IB_TEST_Reject("SET_DATA text length above its maximum", cc, tail, IB_TEST_MAX_TEXT);
         return;
     }
 
@@ -118,14 +121,14 @@ static void IB_TEST_ProcessGroundCommand(const CFE_SB_Buffer_t *buf)
     switch (cc)
     {
         case IB_TEST_NOOP_CC:
-            if (IB_TEST_HasSize(&buf->Msg, cc, "NOOP", sizeof(IB_TEST_NoArgsCmd_t)))
+            if (IB_TEST_HasSize(&buf->Msg, cc, "NOOP size", sizeof(IB_TEST_NoArgsCmd_t)))
             {
                 IB_TEST_Data.CmdCounter++;
                 CFE_EVS_SendEvent(IB_TEST_NOOP_EID, CFE_EVS_EventType_INFORMATION, "IB_TEST: NOOP");
             }
             break;
         case IB_TEST_RESET_COUNTERS_CC:
-            if (IB_TEST_HasSize(&buf->Msg, cc, "RESET_COUNTERS", sizeof(IB_TEST_NoArgsCmd_t)))
+            if (IB_TEST_HasSize(&buf->Msg, cc, "RESET_COUNTERS size", sizeof(IB_TEST_NoArgsCmd_t)))
             {
                 IB_TEST_Data.CmdCounter = 0;
                 IB_TEST_Data.ErrCounter = 0;
@@ -137,7 +140,7 @@ static void IB_TEST_ProcessGroundCommand(const CFE_SB_Buffer_t *buf)
             IB_TEST_SetData(buf, cc);
             break;
         case IB_TEST_SEND_VAR_CC:
-            if (IB_TEST_HasSize(&buf->Msg, cc, "SEND_VAR", sizeof(IB_TEST_NoArgsCmd_t)))
+            if (IB_TEST_HasSize(&buf->Msg, cc, "SEND_VAR size", sizeof(IB_TEST_NoArgsCmd_t)))
             {
                 IB_TEST_Data.CmdCounter++;
                 IB_TEST_PublishVar();

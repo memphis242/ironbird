@@ -17,6 +17,7 @@ import os
 import shutil
 import signal
 import subprocess
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -59,8 +60,11 @@ def cfs(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
         )
     ram_existed = RAM_DIR.exists()
     log = tmp_path_factory.mktemp("cfs") / "console.log"
-    apps = os.environ.get("CFS_APPS", "sch_lab ci_lab to_lab sample_app")
-    env = {**os.environ, "CFS_APPS": f"{apps} ib_test"}
+    apps = os.environ.get("CFS_APPS", "sch_lab ci_lab to_lab sample_app").split()
+    if "ib_test" not in apps:
+        apps.append("ib_test")
+    assert "ci_lab" in apps or "ALL" in apps, "the tests send through CI_LAB"
+    env = {**os.environ, "CFS_APPS": " ".join(apps)}
     with log.open("wb") as sink:
         proc = subprocess.Popen(
             [str(RUN_SH)], stdout=sink, stderr=subprocess.STDOUT, start_new_session=True, env=env
@@ -109,8 +113,31 @@ def _var(g: Ground, command: str, *args: str, flags: tuple[str, ...] = ()) -> di
     return g.wait_for("IB_TEST_VAR", lambda _: True, start=start, timeout=10.0)["fields"]
 
 
-def _hk(g: Ground) -> dict[str, object]:
-    return g.fresh("IB_TEST_HK", "IB_TEST_SEND_HK")
+# SEND_HK requests sent so far to this module's one cFS instance. Every HK packet carries
+# ``hk_counter``, the count of requests the app has answered, so the reply to the Nth request is
+# the packet with ``hk_counter`` N. A reply to a request sent before a command has a number at
+# or below the count taken before that command was sent and is never taken as fresh.
+_HK_REQUESTS = [0]
+
+
+def _hk(g: Ground, timeout: float = 10.0) -> dict[str, object]:
+    """Fields of an HK packet that answers a request sent after this call began (so after every
+    command sent before it); a late reply to an older request is skipped, not taken."""
+    first = _HK_REQUESTS[0] + 1  # the number of the first request this call sends
+    start = g.count()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        g.send("IB_TEST_SEND_HK")
+        _HK_REQUESTS[0] += 1
+        retry = time.monotonic() + 1.0
+        while time.monotonic() < retry:
+            for packet in g.since(start, "IB_TEST_HK"):
+                counter = int(packet["fields"]["hk_counter"])
+                # 16-bit counter: an answer to request N or later (mod 65536) is fresh
+                if (counter - first) % 65536 < 32768:
+                    return packet["fields"]
+            time.sleep(0.05)
+    raise AssertionError(f"no HK reply to request {first} or later within {timeout} s")
 
 
 def test_set_data_is_stored_by_real_fsw_and_published_as_a_variable_length_packet(
@@ -163,7 +190,7 @@ def test_real_fsw_rejects_a_count_that_disagrees_with_the_packet_size(
     for count in ("9", "200"):
         start = g.count()
         g.send("IB_TEST_SET_DATA", f"Count={count}", "Entries=1,2", "Text=x", flags=flags)
-        after = g.fresh("IB_TEST_HK", "IB_TEST_SEND_HK")
+        after = _hk(g)
         assert g.since(start, "IB_TEST_VAR") == []  # nothing was stored, so nothing was published
         assert after["entries"] == before["entries"] and after["text_len"] == before["text_len"]
     final = _hk(g)
@@ -202,6 +229,10 @@ def test_the_ledger_marks_the_injected_fault(ib_test_output: Ground, tmp_path: P
     ]
     requests = [e for e in events if e["event"] == "send.request"]
     assert len(requests) == 1 and requests[0]["allow_count_mismatch"] is True
+    faults = [e for e in events if e["event"] == "send.fault"]
+    assert len(faults) == 1 and faults[0]["fields"] == [
+        {"field": "Count", "given": 9, "implied": 1, "unit": "elements"}
+    ]
     sent = [e for e in events if e["event"] == "tx.command"]
     assert len(sent) == 1 and sent[0]["result"] == "sent"
     raw = bytes.fromhex(sent[0]["raw"])

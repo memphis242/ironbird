@@ -29,6 +29,7 @@ from ironbird.ccdd.model import (
     Message,
     MessageKind,
     TypeClass,
+    VarUnit,
     meets_floor,
 )
 from ironbird.coalesce import Coalescer
@@ -443,7 +444,7 @@ class Session:
         endpoint = route.link.command_endpoint
         extra: dict[str, Any] = {"header": dict(header)} if header else {}
         if allow_count_mismatch:
-            extra["allow_count_mismatch"] = True  # fault injection, ledgered as such
+            extra["allow_count_mismatch"] = True  # asked for; ``send.fault`` records what it did
         self.ledger.record(
             "action",
             "send.request",
@@ -457,6 +458,23 @@ class Session:
         encoded = codec.encode_command(
             command, args, tamper=tamper, header=header, allow_count_mismatch=allow_count_mismatch
         )
+        if encoded.count_faults:  # the values that went out and the ones the data implied
+            self.ledger.record(
+                "action",
+                "send.fault",
+                node=route.server.name,
+                command=encoded.message.name,
+                fault="count_mismatch",
+                fields=[
+                    {
+                        "field": f.field,
+                        "given": f.given,
+                        "implied": f.implied,
+                        "unit": "elements" if f.unit is VarUnit.COUNT else "bytes",
+                    }
+                    for f in encoded.count_faults
+                ],
+            )
         self.ledger.check_transmit(encoded.message.name, route.server.name)
         attempt = TxAttempt(encoded.message.name)
         self._last_tx = attempt

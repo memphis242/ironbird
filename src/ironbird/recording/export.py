@@ -57,8 +57,8 @@ from ironbird.recording.replay import Replay
 from ironbird.retention import is_managed_name
 from ironbird.sanitize import clean
 
-#: A text cell is never cut: the longest field is a ``char[4096]`` whose characters may each
-#: escape to ten.
+#: A text cell is never cut: the longest field is a ``char[]`` of up to 65535 characters, each
+#: of which may escape to ten.
 MAX_CELL_CHARS: Final = 1 << 20
 #: What starts a formula in a spreadsheet: ``= + - @`` and their fullwidth forms (some importers
 #: fold those), and tab, CR and LF.

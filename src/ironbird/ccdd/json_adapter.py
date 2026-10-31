@@ -402,13 +402,28 @@ def _parse_message_fields(
 
 
 def _variable_payload(
-    ctx: _Ctx, raw: Mapping[str, Any], path: str, extent: int, variable: list[FieldDef]
+    ctx: _Ctx,
+    raw: Mapping[str, Any],
+    path: str,
+    extent: int,
+    fixed: list[FieldDef],
+    variable: list[FieldDef],
 ) -> int:
     """The largest payload of a message with variable-length fields, after checking how its
     fields share count fields and where ``remaining`` may stand. ``min_payload`` and
     ``max_payload`` may be given as a check against the values the fields imply."""
     specs = [f.var for f in variable if f.var is not None]
     assert len(specs) == len(variable)
+    if any(f.name == REMAINING for f in fixed):
+        pairs = zip(variable, specs, strict=True)
+        user = next((f for f, spec in pairs if spec.unit is VarUnit.REMAINING), None)
+        if user is not None:
+            raise ctx.fail(
+                path,
+                f'{user.name} uses "{REMAINING}" as the rest of the packet, but a fixed field '
+                f'is named "{REMAINING}" too; rename that field',
+                Code.CCD_LAYOUT,
+            )
     users: dict[str, str] = {}
     for i, (fdef, spec) in enumerate(zip(variable, specs, strict=True)):
         if spec.unit is VarUnit.REMAINING and i != len(variable) - 1:
@@ -507,7 +522,7 @@ def _parse_message(ctx: _Ctx, raw: object, index: int) -> Message:
     extent = max((f.end for f in fixed), default=0)
     if variable:
         variable = [replace(f, offset=extent) for f in variable]
-        payload_size = _variable_payload(ctx, raw, path, extent, variable)
+        payload_size = _variable_payload(ctx, raw, path, extent, fixed, variable)
     else:
         for key in ("min_payload", "max_payload"):
             if key in raw:

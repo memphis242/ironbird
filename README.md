@@ -412,11 +412,13 @@ elements and `...(+N)`; `--format json` carries the whole list; a CSV cell holds
 
 ```bash
 ib send fc MOCK_LOAD_DATA Entries=1,2,3 Text=hello     # Count is filled in; [1,2,3] works too
-ib send fc MOCK_LOAD_DATA Count=9 Entries=1,2 --allow-count-mismatch   # fault injection
+ib send fc MOCK_LOAD_DATA Count=9 Entries=1,2 Text=x --allow-count-mismatch   # fault injection
 ```
 
-A `Count` that disagrees with the data is `IB-ENC-002` unless `--allow-count-mismatch` is given; the
-ledger's `send.request` record carries `allow_count_mismatch`. A number array cannot be used in a
+A `Count` that disagrees with the data is `IB-ENC-002` unless `--allow-count-mismatch` is given (a
+usage error on a command with no count or length field); the ledger's `send.request` record carries
+`allow_count_mismatch` and a `send.fault` record carries the `given` and `implied` value of each
+count that went out wrong (nothing when they agree). A number array cannot be used in a
 `--where` filter (`char[]` and `bytes[]` can).
 
 ## Filtering with --where

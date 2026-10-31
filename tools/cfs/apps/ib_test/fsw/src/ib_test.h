@@ -9,7 +9,9 @@
  *       char    Text[]           the rest of the packet, 0..IB_TEST_MAX_TEXT bytes, no NUL
  *
  *   HK telemetry payload: uint8 CmdCounter, uint8 ErrCounter, uint16 Entries, uint16 TextLen,
- *   uint16 Spare.
+ *   uint16 HkCounter (the HK packets sent so far, this one included; wraps at 65536). Each HK
+ *   packet answers one SEND_HK request, so a reader that counts its requests can tell the reply
+ *   to a request sent now from a late reply to an older one.
  *
  * The variable-length layout is what ironbird's CCDD file examples/ccdd/cfs.json describes.
  */
@@ -63,7 +65,7 @@ typedef struct
     uint8  ErrCounter;
     uint16 Entries;
     uint16 TextLen;
-    uint16 Spare;
+    uint16 HkCounter;
 } IB_TEST_HkPayload_t;
 
 typedef struct
@@ -85,6 +87,7 @@ typedef struct
     uint8  ErrCounter;
     uint16 Entries;
     uint16 TextLen;
+    uint16 HkCounter;
 
     uint32 Data[IB_TEST_MAX_ENTRIES];
     char   Text[IB_TEST_MAX_TEXT];
@@ -95,6 +98,21 @@ typedef struct
     IB_TEST_HkTlm_t  HkTlm;
     IB_TEST_VarTlm_t VarTlm;
 } IB_TEST_Data_t;
+
+/*
+ * Compile-time layout checks (the build is -std=c99 -pedantic, so no _Static_assert): a
+ * negative array size is an error when the condition is false. The sizes are the ones the CCDD
+ * file examples/ccdd/cfs.json and the header profiles in examples/headers rely on.
+ */
+#define IB_TEST_ASSERT_SIZE(name, cond) typedef char IB_TEST_Assert_##name[(cond) ? 1 : -1]
+
+IB_TEST_ASSERT_SIZE(CmdHeader, sizeof(CFE_MSG_CommandHeader_t) == 8);
+IB_TEST_ASSERT_SIZE(TlmHeader, sizeof(CFE_MSG_TelemetryHeader_t) == 16);
+IB_TEST_ASSERT_SIZE(NoArgsCmd, sizeof(IB_TEST_NoArgsCmd_t) == 8);
+IB_TEST_ASSERT_SIZE(HkPayload, sizeof(IB_TEST_HkPayload_t) == 1 + 1 + 2 + 2 + 2);
+IB_TEST_ASSERT_SIZE(HkTlm, sizeof(IB_TEST_HkTlm_t) == 16 + 8);
+IB_TEST_ASSERT_SIZE(VarMaxPayload, IB_TEST_VAR_MAX_PAYLOAD == 2 + 4 * 64 + 122);
+IB_TEST_ASSERT_SIZE(VarTlm, sizeof(IB_TEST_VarTlm_t) == 16 + IB_TEST_VAR_MAX_PAYLOAD);
 
 void IB_TEST_Main(void);
 

@@ -71,6 +71,9 @@ def ccdd_cases() -> dict[str, str]:
     ]
     return {
         "ccdd-var-count-after-array.json": _file(ENTRIES, COUNT),
+        "ccdd-var-remaining-is-a-field.json": _file(
+            _with(COUNT, name="remaining"), _with(ENTRIES, count="remaining"), TEXT
+        ),
         "ccdd-var-missing-max.json": _file(COUNT, _with(ENTRIES, max=None)),
         "ccdd-var-signed-count.json": _file(_with(COUNT, type="int16"), ENTRIES),
         "ccdd-var-remaining-not-last.json": _file(

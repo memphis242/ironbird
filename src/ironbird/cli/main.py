@@ -1090,9 +1090,8 @@ def send(
         parsed = _parse_args(args)
         header_values = _parse_header_values(header)
         tamper: dict[str, int] = {}
-        profile = session.codec_for(session.route(node, link_name=link).server.name).profile(
-            MessageKind.COMMAND
-        )
+        codec = session.codec_for(session.route(node, link_name=link).server.name)
+        profile = codec.profile(MessageKind.COMMAND)
         if bad_checksum:
             if profile.checksum_field is None:
                 raise IronbirdError(Code.CLI_USAGE, f"profile {profile.name} has no checksum field")
@@ -1102,6 +1101,12 @@ def send(
                 raise IronbirdError(Code.CLI_USAGE, f"profile {profile.name} has no length field")
             _check_length_delta(length_delta, profile.length_field.bits, profile.name)
             tamper[profile.length_field.name] = length_delta
+        if allow_count_mismatch and not codec.count_field_names(command, MessageKind.COMMAND):
+            raise IronbirdError(
+                Code.CLI_USAGE,
+                f"--allow-count-mismatch needs a command with a count or length field; "
+                f"{term(command[:64])} has none",
+            )
         sent = await session.send_command(
             node,
             command,

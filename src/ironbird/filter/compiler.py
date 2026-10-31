@@ -200,9 +200,11 @@ def _word_literal(lit: Literal, table: Mapping[str, Any], *, fold: bool) -> Any:
 
 def _bytes_literal(lit: Literal, size: int, op: str, *, variable: bool = False) -> bytes:
     """Bytes from a hex literal. A fixed field is ``size`` bytes, so a comparison takes exactly
-    that many; a variable-length field is up to ``size`` bytes, so it takes any length up to it."""
+    that many; a variable-length field is up to ``size`` bytes, so it takes any length up to it,
+    the empty value (a field with no bytes) included except as a ``contains`` needle."""
     text = _text_literal(lit)
-    if len(text) % 2 or not text or not _HEX_DIGITS.issuperset(text):
+    empty_ok = variable and op != "contains"
+    if len(text) % 2 or (not text and not empty_ok) or not _HEX_DIGITS.issuperset(text):
         raise _Reject('expected hexadecimal bytes in quotes, such as "0aff"')
     value = bytes.fromhex(text)
     if op == "contains":

@@ -285,6 +285,7 @@ def test_the_named_layout_mistakes_are_each_refused_for_that_reason() -> None:
         "ccdd-var-missing-max.json": "required key is missing",
         "ccdd-var-signed-count.json": "unsigned integer",
         "ccdd-var-remaining-not-last.json": "last field",
+        "ccdd-var-remaining-is-a-field.json": "rename that field",
         "ccdd-var-count-too-narrow.json": "cannot be expressed",
         "ccdd-var-fixed-after-variable.json": "declare every fixed field first",
         "ccdd-var-count-shared.json": "share the count field",
@@ -337,6 +338,14 @@ def test_text_list_spellings(codec: Codec) -> None:
     assert codec.decode(TLM, empty).as_dict() == {"n": 0, "Items": ()}  # type: ignore[union-attr]
     blank = codec.encode_telemetry("TRAIL", {"Items": ""}).data
     assert blank[8:] == empty[8:]  # the payload; the header holds the sequence counter
+
+
+def test_text_with_a_nul_is_refused_since_it_would_decode_cut_short(codec: Codec) -> None:
+    for text in ("ab\x00cd", "\x00", "abc\x00"):
+        with pytest.raises(IronbirdError) as info:
+            codec.encode_telemetry("EVT", {"Text": text})
+        assert info.value.code is Code.ENC_ARG and "NUL" in info.value.summary
+        assert "\n" not in info.value.user_line()
 
 
 def test_the_count_is_filled_in_and_a_disagreeing_one_is_refused(codec: Codec) -> None:
@@ -508,6 +517,74 @@ def test_decode_resolved_takes_the_counts_the_check_read(codec: Codec) -> None:
     assert codec.decode_resolved(kind, resolved, other) == codec.decode(kind, other)
     fixed = codec.resolve(TLM, codec.encode_telemetry("EVT", {"Text": ""}).data)
     assert not isinstance(fixed, DecodeError) and fixed.counts == (0,)
+
+
+def test_a_forged_token_is_never_believed_and_never_raises() -> None:
+    c = var_corpus.codec()
+    data = c.encode_telemetry("MOCK_DATA", {"Entries": [1, 2, 3], "Text": "abc"}).data
+    token = c.resolve(TLM, data)
+    assert not isinstance(token, DecodeError) and token.counts == (3, 3)
+    expected = c.decode(TLM, data)
+    assert isinstance(expected, DecodedPacket)
+    forged = [
+        token._replace(counts=()),
+        token._replace(counts=(64, 0)),
+        token._replace(counts=(1, 0)),
+        token._replace(counts=(3, 2)),
+        token._replace(counts=(-1, 3)),
+        token._replace(counts=[3, 3]),  # type: ignore[arg-type]
+        token._replace(message=c.model.by_name["MOCK_LOAD_DATA"]),
+        token._replace(message="MOCK_DATA"),  # type: ignore[arg-type]
+        token._replace(message=c.model.by_name["MOCK_HK"]),
+    ]
+    for bad in forged:
+        assert c.decode_resolved(TLM, bad, data) == expected, bad
+
+
+def test_the_checksum_span_is_checked_at_every_size_it_can_cut_the_field(tmp_path: Path) -> None:
+    """A span that ends 10 bytes before the packet end leaves the 2-byte checksum field at bytes
+    6..7 outside it at 16 bytes and inside it at 18, but cuts it at 17: the sizes between the
+    smallest and the largest packet are checked, not just those two."""
+    profile = tmp_path / "cut.toml"
+    profile.write_text(
+        'name = "cut_tlm"\nkind = "telemetry"\nbyte_order = "big"\n'
+        'mid_fields = ["version", "packet_type", "sec_hdr_flag", "apid"]\n'
+        '[[fields]]\nname = "version"\nbits = 3\nvalue = 0\n'
+        '[[fields]]\nname = "packet_type"\nbits = 1\nvalue = 0\n'
+        '[[fields]]\nname = "sec_hdr_flag"\nbits = 1\nvalue = 1\n'
+        '[[fields]]\nname = "apid"\nbits = 11\ncomputed = "from_mid"\n'
+        '[[fields]]\nname = "seq_flags"\nbits = 2\nvalue = 3\ncheck = false\n'
+        '[[fields]]\nname = "sequence"\nbits = 14\ncomputed = "sequence"\n'
+        '[[fields]]\nname = "length"\nbits = 16\ncomputed = "length"\nbias = -7\n'
+        '[[fields]]\nname = "ck"\nbits = 16\ncomputed = "checksum"\n'
+        'algorithm = "crc16_ccitt"\nspan = { start = 0, end = -10 }\n'
+    )
+    cut = header.load_profile(profile)
+    ck = cut.checksum_field
+    assert ck is not None and cut.min_bytes == 8
+    assert not isinstance(header.checksum_plan(cut, ck, 16), str)
+    assert not isinstance(header.checksum_plan(cut, ck, 18), str)
+    assert "cuts through" in str(header.checksum_plan(cut, ck, 17))
+    assert 17 in header.checksum_probe_sizes(cut, ck, 16, 18)
+
+    def build(low: int, high: int) -> Codec:
+        message = {
+            "name": "V",
+            "kind": "telemetry",
+            "mid": "0x0801",
+            "fields": [
+                {"name": "D", "type": "uint8[]", "length": "remaining", "min": low, "max": high}
+            ],
+        }
+        raw = {"schema": "ironbird-ccdd/1", "target": "t", "messages": [message]}
+        cmd = header.load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_cmd.toml")
+        return Codec(parse_model(raw, "t"), cmd, cut)
+
+    with pytest.raises(IronbirdError) as info:
+        build(8, 10)
+    assert info.value.code is Code.ENC_FIT and "cuts through" in info.value.summary
+    build(8, 8)  # one size, no cut
+    build(10, 10)
 
 
 def test_truncation_at_every_offset_is_typed_and_check_agrees(codec: Codec) -> None:
@@ -760,6 +837,12 @@ def test_the_filter_takes_variable_text_and_bytes_but_not_a_number_array(codec: 
     assert _matches(codec, 'Blob == "aabb"', all_)  # any length up to the maximum
     assert not _matches(codec, 'Blob == "aabbcc"', all_)
     assert _matches(codec, 'Blob contains "bb"', all_)
+    empty = _filter_frame(codec, "ALL", {"Floats": [1], "Blob": ""})
+    assert _matches(codec, 'Blob == ""', empty) and not _matches(codec, 'Blob != ""', empty)
+    assert not _matches(codec, 'Blob == ""', all_) and _matches(codec, 'Blob != ""', all_)
+    for bad in ('Blob contains ""', 'Floats == ""'):
+        with pytest.raises(FilterError):
+            compile_filter(bad, {"n1": codec}, links=LINKS)
     with pytest.raises(FilterError) as info:
         compile_filter('Blob == "' + "aa" * 21 + '"', {"n1": codec}, links=LINKS)
     assert info.value.code is Code.FLT_TYPE and "at most 20" in info.value.summary
@@ -906,8 +989,27 @@ def test_count_mismatch_is_refused_before_anything_is_sent_unless_asked_for(
     ground_events = _events(ground_ledger)
     requests = [e for e in ground_events if e["event"] == "send.request"]
     assert [bool(e.get("allow_count_mismatch")) for e in requests] == [False, True]
+    faults = [e for e in ground_events if e["event"] == "send.fault"]
+    assert len(faults) == 1 and faults[0]["fault"] == "count_mismatch"
+    assert faults[0]["fields"] == [{"field": "Count", "given": 9, "implied": 2, "unit": "elements"}]
     assert len([e for e in ground_events if e["event"] == "tx.command"]) == 1
     assert any(e["event"] == "rx.malformed" for e in _events(fc_ledger))
+
+
+def test_a_reply_rule_with_a_wrong_count_is_refused_without_naming_a_send_option(
+    codec: Codec,
+) -> None:
+    with pytest.raises(IronbirdError) as info:
+        codec.encode_telemetry("TRAIL", {"n": 3, "Items": [1]})
+    assert info.value.code is Code.ENC_ARG and "disagrees" in info.value.summary
+    assert "--allow-count-mismatch" not in info.value.summary
+    packet = codec.encode_telemetry("TRAIL", {"n": 3, "Items": [1]}, allow_count_mismatch=True)
+    assert [(f.field, f.given, f.implied) for f in packet.count_faults] == [("n", 3, 1)]
+    args = {"n": 2, "Data": "0102", "Name": "ab"}
+    same = codec.encode_command("CMD", args, allow_count_mismatch=True)
+    assert same.count_faults == ()  # a value equal to the implied one is no fault
+    assert codec.count_field_names("CMD", CMD) == ("n",)
+    assert codec.count_field_names("EVT", TLM) == ()
 
 
 def test_cli_send_takes_lists_and_the_fault_injection_flag(mock_config_path: Path) -> None:
@@ -932,6 +1034,17 @@ def test_cli_send_takes_lists_and_the_fault_injection_flag(mock_config_path: Pat
         assert wire[8:10] == b"\x07\x00" and len(wire) == 8 + 2 + 8 + 1
         over = runner.invoke(app, [*base, "Entries=" + ",".join(["1"] * 65), "Text=x"])
         assert over.exit_code == 1 and "65 elements exceed 64" in over.output
+        # the flag needs a count or length field to be wrong about
+        none = runner.invoke(app, ["-c", str(mock_config_path), "send", "fc", "MOCK_NOOP"])
+        assert none.exit_code == 0, none.output
+        sink.recv(2048)
+        fixed = runner.invoke(
+            app, ["-c", str(mock_config_path), "send", "fc", "MOCK_NOOP", "--allow-count-mismatch"]
+        )
+        assert fixed.exit_code == 2 and "IB-CLI-" in fixed.output, fixed.output
+        sink.settimeout(0.3)
+        with pytest.raises(TimeoutError):  # nothing went out
+            sink.recv(2048)
     finally:
         sink.close()
 

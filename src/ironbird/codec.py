@@ -105,12 +105,23 @@ class DecodedPacket:
 
 
 @dataclass(frozen=True, slots=True)
+class CountFault:
+    """A count or length field sent with a value other than the one its data implies."""
+
+    field: str  # the count or length field
+    given: int  # the value the caller gave, which went out
+    implied: int  # the value the data of the field it sizes implies
+    unit: VarUnit  # elements (COUNT) or bytes (LENGTH)
+
+
+@dataclass(frozen=True, slots=True)
 class EncodedPacket:
     data: bytes
     message: Message
     mid: int
     sequence: int
     function_code: int | None
+    count_faults: tuple[CountFault, ...] = ()  # injected with ``allow_count_mismatch``
 
 
 def _compile_layout(message: Message) -> _Layout:
@@ -306,6 +317,8 @@ def coerce_variable(message: Message, field: FieldDef, value: object) -> tuple[i
     match element.type_class:
         case TypeClass.CHAR:
             blob = _text_bytes(message, field, value, spec.max)
+            if b"\x00" in blob:  # decode ends text at a NUL, so the tail would not round-trip
+                raise _arg_error(message, field, "text cannot contain a NUL character")
             count = len(blob)
         case TypeClass.BYTES:
             blob = _hex_bytes(message, field, value)
@@ -427,7 +440,8 @@ class Codec:
             )
         # Every size between the smallest and the largest packet must fit the header; a message
         # of one size has the one.
-        sizes = sorted({profile.min_bytes + msg.min_payload, total})
+        smallest = profile.min_bytes + msg.min_payload
+        sizes = sorted({smallest, total})
         lf = profile.length_field
         cf = profile.checksum_field
         for n in sizes:
@@ -438,7 +452,9 @@ class Codec:
                     f"{lf.name} field of profile {profile.name}",
                     details=profile.source,
                 )
-            if cf is not None:
+        if cf is not None:
+            # The span may depend on the size, so check every size where its answer can change.
+            for n in hdr.checksum_probe_sizes(profile, cf, smallest, total):
                 plan = hdr.checksum_plan(profile, cf, n)
                 if isinstance(plan, str):
                     raise IronbirdError(
@@ -510,6 +526,11 @@ class Codec:
 
     # -- encode ----------------------------------------------------------------------
 
+    def count_field_names(self, name: str, kind: MessageKind) -> tuple[str, ...]:
+        """The count and length fields of message ``name`` that its variable-length data
+        determines (empty for a fixed-size message); unknown names are refused as in encoding."""
+        return tuple(sorted(self._layouts[self._lookup(name, kind).name].count_names))
+
     def _lookup(self, name: str, kind: MessageKind) -> Message:
         msg = self.model.by_name.get(name)
         if msg is None or msg.kind is not kind:
@@ -529,7 +550,8 @@ class Codec:
         *,
         strict: bool,
         allow_count_mismatch: bool = False,
-    ) -> bytes:
+        flag_hint: str = "",
+    ) -> tuple[bytes, tuple[CountFault, ...]]:
         names = {f.name for f in msg.fields}
         unexpected = sorted(set(args) - names)
         if unexpected:
@@ -556,6 +578,7 @@ class Codec:
             else:
                 values.append(_zero(f))
         blobs: list[bytes] = []
+        faults: list[CountFault] = []
         for slot in layout.variables:
             f, spec = slot.field, slot.spec
             if f.name in args:
@@ -578,15 +601,19 @@ class Codec:
                     Code.ENC_ARG,
                     f"{msg.name}: argument {holder.name}: {given} disagrees with the {implied} "
                     f"{'elements' if spec.unit is VarUnit.COUNT else 'bytes'} of {f.name}; "
-                    "leave it out to have it filled in (--allow-count-mismatch injects a fault)",
+                    f"leave it out to have it filled in{flag_hint}",
                 )
+            if given != implied:
+                assert isinstance(given, int)  # a count field is an unsigned integer
+                faults.append(CountFault(holder.name, given, implied, spec.unit))
         buf = bytearray(msg.fixed_extent if msg.is_variable else msg.payload_size)
         for seg in layout.segments:
             seg.struct.pack_into(buf, seg.start, *(values[i] for i in seg.indices))
         for blob in blobs:
             buf += blob
         assert msg.min_payload <= len(buf) <= msg.payload_size
-        return bytes(buf)
+        assert allow_count_mismatch or not faults
+        return bytes(buf), tuple(faults)
 
     def _frame(
         self,
@@ -595,6 +622,7 @@ class Codec:
         inputs: Mapping[str, int],
         tamper: Mapping[str, int] | None,
         header: Mapping[str, int] | None,
+        faults: tuple[CountFault, ...] = (),
     ) -> EncodedPacket:
         profile = self._profiles[msg.kind]
         values: dict[str, int] = {**msg.header}
@@ -615,7 +643,7 @@ class Codec:
         assert (
             len(data) <= self.max_packet_bytes
         )  # guaranteed by _validate_fit (+ tamper keeps size)
-        return EncodedPacket(data, msg, msg.mid, sequence, msg.function_code)
+        return EncodedPacket(data, msg, msg.mid, sequence, msg.function_code, faults)
 
     def encode_command(
         self,
@@ -631,13 +659,17 @@ class Codec:
         defaults. A count or length field is filled from the data it sizes; a value given for it
         that disagrees is refused unless ``allow_count_mismatch`` (fault injection)."""
         msg = self._lookup(name, MessageKind.COMMAND)
-        payload = self._encode_payload(
-            msg, args or {}, strict=True, allow_count_mismatch=allow_count_mismatch
+        payload, faults = self._encode_payload(
+            msg,
+            args or {},
+            strict=True,
+            allow_count_mismatch=allow_count_mismatch,
+            flag_hint=" (--allow-count-mismatch injects a fault)",
         )
         profile = self._profiles[MessageKind.COMMAND]
         assert profile.function_code_field is not None and msg.function_code is not None
         return self._frame(
-            msg, payload, {profile.function_code_field: msg.function_code}, tamper, header
+            msg, payload, {profile.function_code_field: msg.function_code}, tamper, header, faults
         )
 
     def encode_telemetry(
@@ -650,12 +682,13 @@ class Codec:
         allow_count_mismatch: bool = False,
     ) -> EncodedPacket:
         """Encode telemetry; fields not given are zero-filled. ``header`` and
-        ``allow_count_mismatch`` are as for :meth:`encode_command`."""
+        ``allow_count_mismatch`` are as for :meth:`encode_command`; a refusal does not name the
+        ``send`` option, which a telemetry sender (``respond``) does not have."""
         msg = self._lookup(name, MessageKind.TELEMETRY)
-        payload = self._encode_payload(
+        payload, faults = self._encode_payload(
             msg, values or {}, strict=False, allow_count_mismatch=allow_count_mismatch
         )
-        return self._frame(msg, payload, {}, tamper, header)
+        return self._frame(msg, payload, {}, tamper, header, faults)
 
     # -- check and decode (the boundary) -------------------------------------------
 
@@ -813,8 +846,9 @@ class Codec:
     def check(self, kind: MessageKind, data: bytes | bytearray | memoryview) -> DecodeError | None:
         """Validate one whole packet without unpacking its fields; ``None`` means well formed.
 
-        Safe on the receive path: it reads the header word, never the payload fields, and never
-        raises. ``decode`` accepts exactly the packets ``check`` accepts.
+        Safe on the receive path: it reads the header word and, for a variable-length message,
+        only the count and length fields of the payload, and never raises. ``decode`` accepts
+        exactly the packets ``check`` accepts.
         """
         result = self.resolve(kind, data)
         return result if isinstance(result, DecodeError) else None
@@ -836,8 +870,9 @@ class Codec:
         This is the second half of :meth:`decode`, for a caller that kept the first half's
         result (the engine's ingest ran it on every frame). The token is believed only when it
         was made by this codec, for this kind, from this very ``bytes`` object (immutable, so its
-        content is what was checked); any other pairing takes the whole :meth:`decode`. Never
-        raises, whatever the pairing.
+        content is what was checked), and when its message, MID, packet size and variable-length
+        counts agree with that content (re-derived, a few integer reads); any other pairing takes
+        the whole :meth:`decode`. Never raises, whatever the token holds.
         """
         if (
             type(resolved) is not Resolved
@@ -845,9 +880,29 @@ class Codec:
             or resolved.kind is not kind
             or resolved.data is not data
             or type(data) is not bytes
+            or not self._token_agrees(kind, resolved, data)
         ):
             return self.decode(kind, data)
         return self._unpack(kind, resolved, data)
+
+    def _token_agrees(self, kind: MessageKind, resolved: Resolved, data: bytes) -> bool:
+        """Whether the message, size and counts of ``resolved`` are what ``data`` says."""
+        msg = resolved.message
+        layout = self._layouts.get(msg.name) if type(msg) is Message else None
+        profile = self._profiles[kind]
+        if layout is None or layout.message is not msg or msg.kind is not kind:
+            return False
+        if hdr.peek_mid(profile, data) != msg.mid:
+            return False
+        payload = len(data) - profile.min_bytes
+        if not msg.is_variable:
+            return payload == msg.payload_size
+        if type(resolved.counts) is not tuple or not msg.min_payload <= payload <= msg.payload_size:
+            return False
+        counts = self._variable_counts(
+            layout, data, profile.size_bytes, len(data) - profile.trailer_size
+        )
+        return counts == resolved.counts
 
     def _unpack(
         self, kind: MessageKind, resolved: Resolved, data: bytes | bytearray | memoryview

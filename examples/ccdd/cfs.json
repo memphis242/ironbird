@@ -2299,7 +2299,7 @@
         {"name": "err_counter", "type": "uint8", "description": "Rejected commands"},
         {"name": "entries", "type": "uint16", "description": "Entries stored by SET_DATA"},
         {"name": "text_len", "type": "uint16", "description": "Text bytes stored by SET_DATA"},
-        {"name": "spare", "type": "uint16"}
+        {"name": "hk_counter", "type": "uint16", "description": "HK packets sent so far, this one included; each answers one IB_TEST_SEND_HK"}
       ]
     },
     {

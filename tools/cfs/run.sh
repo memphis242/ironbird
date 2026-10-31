@@ -24,9 +24,10 @@
 #   CFS_BUILD_DIR  root used by build.sh (default /home/user/build/cfs)
 #   CFS_CONFIG     cFS make configuration (default native_std)
 #   CFS_APPS       space-separated apps to start (default "sch_lab ci_lab to_lab
-#                  sample_app"); set to "ALL" to keep the stock startup script. Add
+#                  sample_app"); the token "ALL" keeps the stock startup script. Add
 #                  "ib_test" (ironbird's own app, built by build.sh) to start it as well;
-#                  it is not part of the stock script, so "ALL" does not start it
+#                  it is not part of the stock script, so "ALL" alone does not start it
+#                  but "ALL ib_test" does
 #   CFS_RUN_UID    uid to drop to when started as root (default 65534)
 set -euo pipefail
 
@@ -65,7 +66,7 @@ mkdir -p "$RUN_DIR"
 cp -a "$EXE_DIR/." "$RUN_DIR/"
 cd "$RUN_DIR"
 
-if [[ "$CFS_APPS" != "ALL" ]]; then
+if [[ " $CFS_APPS " != *" ALL "* ]]; then
     # Keep libraries (minus the functional-test assert lib) and the listed apps.
     awk -F'[ ,]+' -v apps=" $CFS_APPS " '
         /^[[:space:]]*(!|#|$)/ { print; next }
