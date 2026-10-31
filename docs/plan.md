@@ -2930,6 +2930,106 @@ variable-length packet as far as the Stage 1 survey shows (2j confirms it from s
 see decision D6. The `ib_test` cFS app's variable-length packet (a counted array and a tail
 string) is built here, so these cFS cases run against real FSW.
 
+As built (where the build differs from, or settles, the text above)
+- Modules: `ccdd/model.py` (`TypeClass.ARRAY`, `VarUnit`, `VarSpec`, `parse_element_type`,
+  `FieldDef.var`, and on `Message` the derived `fixed_extent`, `min_payload` and `is_variable`),
+  `ccdd/json_adapter.py` (schema `/1`, variable fields, derived payload bounds), `codec.py`
+  (`_VarSlot`, the count walk, `coerce_variable`), `render.py`, `recording/export.py`
+  (`_array_cell`), `filter/compiler.py`, `session.py` + `cli/main.py` (`--allow-count-mismatch`),
+  `errors.py` (`IB-DEC-008` `DEC_COUNT`, `IB-DEC-009` `DEC_OVERRUN`), `ledger.py` (both are
+  evidence-tier errors like the other `IB-DEC-*`). `tools/cfs/apps/ib_test` is the cFS app.
+- Schema. `ironbird-ccdd/1` is the schema the shipped files and new files use; `/0` loads as before
+  and may not use `[]` types, `count`/`length`/`max`/`min` or `min_payload`/`max_payload` (a `[]` type
+  in a `/0` file says which schema it needs; the rest are unknown keys). Rules beyond the text: a
+  variable field takes no `offset`, `enum` or `payload_size`; exactly one of `count` and `length`
+  (`"remaining"` is accepted by either, and a count field cannot be called `remaining`); `max` is
+  `1..65535` elements, `min` `0..max`; the count or length field is a fixed, unsigned integer field
+  that is declared before the field it sizes and whose range holds `max` (elements for `count`,
+  `max * element size` bytes for `length`); one count field sizes one field; a fixed field after a
+  variable one is `IB-CCD-003`, as is a ninth variable field, a `remaining` that is not last and a
+  total above `MAX_PAYLOAD_BYTES`. `min_payload` and `max_payload` are derived (fixed extent plus the
+  fields' minimum and maximum bytes); a file may state them and a disagreement is `IB-CCD-003`.
+  `Message.payload_size` stays and is the maximum (equal to `max_payload`; the fixed messages are
+  unchanged), `min_payload` is new. A variable field's `offset` is the start of the variable section
+  (the end of the fixed fields), which is where it begins only when the fields before it are empty.
+- Where the counts are checked. The text says decode reports `IB-DEC-008` and `IB-DEC-009`; the build
+  does it in `Codec.resolve` (so `check`, which the engine runs on every frame at ingest, reports
+  them) and keeps `decode` believing exactly what `check` accepts, the invariant of 2b. Reasons: a
+  malformed variable-length packet is then counted, ledgered and coalesced once at ingest like any
+  other (the 2b note that `FrameDecoder` must report decode-only errors in both modes has nothing to
+  report, and `FrameDecoder` is unchanged), a filter or a front-end never sees a packet whose fields
+  disagree with its counts, and the walk is done once: `Resolved.counts` carries each field's element
+  count to `decode_resolved`. Only variable messages pay (a fixed message adds one attribute test
+  to `resolve`: `check` 2.1 us on the 4-core host, noisy, 1.6-1.8 us before); `check` of a
+  64-element packet is 3.1 us, its decode 17 us.
+- Errors, in the order the walk meets them. The payload outside `[min_payload, max_payload]`:
+  `IB-DEC-007` at the payload (the packet as a whole is checked before any count is read, so the
+  count fields are always inside it). Per field in wire order: a count above `max`, or a byte
+  length above `max * size`, or `remaining` above that: `IB-DEC-008` at the count field (the start of
+  the data for `remaining`); a byte length or `remaining` that is not a whole number of elements, or
+  fewer elements than `min`: `IB-DEC-007` at the same place; data past the end of the packet (or its
+  trailer): `IB-DEC-009` at the first byte of the data; bytes left after the last field: `IB-DEC-007`
+  at the first of them. Offsets are packet offsets like every `DecodeError`.
+- Values. A scalar array is a tuple, `char[]` is text (up to the first NUL, like `char[N]`), `bytes[]`
+  is `bytes`. `Entries` of 16 or fewer elements shows whole; more shows `[0 1 ... 15 ...(+24)]`
+  and a `bytes[]` shows its first 16 bytes as hex and `...(+N)`. `--format json` carries the whole list
+  (non-finite floats as text), a `bytes[]` its whole hex; a CSV cell is `[1 2 3]` (`[]` empty).
+- Encode. An omitted count or length is filled from its data; one given must agree
+  (`IB-ENC-002`, which names `--allow-count-mismatch`) unless the flag is given, which lets a value
+  that fits the count field go out as given (the data itself must still satisfy `min`/`max`, so
+  the packet fits the cap and the length field). The ledger's `send.request` carries
+  `allow_count_mismatch: true` for such a send and nothing otherwise. A telemetry field that is not
+  given is the smallest array the CCDD allows, zero-filled; a command's is a missing argument
+  (`IB-ENC-003`, the count field is not asked for). Lists are `1,2,3`, `[1, 2, 3]` or `1 2 3` (or a
+  Python list or tuple), at most 1 MiB of text; an element error names the position
+  (`Items[1]`); `char[]` is ASCII, `bytes[]` hex. A response rule can fill a variable field from a
+  string (`fields = { Entries = "1,2,3" }`) or echo a command's; TOML arrays are not accepted in
+  rules.
+- Load-time fit. A message is checked at its smallest and its largest size against the cap, the length
+  field and each checksum span (`IB-ENC-004` as before), because a span or a length that fits one size
+  can fail at another.
+- Filter. `char[]` and `bytes[]` filter like the fixed ones (a `bytes[]` comparison takes any length up
+  to the maximum); a number array has no operator and is `IB-FLT-003` ("an array of numbers cannot be
+  filtered"). Event mappings may name a `char[]` field (`message`), which `events` and `listen` show.
+- `ib_test` (decision D6). `tools/cfs/apps/ib_test` is a small cFS app: `IB_TEST_SET_DATA` (fc 2) carries
+  `u16 Count`, `u32 Entries[Count]` and a tail string and is checked byte for byte by the flight code;
+  a good one is stored and published as `IB_TEST_VAR`, `IB_TEST_SEND_VAR` republishes it,
+  `IB_TEST_SEND_HK` gives counters. `build.sh` copies each `tools/cfs/apps/*` into the checkout and
+  lists it in `sample_defs/targets.cmake` once (repeatable), and fails if `cf/<app>.so` is missing
+  afterwards; `run.sh` adds `ib_test` to the startup script when `CFS_APPS` names it; CI's cache key
+  includes `tools/cfs/apps/**`. An existing build must run `tools/cfs/build.sh` again to get it.
+  `tools/cfs/NOTES.md` section 8 records the layouts and the source check: the stock apps in the
+  verification set have no variable-length packet, but the bundle's MD app does (the dwell packet:
+  `ByteCount`, then that many bytes), so the claim "stock cFS has none" holds only for the verification
+  set. MD needs a dwell table and `CFS_APPS=ALL`; a case against it is deferred. The throughput
+  generator is 2l's.
+- Shipped examples. `examples/ccdd/mock.json` and `cfs.json` are `/1` and gain a variable-length command
+  and reply (`MOCK_LOAD_DATA` / `MOCK_DATA`, with a response rule in `examples/mock.toml` that echoes the
+  array and the string) and the `ib_test` messages. `tests/golden_2i.py` limits its model to the
+  messages the golden file recorded (the new ones would shift the seeded mutants), so the 2i proof is
+  unchanged; the replay corpus was rebuilt (`python tests/replay_corpus.py`) because it embeds the
+  shipped mock CCDD.
+- Tests: `test_variable_length.py` (91 cases: model and schema, 27 `ccdd-var-*` corpus files each
+  refused with its reason, encode and every error spelling, decode of each error class with its
+  offset, truncation at every offset of a packet and of its payload under a right header, Hypothesis
+  (arbitrary and header-shaped payloads: no raise, `check` equals `decode`, decode-encode-decode
+  agrees; counts beyond the buffer and the maximum against a model of the mock message; round trip
+  of every element type), rendering, JSON, CSV cells, events, the filter, the mock end to end through
+  `respond` (smallest, empty and largest packets; a malformed one counted and announced once with
+  `x150`), the refusal and ledgering of `--allow-count-mismatch`, and the CLI); `var_corpus.py`
+  builds the corpus (`ccdd-var-*.json`, 16 `varpacket-{cmd,tlm}-*.bin`) and a test proves the checked-in
+  files are its output. The variable packets are seeds of the mutation fuzz in `test_malformed_input.py`
+  and `tools/fuzz/fuzz_decode.py`. Three benchmarks (variable-length decode and check, and the
+  rejection of a bad count; all far below the 100 us ceiling). `tests/cfs/test_cfs_variable_length.py`
+  (6 cases against real cFS with `ib_test`: SET_DATA stored and published, the smallest and the largest
+  packet, SEND_VAR, the flight code rejecting a count that disagrees with the size (counted in its
+  error counter, nothing stored) for a count beyond the packet and one above the maximum, the ledger
+  marking the injected fault, no `IB-DEC-*` report from the listener) pass with the 28 earlier cFS
+  cases on the dev host.
+- Deferred: arrays of structs (D11); a filter operator over number arrays (`contains`, indexing); TOML
+  arrays in response rules; `--allow-count-mismatch` has no counterpart in `respond`; a real-cFS case
+  against MD's dwell packet; the `ib_test` gcc 8 (EL8) build is covered by CI only.
+
 ### 2k - Serial transport
 
 Config

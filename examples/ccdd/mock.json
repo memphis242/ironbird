@@ -1,5 +1,5 @@
 {
-  "schema": "ironbird-ccdd/0",
+  "schema": "ironbird-ccdd/1",
   "target": "mock",
   "messages": [
     {
@@ -102,6 +102,54 @@
           "description": "Event type"
         },
         {"name": "message", "type": "char[32]", "description": "Event text"}
+      ]
+    },
+    {
+      "name": "MOCK_LOAD_DATA",
+      "kind": "command",
+      "mid": "0x1890",
+      "function_code": 4,
+      "description": "Load a counted array and a tail string (variable length)",
+      "fields": [
+        {"name": "Count", "type": "uint16", "description": "Number of Entries"},
+        {
+          "name": "Entries",
+          "type": "uint32[]",
+          "count": "Count",
+          "max": 64,
+          "description": "Counted array of values"
+        },
+        {
+          "name": "Text",
+          "type": "char[]",
+          "length": "remaining",
+          "max": 122,
+          "description": "Tail string: the rest of the packet"
+        }
+      ]
+    },
+    {
+      "name": "MOCK_DATA",
+      "kind": "telemetry",
+      "mid": "0x0893",
+      "description": "The data last loaded: a counted array and a tail string (variable length)",
+      "category": "commanded",
+      "fields": [
+        {"name": "Count", "type": "uint16", "description": "Number of Entries"},
+        {
+          "name": "Entries",
+          "type": "uint32[]",
+          "count": "Count",
+          "max": 64,
+          "description": "Counted array of values"
+        },
+        {
+          "name": "Text",
+          "type": "char[]",
+          "length": "remaining",
+          "max": 122,
+          "description": "Tail string: the rest of the packet"
+        }
       ]
     }
   ]

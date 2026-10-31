@@ -1,0 +1,1 @@
+{"schema":"ironbird-ccdd/1","target":"t","messages":[{"name":"V","kind":"telemetry","mid":"0x0801","fields":[{"name":"Count","type":"uint16"},{"name":"Entries","type":"uint32[]","max":64}]}]}

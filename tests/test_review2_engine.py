@@ -978,6 +978,10 @@ def stub_toolchain(tmp_path: Path, make_body: str) -> dict[str, str]:
 def test_build_sh_records_the_pinned_version_only_after_a_successful_build(tmp_path: Path) -> None:
     build = tmp_path / "build"
     commit = init_repo(build / "src", "v-actual")
+    targets = build / "src" / "sample_defs" / "targets.cmake"
+    targets.parent.mkdir(parents=True)
+    (build / "src" / "apps").mkdir()
+    targets.write_text("SET(MISSION_NAME stub)\n")
     pinned = build / "PINNED_VERSION"
     base = {"CFS_BUILD_DIR": str(build), "CFS_REF": "v-requested", "CFS_COMMIT": "", "JOBS": "1"}
 
@@ -995,7 +999,8 @@ def test_build_sh_records_the_pinned_version_only_after_a_successful_build(tmp_p
     exe = build / "src" / "build-native_std" / "exe" / "cpu1"
     ok = stub_toolchain(
         tmp_path / "ok",
-        f'mkdir -p "{exe}"; printf "#!/bin/sh\\n" > "{exe}/core-cpu1"; chmod +x "{exe}/core-cpu1"',
+        f'mkdir -p "{exe}/cf"; printf "#!/bin/sh\\n" > "{exe}/core-cpu1"; '
+        f'chmod +x "{exe}/core-cpu1"; touch "{exe}/cf/ib_test.so"',
     )
     done = subprocess.run(
         [str(TOOLS / "build.sh")], env={**ok, **base}, capture_output=True, text=True, check=False
@@ -1004,3 +1009,6 @@ def test_build_sh_records_the_pinned_version_only_after_a_successful_build(tmp_p
     text = pinned.read_text()
     assert f"bundle_commit={commit}" in text
     assert "bundle_ref=v-actual" in text, "the ref is what is checked out, not what was asked for"
+    # ironbird's own app is copied in and listed once, however many builds ran.
+    assert (build / "src" / "apps" / "ib_test" / "CMakeLists.txt").is_file()
+    assert targets.read_text().count("MISSION_GLOBAL_APPLIST ib_test") == 1

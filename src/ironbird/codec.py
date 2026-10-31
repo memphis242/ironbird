@@ -15,8 +15,8 @@ import math
 import re
 import struct
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Final, NamedTuple, cast
 
@@ -27,6 +27,8 @@ from ironbird.ccdd.model import (
     Message,
     MessageKind,
     TypeClass,
+    VarSpec,
+    VarUnit,
 )
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.header import Header, HeaderProfile, ProfileKind
@@ -51,11 +53,26 @@ class _Segment:
 
 
 @dataclass(frozen=True, slots=True)
+class _VarSlot:
+    """A variable-length field and what is needed to read and write it."""
+
+    index: int  # definition-order index of the field
+    field: FieldDef
+    spec: VarSpec
+    element: struct.Struct | None  # one scalar element; None for char and bytes
+    count: struct.Struct | None  # reads the count or length field; None for "remaining"
+    count_offset: int  # payload offset of the count or length field
+    count_index: int  # definition-order index of the count or length field; -1 for "remaining"
+
+
+@dataclass(frozen=True, slots=True)
 class _Layout:
     message: Message
-    segments: tuple[_Segment, ...]
-    text_indices: tuple[int, ...]  # char[N] fields needing bytes -> str
+    segments: tuple[_Segment, ...]  # the fixed fields
+    text_indices: tuple[int, ...]  # fixed char[N] fields needing bytes -> str
     identity: bool  # single segment already in definition order, no char fields
+    variables: tuple[_VarSlot, ...] = ()  # variable-length fields, in wire order
+    count_names: frozenset[str] = frozenset()  # count and length fields their data determines
 
 
 class Resolved(NamedTuple):
@@ -73,6 +90,7 @@ class Resolved(NamedTuple):
     codec: Codec
     kind: MessageKind
     data: bytes | bytearray | memoryview
+    counts: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +114,8 @@ class EncodedPacket:
 
 
 def _compile_layout(message: Message) -> _Layout:
-    order = sorted(range(len(message.fields)), key=lambda i: message.fields[i].offset)
+    fixed = [i for i, f in enumerate(message.fields) if f.var is None]
+    order = sorted(fixed, key=lambda i: message.fields[i].offset)
     segments: list[_Segment] = []
     run: list[int] = []
 
@@ -121,13 +140,31 @@ def _compile_layout(message: Message) -> _Layout:
             close_run()
         run.append(i)
     close_run()
-    text = tuple(i for i, f in enumerate(message.fields) if f.type.type_class is TypeClass.CHAR)
+    text = tuple(i for i in fixed if message.fields[i].type.type_class is TypeClass.CHAR)
     identity = (
         len(segments) <= 1
         and not text
+        and not message.is_variable
         and (not segments or segments[0].indices == tuple(range(len(message.fields))))
     )
-    return _Layout(message, tuple(segments), text, identity)
+    slots: list[_VarSlot] = []
+    for i, f in enumerate(message.fields):
+        spec = f.var
+        if spec is None:
+            continue
+        prefix = f.endian.struct_prefix
+        scalar = spec.element.type_class in (TypeClass.INT, TypeClass.FLOAT)
+        element = struct.Struct(prefix + spec.element.struct_code) if scalar else None
+        count: struct.Struct | None = None
+        count_index = -1
+        if spec.count_field is not None:
+            count_index = next(j for j in fixed if message.fields[j].name == spec.count_field)
+            holder = message.fields[count_index]
+            count = struct.Struct(holder.endian.struct_prefix + holder.type.struct_code)
+        offset = message.fields[count_index].offset if count_index >= 0 else 0
+        slots.append(_VarSlot(i, f, spec, element, count, offset, count_index))
+    names = frozenset(message.fields[s.count_index].name for s in slots if s.count_index >= 0)
+    return _Layout(message, tuple(segments), text, identity, tuple(slots), names)
 
 
 def _decode_text(raw: bytes) -> str:
@@ -147,6 +184,7 @@ def _arg_error(message: Message, field: FieldDef, why: str) -> IronbirdError:
 
 _SPELLED_NON_FINITE: Final = re.compile(r"[+-]?(inf|infinity|nan)", re.IGNORECASE)
 MAX_ENUM_HINT_NAMES: Final = 16
+MAX_LIST_TEXT: Final = 1 << 20  # characters of a spelled-out array or hex value a caller may pass
 
 
 def _enum_hint(field: FieldDef) -> str:
@@ -156,6 +194,33 @@ def _enum_hint(field: FieldDef) -> str:
     names = list(field.enum)[:MAX_ENUM_HINT_NAMES]
     more = f", ... ({len(field.enum)} in all)" if len(field.enum) > len(names) else ""
     return f"; names: {', '.join(names)}{more}"
+
+
+def _text_bytes(message: Message, field: FieldDef, value: object, limit: int) -> bytes:
+    """ASCII text as bytes, at most ``limit`` of them."""
+    if not isinstance(value, str):
+        raise _arg_error(message, field, f"unsupported value {value!r}")
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        raise _arg_error(message, field, "text must be ASCII") from None
+    if len(encoded) > limit:
+        raise _arg_error(message, field, f"{len(encoded)} characters exceed {limit}")
+    return encoded
+
+
+def _hex_bytes(message: Message, field: FieldDef, value: object) -> bytes:
+    """Bytes, or hex digits as bytes; the caller checks the length."""
+    if isinstance(value, bytes):
+        return value
+    if not isinstance(value, str):
+        raise _arg_error(message, field, f"unsupported value {value!r}")
+    if len(value) > MAX_LIST_TEXT:
+        raise _arg_error(message, field, f"the hex text is longer than {MAX_LIST_TEXT} characters")
+    try:
+        return bytes.fromhex(value)
+    except ValueError:
+        raise _arg_error(message, field, "expected hex digits") from None
 
 
 def coerce_value(message: Message, field: FieldDef, value: object) -> object:
@@ -206,31 +271,77 @@ def coerce_value(message: Message, field: FieldDef, value: object) -> object:
                     raise _arg_error(message, field, f"{flt} overflows float32") from None
             return flt
         case TypeClass.CHAR:
-            if not isinstance(value, str):
-                raise _arg_error(message, field, f"unsupported value {value!r}")
-            try:
-                encoded = value.encode("ascii")
-            except UnicodeEncodeError:
-                raise _arg_error(message, field, "text must be ASCII") from None
-            if len(encoded) > ftype.size:
-                raise _arg_error(message, field, f"{len(encoded)} characters exceed {ftype.size}")
-            return encoded
+            return _text_bytes(message, field, value, ftype.size)
         case TypeClass.BYTES:
-            if isinstance(value, bytes):
-                raw = value
-            elif isinstance(value, str):
-                try:
-                    raw = bytes.fromhex(value)
-                except ValueError:
-                    raise _arg_error(message, field, "expected hex digits") from None
-            else:
-                raise _arg_error(message, field, f"unsupported value {value!r}")
+            raw = _hex_bytes(message, field, value)
             if len(raw) != ftype.size:
                 raise _arg_error(
                     message, field, f"needs exactly {ftype.size} bytes, got {len(raw)}"
                 )
             return raw
+        case TypeClass.ARRAY:
+            raise AssertionError("a variable-length field goes through coerce_variable")
     raise AssertionError(f"unhandled type class {ftype.type_class}")  # pragma: no cover
+
+
+def _split_list(message: Message, field: FieldDef, text: str) -> list[str]:
+    """The items of ``1,2,3``, ``[1, 2, 3]`` or ``1 2 3``; empty text is an empty array."""
+    if len(text) > MAX_LIST_TEXT:
+        raise _arg_error(message, field, f"the list is longer than {MAX_LIST_TEXT} characters")
+    body = text.strip()
+    if body.startswith("["):
+        if not body.endswith("]"):
+            raise _arg_error(message, field, "a list starting with [ must end with ]")
+        body = body[1:-1]
+    return body.replace(",", " ").split()
+
+
+def coerce_variable(message: Message, field: FieldDef, value: object) -> tuple[int, bytes]:
+    """The element count and the wire bytes of a variable-length field's value: text for
+    ``char[]``, bytes or hex for ``bytes[]``, a list, tuple or ``1,2,3`` text for a scalar array.
+    The count is checked against the field's ``min`` and ``max``."""
+    spec = field.var
+    assert spec is not None
+    element = spec.element
+    match element.type_class:
+        case TypeClass.CHAR:
+            blob = _text_bytes(message, field, value, spec.max)
+            count = len(blob)
+        case TypeClass.BYTES:
+            blob = _hex_bytes(message, field, value)
+            count = len(blob)
+        case _:
+            if isinstance(value, str):
+                items: Sequence[object] = _split_list(message, field, value)
+            elif isinstance(value, list | tuple):
+                items = cast("Sequence[object]", value)
+            else:
+                raise _arg_error(message, field, f"unsupported value {str(value)[:40]!r}")
+            if len(items) > spec.max:
+                raise _arg_error(message, field, f"{len(items)} elements exceed {spec.max}")
+            plain = replace(field, type=element, var=None)
+            packer = _element_packer(field)
+            pieces: list[bytes] = []
+            for i, item in enumerate(items):
+                try:
+                    number = coerce_value(message, plain, item)
+                except IronbirdError:
+                    # Name the element: the same coercion with the element's position in the name.
+                    indexed = replace(plain, name=f"{field.name}[{i}]")
+                    coerce_value(message, indexed, item)
+                    raise
+                pieces.append(packer.pack(number))
+            count, blob = len(items), b"".join(pieces)
+    if not spec.min <= count <= spec.max:
+        raise _arg_error(
+            message, field, f"{count} elements; the CCDD allows {spec.min} to {spec.max}"
+        )
+    return count, blob
+
+
+def _element_packer(field: FieldDef) -> struct.Struct:
+    assert field.var is not None and field.var.element.struct_code
+    return struct.Struct(field.endian.struct_prefix + field.var.element.struct_code)
 
 
 class Codec:
@@ -314,23 +425,27 @@ class Codec:
                 Code.ENC_FIT,
                 f"{where}: packet of {total} bytes exceeds the {self.max_packet_bytes}-byte cap",
             )
+        # Every size between the smallest and the largest packet must fit the header; a message
+        # of one size has the one.
+        sizes = sorted({profile.min_bytes + msg.min_payload, total})
         lf = profile.length_field
-        if lf is not None and not 0 <= total + lf.bias <= lf.mask:
-            raise IronbirdError(
-                Code.ENC_FIT,
-                f"{where}: packet of {total} bytes does not fit the {lf.bits}-bit "
-                f"{lf.name} field of profile {profile.name}",
-                details=profile.source,
-            )
         cf = profile.checksum_field
-        if cf is not None:
-            plan = hdr.checksum_plan(profile, cf, total)
-            if isinstance(plan, str):
+        for n in sizes:
+            if lf is not None and not 0 <= n + lf.bias <= lf.mask:
                 raise IronbirdError(
                     Code.ENC_FIT,
-                    f"{where}: {plan} (profile {profile.name})",
+                    f"{where}: packet of {n} bytes does not fit the {lf.bits}-bit "
+                    f"{lf.name} field of profile {profile.name}",
                     details=profile.source,
                 )
+            if cf is not None:
+                plan = hdr.checksum_plan(profile, cf, n)
+                if isinstance(plan, str):
+                    raise IronbirdError(
+                        Code.ENC_FIT,
+                        f"{where}: {plan} (profile {profile.name})",
+                        details=profile.source,
+                    )
         if msg.kind is MessageKind.COMMAND:
             assert profile.function_code_field is not None and msg.function_code is not None
             fc_field = profile.by_name[profile.function_code_field]
@@ -407,7 +522,14 @@ class Codec:
             )
         return msg
 
-    def _encode_payload(self, msg: Message, args: Mapping[str, object], *, strict: bool) -> bytes:
+    def _encode_payload(
+        self,
+        msg: Message,
+        args: Mapping[str, object],
+        *,
+        strict: bool,
+        allow_count_mismatch: bool = False,
+    ) -> bytes:
         names = {f.name for f in msg.fields}
         unexpected = sorted(set(args) - names)
         if unexpected:
@@ -416,21 +538,54 @@ class Codec:
                 f"{msg.name}: unexpected argument(s) {', '.join(n[:32] for n in unexpected)}; "
                 f"expected: {', '.join(f.name for f in msg.fields) or 'none'}",
             )
-        missing = [f.name for f in msg.fields if f.name not in args]
+        layout = self._layouts[msg.name]
+        # A count or length field follows from the data it sizes, so it is not required.
+        missing = [
+            f.name for f in msg.fields if f.name not in args and f.name not in layout.count_names
+        ]
         if missing and strict:
             raise IronbirdError(
                 Code.ENC_ARGSET, f"{msg.name}: missing argument(s) {', '.join(missing)}"
             )
-        layout = self._layouts[msg.name]
         values: list[object] = []
         for f in msg.fields:
-            if f.name in args:
+            if f.var is not None:
+                values.append(None)  # set below, once the data is known
+            elif f.name in args:
                 values.append(coerce_value(msg, f, args[f.name]))
             else:
                 values.append(_zero(f))
-        buf = bytearray(msg.payload_size)
+        blobs: list[bytes] = []
+        for slot in layout.variables:
+            f, spec = slot.field, slot.spec
+            if f.name in args:
+                count, blob = coerce_variable(msg, f, args[f.name])
+            else:  # not given: the smallest array the CCDD allows, zero-filled
+                count = spec.min
+                blob = bytes(spec.min_bytes)
+            blobs.append(blob)
+            if slot.count_index < 0:
+                continue
+            holder = msg.fields[slot.count_index]
+            implied = count if spec.unit is VarUnit.COUNT else len(blob)
+            assert implied <= holder.type.bit_range[1], "the CCDD load checked the count field"
+            if holder.name not in args:
+                values[slot.count_index] = implied
+                continue
+            given = values[slot.count_index]
+            if given != implied and not allow_count_mismatch:
+                raise IronbirdError(
+                    Code.ENC_ARG,
+                    f"{msg.name}: argument {holder.name}: {given} disagrees with the {implied} "
+                    f"{'elements' if spec.unit is VarUnit.COUNT else 'bytes'} of {f.name}; "
+                    "leave it out to have it filled in (--allow-count-mismatch injects a fault)",
+                )
+        buf = bytearray(msg.fixed_extent if msg.is_variable else msg.payload_size)
         for seg in layout.segments:
             seg.struct.pack_into(buf, seg.start, *(values[i] for i in seg.indices))
+        for blob in blobs:
+            buf += blob
+        assert msg.min_payload <= len(buf) <= msg.payload_size
         return bytes(buf)
 
     def _frame(
@@ -469,12 +624,16 @@ class Codec:
         *,
         tamper: Mapping[str, int] | None = None,
         header: Mapping[str, int] | None = None,
+        allow_count_mismatch: bool = False,
     ) -> EncodedPacket:
         """Encode a command. ``header`` sets input fields of the command header profile for this
         packet; it wins over the message's own ``header`` values, which win over the profile's
-        defaults."""
+        defaults. A count or length field is filled from the data it sizes; a value given for it
+        that disagrees is refused unless ``allow_count_mismatch`` (fault injection)."""
         msg = self._lookup(name, MessageKind.COMMAND)
-        payload = self._encode_payload(msg, args or {}, strict=True)
+        payload = self._encode_payload(
+            msg, args or {}, strict=True, allow_count_mismatch=allow_count_mismatch
+        )
         profile = self._profiles[MessageKind.COMMAND]
         assert profile.function_code_field is not None and msg.function_code is not None
         return self._frame(
@@ -488,11 +647,14 @@ class Codec:
         *,
         tamper: Mapping[str, int] | None = None,
         header: Mapping[str, int] | None = None,
+        allow_count_mismatch: bool = False,
     ) -> EncodedPacket:
-        """Encode telemetry; fields not given are zero-filled. ``header`` is as for
-        :meth:`encode_command`."""
+        """Encode telemetry; fields not given are zero-filled. ``header`` and
+        ``allow_count_mismatch`` are as for :meth:`encode_command`."""
         msg = self._lookup(name, MessageKind.TELEMETRY)
-        payload = self._encode_payload(msg, values or {}, strict=False)
+        payload = self._encode_payload(
+            msg, values or {}, strict=False, allow_count_mismatch=allow_count_mismatch
+        )
         return self._frame(msg, payload, {}, tamper, header)
 
     # -- check and decode (the boundary) -------------------------------------------
@@ -551,16 +713,102 @@ class Codec:
         else:
             msg = self.model.telemetry_by_mid.get(mid)
             assert msg is not None  # the MID was found in the CCDD above
-        expected = profile.min_bytes + msg.payload_size
-        if size != expected:
+        if not msg.is_variable:
+            expected = profile.min_bytes + msg.payload_size
+            if size != expected:
+                return DecodeError(
+                    Code.DEC_PAYLOAD,
+                    profile.size_bytes,
+                    f"{msg.name} payload is {size - profile.min_bytes} bytes, "
+                    f"CCDD says {msg.payload_size}",
+                    mid,
+                )
+            return Resolved(msg, word, self, kind, data)
+        payload = size - profile.min_bytes
+        if not msg.min_payload <= payload <= msg.payload_size:
             return DecodeError(
                 Code.DEC_PAYLOAD,
                 profile.size_bytes,
-                f"{msg.name} payload is {size - profile.min_bytes} bytes, "
-                f"CCDD says {msg.payload_size}",
+                f"{msg.name} payload is {payload} bytes, "
+                f"CCDD says {msg.min_payload} to {msg.payload_size}",
                 mid,
             )
-        return Resolved(msg, word, self, kind, data)
+        counts = self._variable_counts(
+            self._layouts[msg.name], data, profile.size_bytes, size - profile.trailer_size
+        )
+        if isinstance(counts, DecodeError):
+            return counts
+        return Resolved(msg, word, self, kind, data, counts)
+
+    @staticmethod
+    def _variable_counts(
+        layout: _Layout, data: bytes | bytearray | memoryview, base: int, end: int
+    ) -> tuple[int, ...] | DecodeError:
+        """The element count of each variable-length field of the packet ``data``, whose payload
+        spans ``base`` to ``end``, or the first way the packet disagrees with the CCDD.
+
+        The caller has checked that the payload is no smaller than ``min_payload``, so the
+        fixed fields, with the count and length fields among them, are all inside the packet.
+        The fields' data must tile the rest of the payload exactly.
+        """
+        msg = layout.message
+        assert end - base >= msg.min_payload
+        cursor = base + msg.fixed_extent
+        counts: list[int] = []
+        for slot in layout.variables:
+            spec, name = slot.spec, slot.field.name
+            width = spec.element.size
+            if slot.count is None:  # "remaining": everything up to the end of the payload
+                where, in_bytes, given = cursor, True, end - cursor
+            else:
+                where = base + slot.count_offset
+                in_bytes = spec.unit is VarUnit.LENGTH
+                given = slot.count.unpack_from(data, where)[0]
+                assert isinstance(given, int)
+            limit = spec.max_bytes if in_bytes else spec.max
+            if given > limit:
+                what = "length" if in_bytes else "count"
+                return DecodeError(
+                    Code.DEC_COUNT,
+                    where,
+                    f"{msg.name}.{name} {what} {given} is above the CCDD maximum {limit}",
+                    msg.mid,
+                )
+            n, odd = divmod(given, width) if in_bytes else (given, 0)
+            if odd:
+                return DecodeError(
+                    Code.DEC_PAYLOAD,
+                    where,
+                    f"{msg.name}.{name}: {given} bytes is not a whole number of "
+                    f"{width}-byte elements",
+                    msg.mid,
+                )
+            if n < spec.min:
+                return DecodeError(
+                    Code.DEC_PAYLOAD,
+                    where,
+                    f"{msg.name}.{name} has {n} elements, below the CCDD minimum {spec.min}",
+                    msg.mid,
+                )
+            need = n * width
+            if cursor + need > end:
+                return DecodeError(
+                    Code.DEC_OVERRUN,
+                    cursor,
+                    f"{msg.name}.{name} needs {need} bytes at byte {cursor} but only "
+                    f"{end - cursor} remain",
+                    msg.mid,
+                )
+            cursor += need
+            counts.append(n)
+        if cursor != end:
+            return DecodeError(
+                Code.DEC_PAYLOAD,
+                cursor,
+                f"{msg.name}: {end - cursor} bytes follow the last variable-length field",
+                msg.mid,
+            )
+        return tuple(counts)
 
     def check(self, kind: MessageKind, data: bytes | bytearray | memoryview) -> DecodeError | None:
         """Validate one whole packet without unpacking its fields; ``None`` means well formed.
@@ -630,10 +878,41 @@ class Codec:
                     raw = out[i]
                     assert isinstance(raw, bytes)
                     out[i] = _decode_text(raw)
+                if layout.variables:
+                    self._unpack_variable(layout, resolved, data, base, out)
                 values = tuple(out)
         except struct.error as exc:  # pragma: no cover - sizes were validated above
             return DecodeError(Code.DEC_PAYLOAD, base, f"payload unpack failed: {exc}", msg.mid)
         return DecodedPacket(msg, parsed, values, size)
+
+    @staticmethod
+    def _unpack_variable(
+        layout: _Layout,
+        resolved: Resolved,
+        data: bytes | bytearray | memoryview,
+        base: int,
+        out: list[object],
+    ) -> None:
+        """Set the variable-length fields of ``out``. ``resolved.counts`` was read from this very
+        packet by the check, which also proved that the fields' data tile the end of the payload."""
+        counts = resolved.counts
+        assert len(counts) == len(layout.variables)
+        cursor = base + layout.message.fixed_extent
+        view = memoryview(data)
+        for slot, n in zip(layout.variables, counts, strict=True):
+            width = slot.spec.element.size
+            end = cursor + n * width
+            assert end <= len(data)
+            chunk = view[cursor:end]
+            match slot.spec.element.type_class:
+                case TypeClass.CHAR:
+                    out[slot.index] = _decode_text(bytes(chunk))
+                case TypeClass.BYTES:
+                    out[slot.index] = bytes(chunk)
+                case _:
+                    assert slot.element is not None
+                    out[slot.index] = tuple(v for (v,) in slot.element.iter_unpack(chunk))
+            cursor = end
 
 
 def _zero(field: FieldDef) -> object:
@@ -644,4 +923,6 @@ def _zero(field: FieldDef) -> object:
             return 0.0
         case TypeClass.CHAR | TypeClass.BYTES:
             return b""
+        case TypeClass.ARRAY:
+            return ()
     raise AssertionError("unreachable")  # pragma: no cover

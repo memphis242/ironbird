@@ -83,7 +83,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.CFS_BUILD_DIR }}
-          key: cfs-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ hashFiles('tools/cfs/build.sh') }}
+          key: cfs-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ hashFiles('tools/cfs/build.sh', 'tools/cfs/apps/**') }}
       - name: Build cFS
         if: steps.cache.outputs.cache-hit != 'true'
         run: tools/cfs/build.sh
@@ -266,7 +266,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: /home/ci/cfs-build
-          key: cfs-el8-${{ matrix.name }}-${{ steps.pin.outputs.commit }}-${{ steps.pin.outputs.toolchain }}-${{ hashFiles('tools/cfs/build.sh', 'tools/ci/el8-setup.sh', 'tools/ci/cache-key.sh') }}
+          key: cfs-el8-${{ matrix.name }}-${{ steps.pin.outputs.commit }}-${{ steps.pin.outputs.toolchain }}-${{ hashFiles('tools/cfs/build.sh', 'tools/cfs/apps/**', 'tools/ci/el8-setup.sh', 'tools/ci/cache-key.sh') }}
       - name: Hand the restored cache to the CI user (root)
         if: steps.setup.outputs.ready == 'true'
         shell: bash

@@ -1069,10 +1069,21 @@ def send(
             "(repeatable); wins over the command's CCDD header values and the profile default.",
         ),
     ] = None,
+    allow_count_mismatch: Annotated[
+        bool,
+        typer.Option(
+            "--allow-count-mismatch",
+            help="Fault injection: accept a count or length value that disagrees with the "
+            "data of the variable-length field it sizes.",
+        ),
+    ] = False,
     as_node: AsOption = None,
     verbose: VerboseOption = False,
 ) -> None:
-    """Encode and send one command; print a one-line confirmation."""
+    """Encode and send one command; print a one-line confirmation.
+
+    A variable-length argument is a list (Entries=1,2,3 or Entries=[1,2,3]), text, or hex for
+    bytes; its count or length argument is filled in when left out."""
 
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
         parsed = _parse_args(args)
@@ -1091,7 +1102,13 @@ def send(
             _check_length_delta(length_delta, profile.length_field.bits, profile.name)
             tamper[profile.length_field.name] = length_delta
         sent = await session.send_command(
-            node, command, parsed, tamper=tamper, link=link, header=header_values
+            node,
+            command,
+            parsed,
+            tamper=tamper,
+            link=link,
+            header=header_values,
+            allow_count_mismatch=allow_count_mismatch,
         )
         run.console.out(
             f"sent {term(sent.command)} to {term(sent.node)} via udp {term(sent.endpoint)} "

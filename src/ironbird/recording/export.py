@@ -158,6 +158,13 @@ def _bytes_cell(value: object) -> object:
     return HEX_PREFIX + value.hex()
 
 
+def _array_cell(value: object) -> object:
+    """A variable-length array as one cell, ``[1 2 3]``: the elements are numbers, so the text
+    needs no sanitizing (a non-finite float is spelled ``nan`` or ``inf``)."""
+    assert isinstance(value, tuple)
+    return "[" + " ".join(repr(v) if isinstance(v, float) else str(v) for v in value) + "]"
+
+
 def _converter(field_def: FieldDef, raw_enums: bool) -> Callable[[object], object]:
     """How one decoded value becomes a cell: a number stays a number, an integer with an enum
     becomes its label (the number when the enum lacks the value, or with ``raw_enums``), text and
@@ -180,6 +187,8 @@ def _converter(field_def: FieldDef, raw_enums: bool) -> Callable[[object], objec
             return _text_cell
         case TypeClass.BYTES:
             return _bytes_cell
+        case TypeClass.ARRAY:
+            return _array_cell
     raise AssertionError("unreachable")  # pragma: no cover
 
 

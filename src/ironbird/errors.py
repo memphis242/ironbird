@@ -42,6 +42,8 @@ class Code(StrEnum):
     DEC_CHECKSUM = "IB-DEC-005"  # checksum mismatch
     DEC_UNKNOWN = "IB-DEC-006"  # MID / function code not in the CCDD
     DEC_PAYLOAD = "IB-DEC-007"  # payload size disagrees with the CCDD
+    DEC_COUNT = "IB-DEC-008"  # variable-length count above the CCDD maximum
+    DEC_OVERRUN = "IB-DEC-009"  # variable-length data runs past the end of the packet
     # Transport
     TX_OPEN = "IB-TX-001"  # cannot open / bind
     TX_SEND = "IB-TX-002"  # send failed or refused

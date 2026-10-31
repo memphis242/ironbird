@@ -292,12 +292,14 @@ def _field_value(fld: FieldDef, lit: Literal, op: str) -> Any:
             if not text or len(text) % 2 or any(c not in "0123456789abcdefABCDEF" for c in text):
                 raise _Inexpressible
             raw = bytes.fromhex(text)
-            if op == "contains":
-                if len(raw) > fld.type.size:
+            if op == "contains" or fld.var is not None:
+                if len(raw) > fld.type.size:  # up to the size of a field that varies
                     raise _Inexpressible
             elif len(raw) != fld.type.size:
                 raise _Inexpressible
             return raw
+        case TypeClass.ARRAY:
+            raise _Inexpressible  # a number array has no filter operator
     raise AssertionError("unreachable")
 
 

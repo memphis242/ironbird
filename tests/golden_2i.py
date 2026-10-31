@@ -35,11 +35,31 @@ SEED = 20260217
 MUTANTS_PER_PACKET = 40
 
 
+def _recorded(name: str, model: CcddModel) -> CcddModel:
+    """``model`` limited to the messages the golden file recorded, in file order. Messages added
+    to the shipped files later (Stage 2j's variable-length ones) are not part of the proof: they
+    would also shift the seeded mutants of every message after them."""
+    if not GOLDEN.exists():
+        return model
+    keep = {
+        key.split("/", 1)[1]
+        for key in json.loads(GOLDEN.read_text())["encodes"]
+        if key.startswith(f"{name}/")
+    }
+    kept = tuple(m for m in model.messages if m.name in keep)
+    return CcddModel.build(model.target, model.source, kept)
+
+
 def codecs() -> dict[str, Codec]:
     cmd = header.load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_cmd.toml")
     tlm = header.load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_tlm.toml")
     return {
-        name: Codec(load_ccdd(EXAMPLES / "ccdd" / f"{name}.json"), cmd, tlm, clock=lambda: CLOCK)
+        name: Codec(
+            _recorded(name, load_ccdd(EXAMPLES / "ccdd" / f"{name}.json")),
+            cmd,
+            tlm,
+            clock=lambda: CLOCK,
+        )
         for name in ("mock", "cfs")
     }
 

@@ -52,10 +52,12 @@ VALID_CMDS = [
     CODEC.encode_command("MOCK_NOOP").data,
     CODEC.encode_command("MOCK_SET_MODE", {"mode": "SAFE", "pad": "0"}).data,
     CODEC.encode_command("MOCK_SET_LABEL", {"label": "abc"}).data,
+    CODEC.encode_command("MOCK_LOAD_DATA", {"Entries": "1,2,3", "Text": "abc"}).data,
 ]
 VALID_TLMS = [
     CODEC.encode_telemetry("MOCK_HK", {"cmd_counter": 5, "label": "x"}).data,
     CODEC.encode_telemetry("MOCK_STATUS", {"temperature_c": 1.5}).data,
+    CODEC.encode_telemetry("MOCK_DATA", {"Entries": list(range(20)), "Text": "hello"}).data,
 ]
 
 

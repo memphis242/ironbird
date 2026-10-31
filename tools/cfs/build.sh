@@ -61,12 +61,34 @@ if [[ "$actual_ref" != "$CFS_REF" ]]; then
     echo "build.sh: warning: $SRC_DIR is at $actual_ref, not the requested $CFS_REF" >&2
 fi
 
+# ironbird's own apps (tools/cfs/apps/<name>, today ib_test) are copied into the checkout's apps/
+# and added to the mission's applist, so the one pinned bundle builds them with everything else.
+# Both steps are repeatable: the copy is replaced and the applist line is added once.
+readonly APPS_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/apps"
+readonly TARGETS_CMAKE="$SRC_DIR/sample_defs/targets.cmake"
+[[ -f "$TARGETS_CMAKE" ]] || die "$TARGETS_CMAKE not found; is $SRC_DIR a cFS bundle?"
+for app_dir in "$APPS_SRC"/*/; do
+    [[ -d "$app_dir" ]] || continue
+    app="$(basename "$app_dir")"
+    rm -rf "${SRC_DIR:?}/apps/$app"
+    cp -a "$app_dir" "$SRC_DIR/apps/$app"
+    if ! grep -q "^list(APPEND MISSION_GLOBAL_APPLIST $app) # ironbird\$" "$TARGETS_CMAKE"; then
+        printf 'list(APPEND MISSION_GLOBAL_APPLIST %s) # ironbird\n' "$app" >> "$TARGETS_CMAKE"
+    fi
+    echo "build.sh: added ironbird app $app to the build"
+done
+
 cd "$SRC_DIR"
 make "${CFS_CONFIG}.prep"
 make -j"$JOBS" "${CFS_CONFIG}.install"
 
 readonly EXE_DIR="$SRC_DIR/build-${CFS_CONFIG}/exe/cpu1"
 [[ -x "$EXE_DIR/core-cpu1" ]] || die "build finished but $EXE_DIR/core-cpu1 is missing"
+for app_dir in "$APPS_SRC"/*/; do
+    [[ -d "$app_dir" ]] || continue
+    app="$(basename "$app_dir")"
+    [[ -f "$EXE_DIR/cf/$app.so" ]] || die "build finished but $EXE_DIR/cf/$app.so is missing"
+done
 
 # Record exactly what was built (bundle commit + every submodule commit), only now that the
 # build succeeded; write-then-rename so a reader never sees a half-written file.

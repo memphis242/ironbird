@@ -11,6 +11,8 @@
 #   events:   ib -c examples/mock.toml events           (shell 2, instead of listen)
 #             ib -c examples/mock.toml send fc MOCK_RAISE_EVENT app=DEMO event_id=7 \
 #                 event_type=ERROR "message=bus voltage low"
+#   variable length (a counted array and a tail string; Count is filled in):
+#             ib -c examples/mock.toml send fc MOCK_LOAD_DATA Entries=1,2,3 Text=hello
 
 [ironbird]
 acts_as = "ground"
@@ -46,6 +48,12 @@ echo = { label = "label" }
 on = "MOCK_RAISE_EVENT"
 reply = "MOCK_EVENT"
 echo = { app = "app", event_id = "event_id", event_type = "event_type", message = "message" }
+
+# A variable-length command is answered with the same data in a variable-length reply.
+[[nodes.fc.responses]]
+on = "MOCK_LOAD_DATA"
+reply = "MOCK_DATA"
+echo = { Entries = "Entries", Text = "Text" }
 
 [[nodes.fc.responses]]
 on = "*"

@@ -221,6 +221,8 @@ EVIDENCE_ERRORS: Final = frozenset(
         Code.DEC_CHECKSUM,
         Code.DEC_UNKNOWN,
         Code.DEC_PAYLOAD,
+        Code.DEC_COUNT,
+        Code.DEC_OVERRUN,
         Code.RSP_RULE,
         Code.TX_RECV,
         Code.TX_OVERRUN,

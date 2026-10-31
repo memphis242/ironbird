@@ -36,8 +36,27 @@ def _float_text(value: float) -> str:
     return repr(value) if math.isfinite(value) else str(value)
 
 
+MAX_ELEMENTS_SHOWN = 16  # elements of an array a line shows; the rest is counted
+
+
+def _element_text(value: object) -> str:
+    if isinstance(value, float):
+        return _float_text(value)
+    assert isinstance(value, int)
+    return str(value)
+
+
+def _more(total: int) -> str:
+    """``...(+N)`` for the elements past the first :data:`MAX_ELEMENTS_SHOWN`, else nothing."""
+    return f"...(+{total - MAX_ELEMENTS_SHOWN})" if total > MAX_ELEMENTS_SHOWN else ""
+
+
 def field_text(field: FieldDef, value: object) -> str:
-    """Display form of one decoded field value (enum label, hex for bytes, sanitized text)."""
+    """Display form of one decoded field value (enum label, hex for bytes, sanitized text).
+
+    A variable-length array shows its first :data:`MAX_ELEMENTS_SHOWN` elements and how many more
+    there are (``[1 2 3 ...(+40)]``); a ``bytes[]`` shows that many bytes as hex."""
+    var = field.var
     match field.type.type_class:
         case TypeClass.INT:
             assert isinstance(value, int)
@@ -51,7 +70,17 @@ def field_text(field: FieldDef, value: object) -> str:
             return term(value)
         case TypeClass.BYTES:
             assert isinstance(value, bytes)
-            return value.hex()
+            if var is None:
+                return value.hex()
+            return " ".join(
+                part for part in (value[:MAX_ELEMENTS_SHOWN].hex(), _more(len(value))) if part
+            )
+        case TypeClass.ARRAY:
+            assert var is not None and isinstance(value, tuple)
+            parts = [_element_text(v) for v in value[:MAX_ELEMENTS_SHOWN]]
+            if more := _more(len(value)):
+                parts.append(more)
+            return f"[{' '.join(parts)}]"
     raise AssertionError("unreachable")  # pragma: no cover
 
 
@@ -66,6 +95,12 @@ def json_value(field: FieldDef, value: object) -> Any:
         case TypeClass.CHAR:
             assert isinstance(value, str)
             return jtext(value)
+        case TypeClass.ARRAY:
+            assert isinstance(value, tuple)
+            return [v if not isinstance(v, float) or math.isfinite(v) else str(v) for v in value]
+        case TypeClass.BYTES:
+            assert isinstance(value, bytes)
+            return value.hex()
         case _:
             return field_text(field, value)
 

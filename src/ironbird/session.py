@@ -430,11 +430,14 @@ class Session:
         tamper: Mapping[str, int] | None = None,
         link: str | None = None,
         header: Mapping[str, int] | None = None,
+        allow_count_mismatch: bool = False,
     ) -> SentCommand:
         route = self.route(peer, require=Side.COMMANDER, link_name=link)
         codec = self.codec_for(route.server.name)
         endpoint = route.link.command_endpoint
         extra: dict[str, Any] = {"header": dict(header)} if header else {}
+        if allow_count_mismatch:
+            extra["allow_count_mismatch"] = True  # fault injection, ledgered as such
         self.ledger.record(
             "action",
             "send.request",
@@ -445,7 +448,9 @@ class Session:
             link=route.link.name,
             **extra,
         )
-        encoded = codec.encode_command(command, args, tamper=tamper, header=header)
+        encoded = codec.encode_command(
+            command, args, tamper=tamper, header=header, allow_count_mismatch=allow_count_mismatch
+        )
         self.ledger.check_transmit(encoded.message.name, route.server.name)
         attempt = TxAttempt(encoded.message.name)
         self._last_tx = attempt
