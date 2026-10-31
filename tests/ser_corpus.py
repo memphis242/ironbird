@@ -7,7 +7,8 @@ the work stays within its budget). Every case is built here, so a test proves th
 files are exactly these; a new bug adds a case and regenerates: ``python tests/ser_corpus.py``.
 
 The framer is the mock node's telemetry framer (header profile ``ccsds_v1_cfs_tlm``, which has no
-checksum), the packet cap is 1024, the MID must be in the CCDD, and the stream ends in silence.
+checksum), the packet cap is 1024, it knows the CCDD's MIDs and payload sizes (evidence, not a
+veto), and the stream ends in silence.
 """
 
 from __future__ import annotations
@@ -46,6 +47,21 @@ def codec() -> Codec:
 
 def _hk(c: Codec, counter: int = 1) -> bytes:
     return c.encode_telemetry("MOCK_HK", {"cmd_counter": counter}).data
+
+
+def grown_hk(c: Codec, extra: int = 2, counter: int = 2) -> bytes:
+    """A MOCK_HK packet with ``extra`` payload bytes more than the CCDD says: the flight software
+    struct grew and the CCDD was not updated. Its header is sane and its length is true."""
+    profile = c.profile(MessageKind.TELEMETRY)
+    good = _hk(c, counter)
+    return header.pack(
+        profile, good[profile.size_bytes :] + bytes(extra), mid=header.peek_mid(profile, good)
+    )
+
+
+def unknown_mid(c: Codec, mid: int = 0x8FF, size: int = 6) -> bytes:
+    """A packet with a sane header and a true length whose MID the CCDD does not define."""
+    return header.pack(c.profile(MessageKind.TELEMETRY), bytes(range(size)), mid=mid)
 
 
 def _data_header(c: Codec, total: int) -> bytes:
@@ -98,6 +114,19 @@ def cases() -> dict[str, Case]:
     out["ser-length-lands-on-next-header.bin"] = Case(
         lands + hk[0] + hk[1] + hk[2],
         ((PACKET, lands + hk[0] + hk[1]), (PACKET, hk[2])),
+    )
+
+    # Packets the CCDD disagrees with (a grown payload, a MID it does not define) are still
+    # packets: the decode boundary reports the mismatch, and the packets around them survive.
+    grown = grown_hk(c)
+    out["ser-payload-grown.bin"] = Case(
+        hk[0] + grown + hk[2] + grown + grown,
+        tuple((PACKET, p) for p in (hk[0], grown, hk[2], grown, grown)),
+    )
+    other = unknown_mid(c)
+    out["ser-mid-unknown.bin"] = Case(
+        hk[0] + other + hk[1] + other + other,
+        tuple((PACKET, p) for p in (hk[0], other, hk[1], other, other)),
     )
 
     partial = _data_header(c, profile.min_bytes + 100) + bytes(range(20))

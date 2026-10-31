@@ -6,6 +6,8 @@ a stable code. Relative paths are resolved against the config file's directory.
 
 from __future__ import annotations
 
+import dataclasses
+import math
 import os
 import re
 import tomllib
@@ -48,6 +50,9 @@ MAX_SYNC_BYTES: Final = 8
 MIN_IDLE_MS: Final = 1
 MAX_IDLE_MS: Final = 10_000
 DEFAULT_IDLE_MS: Final = 50
+# The idle time that ends a partial packet must span several character times at the line's baud
+# rate, or the gap between two bytes of one packet looks like silence and every packet is cut.
+IDLE_CHAR_TIMES: Final = 4
 FRAMING_KINDS: Final = ("header_length",)
 
 
@@ -126,6 +131,12 @@ class SerialLinkSpec:
     def bits_per_char(self) -> float:
         """Line bits one byte takes: start bit, data bits, parity bit if any, stop bits."""
         return 1 + self.data_bits + (0 if self.parity == "none" else 1) + self.stop_bits
+
+    @property
+    def min_idle_ms(self) -> int:
+        """The least ``max_idle_ms`` that is safe at this baud rate: ``IDLE_CHAR_TIMES``
+        character times, rounded up to a whole millisecond."""
+        return max(MIN_IDLE_MS, math.ceil(IDLE_CHAR_TIMES * self.bits_per_char * 1000 / self.baud))
 
 
 @dataclass(frozen=True, slots=True)
@@ -630,6 +641,13 @@ def _parse_retention(ctx: _Ctx, raw: object) -> RetentionConfig:
     )
 
 
+def _device_key(device: str) -> str:
+    """The device path with ``//``, ``/./`` and a trailing ``/`` removed, so two spellings of
+    one path are one device. Symlinks are not followed: the transport compares the device
+    numbers when it opens them."""
+    return "/" + os.path.normpath(device).lstrip("/")
+
+
 def _parse_serial(ctx: _Ctx, raw: object, path: str) -> SerialLinkSpec:
     if not isinstance(raw, dict):
         raise ctx.fail(path, "must be a table")
@@ -722,11 +740,13 @@ def _parse_link_transport(
     common = {"name", "from", "to", "transport"}
     if transport == SERIAL_TRANSPORT:
         ctx.keys(raw, lpath, common | {"serial", "framing"}, {"from", "to", "serial"})
+        serial = _parse_serial(ctx, raw["serial"], f"{lpath}.serial")
+        framing = _parse_framing(ctx, raw.get("framing", {}), f"{lpath}.framing")
         return (
             transport,
             None,
-            _parse_serial(ctx, raw["serial"], f"{lpath}.serial"),
-            _parse_framing(ctx, raw.get("framing", {}), f"{lpath}.framing"),
+            serial,
+            _framing_for_line(ctx, serial, framing, raw.get("framing"), lpath),
         )
     ctx.keys(
         raw,
@@ -739,6 +759,28 @@ def _parse_link_transport(
         telemetry_endpoint=ctx.endpoint(raw["telemetry_endpoint"], f"{lpath}.telemetry_endpoint"),
     )
     return transport, udp, None, None
+
+
+def _framing_for_line(
+    ctx: _Ctx, serial: SerialLinkSpec, framing: FramingSpec, raw: object, lpath: str
+) -> FramingSpec:
+    """``framing`` checked against the line it runs on (see ``SerialLinkSpec.min_idle_ms``).
+
+    An idle time the file sets below the least safe one is refused, naming both keys. One the
+    file leaves out is the default, or the least safe one when the baud rate is too low for the
+    default.
+    """
+    floor = serial.min_idle_ms
+    if framing.max_idle_ms >= floor:
+        return framing
+    explicit = isinstance(raw, dict) and "max_idle_ms" in raw
+    if explicit:
+        raise ctx.fail(
+            f"{lpath}.framing.max_idle_ms",
+            f"{framing.max_idle_ms} ms is under {IDLE_CHAR_TIMES} character times at "
+            f"{lpath}.serial.baud = {serial.baud}; use at least {floor} ms or a higher baud rate",
+        )
+    return dataclasses.replace(framing, max_idle_ms=floor)
 
 
 def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
@@ -816,7 +858,7 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
             raise ctx.fail(f"{lpath}.name", f"duplicate link name {lname!r}")
         seen_names.add(lname)
         if serial is not None:
-            owner = devices.setdefault(serial.device, lname)
+            owner = devices.setdefault(_device_key(serial.device), lname)
             if owner != lname:
                 raise ctx.fail(
                     f"{lpath}.serial.device",

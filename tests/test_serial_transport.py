@@ -8,8 +8,12 @@ for the condition it needs, with a generous timeout.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
+import fcntl
+import grp
 import os
+import pwd
 import termios
 import threading
 import tomllib
@@ -30,6 +34,7 @@ from ironbird.transport.serial import (
     DRAIN_FLOOR_S,
     READ_BYTES,
     TX_BUFFER_BYTES,
+    _hung_up,
     errno_of,
     open_error,
 )
@@ -251,6 +256,162 @@ def test_the_drain_timeout_scales_with_bytes_and_baud(device: PtyDevice) -> None
     assert transport._drain_timeout(100_000) > transport._drain_timeout(10_000) > DRAIN_FLOOR_S
 
 
+@pytest.mark.parametrize("receiving", [False, True], ids=["send-only", "receiving"])
+def test_a_device_lost_while_confirm_waits_for_the_uart_puts_the_link_down(
+    device: PtyDevice, monkeypatch: pytest.MonkeyPatch, receiving: bool
+) -> None:
+    real = termios.tcdrain
+
+    def unplug_then_drain(fd: int) -> None:
+        device.unplug()  # the cable comes out while the UART is still sending
+        real(fd)  # the kernel answers EIO
+
+    monkeypatch.setattr(serial_module.termios, "tcdrain", unplug_then_drain)
+
+    async def body() -> None:
+        line = Line(device, fast_reconnect=False)
+        await line.open(receiving=receiving)
+        try:
+            with pytest.raises(IronbirdError) as info:
+                await line.transport.send(hk(1), confirm=True)  # not a raw termios.error
+            assert info.value.code is Code.TX_DOWN and info.value.cause is not None
+            assert line.transport.is_down
+            assert [(up, e and e.code) for up, _, e in line.states] == [(False, Code.TX_DOWN)]
+        finally:
+            await line.transport.close()
+
+    run(body())
+
+
+@pytest.mark.parametrize("raised", [termios.error(errno.EINVAL, "bad"), OSError(errno.EINTR, "x")])
+def test_a_drain_that_fails_for_another_reason_is_a_send_error_and_the_link_stays_up(
+    device: PtyDevice, monkeypatch: pytest.MonkeyPatch, raised: BaseException
+) -> None:
+    def failing(fd: int) -> None:
+        raise raised
+
+    monkeypatch.setattr(serial_module.termios, "tcdrain", failing)
+
+    async def body() -> None:
+        line = Line(device)
+        await line.open(receiving=False)
+        try:
+            with pytest.raises(IronbirdError) as info:
+                await line.transport.send(hk(1), confirm=True)
+            assert info.value.code is Code.TX_SEND and info.value.cause is raised
+            assert not line.transport.is_down and line.states == []
+        finally:
+            await line.transport.close()
+
+    run(body())
+
+
+def test_the_drain_thread_works_on_its_own_descriptor_not_the_ports(
+    device: PtyDevice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[int] = []
+    release = threading.Event()
+
+    def blocked(fd: int) -> None:
+        seen.append(fd)
+        release.wait(30)
+
+    monkeypatch.setattr(serial_module.termios, "tcdrain", blocked)
+
+    async def body() -> None:
+        line = Line(device)
+        await line.open(receiving=False)
+        port_fd = line.transport._fd
+        task = asyncio.ensure_future(line.transport.send(hk(1), confirm=True))
+        try:
+            await wait_for(lambda: bool(seen), "the drain thread")
+            assert seen[0] != port_fd  # the port can close, and its number be reused, under it
+            await line.transport.close()
+            os.fstat(seen[0])  # still the thread's own until its drain returns
+        finally:
+            release.set()
+            with contextlib.suppress(IronbirdError, TransportClosed):
+                await task  # it ends however it ends; what matters is the thread
+            await line.transport.close()
+        await wait_for(lambda: not _is_open(seen[0]), "the thread to close its descriptor")
+
+    run(body())
+
+
+def _is_open(fd: int) -> bool:
+    try:
+        os.fstat(fd)
+    except OSError:
+        return False
+    return True
+
+
+# -- an empty read, and the idle timer ------------------------------------------------------------
+
+
+def test_an_empty_read_after_a_full_chunk_is_an_empty_queue_not_an_unplug(
+    device: PtyDevice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(serial_module, "READ_BYTES", 8)  # the kernel delivers an exact chunk
+
+    async def body() -> None:
+        line = Line(device, fast_reconnect=False)
+        await line.open()
+        try:
+            device.write(b"\x00" * 8)
+            await wait_for(lambda: line.transport.stats().rx_bytes == 8, "the read")
+            await asyncio.sleep(0.1)
+            assert line.states == [] and not line.transport.is_down
+            device.write(hk(1))  # and the line is still being read
+            await wait_for(lambda: line.transport.stats().rx_bytes == 8 + len(hk(1)), "more bytes")
+        finally:
+            await line.transport.close()
+
+    run(body())
+
+
+def test_a_hang_up_is_told_from_an_empty_queue(device: PtyDevice, tmp_path: Path) -> None:
+    fd = os.open(device.path, os.O_RDWR | os.O_NONBLOCK | os.O_NOCTTY)
+    try:
+        assert not _hung_up(fd)  # a healthy, idle line
+        device.unplug()
+        assert _hung_up(fd)
+    finally:
+        os.close(fd)
+    assert _hung_up(fd)  # a descriptor that is not open answers as a hang-up too
+
+
+@pytest.mark.parametrize("how", ["empty", "would-block"])
+def test_a_partial_packet_left_after_a_full_read_expires(
+    device: PtyDevice, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    """Whatever ends the reads of a wakeup (an empty read, or ``EAGAIN``), the idle timer is
+    armed for what the framer holds."""
+    monkeypatch.setattr(serial_module, "READ_BYTES", 20)
+    real_read = os.read
+    calls = {"n": 0}
+
+    def read(fd: int, size: int) -> bytes:
+        calls["n"] += 1
+        if how == "would-block" and calls["n"] % 2 == 0:
+            raise BlockingIOError
+        return real_read(fd, size)
+
+    monkeypatch.setattr(serial_module.os, "read", read)
+
+    async def body() -> None:
+        line = Line(device, idle_ms=30)
+        await line.open()
+        try:
+            tail = hk(1)[:20]  # a whole header, so the framer holds it as a stale candidate
+            device.write(tail)
+            await wait_for(lambda: line.data(FLAG_STALE) == [tail], "the tail after the idle time")
+        finally:
+            await line.transport.close()
+
+    run(body())
+
+
 # -- losing and regaining the device ----------------------------------------------------------
 
 
@@ -401,8 +562,9 @@ def test_a_missing_device_is_a_coded_error_that_says_what_to_check(tmp_path: Pat
 
 def test_a_device_held_by_another_process_is_a_busy_error(device: PtyDevice) -> None:
     async def body() -> None:
-        first = Line(device)
-        await first.open()
+        # what another program does: take the device lock on its own descriptor
+        other = os.open(device.path, os.O_RDWR | os.O_NONBLOCK | os.O_NOCTTY)
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             with pytest.raises(IronbirdError) as info:
                 await Line(device).open()
@@ -410,12 +572,69 @@ def test_a_device_held_by_another_process_is_a_busy_error(device: PtyDevice) -> 
                 info.value
             )
         finally:
-            await first.transport.close()
-        again = Line(device)  # released on close
+            os.close(other)
+        again = Line(device)  # released when the other program lets go
         await again.open()
         await again.transport.close()
 
     run(body())
+
+
+def test_a_device_another_link_of_this_process_holds_is_refused_by_its_number_not_its_path(
+    device: PtyDevice, tmp_path: Path
+) -> None:
+    alias = tmp_path / "alias"
+    alias.symlink_to(device.path)  # a second path to the same device (by-id and ttyUSB0)
+
+    async def body() -> None:
+        first = Line(device)
+        await first.open()
+        second = Line(device)
+        second.transport._spec = type(second.transport._spec)(str(alias), 115200)
+        try:
+            with pytest.raises(IronbirdError) as info:
+                await second.open()
+            error = info.value
+            assert error.code is Code.TX_BUSY and "same device" in error.summary
+            assert (
+                "another process" not in error.summary and "fix the device paths" in error.summary
+            )
+        finally:
+            await first.transport.close()
+        released = Line(device)  # the number is free again once the holder closes
+        released.transport._spec = type(released.transport._spec)(str(alias), 115200)
+        await released.open()
+        await released.transport.close()
+
+    run(body())
+
+
+def test_a_link_that_reconnects_is_not_refused_as_its_own_rival(device: PtyDevice) -> None:
+    async def body() -> None:
+        line = Line(device)
+        await line.open()
+        try:
+            device.unplug()
+            await wait_for(lambda: line.transport.is_down, "the link down")
+            device.plug()
+            await wait_for(lambda: not line.transport.is_down, "the reconnect")
+            assert not line.reports or all("same device" not in r.summary for r in line.reports)
+        finally:
+            await line.transport.close()
+
+    run(body())
+
+
+def test_the_reconnect_backoff_is_read_when_the_transport_is_built(
+    device: PtyDevice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(serial_module, "RECONNECT_MIN_S", 0.01)
+    monkeypatch.setattr(serial_module, "RECONNECT_MAX_S", 0.02)
+    built = Line(device).transport
+    transport = SerialTransport(
+        built._spec, built._framing, built._framer, max_packet_bytes=ser_corpus.CAP
+    )
+    assert transport._backoff == (0.01, 0.02)
 
 
 def test_a_path_that_is_not_a_serial_device_is_refused_as_such(tmp_path: Path) -> None:
@@ -435,7 +654,7 @@ def test_a_path_that_is_not_a_serial_device_is_refused_as_such(tmp_path: Path) -
     ("code", "expected_code", "needle"),
     [
         (errno.ENOENT, Code.TX_OPEN, "check the cable"),
-        (errno.EACCES, Code.TX_OPEN, "usually dialout"),
+        (errno.EACCES, Code.TX_OPEN, "ask an admin"),
         (errno.EPERM, Code.TX_OPEN, "never needs root"),
         (errno.EAGAIN, Code.TX_BUSY, "locked by another process"),
         (errno.EBUSY, Code.TX_BUSY, "locked by another process"),
@@ -455,6 +674,62 @@ def test_open_errors_map_to_coded_messages_with_a_remedy(
         err = open_error("/dev/ttyUSB0", exc)
         assert err.code is expected_code and needle in err.summary
         assert "/dev/ttyUSB0" in err.summary and err.cause is exc
+
+
+def _device_file(tmp_path: Path, mode: int) -> Path:
+    path = tmp_path / "dev"
+    path.write_bytes(b"")
+    path.chmod(mode)
+    return path
+
+
+def _denied(path: Path) -> str:
+    err = open_error(str(path), PermissionError(errno.EACCES, "Permission denied"))
+    assert err.code is Code.TX_OPEN and "never needs root" in err.summary
+    return err.summary
+
+
+def test_a_denied_device_names_its_group_and_says_to_log_in_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _device_file(tmp_path, 0o660)
+    monkeypatch.setattr(serial_module.os, "getgroups", lambda: [])  # the user lacks the group
+    monkeypatch.setattr(grp, "getgrgid", lambda g: grp.struct_group(("uucp", "x", g, [])))
+    summary = _denied(path)
+    assert "add your user to group uucp" in summary and "log in again" in summary
+    assert "dialout" not in summary  # the group is the device's own, not a guess
+
+
+def test_a_user_added_to_the_group_after_logging_in_is_told_to_log_in_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _device_file(tmp_path, 0o660)
+    me = pwd.getpwuid(os.getuid()).pw_name
+    monkeypatch.setattr(serial_module.os, "getgroups", lambda: [])
+    monkeypatch.setattr(grp, "getgrgid", lambda g: grp.struct_group(("lineg", "x", g, [me])))
+    summary = _denied(path)
+    assert "added to group lineg after this login" in summary and "log in again" in summary
+
+
+def test_a_denied_device_whose_group_the_user_already_has_points_at_acls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _device_file(tmp_path, 0o660)
+    monkeypatch.setattr(serial_module.os, "getgroups", lambda: [path.stat().st_gid])
+    assert "already in group" in _denied(path) and "ACLs" in _denied(path)
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o640, 0o620, 0o000])
+def test_a_denied_device_the_group_cannot_open_says_its_permissions_need_changing(
+    tmp_path: Path, mode: int
+) -> None:
+    summary = _denied(_device_file(tmp_path, mode))
+    assert f"mode {mode:04o}" in summary and "group membership cannot help" in summary
+    assert "add your user" not in summary
+
+
+def test_a_denied_device_that_cannot_be_examined_still_gets_advice(tmp_path: Path) -> None:
+    assert "ask an admin" in _denied(tmp_path / "missing")
 
 
 def test_the_errno_behind_a_pyserial_failure_is_found_through_its_cause() -> None:

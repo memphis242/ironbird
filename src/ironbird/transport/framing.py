@@ -12,16 +12,24 @@ configured):
 1. Read the length field once :attr:`HeaderProfile.length_window` bytes are there. The total it
    claims must lie in ``min_bytes .. max_packet_bytes`` or the candidate is rejected before any
    buffer is sized by it.
-2. With the whole header: the fixed-field mask must match and (``require_known_mid``) the MID
-   must be in the CCDD with the claimed payload size inside that MID's range. A lying length is
-   refused here, before it can swallow the packets behind it.
+2. With the whole header: the fixed-field mask must match. The MID and the payload size the
+   CCDD allows for it are supporting evidence, not a veto: a packet whose MID is unknown or
+   whose size disagrees (a flight software struct that grew, a CCDD not yet updated) is still a
+   packet when the rest of the evidence holds, so the decode boundary reports the mismatch
+   (``IB-DEC-006``/``IB-DEC-007``) and the packets around it survive. A lying length is
+   refused by rules 1, 3 and 4 and never by the CCDD.
 3. With the whole candidate: the header and trailer checks of :func:`ironbird.header.check_word`
    (checksum included) must pass. A candidate that fails any step is a false sync: its first
    byte joins the garbage run and scanning restarts at the next byte, never after the candidate,
    so the bytes a false header covered are examined again.
 4. A profile without a checksum proves little with a sane header, so the candidate is also
    confirmed: a sane header (after ``sync``) must follow it immediately, or the line must stay
-   silent for ``max_idle_ns`` (the last packet before a pause waits that long).
+   silent for ``max_idle_ns`` (the last packet before a pause waits that long). A header is sane
+   by rules 1 and 2 alone, whatever its MID.
+
+A candidate is judged, copied and checked once: while it waits for its confirmation the framer
+remembers that it passed, so a stream read a byte at a time costs no more than one read in bulk.
+Only a profile with a checksum is charged per byte for that pass.
 
 Garbage is emitted as ``GARBAGE`` frames, never longer than the cap, when a packet follows, at the
 cap, or on expiry; a partial candidate that the line leaves incomplete for ``max_idle_ns`` is
@@ -86,6 +94,7 @@ class FramerStats:
     stale_bytes: int = 0
     false_syncs: int = 0  # candidates with a sane header that failed a later check
     work_exhausted: int = 0  # times the work budget ran out and unexamined bytes became garbage
+    mismatched: int = 0  # packets emitted although their MID or payload size is not in the CCDD
     work_spent: int = 0  # work units used
     work_earned: int = 0  # work units the budget granted (base plus input)
     episodes_dropped: int = 0  # episodes not kept because the transport did not drain them
@@ -105,7 +114,8 @@ class WorkBudget:
 
 
 class Framer(Protocol):
-    """Turns received bytes into emitted frames. Memory is bounded by the packet cap."""
+    """Turns received bytes into emitted frames. Between two reads at most ``2 * cap + 2 * len(sync)
+    + header`` bytes are held (a garbage run under the cap, then a candidate of up to the cap)."""
 
     def feed(self, chunk: bytes, wall_ns: int, mono_ns: int) -> list[Emit]:
         """Take ``chunk`` (read at ``wall_ns``, ``mono_ns``); return what it completed."""
@@ -187,13 +197,15 @@ class HeaderLengthFramer:
         self._mask = profile.fixed_mask
         self._value = profile.fixed_value
         self._confirm = profile.checksum_field is None
+        self._charge_bytes = profile.checksum_field is not None  # only a checksum pass is O(n)
         self._buf = bytearray()
         self._garb = 0  # buf[:_garb] is classified garbage; the candidate starts there
+        self._cand = 0  # total size of the candidate at _garb if it passed rules 1-3, else 0
         self._last_mono = 0
         self._credit = budget.base
         self._episodes: list[Episode] = []
         self._packets = self._garbage_frames = self._garbage_bytes = 0
-        self._stale_frames = self._stale_bytes = self._false_syncs = 0
+        self._stale_frames = self._stale_bytes = self._false_syncs = self._mismatched = 0
         self._exhausted = self._spent = self._episodes_dropped = 0
         self._earned = budget.base
 
@@ -234,6 +246,7 @@ class HeaderLengthFramer:
             stale_bytes=self._stale_bytes,
             false_syncs=self._false_syncs,
             work_exhausted=self._exhausted,
+            mismatched=self._mismatched,
             work_spent=self._spent,
             work_earned=self._earned,
             episodes_dropped=self._episodes_dropped,
@@ -244,7 +257,8 @@ class HeaderLengthFramer:
 
     def _judge(self, buf: bytearray, head: int, n: int) -> int:
         """What the header at ``buf[head:]`` (``n`` bytes are held) says: ``_REJECT``, ``_WAIT``
-        for more bytes, or the total packet size it claims when the header is plausible."""
+        for more bytes, or the total packet size it claims when the header is sane (rules 1
+        and 2: the MID is not looked at)."""
         avail = n - head
         if avail < self._window:
             return _WAIT
@@ -258,14 +272,18 @@ class HeaderLengthFramer:
             return _WAIT
         if int.from_bytes(prefix, "big") & self._mask != self._value:
             return _REJECT
-        bounds = self._bounds
-        if bounds is not None:
-            mid = hdr.peek_mid(self._profile, prefix)
-            assert mid is not None, "the MID window lies inside the header"
-            allowed = bounds(mid)
-            if allowed is None or not allowed[0] <= total - self._min <= allowed[1]:
-                return _REJECT
         return total
+
+    def _agrees(self, packet: bytes) -> bool:
+        """Whether the MID of ``packet`` is in the CCDD with a payload size inside its range
+        (always, when the framer was given no bounds)."""
+        bounds = self._bounds
+        if bounds is None:
+            return True
+        mid = hdr.peek_mid(self._profile, packet)
+        assert mid is not None, "the MID window lies inside the header"
+        allowed = bounds(mid)
+        return allowed is not None and allowed[0] <= len(packet) - self._min <= allowed[1]
 
     def _confirmed(self, buf: bytearray, end: int, n: int, *, final: bool) -> int:
         """Whether a sane header follows a complete candidate that ends at ``end``: 1 yes, 0 not
@@ -328,6 +346,8 @@ class HeaderLengthFramer:
         sync, sync_len = self._sync, len(self._sync)
         cap, hsize = self._cap, self._hsize
         pos = self._garb
+        passed = self._cand  # the candidate at ``pos`` already passed rules 1-3 on an earlier read
+        self._cand = 0
         stale_from = -1  # start of the stale part of the run (final scans only)
         credit = self._credit
         spent = 0
@@ -335,6 +355,8 @@ class HeaderLengthFramer:
             n = len(buf)
             if credit < 0:  # out of work budget: what is left unexamined becomes garbage
                 keep = sync_len + hsize - 1  # a header may still begin in the last bytes
+                if n - keep > pos:
+                    passed = 0
                 pos = max(pos, n - keep)
                 self._exhausted += 1
                 grace = EVAL_COST * (keep + 2)  # enough to look at the bytes kept
@@ -349,12 +371,18 @@ class HeaderLengthFramer:
                 at = buf.find(sync, pos)
                 if at < 0:
                     pos = n - (0 if final else self._partial_sync(buf, pos, n))
+                    passed = 0
                     break
+                if at != pos:
+                    passed = 0
                 pos = at
             head = pos + sync_len
-            credit -= EVAL_COST
-            spent += EVAL_COST
-            verdict = self._judge(buf, head, n)
+            if passed:
+                verdict = passed
+            else:
+                credit -= EVAL_COST
+                spent += EVAL_COST
+                verdict = self._judge(buf, head, n)
             if verdict == _REJECT:
                 pos += 1
                 continue
@@ -366,14 +394,17 @@ class HeaderLengthFramer:
                     stale_from = pos  # a plausible header the line left incomplete
                 pos += 1
                 continue
-            packet = bytes(buf[head:end])
-            cost = len(packet) >> CHECK_COST_SHIFT
-            credit -= cost
-            spent += cost
-            if isinstance(hdr.check_word(self._profile, packet, max_size=cap), DecodeError):
-                self._false_syncs += 1
-                pos += 1
-                continue
+            packet = b""
+            if not passed:
+                packet = bytes(buf[head:end])
+                if self._charge_bytes:
+                    cost = len(packet) >> CHECK_COST_SHIFT
+                    credit -= cost
+                    spent += cost
+                if isinstance(hdr.check_word(self._profile, packet, max_size=cap), DecodeError):
+                    self._false_syncs += 1
+                    pos += 1
+                    continue
             if self._confirm:
                 credit -= EVAL_COST
                 spent += EVAL_COST
@@ -381,20 +412,26 @@ class HeaderLengthFramer:
                 if sure < 0:
                     self._false_syncs += 1
                     pos += 1
+                    passed = 0
                     continue
                 if sure == 0:
+                    self._cand = verdict  # the packet is not copied: it is the buffer's
                     break
             if pos:
                 self._emit_run(out, bytes(buf[:pos]), stale_from, wall_ns)
+            packet = packet or bytes(buf[head:end])
+            if not self._agrees(packet):
+                self._mismatched += 1
             out.append(Emit(packet, wall_ns, 0))
             self._packets += 1
             del buf[:end]
-            pos, stale_from = 0, -1
+            pos, stale_from, passed = 0, -1, 0
         if final:
             if buf:
                 self._emit_run(out, bytes(buf), stale_from, wall_ns)
                 buf.clear()
             pos = 0
+            self._cand = 0
         else:
             pos = self._split_garbage(out, buf, pos, wall_ns)
         self._garb = pos

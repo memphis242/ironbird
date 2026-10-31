@@ -403,12 +403,13 @@ framing = { kind = "header_length", sync = "", max_idle_ms = 50, require_known_m
 | `serial.flow` | `none` (default), `rtscts`, `xonxoff` |
 | `framing.kind` | `header_length` (the only one): the header profile's length field cuts the stream |
 | `framing.sync` | hex marker of up to 8 bytes that precedes every packet (consumed, not recorded); default none |
-| `framing.max_idle_ms` | 1 to 10000 (default 50): silence after which a pending packet is settled |
-| `framing.require_known_mid` | default `true`: a header is only believed if its MID is in the CCDD and the length fits that MID's payload range |
+| `framing.max_idle_ms` | 1 to 10000 (default 50): silence after which a pending packet is settled; at least 4 character times at the baud rate (the default is raised for a slow line, a smaller value in the file is refused) |
+| `framing.require_known_mid` | default `true`: the framer counts the packets whose MID or payload size the CCDD does not define; they are framed like any other and the decode reports them (`IB-DEC-006`, `IB-DEC-007`). `false`: the CCDD is not consulted |
 
 How the stream is cut. A byte stream has no packet boundaries, so a candidate header must look
-right (length between the smallest and the largest packet, the fixed fields, a known MID with a
-payload size its CCDD allows) and, with a checksum in the profile, the whole packet must pass it.
+right (length between the smallest and the largest packet, the fixed fields) and, with a checksum
+in the profile, the whole packet must pass it. The CCDD does not decide: a packet whose MID or
+payload size it does not define is still a packet, and the decode reports the mismatch.
 A profile without a checksum proves less, so a packet is also confirmed by a plausible header
 right behind it or by `max_idle_ms` of silence: the last packet before a pause waits that long, and
 a packet followed at once by line noise is not believed (use a header profile with a trailer
@@ -423,7 +424,8 @@ latency timer (an FTDI defaults to 16 ms). That is documented, not corrected.
 One process owns the device at a time (`flock`): a second `ib` on it fails with `IB-TX-006`, so a
 `listen` and a `send` take turns (a `respond` on the flight side answers on the same device).
 Errors a user can act on: a missing device (`IB-TX-001`: check the cable, list
-`/dev/serial/by-id`), no permission (`IB-TX-001`: ask an admin to add you to the device's group),
+`/dev/serial/by-id`), no permission (`IB-TX-001`: it names the device's group and says to log in
+again after being added), a device two links of one process both name (`IB-TX-006`),
 a device already in use (`IB-TX-006`). If the device goes away after it was opened (an unplugged
 adapter, `EIO`/`ENXIO`), the link is down, not the command: `IB-TX-008` is shown once, the device is
 reopened with a backoff of 0.5 s to 5 s, a recording gets `link_down` and `link_up` marks and one

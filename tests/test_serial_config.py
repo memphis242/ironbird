@@ -164,6 +164,89 @@ def test_one_device_carries_one_link() -> None:
     assert "already the device of link 'uart'" in info.value.summary
 
 
+@pytest.mark.parametrize(
+    "spelling",
+    ["/dev//ttyUSB0", "/dev/./ttyUSB0", "/dev/ttyUSB0/", "//dev/ttyUSB0", "/dev/x/../ttyUSB0"],
+)
+def test_two_spellings_of_one_device_path_are_one_device(spelling: str) -> None:
+    def edit(data: dict[str, Any]) -> None:
+        data["nodes"]["ground"] = BASE["nodes"]["fc"]
+        other = copy.deepcopy(data["links"][0])
+        other.update(name="again", **{"from": "fc", "to": "ground"})
+        other["serial"]["device"] = spelling
+        data["links"].append(other)
+
+    with pytest.raises(IronbirdError) as info:
+        parse(edit)
+    assert info.value.code is Code.CFG_SCHEMA
+    assert "already the device of link 'uart'" in info.value.summary
+
+
+def test_different_devices_are_not_taken_for_one() -> None:
+    def edit(data: dict[str, Any]) -> None:
+        data["nodes"]["ground"] = BASE["nodes"]["fc"]
+        other = copy.deepcopy(data["links"][0])
+        other.update(name="again", **{"from": "fc", "to": "ground"})
+        other["serial"]["device"] = "/dev/ttyUSB10"
+        data["links"].append(other)
+
+    assert len(parse(edit).links) == 2
+
+
+def idle_edit(baud: int, framing: dict[str, Any] | None, **line: Any) -> Any:
+    def edit(data: dict[str, Any]) -> None:
+        data["links"][0]["serial"].update(baud=baud, **line)
+        if framing is not None:
+            data["links"][0]["framing"] = framing
+
+    return edit
+
+
+@pytest.mark.parametrize(
+    ("baud", "line", "floor"),
+    [
+        (110, {}, 364),  # 4 x 10 bits at 110 baud
+        (300, {}, 134),
+        (9600, {}, 5),  # 4.17 ms rounded up
+        (115_200, {}, 1),
+        (9600, {"data_bits": 7, "parity": "even", "stop_bits": 2.0}, 5),  # 11 bits a character
+        (50, {"data_bits": 5, "parity": "odd", "stop_bits": 2.0}, 720),
+    ],
+)
+def test_the_least_safe_idle_time_is_four_character_times(
+    baud: int, line: dict[str, Any], floor: int
+) -> None:
+    serial = SerialLinkSpec("/dev/ttyUSB0", baud, **line)
+    assert serial.min_idle_ms == floor
+    parse(idle_edit(baud, {"max_idle_ms": floor}, **line))  # exactly the floor is accepted
+    if floor > 1:
+        with pytest.raises(IronbirdError):
+            parse(idle_edit(baud, {"max_idle_ms": floor - 1}, **line))
+
+
+def test_an_idle_time_below_four_character_times_is_refused_naming_both_keys() -> None:
+    with pytest.raises(IronbirdError) as info:
+        parse(idle_edit(9600, {"max_idle_ms": 1}))
+    error = info.value
+    assert error.code is Code.CFG_SCHEMA
+    assert "links[0].framing.max_idle_ms" in error.summary
+    assert "links[0].serial.baud" in error.summary and "at least 5 ms" in error.summary
+    with pytest.raises(IronbirdError) as info:
+        parse(idle_edit(110, {"max_idle_ms": 50}))  # the default value, set explicitly
+    assert "at least 364 ms" in info.value.summary
+
+
+@pytest.mark.parametrize("framing", [None, {}, {"sync": "1ACF"}, {"require_known_mid": False}])
+def test_an_idle_time_left_out_follows_the_baud_rate_when_the_default_is_too_short(
+    framing: dict[str, Any] | None,
+) -> None:
+    slow = parse(idle_edit(110, framing)).links[0].framing
+    assert slow is not None and slow.max_idle_ms == 364
+    fast = parse(idle_edit(115_200, framing)).links[0].framing
+    assert fast is not None and fast.max_idle_ms == 50  # the default stands when it is safe
+    assert parse(idle_edit(300, framing)).links[0].framing.max_idle_ms == 134  # type: ignore[union-attr]
+
+
 # Each checked-in serial config is refused for the reason its name says (tests/test_malformed_input
 # only checks that the code is a configuration one).
 CORPUS_REASONS = {
@@ -190,6 +273,8 @@ CORPUS_REASONS = {
     "cfg-serial-with-udp-endpoint": "command_endpoint: unknown",
     "cfg-udp-with-serial-table": "serial: unknown key",
     "cfg-serial-device-twice": "already the device of link",
+    "cfg-serial-device-twice-spelled": "already the device of link",
+    "cfg-serial-framing-idle-below-baud": "4 character times",
 }
 
 

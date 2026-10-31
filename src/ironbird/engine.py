@@ -33,7 +33,7 @@ from typing import Any, Final, Protocol
 
 from ironbird.ccdd.model import MessageKind
 from ironbird.codec import Codec, Resolved
-from ironbird.config import Link, SystemConfig
+from ironbird.config import SERIAL_TRANSPORT, Link, SystemConfig
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.frame import (
     FLAG_GARBAGE,
@@ -840,6 +840,11 @@ class Engine:
                 raise io.failure
             if not io.receiving:
                 transport = self._new_transport(io)
+                if io.transport is not None and io.link.transport == SERIAL_TRANSPORT:
+                    # A serial device is locked by its opener, so the send-only transport lets go
+                    # of it before the receiving one opens (a UDP socket can share its port).
+                    stale, io.transport = io.transport, None
+                    await stale.close()
                 try:
                     await self._open_transport(io, transport, io.on_data)
                 except _Closing:

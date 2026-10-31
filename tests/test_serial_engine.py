@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+import ser_corpus
 from ironbird.config import load_config
 from ironbird.errors import Code
 from ironbird.frame import FLAG_GARBAGE, FLAG_STALE, GapReason, Stream
@@ -22,7 +23,7 @@ from ironbird.ledger import Ledger
 from ironbird.notice import Level, Notice
 from ironbird.session import Session
 from ironbird.transport import LinkEnd
-from serialutil import hk, serial_config, wait_for
+from serialutil import CODEC, hk, serial_config, wait_for
 from support.ptybridge import PtyDevice
 
 
@@ -53,9 +54,10 @@ def run_ground(
 ) -> tuple[list[Notice], Ledger]:
     from ironbird.transport import serial as serial_module
 
+    # A transport reads these constants when the engine builds it, so a link lost in a test is
+    # reopened within a fraction of a second instead of after the production backoff.
     monkeypatch.setattr(serial_module, "RECONNECT_MIN_S", 0.02)
     monkeypatch.setattr(serial_module, "RECONNECT_MAX_S", 0.1)
-    # the factory builds transports with the module defaults, which the patch above replaced
     config = load_config(serial_config(tmp_path, "ground.toml", device, "ground"))
     notices: list[Notice] = []
     ledger = Ledger(tmp_path / "ledger", session_id="g")
@@ -103,6 +105,61 @@ def test_skipped_bytes_are_frames_but_not_malformed_packets(
     resync = [n for n in notices if n.code is Code.TX_RESYNC]
     assert 1 <= len(resync) <= 2 and not any(n.code.value.startswith("IB-DEC") for n in notices)
     assert not [e for e in events(ledger) if e["event"] == "rx.malformed"]
+
+
+def test_a_packet_the_ccdd_disagrees_with_reaches_the_decode_boundary_with_its_neighbours(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A payload that grew past the CCDD is reported as IB-DEC-007 (and counted malformed); the
+    packets before and after it are received, and nothing is reported as a resynchronisation."""
+    device = PtyDevice(tmp_path / "tty")
+    grown = ser_corpus.grown_hk(CODEC)
+
+    async def scenario(ground: Session) -> None:
+        sink = Sink()
+        capture = await ground.capture([ground.route("fc")], sinks=[sink])
+        engine = ground._engine
+        try:
+            device.write(hk(1) + grown + hk(3))
+            await wait_for(lambda: len(sink.frames) == 3, "three packets, the last settled by idle")
+        finally:
+            await capture.close()
+        assert [f.data for f in sink.frames] == [hk(1), grown, hk(3)]
+        assert [int(f.flags) & (FLAG_GARBAGE | FLAG_STALE) for f in sink.frames] == [0, 0, 0]
+        assert engine.malformed_total == 1 and engine.resync_frames == 0
+
+    try:
+        notices, _ = run_ground(tmp_path, device.path, scenario, monkeypatch=monkeypatch)
+    finally:
+        device.close()
+    assert [n.code for n in notices if n.code.value.startswith(("IB-DEC", "IB-TX-007"))] == [
+        Code.DEC_PAYLOAD
+    ]
+
+
+def test_a_send_only_end_lets_go_of_the_device_before_a_capture_of_the_same_end_opens_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The serial device lock refuses a second open, even by the same process: the engine closes
+    the transport a command opened before it opens the receiving one."""
+    device = PtyDevice(tmp_path / "tty")
+
+    async def scenario(ground: Session) -> None:
+        await ground.send_command("fc", "MOCK_NOOP")  # opens a send-only transport
+        sink = Sink()
+        capture = await ground.capture([ground.route("fc")], sinks=[sink])
+        try:
+            device.write(hk(1))
+            await wait_for(lambda: len(sink.frames) == 1, "a packet on the receiving transport")
+            await ground.send_command("fc", "MOCK_NOOP")  # and the receiving one still sends
+        finally:
+            await capture.close()
+
+    try:
+        notices, _ = run_ground(tmp_path, device.path, scenario, monkeypatch=monkeypatch)
+    finally:
+        device.close()
+    assert not [n for n in notices if n.code in (Code.TX_BUSY, Code.TX_OPEN)]
 
 
 def test_bytes_flagged_garbage_are_never_taken_for_a_packet_even_if_they_look_like_one(

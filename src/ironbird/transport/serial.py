@@ -30,7 +30,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import grp
 import os
+import pwd
+import select
+import stat
 import termios
 import threading
 import time
@@ -52,6 +56,7 @@ from ironbird.transport.base import (
 from ironbird.transport.framing import Emit, Framer
 
 READ_BYTES: Final = 4096  # most one read takes from the device
+_HANGUP_EVENTS: Final = select.POLLHUP | select.POLLERR | select.POLLNVAL
 READS_PER_WAKEUP: Final = 16  # reads before the loop gets a turn (level-triggered: called again)
 TX_BUFFER_BYTES: Final = 64 * 1024
 RECONNECT_MIN_S: Final = 0.5
@@ -107,6 +112,52 @@ def errno_of(exc: BaseException) -> int | None:
     return None
 
 
+def _denied_advice(device: str) -> str:
+    """What to do about a device the user may not open, from who owns it and who the user is.
+
+    Group membership only helps when the device grants its group read and write; a user who was
+    added to the group after logging in needs a new login before the process has it.
+    """
+    try:
+        info = os.stat(device)
+    except OSError:
+        return "ask an admin to give your user access to the device (usually group dialout)"
+    try:
+        group = grp.getgrgid(info.st_gid)
+        group_name, members = group.gr_name, group.gr_mem
+    except KeyError:
+        group_name, members = str(info.st_gid), []
+    try:
+        owner = pwd.getpwuid(info.st_uid).pw_name
+    except KeyError:
+        owner = str(info.st_uid)
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o060 != 0o060:
+        return (
+            f"the device is mode {mode:04o} owned by {owner}:{group_name}, so group membership "
+            "cannot help; ask an admin to change its permissions (a udev rule)"
+        )
+    if info.st_gid in os.getgroups():
+        return (
+            f"your user is already in group {group_name}, which may use the device; ask an "
+            "admin to check ACLs and mount options"
+        )
+    try:
+        me = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        me = ""
+    if me and me in members:
+        return (
+            f"you were added to group {group_name} after this login; log in again so the "
+            "new group takes effect"
+        )
+    return f"ask an admin to add your user to group {group_name}, then log in again"
+
+
+_OPEN_DEVICES: Final[dict[int, SerialTransport]] = {}  # device number -> its transport
+_OPEN_DEVICES_LOCK: Final = threading.Lock()
+
+
 def open_error(device: str, exc: BaseException) -> IronbirdError:
     """The coded error for a device that could not be opened, with what to do about it."""
     code = errno_of(exc)
@@ -121,8 +172,8 @@ def open_error(device: str, exc: BaseException) -> IronbirdError:
     if code in _DENIED_ERRNOS:
         return IronbirdError(
             Code.TX_OPEN,
-            f"cannot open serial {device}: permission denied; ask an admin to add your user to "
-            "the device's group (usually dialout); ironbird never needs root",
+            f"cannot open serial {device}: permission denied; {_denied_advice(device)}; "
+            "ironbird never needs root",
             cause=exc,
         )
     match code:
@@ -149,11 +200,16 @@ class SerialTransport:
         report: Callable[[IronbirdError], None] | None = None,
         link_state: LinkStateHandler | None = None,
         max_packet_bytes: int,
-        reconnect_min_s: float = RECONNECT_MIN_S,
-        reconnect_max_s: float = RECONNECT_MAX_S,
+        reconnect_min_s: float | None = None,
+        reconnect_max_s: float | None = None,
         wall_ns: Callable[[], int] = time.time_ns,
         mono_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
+        # The backoff defaults are the module constants as they are when the transport is built.
+        if reconnect_min_s is None:
+            reconnect_min_s = RECONNECT_MIN_S
+        if reconnect_max_s is None:
+            reconnect_max_s = RECONNECT_MAX_S
         assert 0 < reconnect_min_s <= reconnect_max_s
         self._spec = spec
         self._framing = framing
@@ -168,6 +224,7 @@ class SerialTransport:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._port: serial.Serial | None = None
         self._fd = -1
+        self._rdev: int | None = None  # device number registered in _OPEN_DEVICES while open
         self._timer: asyncio.TimerHandle | None = None
         self._reconnect: asyncio.Task[None] | None = None
         self._txbuf = bytearray()
@@ -232,6 +289,7 @@ class SerialTransport:
     def _open_port(self) -> serial.Serial:
         """Open and configure the device (non-blocking calls only). Raises a coded error."""
         spec = self._spec
+        self._refuse_own_device()
         port = serial.Serial(
             port=None,
             baudrate=spec.baud,
@@ -252,11 +310,44 @@ class SerialTransport:
             raise open_error(spec.device, exc) from exc
         return port
 
+    def _refuse_own_device(self) -> None:
+        """Refuse a device another link of this process already holds, whatever path names it.
+
+        The device lock would refuse it too, but as if another program held it; a symlink such as
+        ``/dev/serial/by-id/...`` and the ``/dev/ttyUSB0`` it points to are one device.
+        """
+        try:
+            info = os.stat(self._spec.device)
+        except OSError:
+            return  # the open reports it
+        if not stat.S_ISCHR(info.st_mode):
+            return
+        with _OPEN_DEVICES_LOCK:
+            holder = _OPEN_DEVICES.get(info.st_rdev)
+        if holder is not None and holder is not self:
+            raise IronbirdError(
+                Code.TX_BUSY,
+                f"{self.description} is the same device as {holder.description}, held by "
+                "another link of this process; one device carries one link, so fix the "
+                "device paths in the config",
+            )
+
+    def _register_device(self, port: serial.Serial) -> None:
+        """Note which device number ``port`` is, so another link of this process is refused it."""
+        try:
+            info = os.fstat(port.fileno())
+        except OSError:
+            return
+        with _OPEN_DEVICES_LOCK:
+            _OPEN_DEVICES[info.st_rdev] = self
+        self._rdev = info.st_rdev
+
     def _attach(self, port: serial.Serial) -> None:
         """Make ``port`` the live device: the loop watches its descriptor."""
         loop = self._loop
         assert loop is not None
         self._port, self._fd = port, port.fileno()
+        self._register_device(port)
         try:
             if self._receiver is not None:
                 loop.add_reader(self._fd, self._on_readable)
@@ -275,6 +366,11 @@ class SerialTransport:
                 loop.remove_writer(fd)
         self._writer_on = False
         self._port, self._fd = None, -1
+        rdev, self._rdev = self._rdev, None
+        if rdev is not None:
+            with _OPEN_DEVICES_LOCK:
+                if _OPEN_DEVICES.get(rdev) is self:
+                    del _OPEN_DEVICES[rdev]
         if port is not None:
             with contextlib.suppress(Exception):
                 port.close()
@@ -312,7 +408,9 @@ class SerialTransport:
 
     def _arm_idle_timer(self) -> None:
         loop, deadline = self._loop, self._framer.deadline_ns()
-        if self._timer is not None or deadline is None or loop is None or self._closed:
+        if self._timer is not None or deadline is None or loop is None:
+            return
+        if self._closed or self._down:
             return
         delay = max(0.0, (deadline - self._mono_ns()) / 1e9)
         self._timer = loop.call_later(delay, self._on_idle)
@@ -325,8 +423,21 @@ class SerialTransport:
         self._arm_idle_timer()
 
     def _on_readable(self) -> None:
+        try:
+            self._read_available()
+        finally:
+            self._arm_idle_timer()  # whatever ended the reads, a partial packet must expire
+
+    def _read_available(self) -> None:
+        """Read what the device has, up to ``READS_PER_WAKEUP`` reads.
+
+        An empty read means the device closed only when it is the first of the wakeup, the loop
+        having been told the descriptor is readable, and the line then confirms a hang-up. Later
+        in the wakeup it means the device has nothing more: a tty set to return at once
+        (``VMIN=0``) answers an empty queue with an empty read, not ``EAGAIN``.
+        """
         fd = self._fd
-        for _ in range(READS_PER_WAKEUP):
+        for attempt in range(READS_PER_WAKEUP):
             if fd < 0 or fd != self._fd:
                 return  # lost while delivering
             try:
@@ -338,13 +449,13 @@ class SerialTransport:
                 self._lost(exc)
                 return
             if not chunk:
-                self._lost(None, "end of file: the device closed")
+                if attempt == 0 and _hung_up(fd):
+                    self._lost(None, "end of file: the device closed")
                 return
             self._rx_bytes += len(chunk)
             self._deliver(self._framer.feed(chunk, self._wall_ns(), self._mono_ns()))
             if len(chunk) < READ_BYTES:
-                break
-        self._arm_idle_timer()
+                return
 
     # -- losing and regaining the device -------------------------------------------------
 
@@ -570,35 +681,69 @@ class SerialTransport:
             await self._drain(size)
 
     async def _drain(self, pending: int) -> None:
-        """Wait for the UART to send what was written (``tcdrain`` in a helper thread)."""
+        """Wait for the UART to send what was written (``tcdrain`` in a helper thread).
+
+        The thread works on a duplicate of the descriptor, so closing the port (or the number
+        being reused) while it runs cannot send it to another device. A drain that fails because
+        the device went away puts the link down; any other failure is a send error.
+        """
         loop, fd = self._loop, self._fd
         if loop is None or fd < 0:
             return
+        try:
+            helper = _DrainFd(fd)
+        except OSError as exc:
+            raise self._drain_failed(exc) from exc
         future: asyncio.Future[None] = loop.create_future()
         timeout = self._drain_timeout(pending)
 
         def drain() -> None:
             outcome: BaseException | None = None
             try:
-                termios.tcdrain(fd)
+                termios.tcdrain(helper.fd)
             except (termios.error, OSError) as exc:
                 outcome = exc
+            finally:
+                helper.close()
             with contextlib.suppress(RuntimeError):  # the loop may be gone
                 loop.call_soon_threadsafe(_finish, future, outcome)
 
-        start_thread(threading.Thread(target=drain, name="serial-drain", daemon=True))
+        try:
+            start_thread(threading.Thread(target=drain, name="serial-drain", daemon=True))
+        except BaseException:
+            helper.close()
+            raise
         try:
             async with asyncio.timeout(timeout):
                 await future
         except TimeoutError as exc:
-            with contextlib.suppress(termios.error, OSError):
-                termios.tcflush(fd, termios.TCOFLUSH)  # also wakes the thread
+            helper.flush()  # also wakes the thread
             raise IronbirdError(
                 Code.TX_SEND,
                 f"{self.description}: sent bytes did not leave the UART within {timeout:.1f} s "
                 "(is the peer reading? flow control?); the rest was discarded",
                 cause=exc,
             ) from exc
+        except (termios.error, OSError) as exc:
+            raise self._drain_failed(exc) from exc
+
+    def _drain_failed(self, exc: BaseException) -> IronbirdError:
+        """The coded error for a drain that failed with ``exc`` (a lost device ends the link)."""
+        if errno_of(exc) in _LOST_ERRNOS:
+            self._rx_errors += 1
+            self._lost(exc)
+            return IronbirdError(
+                Code.TX_DOWN,
+                f"{self.description}: not sent, the link is down (the device went away while "
+                "the UART was sending); reconnecting",
+                cause=exc,
+            )
+        reason = getattr(exc, "strerror", None) or str(exc)
+        return IronbirdError(
+            Code.TX_SEND,
+            f"{self.description}: waiting for the UART to empty failed: {reason}",
+            cause=exc,
+        )
 
     # -- closing ---------------------------------------------------------------------
 
@@ -619,6 +764,50 @@ class SerialTransport:
         self._receiver = None
         self._detach()
         self._fail_sends(TransportClosed())
+
+
+def _hung_up(fd: int) -> bool:
+    """Whether the device behind ``fd`` is gone: the kernel reports a hang-up, or the descriptor
+    no longer answers as a terminal."""
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)  # POLLHUP, POLLERR and POLLNVAL are always reported
+    try:
+        events = poller.poll(0)
+    except OSError:
+        return True
+    if any(mask & _HANGUP_EVENTS for _, mask in events):
+        return True
+    try:
+        termios.tcgetattr(fd)
+    except (termios.error, OSError):
+        return True
+    return False
+
+
+class _DrainFd:
+    """A duplicate of the port's descriptor for the helper thread that drains it.
+
+    The thread closes it when its drain returns; ``flush`` (event-loop side) discards the output
+    queue to wake a drain that never ends, and does nothing once the descriptor is closed.
+    """
+
+    def __init__(self, fd: int) -> None:
+        self.fd = os.dup(fd)
+        self._open = True
+        self._lock = threading.Lock()
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._open:
+                with contextlib.suppress(termios.error, OSError):
+                    termios.tcflush(self.fd, termios.TCOFLUSH)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._open:
+                self._open = False
+                with contextlib.suppress(OSError):
+                    os.close(self.fd)
 
 
 def _finish(future: asyncio.Future[None], outcome: BaseException | None) -> None:

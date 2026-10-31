@@ -278,17 +278,75 @@ def test_an_empty_read_changes_nothing() -> None:
     assert framer.feed(b"", 1, 0) == [] and framer.deadline_ns() is None
 
 
-def test_not_requiring_a_known_mid_accepts_a_header_the_ccdd_does_not_define() -> None:
+def test_a_header_the_ccdd_does_not_define_is_still_a_packet() -> None:
     packet = pec(0x7FF, b"zz")
-    assert packets(pec_framer().feed(packet, 1, 0)) == []  # 0x7FF is not in the bounds table
+    framer = pec_framer()
+    assert packets(framer.feed(packet, 1, 0)) == [packet]  # 0x7FF is not in the bounds table
+    assert framer.stats().mismatched == 1
     open_framer = pec_framer(payload_bounds=None)
     assert packets(open_framer.feed(packet, 1, 0)) == [packet]
+    assert open_framer.stats().mismatched == 0
 
 
-def test_a_payload_outside_the_range_of_its_mid_is_refused() -> None:
+def test_a_payload_outside_the_range_of_its_mid_is_still_a_packet() -> None:
     bad = pec(0x200, b"toolong")  # MID 0x200 carries exactly 4 bytes
     framer = pec_framer()
-    assert packets(finish(framer, framer.feed(bad, 1, 0))) == []
+    assert packets(finish(framer, framer.feed(bad, 1, 0))) == [bad]
+    assert framer.stats().mismatched == 1 and framer.stats().garbage_bytes == 0
+
+
+def grown() -> bytes:
+    return ser_corpus.grown_hk(CODEC)
+
+
+def unknown() -> bytes:
+    return ser_corpus.unknown_mid(CODEC)
+
+
+@pytest.mark.parametrize("sizes", [[10_000], [1], [7], [3, 11, 1]], ids=str)
+def test_a_packet_the_ccdd_disagrees_with_costs_neither_it_nor_the_packets_around_it(
+    sizes: list[int],
+) -> None:
+    """A struct that grew without the CCDD: the decode boundary reports it (IB-DEC-007), the
+    framer must not turn it, and the packet before it, into garbage."""
+    stream = hk(1) + grown() + hk(3) + hk(4)
+    assert isinstance(hdr.check(TLM_PROFILE, grown()), type(None))  # the header and length are true
+    framer = tlm_framer()
+    got = finish(framer, feed(framer, split(stream, sizes)))
+    assert [(e.flags, e.data) for e in got] == [(0, p) for p in (hk(1), grown(), hk(3), hk(4))]
+    assert framer.stats().mismatched == 1 and framer.stats().garbage_bytes == 0
+
+
+@pytest.mark.parametrize("sizes", [[10_000], [1]], ids=str)
+def test_packets_the_ccdd_disagrees_with_may_follow_each_other(sizes: list[int]) -> None:
+    """The header that confirms a packet need not be one the CCDD knows."""
+    stream = grown() * 4
+    framer = tlm_framer()
+    got = finish(framer, feed(framer, split(stream, sizes)))
+    assert packets(got) == [grown()] * 4 and framer.stats().mismatched == 4
+    assert [e.flags for e in got] == [0] * 4
+    stream = unknown() + grown() + unknown() + hk(2)
+    framer = tlm_framer()
+    got = finish(framer, feed(framer, split(stream, sizes)))
+    assert packets(got) == [unknown(), grown(), unknown(), hk(2)]
+
+
+def test_a_checksummed_packet_with_a_mid_the_ccdd_lacks_does_not_cost_its_neighbours() -> None:
+    good = [pec(0x100, b"a" * 10) for _ in range(3)]
+    other = pec(0x101, b"a" * 10)  # a valid checksum, a MID the CCDD does not define yet
+    framer = pec_framer()
+    got = framer.feed(good[0] + other + good[1] + good[2], 1, 0)  # no flush: only the reads
+    assert [(e.flags, e.data) for e in got] == [(0, p) for p in (good[0], other, good[1], good[2])]
+
+
+def test_a_lying_length_on_a_known_mid_is_still_refused_by_what_is_not_the_ccdd() -> None:
+    """With no veto from the CCDD, a false header is refused by the checksum, or without one by
+    nothing following it that looks like a header."""
+    framer = tlm_framer()
+    lie = ser_corpus._data_header(CODEC, TLM_PROFILE.min_bytes + 50)  # claims 50 payload bytes
+    stream = lie + hk(1) + hk(2)  # the claimed span ends inside hk(2): no header there
+    got = finish(framer, feed(framer, split(stream, [5] * 40)))
+    assert packets(got) == [hk(1), hk(2)] and wire(got) == stream
 
 
 def test_the_work_budget_turns_unexamined_bytes_into_garbage_instead_of_running_long() -> None:
@@ -312,13 +370,117 @@ def test_a_normal_stream_never_meets_the_default_budget() -> None:
     assert framer.stats().work_exhausted == 0
 
 
-def test_pending_bytes_stay_bounded_by_the_packet_cap() -> None:
+def held_bound(profile: hdr.HeaderProfile, sync: bytes) -> int:
+    """The most bytes held between two reads (the documented bound): a garbage run shorter than
+    the cap, then a candidate of at most the cap that is still waiting for its bytes or for the
+    header that confirms it, with the sync marker of each."""
+    return 2 * CAP + 2 * len(sync) + profile.size_bytes
+
+
+def _late_header_stream(profile: hdr.HeaderProfile, sync: bytes, byte: int) -> bytes:
+    """``CAP - 1 - len(sync)`` bytes no header can begin in, then a header claiming a full cap:
+    the framer holds the garbage and waits for the candidate to complete."""
+    length = (CAP - profile.min_bytes).to_bytes(2, "big")  # the profiles keep it at offset 4
+    head = bytearray(profile.size_bytes)
+    head[4:6] = length
+    if profile is TLM_PROFILE:
+        head[0] = 0x08
+    noise = bytes([byte]) * (CAP - 1 - len(sync))
+    return noise + sync + bytes(head) + bytes([byte]) * CAP
+
+
+@pytest.mark.parametrize("sync", [b"", b"\x1a\xcf\xfc\x1d"], ids=["nosync", "sync"])
+@pytest.mark.parametrize("kind", ["pec", "tlm"])
+@pytest.mark.parametrize("step", [1, 7, 100])
+def test_pending_bytes_stay_within_two_caps_plus_a_header(
+    kind: str, sync: bytes, step: int
+) -> None:
+    """The text of docs/plan.md bounds the held bytes: the garbage run in front of a candidate
+    (under one cap) and the candidate (up to one cap), not the cap alone."""
+    profile = PEC_PROFILE if kind == "pec" else TLM_PROFILE
+    stream = _late_header_stream(profile, sync, 0xFF)
+    framer = make(kind, sync=sync, budget=WorkBudget())
+    held = 0
+    for n in range(0, len(stream), step):
+        framer.feed(stream[n : n + step], n, n)
+        held = max(held, framer.stats().pending_bytes)
+    bound = held_bound(profile, sync)
+    assert held <= bound
+    assert held > CAP + profile.size_bytes  # the hostile stream does hold more than one cap
+
+
+def test_noise_without_headers_holds_at_most_the_cap() -> None:
     framer = pec_framer()
     held = 0
     for n in range(300):
         framer.feed(b"\xfe" * 100, n, n)
         held = max(held, framer.stats().pending_bytes)
     assert held <= CAP + 100
+
+
+# -- a clean stream, read in any way, never exhausts the work budget ------------------------------
+
+CLEAN_PROFILES = {
+    "tlm": (TLM_PROFILE, 0x893),
+    "tlm-time": (
+        hdr.load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_tlm_cfe_time.toml"),
+        0x893,
+    ),
+    "pec": (PEC_PROFILE, 0x100),
+}
+# Small enough that a stream whose scanning costs more than the bytes pay for runs it out within
+# a few dozen packets; the default budget would take thousands.
+STINGY = WorkBudget(base=2048, cap=4096)
+
+
+def clean_stream(name: str, payload: int, count: int, sync: bytes) -> tuple[bytes, list[bytes]]:
+    profile, mid = CLEAN_PROFILES[name]
+    packet = hdr.pack(profile, bytes(payload), mid=mid, now=1.8e9)
+    return (sync + packet) * count, [packet] * count
+
+
+@pytest.mark.parametrize(
+    "sync", [b"", b"\x1a\xcf\xfc\x1d", bytes(8)], ids=["nosync", "sync4", "sync8"]
+)
+@pytest.mark.parametrize("payload", [0, 1, 2, 3, 4, 8])
+@pytest.mark.parametrize("name", sorted(CLEAN_PROFILES))
+@pytest.mark.parametrize("step", [1, 2, 3])
+def test_a_clean_stream_read_a_few_bytes_at_a_time_never_exhausts_the_work_budget(
+    name: str, payload: int, sync: bytes, step: int
+) -> None:
+    profile = CLEAN_PROFILES[name][0]
+    stream, expected = clean_stream(name, payload, 200, sync)
+    framer = HeaderLengthFramer(profile, max_packet_bytes=CAP, sync=sync, budget=STINGY)
+    out = finish(framer, feed(framer, split(stream, [step] * (len(stream) // step + 1))))
+    stats = framer.stats()
+    assert packets(out) == expected and stats.garbage_bytes == 0
+    assert stats.work_exhausted == 0, f"{stats.work_spent} spent, {stats.work_earned} earned"
+
+
+def test_a_complete_candidate_is_checked_once_however_many_reads_confirm_it() -> None:
+    """A packet with no checksum waits for the header behind it: each byte of that header costs
+    the confirmation, not another look at the packet."""
+    stream, _ = clean_stream("tlm", 4, 2, b"")
+    first = len(stream) // 2
+    framer = tlm_framer(payload_bounds=None, budget=WorkBudget())
+    framer.feed(stream[:first], 1, 0)
+    assert framer.stats().packets == 0
+    for n in range(first, len(stream) - 1):  # the second packet, but for its last byte
+        before = framer.stats()
+        framer.feed(stream[n : n + 1], 2 + n, n)
+        if framer.stats().packets == before.packets:  # the byte that confirms it starts the next
+            assert framer.stats().work_spent - before.work_spent <= EVAL_COST
+    assert framer.stats().packets == 1
+
+
+def test_only_a_profile_with_a_checksum_pays_per_byte_for_checking_a_candidate() -> None:
+    plain = HeaderLengthFramer(TLM_PROFILE, max_packet_bytes=CAP, budget=WorkBudget())
+    summed = HeaderLengthFramer(PEC_PROFILE, max_packet_bytes=CAP, budget=WorkBudget())
+    big = CAP - 100
+    plain.feed(hdr.pack(TLM_PROFILE, bytes(big - TLM_PROFILE.min_bytes), mid=0x893) * 2, 1, 0)
+    summed.feed(hdr.pack(PEC_PROFILE, bytes(big - PEC_PROFILE.min_bytes), mid=0x100) * 2, 1, 0)
+    assert summed.stats().work_spent >= big // 2
+    assert plain.stats().work_spent < big // 8  # a header judgement or two
 
 
 # -- profiles a stream cannot be framed with ------------------------------------------------
@@ -568,6 +730,79 @@ def test_hostile_input_is_processed_within_the_work_budget(
     stats = framer.stats()
     assert wire(got) == stream
     assert stats.work_spent <= stats.work_earned + CAP // 2 + 4 * EVAL_COST
+
+
+@st.composite
+def any_pec_packet(draw: st.DrawFn) -> bytes:
+    """A valid PEC packet with any MID and payload size, the CCDD's or not."""
+    mid = draw(st.sampled_from([*sorted(PEC_BOUNDS), 0x101, 0x7FF]))
+    return pec(mid, draw(st.binary(max_size=60)))
+
+
+@st.composite
+def any_tlm_packet(draw: st.DrawFn) -> bytes:
+    """A well-formed telemetry packet that the CCDD may or may not agree with."""
+    kind = draw(st.sampled_from(["known", "grown", "grown-more", "unknown"]))
+    if kind == "known":
+        return draw(tlm_packet())
+    if kind == "unknown":
+        mid = draw(st.sampled_from([0x8FF, 0xFFF, 0x801]))
+        return ser_corpus.unknown_mid(CODEC, mid, draw(st.integers(0, 40)))
+    return ser_corpus.grown_hk(CODEC, 2 if kind == "grown" else draw(st.integers(1, 200)))
+
+
+def valid_packets(max_size: int) -> st.SearchStrategy[tuple[str, list[bytes]]]:
+    """A profile name and valid packets of it (the CCDD's or not), as a stream carries them."""
+    return st.sampled_from(["pec", "tlm"]).flatmap(
+        lambda kind: st.tuples(
+            st.just(kind),
+            st.lists(
+                any_pec_packet() if kind == "pec" else any_tlm_packet(),
+                min_size=1,
+                max_size=max_size,
+            ),
+        )
+    )
+
+
+def _valid(kind: str, items: list[bytes]) -> list[bytes]:
+    profile = PEC_PROFILE if kind == "pec" else TLM_PROFILE
+    assert all(hdr.check(profile, p) is None and len(p) <= CAP for p in items)
+    return items
+
+
+@FUZZ
+@given(
+    valid=valid_packets(12),
+    sizes=st.lists(st.integers(1, 40), max_size=30),
+    sync=SYNCS,
+)
+def test_well_formed_packets_are_all_framed_whether_or_not_the_ccdd_agrees_with_them(
+    valid: tuple[str, list[bytes]], sizes: list[int], sync: bytes
+) -> None:
+    kind, items = valid
+    stream = b"".join(sync + p for p in _valid(kind, items))
+    framer = make(kind, sync=sync)
+    got = finish(framer, feed(framer, split(stream, sizes)))
+    assert [(e.flags, e.data) for e in got] == [(0, p) for p in items]
+
+
+@FUZZ
+@given(
+    valid=valid_packets(40),
+    sizes=st.lists(st.integers(1, 5), max_size=60),
+    sync=SYNCS,
+)
+def test_a_stream_of_valid_packets_never_exhausts_the_work_budget_however_it_is_read(
+    valid: tuple[str, list[bytes]], sizes: list[int], sync: bytes
+) -> None:
+    kind, items = valid
+    stream = b"".join(sync + p for p in _valid(kind, items))
+    framer = make(kind, sync=sync, budget=STINGY)
+    chunks = split(stream, sizes) if sizes else split(stream, [1] * len(stream))
+    got = finish(framer, feed(framer, chunks))
+    assert packets(got) == items and framer.stats().garbage_bytes == 0
+    assert framer.stats().work_exhausted == 0
 
 
 # -- the checked-in corpus -------------------------------------------------------------------
