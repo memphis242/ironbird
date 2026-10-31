@@ -3004,13 +3004,20 @@ As built (where the build differs from, or settles, the text above)
   length field, and its checksum span at every size where the span's answer can change (the two ends and
   the sizes where the span start, span end, checksum field and packet bounds cross, with their
   neighbours; `header.checksum_probe_sizes`), so a span such as `end = -10` that cuts the checksum field
-  only at a size in between is `IB-ENC-004` at load, not on the wire. A fixed field named `remaining` in
+  only at a size in between is `IB-ENC-004` at load, not on the wire. The probe covers every byte size
+  from the smallest to the largest packet, reachable or not (conservative by design: a size the
+  length field or the CCDD would never produce can still refuse the message). A fixed field named `remaining` in
   a message that uses the `"remaining"` keyword is `IB-CCD-*` (layout) at load: the name and the keyword
   cannot be told apart.
-- Decode token. `decode_resolved` believes a `Resolved` only when its message, MID, packet size and
-  variable-length counts agree with the bytes (the counts are re-read, a few integer reads); any other
-  token takes the whole `decode`, so a forged token gives a `DecodeError` or the right values, never an
-  assertion or wrong values.
+- Decode token. Only `Codec.resolve` makes a `Resolved`: construction needs a module-private key, the fields
+  are read-only, and there is no `_replace`, copy or pickle. It records the issuing codec and the exact
+  `bytes` object it was made from. `decode_resolved` trusts it, with no re-derivation (identity checks
+  only, so the hot path costs what it did before the token had a content check), when it is a `Resolved`
+  of this codec, of the same kind, for that very `bytes` object; any other pairing (another codec or
+  kind, other bytes, a `bytearray` or `memoryview`, or a look-alike that is not a `Resolved`) takes the
+  whole `decode`, so the answer is always `decode(kind, data)`'s and never raises. The guarantee holds
+  against the public API; code that deliberately builds an instance around the private key or
+  `object.__new__` is outside it.
 - Filter. `char[]` and `bytes[]` filter like the fixed ones (a `bytes[]` comparison takes any length up
   to the maximum, the empty value `""` included; `contains ""` is refused); a number array has no operator and is `IB-FLT-003` ("an array of numbers cannot be
   filtered"). Event mappings may name a `char[]` field (`message`), which `events` and `listen` show.

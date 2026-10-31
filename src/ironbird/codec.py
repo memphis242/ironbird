@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Final, NamedTuple, cast
+from typing import Final, NoReturn, cast, final
 
 from ironbird import header as hdr
 from ironbird.ccdd.model import (
@@ -75,22 +75,67 @@ class _Layout:
     count_names: frozenset[str] = frozenset()  # count and length fields their data determines
 
 
-class Resolved(NamedTuple):
-    """What :meth:`Codec.resolve` established about a packet that passed the check: the message
-    it is and the header word. :meth:`Codec.decode_resolved` unpacks the fields from it without
-    repeating the check.
+_ISSUE = object()  # the key only :meth:`Codec.resolve` holds; a Resolved is built with it
 
-    The token keeps the codec, message kind and bytes it was made from, and
-    :meth:`Codec.decode_resolved` only trusts it for exactly those (by identity), so a token that
-    is stale, foreign or paired with other bytes is never believed.
+
+@final
+class Resolved:
+    """What :meth:`Codec.resolve` established about a packet that passed the check: the message
+    it is, the header word and the variable-length counts. :meth:`Codec.decode_resolved`
+    unpacks the fields from it without repeating the check.
+
+    Only :meth:`Codec.resolve` makes one: construction needs a key this module keeps to itself,
+    and the fields are read-only (there is no ``_replace`` and no copy or pickle round trip). The
+    token records the codec and the ``bytes`` object it was made from (its message knows the
+    kind), and :meth:`Codec.decode_resolved` believes it only for exactly those. A mutable
+    ``bytearray`` or ``memoryview`` packet gets a token that is never believed, because its
+    content may have changed since the check.
     """
+
+    __slots__ = ("codec", "counts", "data", "message", "word")
 
     message: Message
     word: int
+    counts: tuple[int, ...]
     codec: Codec
-    kind: MessageKind
     data: bytes | bytearray | memoryview
-    counts: tuple[int, ...] = ()
+
+    def __init__(
+        self,
+        key: object,
+        message: Message,
+        word: int,
+        codec: Codec,
+        data: bytes | bytearray | memoryview,
+        counts: tuple[int, ...] = (),
+    ) -> None:
+        if key is not _ISSUE:
+            raise TypeError("a Resolved is made only by Codec.resolve")
+        # the slot descriptors set the fields; __setattr__ refuses every later write
+        _SET_MESSAGE(self, message)
+        _SET_WORD(self, word)
+        _SET_COUNTS(self, counts)
+        _SET_CODEC(self, codec)
+        _SET_DATA(self, data)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("a Resolved is read-only")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("a Resolved is read-only")
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("a Resolved cannot be copied or pickled")
+
+    def __repr__(self) -> str:
+        return f"Resolved({self.message.name}, word=0x{self.word:08X}, counts={self.counts})"
+
+
+_SET_MESSAGE = Resolved.message.__set__  # type: ignore[attr-defined]
+_SET_WORD = Resolved.word.__set__  # type: ignore[attr-defined]
+_SET_COUNTS = Resolved.counts.__set__  # type: ignore[attr-defined]
+_SET_CODEC = Resolved.codec.__set__  # type: ignore[attr-defined]
+_SET_DATA = Resolved.data.__set__  # type: ignore[attr-defined]
 
 
 @dataclass(frozen=True, slots=True)
@@ -756,7 +801,7 @@ class Codec:
                     f"CCDD says {msg.payload_size}",
                     mid,
                 )
-            return Resolved(msg, word, self, kind, data)
+            return Resolved(_ISSUE, msg, word, self, data)
         payload = size - profile.min_bytes
         if not msg.min_payload <= payload <= msg.payload_size:
             return DecodeError(
@@ -771,7 +816,7 @@ class Codec:
         )
         if isinstance(counts, DecodeError):
             return counts
-        return Resolved(msg, word, self, kind, data, counts)
+        return Resolved(_ISSUE, msg, word, self, data, counts)
 
     @staticmethod
     def _variable_counts(
@@ -868,41 +913,23 @@ class Codec:
         """Unpack the fields of ``data``, which :meth:`resolve` already accepted as ``resolved``.
 
         This is the second half of :meth:`decode`, for a caller that kept the first half's
-        result (the engine's ingest ran it on every frame). The token is believed only when it
-        was made by this codec, for this kind, from this very ``bytes`` object (immutable, so its
-        content is what was checked), and when its message, MID, packet size and variable-length
-        counts agree with that content (re-derived, a few integer reads); any other pairing takes
-        the whole :meth:`decode`. Never raises, whatever the token holds.
+        result (the engine's ingest ran it on every frame). Only :meth:`resolve` makes a
+        :class:`Resolved`, so its content is trusted without a second look, but only for the
+        codec, kind and ``bytes`` object it was made from: the checks here are identities and
+        nothing is re-derived. Any other pairing (another codec or kind, other or mutable bytes,
+        or an object that is not a ``Resolved``) takes the whole :meth:`decode`, so the answer is
+        always what ``decode(kind, data)`` gives, and this never raises.
         """
         if (
             type(resolved) is not Resolved
             or resolved.codec is not self
-            or resolved.kind is not kind
             or resolved.data is not data
+            or resolved.message.kind is not kind
             or type(data) is not bytes
-            or not self._token_agrees(kind, resolved, data)
         ):
             return self.decode(kind, data)
+        assert resolved.message.name in self._layouts
         return self._unpack(kind, resolved, data)
-
-    def _token_agrees(self, kind: MessageKind, resolved: Resolved, data: bytes) -> bool:
-        """Whether the message, size and counts of ``resolved`` are what ``data`` says."""
-        msg = resolved.message
-        layout = self._layouts.get(msg.name) if type(msg) is Message else None
-        profile = self._profiles[kind]
-        if layout is None or layout.message is not msg or msg.kind is not kind:
-            return False
-        if hdr.peek_mid(profile, data) != msg.mid:
-            return False
-        payload = len(data) - profile.min_bytes
-        if not msg.is_variable:
-            return payload == msg.payload_size
-        if type(resolved.counts) is not tuple or not msg.min_payload <= payload <= msg.payload_size:
-            return False
-        counts = self._variable_counts(
-            layout, data, profile.size_bytes, len(data) - profile.trailer_size
-        )
-        return counts == resolved.counts
 
     def _unpack(
         self, kind: MessageKind, resolved: Resolved, data: bytes | bytearray | memoryview

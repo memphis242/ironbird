@@ -13,6 +13,7 @@ import re
 import socket
 import struct
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,7 @@ from ironbird.ccdd.json_adapter import JsonAdapter, parse_model
 from ironbird.ccdd.loader import load_ccdd
 from ironbird.ccdd.model import MessageKind, TypeClass, VarUnit
 from ironbird.cli.main import app
-from ironbird.codec import Codec, DecodedPacket
+from ironbird.codec import Codec, DecodedPacket, Resolved
 from ironbird.config import load_config
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.filter import FilterError, compile_filter
@@ -519,26 +520,76 @@ def test_decode_resolved_takes_the_counts_the_check_read(codec: Codec) -> None:
     assert not isinstance(fixed, DecodeError) and fixed.counts == (0,)
 
 
-def test_a_forged_token_is_never_believed_and_never_raises() -> None:
+def test_a_resolved_cannot_be_forged_and_a_mispaired_one_is_never_believed() -> None:
+    """Only ``resolve`` makes a token and its fields are read-only; every other pairing of a
+    token (or look-alike) with bytes answers exactly what ``decode`` does, and never raises."""
     c = var_corpus.codec()
     data = c.encode_telemetry("MOCK_DATA", {"Entries": [1, 2, 3], "Text": "abc"}).data
     token = c.resolve(TLM, data)
-    assert not isinstance(token, DecodeError) and token.counts == (3, 3)
+    assert isinstance(token, Resolved) and token.counts == (3, 3)
     expected = c.decode(TLM, data)
     assert isinstance(expected, DecodedPacket)
-    forged = [
-        token._replace(counts=()),
-        token._replace(counts=(64, 0)),
-        token._replace(counts=(1, 0)),
-        token._replace(counts=(3, 2)),
-        token._replace(counts=(-1, 3)),
-        token._replace(counts=[3, 3]),  # type: ignore[arg-type]
-        token._replace(message=c.model.by_name["MOCK_LOAD_DATA"]),
-        token._replace(message="MOCK_DATA"),  # type: ignore[arg-type]
-        token._replace(message=c.model.by_name["MOCK_HK"]),
+    assert c.decode_resolved(TLM, token, data) == expected
+
+    # no way to construct one, change one or copy one through the public surface
+    msg = token.message
+    for key in (None, 0, object(), ()):
+        with pytest.raises(TypeError):
+            Resolved(key, msg, token.word, c, data, token.counts)  # type: ignore[arg-type]
+    for name, value in (("word", 0), ("counts", ()), ("message", msg), ("data", b""), ("x", 1)):
+        with pytest.raises(AttributeError):
+            setattr(token, name, value)
+    with pytest.raises(AttributeError):
+        del token.word
+    assert not hasattr(token, "_replace")
+    with pytest.raises(TypeError):
+        copy.copy(token)
+    with pytest.raises(TypeError):
+        copy.deepcopy(token)
+    assert c.decode_resolved(TLM, token, data) == expected  # still the one the check made
+
+    # look-alikes that are not a Resolved
+    @dataclass
+    class Lookalike:
+        message: Any
+        word: Any
+        counts: Any
+        codec: Any
+        data: Any
+
+    lookalikes: list[object] = [
+        (msg, token.word, c, data, token.counts),
+        Lookalike(msg, token.word, token.counts, c, data),
+        Lookalike(msg, None, (3.0, 3), c, data),
+        Lookalike(msg, "x", (-1, 3), c, data),
+        None,
+        "MOCK_DATA",
+        3.5,
     ]
-    for bad in forged:
-        assert c.decode_resolved(TLM, bad, data) == expected, bad
+    for fake in lookalikes:
+        assert c.decode_resolved(TLM, fake, data) == expected, fake  # type: ignore[arg-type]
+
+    # a real token paired with other bytes, a mutable copy, another kind or another codec
+    flipped = bytearray(data)
+    flipped[5] ^= 1  # the length byte
+    last = bytearray(data)
+    last[-1] ^= 0xFF  # the last byte (checksum or text)
+    for other in (bytes(flipped), bytes(last), bytes(data), data[:-1], data + b"\0", b""):
+        assert c.decode_resolved(TLM, token, other) == c.decode(TLM, other)
+    for mutable in (bytearray(data), memoryview(data), memoryview(bytearray(data))):
+        assert c.decode_resolved(TLM, token, mutable) == expected
+    assert c.decode_resolved(CMD, token, data) == c.decode(CMD, data)
+    twin = var_corpus.codec()
+    assert twin.decode_resolved(TLM, token, data) == twin.decode(TLM, data)
+
+    # a command token against a different command of the same MID
+    kind, mode = wrap(c, "MOCK_SET_MODE", bytes(2))
+    mode_token = c.resolve(kind, mode)
+    assert isinstance(mode_token, Resolved)
+    assert c.decode_resolved(kind, mode_token, mode) == c.decode(kind, mode)
+    for name in ("MOCK_SET_LABEL", "MOCK_NOOP", "MOCK_LOAD_DATA"):
+        other = wrap(c, name, bytes(2))[1]
+        assert c.decode_resolved(kind, mode_token, other) == c.decode(kind, other), name
 
 
 def test_the_checksum_span_is_checked_at_every_size_it_can_cut_the_field(tmp_path: Path) -> None:
