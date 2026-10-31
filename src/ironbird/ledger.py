@@ -556,6 +556,8 @@ class Ledger:
 
     @property
     def pending(self) -> int:
+        """Records queued and not yet handed to the writer thread. Records already handed over
+        may still be unwritten: :meth:`flush` waits (bounded) for the writer to catch up."""
         return len(self._queue)
 
     @property
