@@ -90,16 +90,18 @@ class TypeClass(StrEnum):
     FLOAT = "float"
     CHAR = "char"
     BYTES = "bytes"
+    ARRAY = "array"  # variable-length run of one scalar type; the value is a tuple
 
 
 @dataclass(frozen=True, slots=True)
 class FieldType:
-    """A wire type: scalar (fixed width) or fixed-length char/bytes array."""
+    """A wire type: a scalar (fixed width), a fixed-length char/bytes array, or a variable-length
+    array (``text`` ends in ``[]``; ``size`` is then its largest size on the wire)."""
 
-    text: str  # canonical spelling, e.g. "uint16" or "char[16]"
+    text: str  # canonical spelling, e.g. "uint16", "char[16]" or "uint32[]"
     type_class: TypeClass
-    size: int  # bytes on the wire
-    struct_code: str  # one struct format item, e.g. "H" or "16s"
+    size: int  # bytes on the wire (the maximum for a variable-length type)
+    struct_code: str  # one struct format item, e.g. "H" or "16s"; empty when variable-length
     signed: bool = False
 
     @property
@@ -110,6 +112,7 @@ class FieldType:
 
 
 MAX_ARRAY_LEN: Final = 4096
+MAX_VAR_FIELDS: Final = 8  # variable-length fields in one message
 MAX_ENUM_ENTRIES: Final = 65536
 MAX_PAYLOAD_BYTES: Final = 65535
 
@@ -145,8 +148,75 @@ def parse_type(text: str) -> FieldType | str:
     return FieldType(f"{match.group(1)}[{length}]", kind, length, f"{length}s")
 
 
+_ELEMENT_CHAR: Final = FieldType("char", TypeClass.CHAR, 1, "c")
+_ELEMENT_BYTES: Final = FieldType("bytes", TypeClass.BYTES, 1, "B")
+_VAR_RE: Final = re.compile(r"([a-z0-9]+)\[\]")
+
+
+def parse_element_type(text: str) -> FieldType | str:
+    """Parse the element type of a variable-length array from its spelling with the ``[]``
+    (``uint32[]``, ``char[]``, ``bytes[]``); returns the element type or a reason string."""
+    match = _VAR_RE.fullmatch(text)
+    if match is not None:
+        name = match.group(1)
+        if name == "char":
+            return _ELEMENT_CHAR
+        if name == "bytes":
+            return _ELEMENT_BYTES
+        scalar = _SCALARS.get(name)
+        if scalar is not None:
+            return scalar
+    return (
+        "unknown element type; use uint8/16/32/64, int8/16/32/64, float32/64, char or bytes "
+        "before the []"
+    )
+
+
+class VarUnit(StrEnum):
+    """What a variable-length field's size is measured in on the wire."""
+
+    COUNT = "count"  # a count field holds the number of elements
+    LENGTH = "length"  # a count field holds the number of bytes
+    REMAINING = "remaining"  # no count field: the field takes the rest of the packet
+
+
+@dataclass(frozen=True, slots=True)
+class VarSpec:
+    """How a variable-length field is sized. ``min`` and ``max`` are element counts; the wire
+    size of ``n`` elements is ``n * element.size`` bytes."""
+
+    element: FieldType  # a scalar, or the 1-byte char/bytes element
+    unit: VarUnit
+    count_field: str | None  # the fixed field holding the count or byte length; None: remaining
+    min: int
+    max: int
+
+    def __post_init__(self) -> None:
+        assert (self.unit is VarUnit.REMAINING) == (self.count_field is None)
+        assert 0 <= self.min <= self.max and self.element.size >= 1
+
+    @property
+    def min_bytes(self) -> int:
+        return self.min * self.element.size
+
+    @property
+    def max_bytes(self) -> int:
+        return self.max * self.element.size
+
+    def var_type(self) -> FieldType:
+        """The :class:`FieldType` of a field with this spec."""
+        klass = self.element.type_class
+        if klass not in (TypeClass.CHAR, TypeClass.BYTES):
+            klass = TypeClass.ARRAY
+        return FieldType(f"{self.element.text}[]", klass, self.max_bytes, "", False)
+
+
 @dataclass(frozen=True, slots=True)
 class FieldDef:
+    """One field. A variable-length field (``var`` set) has ``offset`` = the start of the
+    variable-length section (the end of the fixed fields), which is where it begins only when
+    every variable-length field before it is empty."""
+
     name: str
     type: FieldType
     offset: int  # bytes from payload start
@@ -154,6 +224,7 @@ class FieldDef:
     enum: Mapping[str, int] | None = None
     units: str = ""
     description: str = ""
+    var: VarSpec | None = None
     # value -> label, built once from ``enum`` so lookups are O(1)
     enum_by_value: Mapping[int, str] = field(init=False, repr=False, compare=False)
 
@@ -206,16 +277,38 @@ class Message:
     # Values for the header profile's input fields, by name (the profile default applies to the
     # rest); the codec checks the names and widths against the profile.
     header: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
+    # The end of the fixed fields, and the smallest payload. ``payload_size`` is the largest
+    # payload; all three are equal for a message without variable-length fields.
+    fixed_extent: int = field(init=False, default=0, compare=False)
+    min_payload: int = field(init=False, default=0, compare=False)
+    is_variable: bool = field(init=False, default=False, compare=False)
 
     def __post_init__(self) -> None:
         assert (self.function_code is not None) == (self.kind is MessageKind.COMMAND)
-        assert self.payload_size >= max((f.end for f in self.fields), default=0)
+        fixed = [f for f in self.fields if f.var is None]
+        specs = [f.var for f in self.fields if f.var is not None]
+        assert self.fields[: len(fixed)] == tuple(fixed), "fixed fields come before variable ones"
+        assert len(specs) <= MAX_VAR_FIELDS
+        extent = max((f.end for f in fixed), default=0)
+        object.__setattr__(self, "fixed_extent", extent)
+        object.__setattr__(self, "is_variable", bool(specs))
+        if specs:
+            largest = extent + sum(spec.max_bytes for spec in specs)
+            assert self.payload_size == largest, "no padding after variable-length fields"
+            object.__setattr__(self, "min_payload", extent + sum(s.min_bytes for s in specs))
+        else:
+            assert self.payload_size >= extent
+            object.__setattr__(self, "min_payload", self.payload_size)
         assert (self.event is not None) == (self.category is Category.EVENT)
         assert self.kind is MessageKind.TELEMETRY or self.category is Category.OTHER
         if self.event is not None:
             names = {f.name for f in self.fields}
             refs = (self.event.id, self.event.type, self.event.app, self.event.message)
             assert all(ref in names for ref in refs if ref is not None)
+
+    @property
+    def max_payload(self) -> int:
+        return self.payload_size
 
     def field(self, name: str) -> FieldDef | None:
         for f in self.fields:

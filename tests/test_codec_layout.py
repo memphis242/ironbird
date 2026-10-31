@@ -54,6 +54,8 @@ def _value(draw: st.DrawFn, field: FieldDef) -> object:
             return draw(st.text(alphabet, max_size=ftype.size))
         case TypeClass.BYTES:
             return draw(st.binary(min_size=ftype.size, max_size=ftype.size))
+        case TypeClass.ARRAY:
+            raise AssertionError("these layouts have only fixed fields")
     raise AssertionError("unreachable")
 
 

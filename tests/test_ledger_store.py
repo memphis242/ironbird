@@ -797,6 +797,32 @@ def test_leaving_the_reserve_is_tried_once_a_minute_while_it_is_in_use(tmp_path:
     assert [r["text"] for r in rig.rows(bookkeeping=False) if r["event"] == "rx.event"] == ["e"]
 
 
+def test_a_retired_reserve_whose_name_could_not_be_removed_is_recorded_as_left_over(
+    tmp_path: Path,
+) -> None:
+    """No non-replacing rename (NFS): the reserve is retired by hard link, and the unlink of its
+    reserve name fails. The part is committed; the record names the name left over, not a
+    failed directory sync."""
+    _reserve_works(tmp_path)
+    rig = Rig(tmp_path, long=True)
+    rig.ledger.open()
+    rule = rig.fs.fail("write", errno.ENOSPC)
+    rig.ledger.record("action", "enter-reserve")
+    rig.ledger.flush()
+    stamp = stamp_of(rig.ledger.start_ns)
+    reserve = reserve_name(stamp, "s", 1)
+    assert (rig.dir / reserve).exists()
+    rule.off = True
+    rig.fs.override("renameat2_noreplace", lambda _dir_fd, _old, _new: None)
+    rig.fs.fail("unlink_at", errno.EIO, when=lambda _dir_fd, name: name == reserve)
+    rig.step(61.0)  # the next reserve allocates and the one in use retires
+    assert (rig.dir / part_name(stamp, "s", 2)).exists()
+    rig.ledger.close()
+    notes = [r for r in rig.events("ledger.note") if r.get("leftover") == reserve]
+    assert [n["note"] for n in notes] == ["retire_leftover"], rig.events("ledger.note")
+    assert notes[0]["name"] == part_name(stamp, "s", 2) and notes[0]["text"]
+
+
 def test_unlimited_tiers_are_still_counted_only_while_the_reserve_is_in_use(
     tmp_path: Path,
 ) -> None:

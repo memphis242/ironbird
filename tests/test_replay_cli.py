@@ -17,9 +17,10 @@ from typing import Any
 
 import pytest
 
+from ironbird.errors import Code
 from ironbird.recording.format import RecordType
 from ironbird.recording.reader import RecordingReader
-from ironbird.recording.writer import RecorderOptions
+from ironbird.recording.writer import RecorderOptions, part_path
 from recutil import CLI_MAIN, Proc, run_ib, send_datagrams
 from replayutil import (
     T0,
@@ -678,6 +679,75 @@ def test_follow_idle_ends_a_quiet_follow(tmp_path: Path, env: dict[str, str]) ->
     assert len(done.stdout.splitlines()) == 2 and took >= 1.0
     assert live.returncode == 0 and "still being written" in live.stderr
     assert "not closed cleanly" not in done.stderr and "IB-REC-007" in done.stderr
+
+
+# Child-side hooks: the follow says when it waits for the next part, a check of that part that
+# fails says so too, and the head of a new part is awaited for a minute, so the signal lands
+# while the retry is handling the error.
+_HEAD_WAIT_HOOKS = """
+import os
+from pathlib import Path
+from ironbird.recording import replay
+WAITING, MARK = Path(os.environ["IB_TEST_WAITING"]), Path(os.environ["IB_TEST_MARK"])
+replay.HEAD_WAIT_POLLS = 600
+real_next, real_check = replay.Replay._next_part, replay.Replay._check_set
+
+def next_part(self, closed):
+    WAITING.touch()
+    return real_next(self, closed)
+
+def check_set(self, *args):
+    try:
+        return real_check(self, *args)
+    except Exception:
+        MARK.touch()
+        raise
+
+replay.Replay._next_part, replay.Replay._check_set = next_part, check_set
+"""
+
+
+def test_a_signal_while_the_head_of_a_new_part_is_awaited_reports_no_error(
+    tmp_path: Path, env: dict[str, str]
+) -> None:
+    """The empty next part is retried on purpose; Ctrl-C during the retry ends the follow with
+    the interruption alone, not with the error the retry was handling."""
+    import fcntl
+
+    path = tmp_path / "live.ibrec"
+    write_recording(path, hk_frames(3))
+    waiting, mark = tmp_path / "waiting", tmp_path / "head-retried"
+    lock = os.open(path, os.O_RDONLY)
+    fcntl.flock(lock, fcntl.LOCK_EX)  # a live writer: the follow goes on past the trailer
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _HEAD_WAIT_HOOKS + CLI_MAIN, "replay", str(path), "--follow"],
+        env={**env, "IB_TEST_WAITING": str(waiting), "IB_TEST_MARK": str(mark)},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+
+        def wait_for(reached: Path) -> None:
+            while not reached.exists():
+                assert proc.poll() is None, proc.communicate()[1]
+                assert time.monotonic() < deadline
+                time.sleep(0.005)
+
+        wait_for(waiting)
+        part_path(path, 2).write_bytes(b"")  # created, its head not written yet
+        wait_for(mark)
+        proc.send_signal(signal.SIGINT)
+        _, err = proc.communicate(timeout=60)
+    finally:
+        os.close(lock)
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 130, err
+    assert "interrupted (SIGINT)" in err and Code.REC_FORMAT.value not in err, err
+    errors = [e for e in ledger_events(tmp_path) if e["kind"] == "error"]
+    assert errors == [], errors
 
 
 def test_replay_never_modifies_the_recording(tmp_path: Path, env: dict[str, str]) -> None:

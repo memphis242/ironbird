@@ -22,12 +22,21 @@ belong to the invoking user, derive from the run directory's key files, and have
 | `CFS_REF` / `CFS_COMMIT` | `v7.0.1` / its commit | build |
 | `CFS_CONFIG` | `native_std` | both |
 | `JOBS` | `nproc` | build |
-| `CFS_APPS` | `sch_lab ci_lab to_lab sample_app` (`ALL` = stock startup script) | run |
+| `CFS_APPS` | `sch_lab ci_lab to_lab sample_app` (the token `ALL` keeps the stock startup script; add `ib_test` to start ironbird's own app, e.g. `ALL ib_test`) | run |
 | `CFS_RUN_UID` | `65534` (only used when started as root) | run |
 
 EL8: CI also builds and runs this on `oraclelinux:8` (gcc 8.5, cmake and git from the EL8
 AppStream, bash 4.4, util-linux 2.32) as a non-root user; `tools/ci/el8-setup.sh` is the package
 list those hosts need (`flock`, `setpriv` and `ipcrm` come from util-linux).
+
+`apps/ib_test` is ironbird's own cFS app: it gives the acceptance tests the variable-length packet that
+stock cFS lacks (a counted array and a tail string, decision D6). `build.sh` copies each directory of
+`tools/cfs/apps/` into the checkout's `apps/`, lists it once in `sample_defs/targets.cmake` and checks
+that `cf/<app>.so` was built; `run.sh` adds `ib_test` to the startup script when `CFS_APPS` names it.
+Its commands are `IB_TEST_NOOP`, `IB_TEST_RESET_COUNTERS`, `IB_TEST_SET_DATA` (counted array and tail
+string, stored and published as `IB_TEST_VAR`), `IB_TEST_SEND_VAR` and `IB_TEST_SEND_HK`; telemetry MIDs
+0x08E0 (HK) and 0x08E1 (VAR) are not in TO_LAB's table, so a test adds them with `TO_LAB_ADD_PKT`.
+The layouts are in `apps/ib_test/fsw/src/ib_test.h` and `examples/ccdd/cfs.json`.
 
 Behind the agent proxy a failed clone is a proxy problem, see `/root/.ccr/README.md`.
 

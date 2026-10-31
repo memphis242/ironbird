@@ -118,6 +118,32 @@ def test_check_rejects_garbage_cheaply(benchmark: Any, mock_codec: Codec) -> Non
     _check_ceiling(benchmark, DECODE_CEILING_S)
 
 
+def test_decode_and_check_variable_length_telemetry_rate(benchmark: Any, mock_codec: Codec) -> None:
+    """A counted array of 64 words and a tail string: the check reads the counts, the decode
+    unpacks the elements with one single-element struct."""
+    wire = mock_codec.encode_telemetry(
+        "MOCK_DATA", {"Entries": list(range(64)), "Text": "x" * 100}
+    ).data
+    assert mock_codec.check(MessageKind.TELEMETRY, wire) is None
+    result = benchmark(mock_codec.decode, MessageKind.TELEMETRY, wire)
+    assert isinstance(result, DecodedPacket) and len(result.values[1]) == 64  # type: ignore[arg-type]
+    _check_ceiling(benchmark, DECODE_CEILING_S)
+
+
+def test_check_variable_length_frame_rate(benchmark: Any, mock_codec: Codec) -> None:
+    wire = mock_codec.encode_telemetry("MOCK_DATA", {"Entries": list(range(64))}).data
+    assert benchmark(mock_codec.check, MessageKind.TELEMETRY, wire) is None
+    _check_ceiling(benchmark, DECODE_CEILING_S)
+
+
+def test_check_rejects_a_variable_length_count_cheaply(benchmark: Any, mock_codec: Codec) -> None:
+    kind, wire = MessageKind.TELEMETRY, mock_codec.encode_telemetry("MOCK_DATA").data
+    bad = wire[:16] + b"\xff\xff" + wire[18:]
+    result = benchmark(mock_codec.check, kind, bad)
+    assert result is not None and result.code is Code.DEC_COUNT
+    _check_ceiling(benchmark, DECODE_CEILING_S)
+
+
 @pytest.fixture
 def v2_codec() -> Codec:
     """The mock CCDD on the cFE MsgId V2 header: the MID is read from three places in the

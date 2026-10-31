@@ -267,6 +267,8 @@ def check_cell(field: FieldDef, cell: str, value: object, *, raw_enums: bool = F
             assert cell == text or text[:1] in "=+-@\t\r\n"
         case TypeClass.BYTES:
             assert isinstance(value, bytes) and cell == "0x" + value.hex()
+        case TypeClass.ARRAY:
+            assert isinstance(value, tuple) and cell == "[" + " ".join(map(repr, value)) + "]"
 
 
 WIDE_COLUMNS = [

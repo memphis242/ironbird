@@ -1,5 +1,5 @@
 {
-  "schema": "ironbird-ccdd/0",
+  "schema": "ironbird-ccdd/1",
   "target": "cfs",
   "messages": [
     {
@@ -2229,6 +2229,100 @@
           "offset": 58,
           "description": "Struct tail padding",
           "units": ""
+        }
+      ]
+    },
+    {
+      "name": "IB_TEST_NOOP",
+      "kind": "command",
+      "mid": "0x18E0",
+      "function_code": 0,
+      "description": "ironbird's test app (tools/cfs/apps/ib_test): no operation",
+      "fields": []
+    },
+    {
+      "name": "IB_TEST_RESET_COUNTERS",
+      "kind": "command",
+      "mid": "0x18E0",
+      "function_code": 1,
+      "description": "ironbird's test app: reset the command counters",
+      "fields": []
+    },
+    {
+      "name": "IB_TEST_SET_DATA",
+      "kind": "command",
+      "mid": "0x18E0",
+      "function_code": 2,
+      "description": "ironbird's test app: store a counted array and a tail string, then publish IB_TEST_VAR (variable length)",
+      "fields": [
+        {"name": "Count", "type": "uint16", "description": "Number of Entries"},
+        {
+          "name": "Entries",
+          "type": "uint32[]",
+          "count": "Count",
+          "max": 64,
+          "description": "Counted array of values"
+        },
+        {
+          "name": "Text",
+          "type": "char[]",
+          "length": "remaining",
+          "max": 122,
+          "description": "Tail string: the rest of the packet"
+        }
+      ]
+    },
+    {
+      "name": "IB_TEST_SEND_VAR",
+      "kind": "command",
+      "mid": "0x18E0",
+      "function_code": 3,
+      "description": "ironbird's test app: publish IB_TEST_VAR with the stored data",
+      "fields": []
+    },
+    {
+      "name": "IB_TEST_SEND_HK",
+      "kind": "command",
+      "mid": "0x18E1",
+      "function_code": 0,
+      "description": "Request one IB_TEST housekeeping packet",
+      "fields": []
+    },
+    {
+      "name": "IB_TEST_HK",
+      "kind": "telemetry",
+      "mid": "0x08E0",
+      "description": "ironbird's test app housekeeping",
+      "category": "housekeeping",
+      "fields": [
+        {"name": "cmd_counter", "type": "uint8", "description": "Accepted commands"},
+        {"name": "err_counter", "type": "uint8", "description": "Rejected commands"},
+        {"name": "entries", "type": "uint16", "description": "Entries stored by SET_DATA"},
+        {"name": "text_len", "type": "uint16", "description": "Text bytes stored by SET_DATA"},
+        {"name": "hk_counter", "type": "uint16", "description": "HK packets sent so far, this one included; each answers one IB_TEST_SEND_HK"}
+      ]
+    },
+    {
+      "name": "IB_TEST_VAR",
+      "kind": "telemetry",
+      "mid": "0x08E1",
+      "description": "ironbird's test app: the stored counted array and tail string (variable length)",
+      "category": "commanded",
+      "fields": [
+        {"name": "Count", "type": "uint16", "description": "Number of Entries"},
+        {
+          "name": "Entries",
+          "type": "uint32[]",
+          "count": "Count",
+          "max": 64,
+          "description": "Counted array of values"
+        },
+        {
+          "name": "Text",
+          "type": "char[]",
+          "length": "remaining",
+          "max": 122,
+          "description": "Tail string: the rest of the packet"
         }
       ]
     }

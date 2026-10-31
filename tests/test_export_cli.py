@@ -12,6 +12,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,7 @@ from ironbird.recording.reader import RecordingReader
 from ironbird.recording.replay import Replay
 from recutil import CLI_MAIN, run_ib
 from replayutil import child_env, hk_frames, write_recording
-from support.faultfs import FaultFs
+from support.faultfs import FaultFs, Rule
 from test_replay import split_set
 
 LEDGER_NAME = "20261031T010203Z-0123456789ab.jsonl"
@@ -510,6 +511,18 @@ def test_a_member_swapped_for_another_file_is_not_written_to(tmp_path: Path) -> 
     assert [p.name for p in (tmp_path / out.leftover).iterdir()] == ["a.csv"]
 
 
+def test_a_member_that_cannot_be_identified_is_removed_at_once(tmp_path: Path) -> None:
+    fs = FaultFs()
+    final = tmp_path / "out"
+    with TempDirOutput(final, fs=fs) as out:
+        out.create("a.csv")
+        fs.rules.append(Rule("fstat", err=errno.EIO, times=1))
+        with pytest.raises(OSError):
+            out.create("b.csv")
+        assert [p.name for p in out.path.iterdir()] == ["a.csv"]
+    assert out.leftover is None and not final.exists() and temporaries(tmp_path) == []
+
+
 def test_a_foreign_file_in_the_temporary_directory_is_left_alone_and_named(tmp_path: Path) -> None:
     final = tmp_path / "out"
     out = TempDirOutput(final)
@@ -682,6 +695,592 @@ def test_sigterm_during_an_export_leaves_no_temporary_file(
             proc.kill()
     assert proc.returncode == 143, err
     assert not out.exists() and temporaries(tmp_path) == []
+
+
+# Child-side hooks that stop the export for a moment at one point where a temporary has just
+# been made: the file or directory created, a table created in it, or the context manager
+# entered but its cleanup not yet registered (an ExitStack). A process descheduled there on a
+# loaded host is what the signal of the test above can hit; the mark tells the parent to send
+# it now.
+_WINDOW_HOOKS = """
+import os, time
+from pathlib import Path
+from ironbird import atomicfile, fsops
+WHERE, MARK = os.environ["IB_TEST_WINDOW"], Path(os.environ["IB_TEST_MARK"])
+
+def window():
+    MARK.touch()
+    time.sleep(0.5)
+
+def hook_open(real):
+    def open_at(self, dir_fd, name, flags, mode=0o600):
+        fd = real(self, dir_fd, name, flags, mode)
+        if flags & os.O_CREAT and name.endswith({"file": ".tmp", "member": ".csv"}.get(WHERE, "/")):
+            window()
+        return fd
+    return open_at
+
+def hook_mkdir(real):
+    def mkdir_at(self, dir_fd, name, mode=0o700):
+        real(self, dir_fd, name, mode)
+        if WHERE == "dir" and name.endswith(".tmp"):
+            window()
+    return mkdir_at
+
+def hook_enter(real, where):
+    def enter(self):
+        entered = real(self)
+        if WHERE == where:
+            window()
+        return entered
+    return enter
+
+fsops.FileSystem.open_at = hook_open(fsops.FileSystem.open_at)
+fsops.FileSystem.mkdir_at = hook_mkdir(fsops.FileSystem.mkdir_at)
+atomicfile.TempOutput.__enter__ = hook_enter(atomicfile.TempOutput.__enter__, "entered")
+atomicfile.TempDirOutput.__enter__ = hook_enter(atomicfile.TempDirOutput.__enter__, "dir_entered")
+"""
+
+
+def _signal_at_window(
+    tmp_path: Path, env: dict[str, str], hooks: str, where: str, fmt: str, *, send: bool = True
+) -> tuple[Path, str]:
+    """Run an export of a small recording to ``tmp_path/out`` with ``hooks`` installed, send
+    SIGTERM once the hooks report the window ``where`` reached, and check it ended by the
+    signal. ``send=False``: the hooks end the command by the signal themselves. Returns the
+    output path and stderr."""
+    hk_and_status(tmp_path / "in.ibrec", 6, 4)
+    out, mark = tmp_path / "out", tmp_path / "window-reached"
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            hooks + CLI_MAIN,
+            "export",
+            str(tmp_path / "in.ibrec"),
+            "--format",
+            fmt,
+            "-o",
+            str(out),
+        ],
+        env={
+            **env,
+            "IB_TEST_WINDOW": where,
+            "IB_TEST_MARK": str(mark),
+            "IB_TEST_FINAL": out.name,
+        },
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        if send:
+            deadline = time.monotonic() + 60
+            while not mark.exists():
+                assert proc.poll() is None, "the export ended without reaching the window"
+                assert time.monotonic() < deadline
+                time.sleep(0.002)
+            proc.send_signal(signal.SIGTERM)
+        _, err = proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 143, err
+    return out, err
+
+
+@pytest.mark.parametrize(
+    ("where", "fmt"),
+    [
+        ("file", "text"),
+        ("entered", "text"),
+        ("dir", "csv"),
+        ("member", "csv"),
+        ("dir_entered", "csv"),
+    ],
+)
+def test_a_signal_just_as_a_temporary_is_made_leaves_nothing_behind(
+    tmp_path: Path, env: dict[str, str], where: str, fmt: str
+) -> None:
+    """The signal lands right after the temporary file, directory or table is created, before
+    the code that made it has recorded it for removal: it is removed all the same."""
+    out, err = _signal_at_window(tmp_path, env, _WINDOW_HOOKS, where, fmt)
+    assert not out.exists() and temporaries(tmp_path) == [], err
+
+
+# Child-side hooks for the steps after the tables are written. ``discard_*``: the commit fails
+# (the data sync of a temporary gives EIO) and the signal lands while the cleanup is between
+# checking a temporary and removing it. ``renameat2`` and ``link``: the signal lands right after
+# the rename (or the hard link, whose unlink of the temporary name is still to come).
+# ``placeholder_*``: the file system has neither a non-replacing rename nor hard links (a
+# directory export on NFS), so the commit makes an empty placeholder at the final name and
+# renames over it; the signal lands between the two. ``after_commit``: the command is ended by
+# the signal after the commit, from the summary.
+_LATE_HOOKS = """
+import errno, os, time
+from pathlib import Path
+from ironbird import fsops
+WHERE, MARK = os.environ["IB_TEST_WINDOW"], Path(os.environ["IB_TEST_MARK"])
+FINAL = os.environ["IB_TEST_FINAL"]
+FS = fsops.FileSystem
+
+def window():
+    MARK.touch()
+    time.sleep(0.5)
+
+def hook_fdatasync(real):
+    def fdatasync(self, fd):
+        if WHERE.startswith("discard") and ".tmp" in os.readlink(f"/proc/self/fd/{fd}"):
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        real(self, fd)
+    return fdatasync
+
+def hook_unlink(real):
+    def unlink_at(self, dir_fd, name):
+        if name.endswith({"discard_file": ".tmp", "discard_member": ".csv"}.get(WHERE, "/")):
+            window()
+        real(self, dir_fd, name)
+    return unlink_at
+
+def hook_mkdir(real):
+    def mkdir_at(self, dir_fd, name, mode=0o700):
+        real(self, dir_fd, name, mode)
+        if WHERE == "placeholder_dir" and name == FINAL:
+            window()
+    return mkdir_at
+
+def hook_open(real):
+    def open_at(self, dir_fd, name, flags, mode=0o600):
+        fd = real(self, dir_fd, name, flags, mode)
+        if WHERE == "placeholder_file" and name == FINAL and flags & os.O_CREAT:
+            window()
+        return fd
+    return open_at
+
+def hook_renameat2(real):
+    def renameat2_noreplace(self, dir_fd, old, new):
+        got = real(self, dir_fd, old, new)
+        if WHERE == "renameat2":
+            window()
+        return got
+    return renameat2_noreplace
+
+def hook_link(real):
+    def link_at(self, dir_fd, old, new):
+        real(self, dir_fd, old, new)
+        if WHERE == "link":
+            window()
+    return link_at
+
+def hook_fsync(real):
+    def fsync(self, fd):
+        real(self, fd)
+        if MARK.exists() and os.path.isdir(f"/proc/self/fd/{fd}"):
+            Path(str(MARK) + ".synced").touch()  # a directory synced after the window
+    return fsync
+
+def no_renameat2(self, dir_fd, old, new):
+    return None
+
+def no_link(self, dir_fd, old, new):
+    raise OSError(errno.EPERM, os.strerror(errno.EPERM))
+
+FS.fdatasync = hook_fdatasync(FS.fdatasync)
+FS.unlink_at = hook_unlink(FS.unlink_at)
+FS.mkdir_at = hook_mkdir(FS.mkdir_at)
+FS.open_at = hook_open(FS.open_at)
+FS.fsync = hook_fsync(FS.fsync)
+FS.renameat2_noreplace = hook_renameat2(FS.renameat2_noreplace)
+FS.link_at = hook_link(FS.link_at)
+if WHERE == "link":
+    FS.renameat2_noreplace = no_renameat2
+if WHERE.startswith("placeholder"):
+    FS.renameat2_noreplace, FS.link_at = no_renameat2, no_link
+if WHERE == "after_commit":
+    # a signal that reaches the command after the commit, whatever held it off until then
+    import signal
+    from ironbird.cli import main as cli_main
+
+    def summary_then_signal(*args, **kwargs):
+        cli_main._STATE.signum = signal.SIGTERM
+        raise cli_main._Terminated(signal.SIGTERM)
+
+    cli_main._export_summary = summary_then_signal
+"""
+
+
+@pytest.mark.parametrize(("where", "fmt"), [("discard_file", "text"), ("discard_member", "csv")])
+def test_a_signal_during_the_cleanup_of_a_failed_commit_leaves_nothing_behind(
+    tmp_path: Path, env: dict[str, str], where: str, fmt: str
+) -> None:
+    """The cleanup after a failed commit is not cut short by a signal that lands in it."""
+    out, err = _signal_at_window(tmp_path, env, _LATE_HOOKS, where, fmt)
+    assert not out.exists() and temporaries(tmp_path) == [], err
+
+
+@pytest.mark.parametrize(
+    ("where", "fmt"), [("placeholder_file", "text"), ("placeholder_dir", "csv")]
+)
+def test_a_signal_between_placeholder_and_rename_leaves_no_empty_output(
+    tmp_path: Path, env: dict[str, str], where: str, fmt: str
+) -> None:
+    """A commit by placeholder is not split by a signal: the final name ends up with the whole
+    export, never the empty placeholder, and no temporary is left."""
+    out, err = _signal_at_window(tmp_path, env, _LATE_HOOKS, where, fmt)
+    assert temporaries(tmp_path) == [], err
+    if fmt == "csv":
+        assert out.is_dir() and all(p.stat().st_size > 0 for p in out.iterdir()), err
+        assert any(out.iterdir()), err
+    else:
+        assert out.is_file() and out.stat().st_size > 0, err
+
+
+# Child-side hook: every data sync of a temporary (the file, or each table of a directory) counts
+# itself and stops for a while, the first one with the mark that has the parent send the signal.
+_SYNC_HOOKS = """
+import os, time
+from pathlib import Path
+from ironbird import fsops
+MARK = Path(os.environ["IB_TEST_MARK"])
+FS = fsops.FileSystem
+
+def hook_fdatasync(real):
+    def fdatasync(self, fd):
+        if ".tmp" in os.readlink(f"/proc/self/fd/{fd}"):
+            with open(str(MARK) + ".syncs", "a") as count:
+                count.write("x")
+            MARK.touch()
+            time.sleep(2.0)
+        real(self, fd)
+    return fdatasync
+
+FS.fdatasync = hook_fdatasync(FS.fdatasync)
+"""
+
+
+@pytest.mark.parametrize("fmt", ["text", "csv"])
+def test_a_signal_during_the_data_sync_aborts_the_export_and_leaves_nothing(
+    tmp_path: Path, env: dict[str, str], fmt: str
+) -> None:
+    """Syncing the data changes no name, so a signal there ends the export at once: no further
+    sync, no commit, the temporary removed, and the interruption does not claim an output."""
+    out, err = _signal_at_window(tmp_path, env, _SYNC_HOOKS, "sync", fmt)
+    assert not out.exists() and temporaries(tmp_path) == [], err
+    assert (tmp_path / "window-reached.syncs").read_text() == "x", "it waited for every sync"
+    assert "written" not in err
+    (stop,) = _stops(tmp_path)
+    assert stop["committed"] is False and stop["reason"] == "interrupted"
+
+
+def _stops(tmp_path: Path) -> list[dict[str, Any]]:
+    return [e for e in ledger_events(tmp_path) if e["event"] == "export.stop"]
+
+
+def _errors(tmp_path: Path, code: Code) -> list[dict[str, Any]]:
+    return [e for e in ledger_events(tmp_path) if e["kind"] == "error" and e["event"] == code.value]
+
+
+def _assert_whole(out: Path, fmt: str) -> None:
+    if fmt == "csv":
+        assert out.is_dir() and sorted(p.name for p in out.iterdir()) == [
+            "MOCK_HK.csv",
+            "MOCK_STATUS.csv",
+            "malformed.csv",
+        ]
+    else:
+        assert out.is_file() and len(out.read_text().splitlines()) == 10
+
+
+@pytest.mark.parametrize(
+    ("where", "fmt"),
+    [
+        ("renameat2", "text"),
+        ("renameat2", "csv"),
+        ("link", "text"),
+        ("placeholder_file", "text"),
+        ("placeholder_dir", "csv"),
+    ],
+)
+def test_a_signal_in_the_commit_is_reported_as_after_the_export_was_written(
+    tmp_path: Path, env: dict[str, str], where: str, fmt: str
+) -> None:
+    """The export is whole under its final name when the signal is acted on: the directory is
+    still synced, the ledger has the finished export (rows, not 0), and the user is told the
+    export was written."""
+    out, err = _signal_at_window(tmp_path, env, _LATE_HOOKS, where, fmt)
+    assert temporaries(tmp_path) == [], err
+    _assert_whole(out, fmt)
+    assert (tmp_path / "window-reached.synced").exists(), "the directory sync was skipped"
+    (stop,) = _stops(tmp_path)
+    assert stop["rows"] == 10 and stop["committed"] is True and stop["output"] == str(out)
+    notice = next(e for e in ledger_events(tmp_path) if e["event"] == "cli.signal")["notice"]
+    assert "SIGTERM" in notice and "written to" in notice and str(out) in notice
+    assert notice in err
+
+
+@pytest.mark.parametrize(("fmt"), ["text", "csv"])
+def test_a_signal_after_the_commit_still_ledgers_the_finished_export(
+    tmp_path: Path, env: dict[str, str], fmt: str
+) -> None:
+    """Whatever lets a signal through after the commit, the stop record says committed, with the
+    output and the rows, and the line names the output."""
+    out, err = _signal_at_window(tmp_path, env, _LATE_HOOKS, "after_commit", fmt, send=False)
+    _assert_whole(out, fmt)
+    (stop,) = _stops(tmp_path)
+    assert stop["rows"] == 10 and stop["committed"] is True and stop["output"] == str(out)
+    assert stop["reason"] == "done"
+    assert "written to" in err and str(out) in err and temporaries(tmp_path) == []
+
+
+@pytest.mark.parametrize(("where", "fmt"), [("discard_file", "text"), ("discard_member", "csv")])
+def test_a_signal_in_the_cleanup_does_not_hide_the_error_that_caused_it(
+    tmp_path: Path, env: dict[str, str], where: str, fmt: str
+) -> None:
+    """The failed commit (EIO) is ledgered once and shown, besides the interruption."""
+    out, err = _signal_at_window(tmp_path, env, _LATE_HOOKS, where, fmt)
+    assert not out.exists() and temporaries(tmp_path) == [], err
+    failures = _errors(tmp_path, Code.EXP_WRITE)
+    assert len(failures) == 1, failures
+    assert Code.EXP_WRITE.value in err and "interrupted" in err
+    assert [e["reason"] for e in _stops(tmp_path)] == ["error"]
+
+
+# Child-side hooks that fail a step that runs in a held scope and not yet in the export's
+# cleanup: ``open_dir``: the directory of the output cannot be opened; ``member_enospc``: the
+# disk is full as the first table is created. Each waits first, so the signal lands as the
+# failure leaves the scope.
+_STEP_FAILURE_HOOKS = """
+import errno, os, time
+from pathlib import Path
+from ironbird import fsops
+WHERE, MARK = os.environ["IB_TEST_WINDOW"], Path(os.environ["IB_TEST_MARK"])
+FS = fsops.FileSystem
+real_dir, real_open = FS.open_dir, FS.open_at
+
+def open_dir(self, path):
+    if WHERE == "open_dir" and "missing" in str(path):
+        MARK.touch()
+        time.sleep(0.5)
+    return real_dir(self, path)
+
+def open_at(self, dir_fd, name, flags, mode=0o600):
+    if WHERE == "member_enospc" and name.endswith(".csv") and flags & os.O_CREAT:
+        MARK.touch()
+        time.sleep(0.5)
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), name)
+    return real_open(self, dir_fd, name, flags, mode)
+
+FS.open_dir, FS.open_at = open_dir, open_at
+"""
+
+
+@pytest.mark.parametrize("signalled", [True, False])
+@pytest.mark.parametrize(("where", "fmt"), [("open_dir", "text"), ("member_enospc", "csv")])
+def test_a_step_that_fails_is_reported_as_the_export_failure_with_or_without_a_signal(
+    tmp_path: Path, env: dict[str, str], where: str, fmt: str, signalled: bool
+) -> None:
+    """A step of the write that fails (the output's directory is missing, the disk is full) is
+    IB-EXP-001 with the advice of that error. A signal that lands as the step's scope ends
+    takes the raw ``OSError`` out of the code that would have mapped it; the user is still
+    shown IB-EXP-001, never an unexpected-exception report, and the ledger agrees."""
+    hk_and_status(tmp_path / "in.ibrec", 3, 2)
+    out, mark = tmp_path / ("missing/out" if where == "open_dir" else "out"), tmp_path / "mark"
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _STEP_FAILURE_HOOKS + CLI_MAIN,
+            "export",
+            str(tmp_path / "in.ibrec"),
+            "--format",
+            fmt,
+            "-o",
+            str(out),
+        ],
+        env={**env, "IB_TEST_WINDOW": where, "IB_TEST_MARK": str(mark)},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        if signalled:
+            deadline = time.monotonic() + 60
+            while not mark.exists():
+                assert proc.poll() is None, "the export ended without reaching the step"
+                assert time.monotonic() < deadline
+                time.sleep(0.002)
+            proc.send_signal(signal.SIGTERM)
+        _, err = proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == (143 if signalled else 1), err
+    assert Code.EXP_WRITE.value in err and Code.INTERNAL.value not in err, err
+    assert ("interrupted" in err) is signalled
+    assert len(_errors(tmp_path, Code.EXP_WRITE)) == 1 and not _errors(tmp_path, Code.INTERNAL)
+    assert [e["reason"] for e in _stops(tmp_path)] == ["error"]
+    assert not out.exists() and temporaries(tmp_path) == []
+
+
+class _Raised(BaseException):
+    pass
+
+
+@pytest.fixture
+def raising_hup() -> Any:
+    def handler(_signum: int, _frame: object) -> None:
+        raise _Raised
+
+    previous = signal.signal(signal.SIGHUP, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+
+def _hup_after(real: Any) -> Any:
+    """``real`` followed by a SIGHUP to this thread (its handler raises :class:`_Raised`)."""
+
+    def call(*args: Any) -> Any:
+        got = real(*args)
+        signal.pthread_kill(threading.get_ident(), signal.SIGHUP)
+        return got
+
+    return call
+
+
+_MAIN_THREAD_ONLY = pytest.mark.skipif(
+    threading.current_thread() is not threading.main_thread(),
+    reason="signal handlers can only be set in the main thread",
+)
+
+
+@_MAIN_THREAD_ONLY
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_a_signal_in_the_rename_is_acted_on_after_the_directory_sync_and_the_note(
+    tmp_path: Path, raising_hup: None, kind: str
+) -> None:
+    fs = FaultFs()
+    fs.override("renameat2_noreplace", _hup_after(fsops.REAL_FS.renameat2_noreplace))
+    out = tmp_path / "out"
+    output: TempOutput | TempDirOutput = (
+        TempOutput(out, fs=fs) if kind == "file" else TempDirOutput(out, fs=fs)
+    )
+    with pytest.raises(_Raised), output:
+        if isinstance(output, TempOutput):
+            output.write(b"x")
+        else:
+            output.write(output.create("a.csv"), b"x")
+        output.commit()
+    assert output.committed and out.exists() and temporaries(tmp_path) == []
+    renamed = next(i for i, (name, _) in enumerate(fs.calls) if name == "renameat2_noreplace")
+    dir_fd = fs.calls[renamed][1][0]
+    assert ("fsync", (dir_fd,)) in fs.calls[renamed:], "the directory sync was skipped"
+
+
+# -- committing by hard link: the unlink of the temporary name ----
+
+
+def _no_renameat2(fs: FaultFs) -> None:
+    fs.override("renameat2_noreplace", lambda dir_fd, old, new: None)  # as on NFS
+
+
+def test_a_link_commit_whose_unlink_reply_was_lost_is_a_success(tmp_path: Path, rec: Path) -> None:
+    """The unlink went through but its reply was lost, and the retransmit gets ENOENT."""
+    fs = FaultFs()
+    _no_renameat2(fs)
+
+    def lost_reply(dir_fd: int, name: str) -> None:
+        fsops.REAL_FS.unlink_at(dir_fd, name)
+        raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), name)
+
+    fs.override("unlink_at", lost_reply)
+    out = tmp_path / "out.txt"
+    result, note = write_to_file(out, force=False, run=run_into(rec), fs=fs)
+    assert note is None and result.rows == 10 and len(out.read_text().splitlines()) == 10
+    assert temporaries(tmp_path) == []
+
+
+def test_a_link_commit_that_cannot_remove_the_temporary_name_is_committed_and_names_it(
+    tmp_path: Path, rec: Path
+) -> None:
+    fs = FaultFs()
+    _no_renameat2(fs)
+    fs.fail("unlink_at", errno.EIO, when=lambda dir_fd, name: name.endswith(".tmp"))
+    out = tmp_path / "out.txt"
+    with TempOutput(out, fs=fs) as direct:
+        direct.write(b"complete\n")
+        with pytest.raises(atomicfile.LeftoverAfterCommit) as caught:
+            direct.commit()
+    left = direct.name
+    assert caught.value.leftover == left and direct.committed
+    assert out.read_bytes() == b"complete\n" and temporaries(tmp_path) == [left]
+    (tmp_path / left).unlink()
+
+    result, note = write_to_file(out.with_name("other.txt"), force=False, run=run_into(rec), fs=fs)
+    assert result.rows == 10 and len(out.with_name("other.txt").read_text().splitlines()) == 10
+    assert note is not None and "remove it by hand" in note
+    assert "partial output was removed" not in note
+    assert note.count(".other.txt.") == 1 and len(temporaries(tmp_path)) == 1
+
+
+@_MAIN_THREAD_ONLY
+@pytest.mark.parametrize("case", ["ironbird", "other", "handled"])
+def test_only_a_failure_that_a_signal_replaced_is_reported_with_the_interruption(
+    tmp_path: Path, rec: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """A signal acted on as a held scope ends while a failure leaves it takes the failure's
+    place: the ledger has the failure and the user is shown it, besides the interruption (an
+    unexpected exception as IB-INT-001, as without the signal). A failure that was being handled
+    on purpose when the signal arrived (``handled``: a retry waiting in its ``except`` block) is
+    not reported: it is on the signal's context, but nothing replaced it."""
+    from typer.testing import CliRunner
+
+    from ironbird.cli import main as cli_main
+    from ironbird.sigmask import signals_held
+
+    for name in ("state", "recordings"):
+        (tmp_path / name).mkdir(mode=0o700)
+    for key, value in child_env(tmp_path).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("IRONBIRD_CONFIG", raising=False)
+    for attr in ("signum", "announced", "_raises"):  # restored after the test
+        monkeypatch.setattr(cli_main._STATE, attr, getattr(cli_main._STATE, attr))
+    monkeypatch.setattr(cli_main._STATE, "signum", 0)
+    previous = signal.signal(signal.SIGTERM, cli_main._STATE._handle)
+
+    def sigterm() -> None:
+        signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+
+    def failing(*args: Any, **kwargs: Any) -> None:
+        if case == "handled":
+            try:
+                raise IronbirdError(Code.EXP_WRITE, "cannot write the export: retried")
+            except IronbirdError:
+                sigterm()  # the handler raises here, inside the except block
+            raise AssertionError("not reached")
+        with signals_held():  # held: the handler runs as the failure leaves the scope
+            sigterm()
+            if case == "ironbird":
+                raise IronbirdError(Code.EXP_WRITE, "cannot write the export: disk trouble")
+            raise ValueError("not an ironbird error")
+
+    monkeypatch.setattr(cli_main, "write_to_file", failing)
+    try:
+        result = CliRunner().invoke(
+            cli_main.app, ["export", str(rec), "--format", "text", "-o", str(tmp_path / "o.txt")]
+        )
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert result.exit_code == 143, result.output
+    assert "interrupted" in result.output
+    reported = {"ironbird": Code.EXP_WRITE, "other": Code.INTERNAL, "handled": None}[case]
+    for code in (Code.EXP_WRITE, Code.INTERNAL):
+        assert bool(_errors(tmp_path, code)) is (code is reported), ledger_events(tmp_path)
+        assert (code.value in result.output) is (code is reported)
+    assert [e["reason"] for e in _stops(tmp_path)] == [
+        "interrupted" if reported is None else "error"
+    ]
 
 
 def test_a_reader_that_goes_away_ends_a_stdout_export_quietly(
@@ -908,7 +1507,7 @@ def test_an_output_that_became_the_input_while_exporting_is_refused_at_the_commi
         return result
 
     with pytest.raises(IronbirdError) as caught, contextlib.closing(replaying):
-        write_to_file(out, force=True, run=run, before_commit=input_guard(out, replaying))
+        write_to_file(out, force=True, run=run, before_publish=input_guard(out, replaying))
     assert (
         caught.value.code is Code.EXP_EXISTS and "recording being exported" in caught.value.summary
     )
@@ -928,7 +1527,7 @@ def test_a_directory_output_that_became_the_input_is_refused_at_the_commit(
         return result
 
     with pytest.raises(IronbirdError) as caught, contextlib.closing(replaying):
-        write_to_directory(out, run=run, before_commit=input_guard(out, replaying))
+        write_to_directory(out, run=run, before_publish=input_guard(out, replaying))
     assert caught.value.code is Code.EXP_EXISTS and temporaries(tmp_path) == []
     assert out.is_symlink() and out.samefile(rec)
 
@@ -937,7 +1536,7 @@ def test_the_guard_lets_an_ordinary_output_through(tmp_path: Path, rec: Path) ->
     out = tmp_path / "out.txt"
     replaying, inner = export_text_of(rec)
     with contextlib.closing(replaying):
-        write_to_file(out, force=False, run=inner, before_commit=input_guard(out, replaying))
+        write_to_file(out, force=False, run=inner, before_publish=input_guard(out, replaying))
     assert len(out.read_text().splitlines()) == 10
 
 

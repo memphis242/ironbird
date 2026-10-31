@@ -388,6 +388,39 @@ Telemetry messages carry a `category` in the CCDD, in priority order: `event`,
 also has an `event` mapping naming its app/id/type/message fields; see `docs/plan.md`
 ("Telemetry categories and events") and `examples/ccdd/cfs.json`.
 
+## Variable-length payloads
+
+A CCDD in schema `ironbird-ccdd/1` can end a message with fields whose size is on the wire:
+
+```json
+{"name": "Count",   "type": "uint16"},
+{"name": "Entries", "type": "uint32[]", "count": "Count", "max": 64},
+{"name": "Text",    "type": "char[]",   "length": "remaining", "max": 122}
+```
+
+The element type is a scalar, `char` or `bytes`. `count` names the fixed field that holds the number
+of elements, `length` the one that holds the number of bytes, and `"remaining"` takes the rest of the
+packet (last field only). `max` is required (`min` defaults to 0); the count field is an unsigned
+integer in the fixed fields, which all come first, and must be able to hold `max`. At most 8 such
+fields per message; the message's `min_payload`/`max_payload` follow from them.
+
+A received packet is checked at ingest like any other: a payload outside the message's range is
+`IB-DEC-007`, a count above `max` is `IB-DEC-008` (the offset is the count field), data that runs
+past the end of the packet is `IB-DEC-009`, and bytes left after the last field are `IB-DEC-007`.
+Values are tuples (`Entries`), text (`Text`, up to the first NUL) or bytes. `listen` shows the first 16
+elements and `...(+N)`; `--format json` carries the whole list; a CSV cell holds `[1 2 3]`.
+
+```bash
+ib send fc MOCK_LOAD_DATA Entries=1,2,3 Text=hello     # Count is filled in; [1,2,3] works too
+ib send fc MOCK_LOAD_DATA Count=9 Entries=1,2 Text=x --allow-count-mismatch   # fault injection
+```
+
+A `Count` that disagrees with the data is `IB-ENC-002` unless `--allow-count-mismatch` is given (a
+usage error on a command with no count or length field); the ledger's `send.request` record carries
+`allow_count_mismatch` and a `send.fault` record carries the `given` and `implied` value of each
+count that went out wrong (nothing when they agree). A number array cannot be used in a
+`--where` filter (`char[]` and `bytes[]` can).
+
 ## Filtering with --where
 
 `ib listen NODE --where EXPR` and `ib events --where EXPR` show only the frames the expression
@@ -475,7 +508,7 @@ field path; a span that does not fit one particular packet is `IB-ENC-004` for a
 - `examples/ironbird.toml` - ground plus a real cFS flight computer (CI_LAB 1234, TO_LAB 2234), telemetry header time in the cFE epoch.
 - `examples/mock.toml` - ironbird-vs-ironbird on distinct ports, with response rules, telemetry header time in Unix seconds.
 - `examples/headers/*.toml` - header profiles (bit widths, fixed/computed fields, checksum).
-- `examples/ccdd/*.json` - placeholder CCDD JSON (`ironbird-ccdd/0`).
+- `examples/ccdd/*.json` - placeholder CCDD JSON (`ironbird-ccdd/1`; `ironbird-ccdd/0` files still load).
 
 ## Development
 

@@ -482,3 +482,35 @@ EVS HK payload: +0 u8 CommandCounter, +1 u8 CommandErrorCounter, +2 u8 MessageFo
 LogFullFlag, +7 u8 LogMode, +8 u16 MessageSendCounter, +10 u16 LogOverflowCounter, +12 u8
 LogEnabled, +13 u8[3] Padding, +16 `AppData[16]` of 8-byte records (u32 AppID, u16
 AppMessageSentCounter, u8 AppEnableStatus, u8 AppMessageSquelchedCounter).
+
+## 8. Variable-length packets: none in stock cFS, and `ib_test`
+
+Checked in the source of the pinned bundle (stage 2j). Every command of cFE ES, EVS, TIME, SB, TBL
+and of SAMPLE_APP, CI_LAB, TO_LAB and SCH_LAB has one exact size, which the app verifies with
+`CFE_MSG_GetSize` (section 5), and every telemetry packet of those apps is a fixed `sizeof`. The
+places the bundle sets a packet size at run time (`grep CFE_MSG_SetSize`) are CI_LAB (the size of the
+datagram it ingests), CF (CFDP PDUs, protocol bytes with their own framing) and MD, whose dwell
+packet is `sizeof(MD_DwellPkt_t) - MD_INTERFACE_DWELL_TABLE_SIZE * 4 + DataSize` with `ByteCount`
+= `DataSize` in its payload (`apps/md/fsw/src/md_dwell_pkt.c`): a count followed by that many bytes.
+That is a stock variable-length packet, but MD is not part of the verification set (it starts only
+with `CFS_APPS=ALL`, and a dwell packet needs a loaded dwell table and a started dwell on top), so
+the acceptance tests do not depend on it; a case against it is a follow-up. The core and sample
+apps in the verification set have none.
+
+`tools/cfs/apps/ib_test` is the app that does. It is built with the bundle (`build.sh` copies it to
+`apps/ib_test` and lists it in `sample_defs/targets.cmake`) and started by `run.sh` when `CFS_APPS`
+names it. Topic IDs `0xE0` and `0xE1`, above every topic the bundle uses (`0xC9` is the highest).
+
+| Message | MID | Layout after the cFE header |
+|---------|-----|-----------------------------|
+| commands | `0x18E0` | fc 0 NOOP, fc 1 RESET_COUNTERS, fc 3 SEND_VAR: header only (8 bytes) |
+| `IB_TEST_SET_DATA` (fc 2) | `0x18E0` | `u16 Count`, `u32 Entries[Count]`, then the string to the end of the packet (0..122 bytes, no NUL); size 10 + 4 Count + length |
+| `IB_TEST_SEND_HK` | `0x18E1` | header only |
+| `IB_TEST_HK` | `0x08E0` | `u8 CmdCounter`, `u8 ErrCounter`, `u16 Entries`, `u16 TextLen`, `u16 Spare` (24 bytes) |
+| `IB_TEST_VAR` | `0x08E1` | the same layout as SET_DATA: 18..396 bytes |
+
+SET_DATA is checked against the layout byte for byte: a count above 64, a count that runs past the
+packet, or a string above 122 bytes bumps `ErrCounter` (event 5 `IB_TEST: ... rejected`) and stores
+nothing. A good one stores the data, bumps `CmdCounter`, and publishes `IB_TEST_VAR`. TO_LAB does not
+forward the two telemetry MIDs by default; add them with `TO_LAB_ADD_PKT Stream=0x8E0` and
+`Stream=0x8E1`. Both are little-endian, as everything else on this target.

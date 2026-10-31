@@ -29,13 +29,7 @@ import typer
 from ironbird import render
 from ironbird.ccdd.model import EventSeverity, MessageKind
 from ironbird.cli import prunecmd
-from ironbird.cli.output import (
-    CLOSE_WAIT_S,
-    HANDLED_SIGNALS,
-    BoundedWriter,
-    Console,
-    signals_held,
-)
+from ironbird.cli.output import CLOSE_WAIT_S, BoundedWriter, Console
 from ironbird.codec import Codec
 from ironbird.config import RecordingConfig, RetentionConfig, SystemConfig, find_config, load_config
 from ironbird.errors import Code, IronbirdError
@@ -57,6 +51,7 @@ from ironbird.recording.export import (
     ExportResult,
     Selection,
     StdoutDestination,
+    WriteProgress,
     check_messages,
     check_single_layout,
     input_guard,
@@ -87,6 +82,7 @@ from ironbird.retention import LONG_COMMANDS
 from ironbird.retnotices import Notices
 from ironbird.retservice import Retention
 from ironbird.session import Route, Session, Side
+from ironbird.sigmask import HANDLED_SIGNALS, Hold, Interrupted, signals_held
 
 EXIT_TIMEOUT: Final = 3  # --count was given and not reached before --timeout
 EXIT_OUTPUT_LOST: Final = 4  # the command completed but stdout lines were lost
@@ -228,12 +224,8 @@ def _root(
 # -- signals ------------------------------------------------------------------------------
 
 
-class _Terminated(BaseException):
+class _Terminated(Interrupted):
     """Raised by the signal handler when no event loop is running to cancel instead."""
-
-    def __init__(self, signum: int) -> None:
-        super().__init__(signum)
-        self.signum = signum
 
 
 class _SignalState:
@@ -313,6 +305,8 @@ class _Run:
     config_error: IronbirdError | None = None
     config_missing: bool = False  # no configuration file at all (not an error for offline tools)
     retention: Retention | None = None
+    # an output complete under its final name, as "the export was written to X" (for a signal)
+    wrote: str | None = None
 
 
 Body = Callable[[Session, SystemConfig, "_Run"], Awaitable[int]]
@@ -405,6 +399,8 @@ def _interrupt_notice(name: str, signum: int, run: _Run) -> str:
     sig = signal.Signals(signum).name
     tx = run.session.last_tx if run.session is not None else None
     if name != "send":
+        if run.wrote is not None:
+            return f"interrupted ({sig}) after {run.wrote}"
         return f"interrupted ({sig})"
     if tx is None:
         return f"interrupted ({sig}): no command was built, so nothing was sent"
@@ -696,6 +692,40 @@ def _usage_error(
     return None
 
 
+def _shown_replacement(stop: BaseException) -> Exception | None:
+    """The failure that ``stop`` (a signal's exception) replaced and that is reported with the
+    interruption (see :func:`_report_replaced`), if any."""
+    replaced = stop.replaced if isinstance(stop, Interrupted) else None
+    if isinstance(replaced, Exception) and not isinstance(replaced, typer.Exit):
+        return replaced
+    return None
+
+
+def _report_replaced(stop: BaseException, ledger: Ledger, console: Console, verbose: bool) -> None:
+    """Ledger and show the failure that a signal's exception replaced, if it replaced one.
+
+    Only :attr:`~ironbird.sigmask.Interrupted.replaced` counts: the exception that was leaving a
+    held scope as the signal was acted on at its end (a cleanup that runs for a failure is
+    where a signal lands then). An exception that was being handled on purpose when a signal
+    arrived is not one, and neither is anything on the ``__context__`` chain. An
+    :class:`IronbirdError` is reported as it is; any other exception as ``IB-INT-001`` with its
+    traceback, as it would have been without the signal."""
+    replaced = _shown_replacement(stop)
+    if replaced is None:
+        return
+    if isinstance(replaced, IronbirdError):
+        error = replaced
+    else:
+        error = IronbirdError(
+            Code.INTERNAL,
+            f"unexpected {type(replaced).__name__}: {replaced}",
+            details="".join(traceback.format_exception(replaced)),
+            cause=replaced,
+        )
+    ledger.record_error(error)
+    _print_error(console, error, verbose)
+
+
 def _run(
     ctx: typer.Context,
     as_node: str | None,
@@ -798,6 +828,7 @@ def _run(
             if not _STATE.signum:
                 raise
             signum = stop.signum if isinstance(stop, _Terminated) else _STATE.signum
+            _report_replaced(stop, ledger, console, glob.verbose)
             code = _record_signal(name, signum, run, ledger, console)
         except IronbirdError as exc:
             ledger.record_error(exc)
@@ -1070,18 +1101,28 @@ def send(
             "(repeatable); wins over the command's CCDD header values and the profile default.",
         ),
     ] = None,
+    allow_count_mismatch: Annotated[
+        bool,
+        typer.Option(
+            "--allow-count-mismatch",
+            help="Fault injection: accept a count or length value that disagrees with the "
+            "data of the variable-length field it sizes.",
+        ),
+    ] = False,
     as_node: AsOption = None,
     verbose: VerboseOption = False,
 ) -> None:
-    """Encode and send one command; print a one-line confirmation."""
+    """Encode and send one command; print a one-line confirmation.
+
+    A variable-length argument is a list (Entries=1,2,3 or Entries=[1,2,3]), text, or hex for
+    bytes; its count or length argument is filled in when left out."""
 
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
         parsed = _parse_args(args)
         header_values = _parse_header_values(header)
         tamper: dict[str, int] = {}
-        profile = session.codec_for(session.route(node, link_name=link).server.name).profile(
-            MessageKind.COMMAND
-        )
+        codec = session.codec_for(session.route(node, link_name=link).server.name)
+        profile = codec.profile(MessageKind.COMMAND)
         if bad_checksum:
             if profile.checksum_field is None:
                 raise IronbirdError(Code.CLI_USAGE, f"profile {profile.name} has no checksum field")
@@ -1091,8 +1132,20 @@ def send(
                 raise IronbirdError(Code.CLI_USAGE, f"profile {profile.name} has no length field")
             _check_length_delta(length_delta, profile.length_field.bits, profile.name)
             tamper[profile.length_field.name] = length_delta
+        if allow_count_mismatch and not codec.count_field_names(command, MessageKind.COMMAND):
+            raise IronbirdError(
+                Code.CLI_USAGE,
+                f"--allow-count-mismatch needs a command with a count or length field; "
+                f"{term(command[:64])} has none",
+            )
         sent = await session.send_command(
-            node, command, parsed, tamper=tamper, link=link, header=header_values
+            node,
+            command,
+            parsed,
+            tamper=tamper,
+            link=link,
+            header=header_values,
+            allow_count_mismatch=allow_count_mismatch,
         )
         run.console.out(
             f"sent {term(sent.command)} to {term(sent.node)} via udp {term(sent.endpoint)} "
@@ -1590,11 +1643,20 @@ def rec_repair(
     """Copy the valid prefix of IN plus a fresh index and trailer to a new file OUT."""
 
     def work(ledger: Ledger, console: Console, run: _Run) -> int:
+        # Begun by the publish of the repaired file and released as this block ends, after the
+        # repair is recorded and reported (as for ib export).
+        with Hold() as hold:
+            return work_holding(ledger, console, run, hold)
+
+    def work_holding(ledger: Ledger, console: Console, run: _Run, hold: Hold) -> int:
         ledger.record("action", "rec.repair.start", source=source, output=output, force=force)
         try:
-            result = rec_inspect.repair(source, output, force=force)
+            result = rec_inspect.repair(source, output, force=force, hold=hold)
         except IronbirdError as exc:
             return _rec_failure(ledger, console, run, exc)
+        # a signal acted on from here finds the repaired file whole; the notice says so
+        named = term(str(result.output), 300, err=True)
+        run.wrote = f"the repaired recording was written to {named}"
         ledger.record(
             "action",
             "rec.repair.done",
@@ -1619,6 +1681,15 @@ def rec_repair(
             sync_warning = IronbirdError(Code.REC_DIRSYNC, warning)
             ledger.record_error(sync_warning, output=result.output)
             console.err(sync_warning.user_line())
+        if result.leftover is not None:
+            left = IronbirdError(
+                Code.REC_LEFTOVER,
+                f"the repaired file {term(str(result.output), 400, err=True)} was written, but "
+                f"the temporary file {term(result.leftover, 200, err=True)} beside it could not "
+                "be removed; remove it by hand",
+            )
+            ledger.record_error(left, output=result.output)
+            console.err(left.user_line())
         damage = result.damage
         if damage is None:
             return 0
@@ -2291,9 +2362,18 @@ def export_command(
     base: Globals = ctx.obj
 
     def work(ledger: Ledger, console: Console, run: _Run) -> int:
+        # Begun by the publish of the output and released as this block ends, after the export
+        # is recorded and summarised: a signal cannot cut that short; its handler runs then.
+        with Hold() as hold:
+            return work_holding(ledger, console, run, hold)
+
+    def work_holding(ledger: Ledger, console: Console, run: _Run, hold: Hold) -> int:
         replaying: Replay | None = None
         ending = "interrupted"
         rows = 0
+        stopped = False  # export.stop is in the ledger
+        directory = False  # the output is a directory of tables
+        progress = WriteProgress()
         try:
             start = parse_time_spec(from_, "--from") if from_ is not None else None
             end = parse_time_spec(to, "--to") if to is not None else None
@@ -2414,24 +2494,27 @@ def export_command(
             if output is None:
                 result = run_it(StdoutDestination(console.stdout.write_wait))
                 target = "stdout"
-            elif directory:
-                result, sync = write_to_directory(
-                    output, run=run_it, before_commit=input_guard(output, replaying)
-                )
-                target = f"directory {term(str(output), 300, err=True)}"
             else:
-                result, sync = write_to_file(
-                    output, force=force, run=run_it, before_commit=input_guard(output, replaying)
-                )
-                target = term(str(output), 300, err=True)
+                guard = input_guard(output, replaying)
+                if directory:
+                    target = f"directory {term(str(output), 300, err=True)}"
+                    result, sync = write_to_directory(
+                        output, run=run_it, before_publish=guard, hold=hold, progress=progress
+                    )
+                else:
+                    target = term(str(output), 300, err=True)
+                    result, sync = write_to_file(
+                        output,
+                        force=force,
+                        run=run_it,
+                        before_publish=guard,
+                        hold=hold,
+                        progress=progress,
+                    )
             ending = result.ending.value
             rows = result.rows
             if sync is not None:
-                warning = (
-                    f"the directory of {term(str(output), 300, err=True)} could not be synced "
-                    f"({term(sync, 200, err=True)}); the export exists, but its name may not "
-                    "survive a power loss"
-                )
+                warning = term(sync, 600, err=True)
                 ledger.record("warning", Code.EXP_WRITE.value, summary=warning, output=output)
                 console.err(f"warning {Code.EXP_WRITE.value}: {warning}")
             _report_unclosed(replaying, ledger, console, "exported")
@@ -2453,6 +2536,8 @@ def export_command(
                 "export.stop",
                 reason=ending,
                 rows=result.rows,
+                committed=progress.committed,
+                output=output,
                 files=result.files,
                 tables=dict(list(result.per_table.items())[:64]),
                 decoded=result.decoded,
@@ -2470,16 +2555,36 @@ def export_command(
                 chunks_skipped=stats.chunks_skipped,
                 rejected=dict(result.rejected),
             )
+            stopped = True
             damaged = stats.mid_file_damage or bool(stats.missing_parts)
             return EXIT_DAMAGED_INPUT if damaged else 0
         except IronbirdError as exc:
             ending = "error"
             return _rec_failure(ledger, console, run, exc)
+        except Interrupted as stop:
+            if _shown_replacement(stop) is not None:
+                ending = "error"  # a failure the signal replaced; _run reports it
+            raise
         finally:
             if replaying is not None:
                 replaying.close()
-            if ending in ("interrupted", "error"):
-                ledger.record("state", "export.stop", reason=ending, rows=rows)
+            if progress.committed:
+                # A signal acted on after the commit finds the export whole under its final
+                # name; the notice says so.
+                assert output is not None
+                named = f"{'directory ' if directory else ''}{term(str(output), 300, err=True)}"
+                run.wrote = f"the export was written to {named}"
+            if not stopped:
+                if progress.result is not None:
+                    rows = progress.result.rows
+                ledger.record(
+                    "state",
+                    "export.stop",
+                    reason=ending,
+                    rows=rows,
+                    committed=progress.committed,
+                    output=output,
+                )
 
     _run(ctx, None, verbose, None, "export", offline=work)
 

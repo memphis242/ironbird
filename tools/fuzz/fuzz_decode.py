@@ -5,7 +5,8 @@ Usage: python tools/fuzz/fuzz_decode.py [-max_total_time=N]
 Invariant: Codec.decode and header.unpack never raise and return a typed result for any
 bytes, in either direction, through the shipped headers, the cFE MsgId V2 headers (a MID read
 from three places) and a header with a CRC trailer; frame_length answers an int or None.
-Seeds are the checked-in malformed packets plus valid packets.
+Seeds are the checked-in malformed packets (including the variable-length ones) plus valid
+packets.
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ _SHIPPED_VALID = (
     CODEC.encode_command("MOCK_NOOP").data,
     CODEC.encode_command("MOCK_SET_LABEL", {"label": "abc"}).data,
     CODEC.encode_telemetry("MOCK_HK", {"cmd_counter": 5, "label": "x"}).data,
+    CODEC.encode_command("MOCK_LOAD_DATA", {"Entries": "1,2,3", "Text": "abc"}).data,
+    CODEC.encode_telemetry("MOCK_DATA", {"Entries": list(range(40)), "Text": "hello"}).data,
 )
 KINDS = (MessageKind.COMMAND, MessageKind.TELEMETRY)
 
@@ -111,7 +114,7 @@ def one_input(data: bytes) -> None:
 def main() -> None:
     """Fuzz in a scratch corpus seeded from the checked-in packets (the repo stays clean)."""
     scratch = Path(tempfile.mkdtemp(prefix="ironbird-fuzz-"))
-    for i, packet in enumerate((REPO / "tests" / "corpus" / "malformed").glob("packet-*.bin")):
+    for i, packet in enumerate((REPO / "tests" / "corpus" / "malformed").glob("*packet-*.bin")):
         (scratch / f"seed{i}").write_bytes(packet.read_bytes())
     for i, packet in enumerate(VALID):
         (scratch / f"valid{i}").write_bytes(packet)

@@ -2938,6 +2938,213 @@ variable-length packet as far as the Stage 1 survey shows (2j confirms it from s
 see decision D6. The `ib_test` cFS app's variable-length packet (a counted array and a tail
 string) is built here, so these cFS cases run against real FSW.
 
+As built (where the build differs from, or settles, the text above)
+- Modules: `ccdd/model.py` (`TypeClass.ARRAY`, `VarUnit`, `VarSpec`, `parse_element_type`,
+  `FieldDef.var`, and on `Message` the derived `fixed_extent`, `min_payload` and `is_variable`),
+  `ccdd/json_adapter.py` (schema `/1`, variable fields, derived payload bounds), `codec.py`
+  (`_VarSlot`, the count walk, `coerce_variable`), `render.py`, `recording/export.py`
+  (`_array_cell`), `filter/compiler.py`, `session.py` + `cli/main.py` (`--allow-count-mismatch`),
+  `errors.py` (`IB-DEC-008` `DEC_COUNT`, `IB-DEC-009` `DEC_OVERRUN`), `ledger.py` (both are
+  evidence-tier errors like the other `IB-DEC-*`). `tools/cfs/apps/ib_test` is the cFS app.
+- Schema. `ironbird-ccdd/1` is the schema the shipped files and new files use; `/0` loads as before
+  and may not use `[]` types, `count`/`length`/`max`/`min` or `min_payload`/`max_payload` (a `[]` type
+  in a `/0` file says which schema it needs; the rest are unknown keys). Rules beyond the text: a
+  variable field takes no `offset`, `enum` or `payload_size`; exactly one of `count` and `length`
+  (`"remaining"` is accepted by either, and a count field cannot be called `remaining`); `max` is
+  `1..65535` elements, `min` `0..max`; the count or length field is a fixed, unsigned integer field
+  that is declared before the field it sizes and whose range holds `max` (elements for `count`,
+  `max * element size` bytes for `length`); one count field sizes one field; a fixed field after a
+  variable one is `IB-CCD-003`, as is a ninth variable field, a `remaining` that is not last and a
+  total above `MAX_PAYLOAD_BYTES`. `min_payload` and `max_payload` are derived (fixed extent plus the
+  fields' minimum and maximum bytes); a file may state them and a disagreement is `IB-CCD-003`.
+  `Message.payload_size` stays and is the maximum (equal to `max_payload`; the fixed messages are
+  unchanged), `min_payload` is new. A variable field's `offset` is the start of the variable section
+  (the end of the fixed fields), which is where it begins only when the fields before it are empty.
+- Where the counts are checked. The text says decode reports `IB-DEC-008` and `IB-DEC-009`; the build
+  does it in `Codec.resolve` (so `check`, which the engine runs on every frame at ingest, reports
+  them) and keeps `decode` believing exactly what `check` accepts, the invariant of 2b. Reasons: a
+  malformed variable-length packet is then counted, ledgered and coalesced once at ingest like any
+  other (the 2b note that `FrameDecoder` must report decode-only errors in both modes has nothing to
+  report, and `FrameDecoder` is unchanged), a filter or a front-end never sees a packet whose fields
+  disagree with its counts, and the walk is done once: `Resolved.counts` carries each field's element
+  count to `decode_resolved`. Only variable messages pay (a fixed message adds one attribute test
+  to `resolve`: `check` 2.1 us on the 4-core host, noisy, 1.6-1.8 us before); `check` of a
+  64-element packet is 3.1 us, its decode 17 us.
+- Errors, in the order the walk meets them. The payload outside `[min_payload, max_payload]`:
+  `IB-DEC-007` at the payload (the packet as a whole is checked before any count is read, so the
+  count fields are always inside it). Per field in wire order: a count above `max`, or a byte
+  length above `max * size`, or `remaining` above that: `IB-DEC-008` at the count field (the start of
+  the data for `remaining`); a byte length or `remaining` that is not a whole number of elements, or
+  fewer elements than `min`: `IB-DEC-007` at the same place; data past the end of the packet (or its
+  trailer): `IB-DEC-009` at the first byte of the data; bytes left after the last field: `IB-DEC-007`
+  at the first of them. Offsets are packet offsets like every `DecodeError`.
+- Values. A scalar array is a tuple, `char[]` is text (up to the first NUL, like `char[N]`), `bytes[]`
+  is `bytes`. `Entries` of 16 or fewer elements shows whole; more shows `[0 1 ... 15 ...(+24)]`
+  and a `bytes[]` shows its first 16 bytes as hex and `...(+N)`. `--format json` carries the whole list
+  (non-finite floats as text), a `bytes[]` its whole hex; a CSV cell is `[1 2 3]` (`[]` empty).
+- Encode. An omitted count or length is filled from its data; one given must agree
+  (`IB-ENC-002`, which names `--allow-count-mismatch`) unless the flag is given, which lets a value
+  that fits the count field go out as given (the data itself must still satisfy `min`/`max`, so
+  the packet fits the cap and the length field). The ledger's `send.request` carries
+  `allow_count_mismatch: true` for such a send and nothing otherwise, and a `send.fault` record
+  (essential) follows the encode with the `given` and `implied` value and unit of each count that went
+  out wrong; a flag whose values agree with the data records no fault. `ib send --allow-count-mismatch`
+  on a command with no count or length field is a usage error (like `--bad-checksum` without a checksum
+  field), before anything is sent. `IB-ENC-002` names the flag only for a command; the same refusal for
+  a telemetry reply (`respond`, which has no such flag) does not. `char[]` text with a NUL is refused
+  (`IB-ENC-002`) since a decode ends text at a NUL and the
+  tail would come back shorter. A telemetry field that is not
+  given is the smallest array the CCDD allows, zero-filled; a command's is a missing argument
+  (`IB-ENC-003`, the count field is not asked for). Lists are `1,2,3`, `[1, 2, 3]` or `1 2 3` (or a
+  Python list or tuple), at most 1 MiB of text; an element error names the position
+  (`Items[1]`); `char[]` is ASCII, `bytes[]` hex. A response rule can fill a variable field from a
+  string (`fields = { Entries = "1,2,3" }`) or echo a command's; TOML arrays are not accepted in
+  rules.
+- Load-time fit. A message is checked at its smallest and its largest size against the cap and the
+  length field, and its checksum span at every size where the span's answer can change (the two ends and
+  the sizes where the span start, span end, checksum field and packet bounds cross, with their
+  neighbours; `header.checksum_probe_sizes`), so a span such as `end = -10` that cuts the checksum field
+  only at a size in between is `IB-ENC-004` at load, not on the wire. The probe covers every byte size
+  from the smallest to the largest packet, reachable or not (conservative by design: a size the
+  length field or the CCDD would never produce can still refuse the message). A fixed field named `remaining` in
+  a message that uses the `"remaining"` keyword is `IB-CCD-*` (layout) at load: the name and the keyword
+  cannot be told apart.
+- Decode token. Only `Codec.resolve` makes a `Resolved`: construction needs a module-private key, the fields
+  are read-only, and there is no `_replace`, copy or pickle. It records the issuing codec and the exact
+  `bytes` object it was made from. `decode_resolved` trusts it, with no re-derivation (identity checks
+  only, so the hot path costs what it did before the token had a content check), when it is a `Resolved`
+  of this codec, of the same kind, for that very `bytes` object; any other pairing (another codec or
+  kind, other bytes, a `bytearray` or `memoryview`, or a look-alike that is not a `Resolved`) takes the
+  whole `decode`, so the answer is always `decode(kind, data)`'s and never raises. The guarantee holds
+  against the public API; code that deliberately builds an instance around the private key or
+  `object.__new__` is outside it.
+- Filter. `char[]` and `bytes[]` filter like the fixed ones (a `bytes[]` comparison takes any length up
+  to the maximum, the empty value `""` included; `contains ""` is refused); a number array has no operator and is `IB-FLT-003` ("an array of numbers cannot be
+  filtered"). Event mappings may name a `char[]` field (`message`), which `events` and `listen` show.
+- `ib_test` (decision D6). `tools/cfs/apps/ib_test` is a small cFS app: `IB_TEST_SET_DATA` (fc 2) carries
+  `u16 Count`, `u32 Entries[Count]` and a tail string and is checked byte for byte by the flight code;
+  a good one is stored and published as `IB_TEST_VAR`, `IB_TEST_SEND_VAR` republishes it,
+  `IB_TEST_SEND_HK` gives counters and `hk_counter`, the HK packets sent so far (each answers one
+  request), which the cFS tests use to take only a reply to a request sent after the command, never a
+  late reply to an older one. The app's rejection event says `got N, limit M`, and `ib_test.h` asserts
+  the header and payload sizes the CCDD relies on at compile time (a negative-size typedef: the build is
+  `-std=c99 -pedantic`). `build.sh` copies each `tools/cfs/apps/*` into the checkout and
+  lists it in `sample_defs/targets.cmake` once (repeatable), and fails if `cf/<app>.so` is missing
+  afterwards; `run.sh` adds `ib_test` to the startup script when `CFS_APPS` names it, and `ALL` is a token of
+  `CFS_APPS` (`ALL ib_test` keeps the stock script and adds `ib_test`); CI's cache key
+  includes `tools/cfs/apps/**`. An existing build must run `tools/cfs/build.sh` again to get it.
+  `tools/cfs/NOTES.md` section 8 records the layouts and the source check: the stock apps in the
+  verification set have no variable-length packet, but the bundle's MD app does (the dwell packet:
+  `ByteCount`, then that many bytes), so the claim "stock cFS has none" holds only for the verification
+  set. MD needs a dwell table and `CFS_APPS=ALL`; a case against it is deferred. The throughput
+  generator is 2l's.
+- Shipped examples. `examples/ccdd/mock.json` and `cfs.json` are `/1` and gain a variable-length command
+  and reply (`MOCK_LOAD_DATA` / `MOCK_DATA`, with a response rule in `examples/mock.toml` that echoes the
+  array and the string) and the `ib_test` messages. `tests/golden_2i.py` limits its model to the
+  messages the golden file recorded (the new ones would shift the seeded mutants), so the 2i proof is
+  unchanged; the replay corpus was rebuilt (`python tests/replay_corpus.py`) because it embeds the
+  shipped mock CCDD.
+- Tests: `test_variable_length.py` (96 cases: model and schema, 28 `ccdd-var-*` corpus files each
+  refused with its reason, encode and every error spelling, decode of each error class with its
+  offset, truncation at every offset of a packet and of its payload under a right header, Hypothesis
+  (arbitrary and header-shaped payloads: no raise, `check` equals `decode`, decode-encode-decode
+  agrees; counts beyond the buffer and the maximum against a model of the mock message; round trip
+  of every element type), rendering, JSON, CSV cells, events, the filter, the mock end to end through
+  `respond` (smallest, empty and largest packets; a malformed one counted and announced once with
+  `x150`), the refusal and ledgering of `--allow-count-mismatch`, and the CLI); `var_corpus.py`
+  builds the corpus (`ccdd-var-*.json`, 16 `varpacket-{cmd,tlm}-*.bin`) and a test proves the checked-in
+  files are its output. The variable packets are seeds of the mutation fuzz in `test_malformed_input.py`
+  and `tools/fuzz/fuzz_decode.py`. Three benchmarks (variable-length decode and check, and the
+  rejection of a bad count; all far below the 100 us ceiling). `tests/cfs/test_cfs_variable_length.py`
+  (6 cases against real cFS with `ib_test`: SET_DATA stored and published, the smallest and the largest
+  packet, SEND_VAR, the flight code rejecting a count that disagrees with the size (counted in its
+  error counter, nothing stored) for a count beyond the packet and one above the maximum, the ledger
+  marking the injected fault, no `IB-DEC-*` report from the listener) pass with the 28 earlier cFS
+  cases on the dev host.
+- Signals around temporaries (a 2h/2e fix made in this stage). Outside an event loop the CLI's signal
+  handler raises `sigmask.Interrupted` (`_Terminated`), so it can land between any two lines. The
+  design has three parts, all in `sigmask.py` and `atomicfile.py`:
+  1. Held scopes. `signals_held()` blocks SIGINT, SIGTERM and SIGHUP; a signal that arrives waits,
+     and its handler runs as the scope ends. Every step that changes the file system and records the
+     change runs in one: creating a temporary file, directory or member together with recording it
+     for removal, the removal of what was created (`_discard`), and the publish below. Scopes end in
+     the reverse order they began (asserted per thread). The mask is read before blocking, because
+     `pthread_sigmask` runs a pending handler before it returns. Helper threads (ledger, retention,
+     gate, output, recorder) start inside one and inherit the block.
+  2. Two-phase commit. `prepare()` syncs the data (a file; every member and the temporary
+     directory) and renames nothing, so it is interruptible: a signal there aborts, the cleanup
+     removes the temporary, and the interruption claims no output. `publish(hold=)` is held from the
+     rename (renameat2, link and unlink, or placeholder and rename, or the `--force` replacement)
+     through the directory sync and the `committed` flag, so a signal is acted on only once the
+     output is durable and known committed. `commit()` is both. A `sigmask.Hold` is the one helper
+     for a caller that must also finish its own record first: `with Hold() as hold:` around the
+     command's work, passed down to `publish`, which calls `hold.begin()` right before the rename;
+     the signal then acts as the block ends. `ib export` (through `write_to_file`/`write_to_directory`,
+     whose `before_publish` input guard runs after the syncs) and `ib rec repair` use it identically:
+     after the rename the done record (`export.stop` with `committed`, the output and the rows;
+     `rec.repair.done`), the result line and any warning are written, then the signal acts, exit
+     128+n, with `interrupted (SIGTERM) after the export was written to X` (or `after the repaired
+     recording was written to X`), also in the `cli.signal` record. `Hold.begin` asserts that no held
+     scope opened since the block began is still open, so an inner scope can never lift it.
+  3. What a signal replaced. When a held scope ends while an exception leaves it (its body raised,
+     or a cleanup passes `unwinding=` the exception its `__exit__` runs for), the `Interrupted` that
+     the handler raises records that exception in `replaced`. A plain step scope (a temporary
+     created, a rename) raises a raw `OSError`, `Collision` or `SyncAfterCommit` that the code one
+     level up maps to its error, so that code wraps itself in `sigmask.naming_replaced(mapper)`,
+     which passes `replaced` through the same mapping: `write_to_file` and `write_to_directory` name
+     `IB-EXP-001` or `IB-EXP-002`, `repair` `IB-REC-001`, and a committed output whose only trouble
+     was the directory sync (a warning without a signal) names nothing; the recovery steps of
+     retention (the prune command runs them in the main thread) handle such a failure themselves
+     (the session is protected, a message says so) and name nothing. `_run` ledgers and shows the
+     one failure that is named besides the interruption (an `IronbirdError` as it is, anything else
+     as `IB-INT-001` with its traceback) and nothing from the `__context__` chain, so an error
+     handled on purpose when the signal arrived (the `replay --follow` head-wait retry) is not
+     reported, and nothing is reported twice. `ib export` records `export.stop` with reason `error`
+     whenever a failure is shown that way, `interrupted` otherwise. `signals_held` restores the mask
+     before it asserts the scope order.
+  On NFS, which has no `RENAME_NOREPLACE`, a regular file takes the hard-link path (link, then unlink
+  of the old name); the placeholder path applies to directory exports and to file systems without
+  hard links, and a held signal never leaves the empty placeholder at the final name. `ENOENT` from
+  the unlink (a retransmit after a lost reply, NFSv3) is success; any other unlink error is
+  `LeftoverAfterCommit` (a `SyncAfterCommit`: the name is committed and the directory still synced),
+  naming the old name and carrying the sync failure if any. Every caller handles it explicitly: an
+  export warns `IB-EXP-001` (the file was written, the temporary T beside it could not be removed;
+  remove it by hand; exit 0); `rec repair` warns `IB-REC-012`; the ledger's reserve retirement
+  records `ledger.note` `retire_leftover` (the part, the reserve name left, the reason); recovery
+  records `leftover` and `leftover_error` in `ledger.recovered`, and the next scan completes the
+  rename (the reserve name is unlinked once it and the part, or its own `.damaged` set-aside, are
+  checked to be the same inode with two links; a completed set-aside is recorded with `new` null
+  and is not counted as recovered); a salvage copy whose temporary name stays records it under
+  `copy` and its one `IB-RET-004` line says to delete it. `export.write_to_file` and
+  `write_to_directory` hold the signals across `ExitStack.enter_context` until the stack holds the
+  cleanup, and fill an optional `WriteProgress` (the temporary output and the result). A member that
+  `fstat` cannot identify right after its creation is removed by name at once
+  (`TempDirOutput.create`, on the deletion allowlist). Tests: the signal at each window, sent to a
+  real `ib export` from a hook that stops there (`test_export_cli.py`: temporary made, data sync,
+  rename, link, placeholder, cleanup of a failed commit, after the commit), the same for `rec repair`
+  (rename, leftover; `test_recording_tools.py`), Ctrl-C in the `replay --follow` head wait
+  (`test_replay_cli.py`), the replaced, unexpected and handled failure under a signal in `_run`, the
+  in-process rename with a signal and the directory sync after it, the lost and the failed unlink of
+  a link commit, the leftover paths of retirement, recovery and salvage (`test_ledger_store.py`,
+  `test_ledger_recovery.py`), and `test_sigmask.py` (`replaced`, `unwinding`, `Hold`, `naming_replaced`, the order assert), and
+  `test_signal_replaced.py` (the replaced failure of each step named as the error without a signal, for
+  export, repair and recovery) with the CLI cases in `test_export_cli.py`.
+- Deferred: arrays of structs (D11); a filter operator over number arrays (`contains`, indexing); TOML
+  arrays in response rules; `--allow-count-mismatch` has no counterpart in `respond` (a reply rule with a wrong count is refused); a real-cFS case
+  against MD's dwell packet; the `ib_test` gcc 8 (EL8) build is covered by CI only. Signals: the
+  default executor threads of `asyncio.to_thread` (UDP drop scan) start without the signal block;
+  harmless while the loop runs (the handler cancels, it does not raise) and gone after `asyncio.run`,
+  but a held scope inside a running loop does not stop the handler from running in it. An `fstat`
+  failure on a held temporary inside `TempOutput._discard` at `__exit__` raises a bare `OSError` and
+  keeps the file unreported (`TempOutput` has no `leftover` like `TempDirOutput`).
+- Deferred (signals): in the failed-cleanup case the ledger has `export.stop` with reason `error` before
+  the `IB-EXP-001` record (the replaced failure is ledgered by `_run` after the command's `finally`).
+- Deferred (signals): `test_replay_cli.py::test_a_signal_ends_a_replay_that_is_blocked_on_a_reader_that_never_reads`
+  fails under extreme load (40 CPU burners) with exit -15, also on `main`.
+- Deferred (signals): a signal acted on in a main-thread prune recovery after a rename committed loses the
+  `ledger.recovered` record of that step (the scan is abandoned with the exception); the next scan finds the
+  part under its new name.
+
 ### 2k - Serial transport
 
 Config
@@ -3078,6 +3285,7 @@ Verification
 | `IB-REC-009` | `REC_DEFS` | embedded definitions differ from config, or cannot be loaded | 2g |
 | `IB-REC-010` | `REC_SPACE` | low disk space for the recording | 2e |
 | `IB-REC-011` | `REC_DIRSYNC` | the recording's directory cannot be synced; its name may not survive a power loss (warning) | 2e |
+| `IB-REC-012` | `REC_LEFTOVER` | `rec repair`: the repaired copy is complete under its name, but its temporary name beside it could not be removed (a hard-link commit, as on NFS); remove it by hand (warning) | 2j |
 | `IB-FLT-001` | `FLT_SYNTAX` | filter syntax error (column, excerpt) | 2f |
 | `IB-FLT-002` | `FLT_NAME` | unknown name in a filter, or a reserved name misused | 2f |
 | `IB-FLT-003` | `FLT_TYPE` | literal does not fit the name's type, or the filter can never match | 2f |

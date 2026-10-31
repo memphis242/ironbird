@@ -874,30 +874,66 @@ def peek_mid(profile: HeaderProfile, data: Buffer) -> int | None:
 # ---------------------------------------------------------------------------------------
 
 
+def _checksum_lines(
+    profile: HeaderProfile, cf: HeaderField
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    """The span start, the span end and the checksum field offset of an ``n``-byte packet, each
+    as ``(slope, constant)`` meaning ``slope * n + constant`` with a slope of 0 or 1."""
+    hs = profile.size_bytes
+    span = cf.span
+    start, end = (0, 0), (1, 0)
+    match span.kind:
+        case SpanKind.PACKET:
+            pass
+        case SpanKind.HEADER:
+            end = (0, hs)
+        case SpanKind.PAYLOAD:
+            start, end = (0, hs), (1, -profile.trailer_size)
+        case SpanKind.RANGE:
+            start, end = (0, span.start), (1, span.end)
+    at = (1, cf.offset - profile.trailer_size) if cf.trailer else (0, cf.offset)
+    return start, end, at
+
+
 def checksum_plan(profile: HeaderProfile, cf: HeaderField, n: int) -> tuple[int, int, int] | str:
     """Where the checksum ``cf`` of an ``n``-byte packet looks: ``(start, end, zero_at)``, the
     bytes ``start:end`` it covers and the offset of the checksum field itself within them (-1
     when the field is outside the span), or the reason the span does not fit this packet."""
-    hs = profile.size_bytes
-    span = cf.span
-    match span.kind:
-        case SpanKind.PACKET:
-            start, end = 0, n
-        case SpanKind.HEADER:
-            start, end = 0, hs
-        case SpanKind.PAYLOAD:
-            start, end = hs, n - profile.trailer_size
-        case SpanKind.RANGE:
-            start, end = span.start, n + span.end
+    (s_slope, s_const), (e_slope, e_const), (a_slope, a_const) = _checksum_lines(profile, cf)
+    start, end = s_slope * n + s_const, e_slope * n + e_const
     if not 0 <= start <= end <= n:
         return f"checksum span {start}..{end} lies outside the {n}-byte packet"
     width = cf.bits // 8
-    at = cf.offset + (n - profile.trailer_size if cf.trailer else 0)
+    at = a_slope * n + a_const
     if start <= at and at + width <= end:
         return start, end, at - start
     if at + width <= start or at >= end:
         return start, end, -1
     return f"checksum span {start}..{end} cuts through the checksum field at byte {at}"
+
+
+def checksum_probe_sizes(profile: HeaderProfile, cf: HeaderField, lo: int, hi: int) -> list[int]:
+    """The packet sizes in ``lo..hi`` at which :func:`checksum_plan` can change its answer: the
+    two ends and, for each pair of the span start, span end, checksum field and packet bounds,
+    the size where they cross and its neighbours. Between two probes every comparison the plan
+    makes keeps its result, so a plan that holds at all of them holds at every size."""
+    start, end, at = _checksum_lines(profile, cf)
+    width = cf.bits // 8
+    lines = [
+        (0, 0),
+        (1, 0),
+        start,
+        end,
+        at,
+        (at[0], at[1] + width),
+    ]
+    found = {lo, hi}
+    for i, (s1, c1) in enumerate(lines):
+        for s2, c2 in lines[i + 1 :]:
+            if s1 != s2:
+                cross = (c2 - c1) // (s1 - s2)
+                found.update(n for n in (cross - 1, cross, cross + 1) if lo <= n <= hi)
+    return sorted(found)
 
 
 def _checksum_of(profile: HeaderProfile, cf: HeaderField, data: Buffer, n: int) -> int | str:

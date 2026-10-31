@@ -44,7 +44,14 @@ from pathlib import Path
 from typing import Final, Protocol
 
 from ironbird import render
-from ironbird.atomicfile import Collision, Locked, SyncAfterCommit, TempDirOutput, TempOutput
+from ironbird.atomicfile import (
+    Collision,
+    LeftoverAfterCommit,
+    Locked,
+    SyncAfterCommit,
+    TempDirOutput,
+    TempOutput,
+)
 from ironbird.ccdd.model import FieldDef, Message, TypeClass
 from ironbird.codec import Codec
 from ironbird.engine import FrameDecoder
@@ -56,9 +63,10 @@ from ironbird.recording.player import Ending
 from ironbird.recording.replay import Replay
 from ironbird.retention import is_managed_name
 from ironbird.sanitize import clean
+from ironbird.sigmask import Hold, naming_replaced, signals_held
 
-#: A text cell is never cut: the longest field is a ``char[4096]`` whose characters may each
-#: escape to ten.
+#: A text cell is never cut: the longest field is a ``char[]`` of up to 65535 characters, each
+#: of which may escape to ten.
 MAX_CELL_CHARS: Final = 1 << 20
 #: What starts a formula in a spreadsheet: ``= + - @`` and their fullwidth forms (some importers
 #: fold those), and tab, CR and LF.
@@ -158,6 +166,13 @@ def _bytes_cell(value: object) -> object:
     return HEX_PREFIX + value.hex()
 
 
+def _array_cell(value: object) -> object:
+    """A variable-length array as one cell, ``[1 2 3]``: the elements are numbers, so the text
+    needs no sanitizing (a non-finite float is spelled ``nan`` or ``inf``)."""
+    assert isinstance(value, tuple)
+    return "[" + " ".join(repr(v) if isinstance(v, float) else str(v) for v in value) + "]"
+
+
 def _converter(field_def: FieldDef, raw_enums: bool) -> Callable[[object], object]:
     """How one decoded value becomes a cell: a number stays a number, an integer with an enum
     becomes its label (the number when the enum lacks the value, or with ``raw_enums``), text and
@@ -180,6 +195,8 @@ def _converter(field_def: FieldDef, raw_enums: bool) -> Callable[[object], objec
             return _text_cell
         case TypeClass.BYTES:
             return _bytes_cell
+        case TypeClass.ARRAY:
+            return _array_cell
     raise AssertionError("unreachable")  # pragma: no cover
 
 
@@ -888,54 +905,137 @@ def _write_error(output: Path, exc: OSError, *, created: bool = True) -> Ironbir
     )
 
 
+@dataclass(slots=True)
+class WriteProgress:
+    """What a :func:`write_to_file` or :func:`write_to_directory` got done, readable after any
+    exit of it (an exception, a signal's included): the temporary output once it is made, and the
+    result once ``run`` has returned."""
+
+    temp: TempOutput | TempDirOutput | None = None
+    result: ExportResult | None = None
+
+    @property
+    def committed(self) -> bool:
+        """Whether the output has its final name (complete, whatever came after)."""
+        return self.temp is not None and self.temp.committed
+
+
+def _after_commit_note(output: Path, exc: SyncAfterCommit, what: str) -> str:
+    """Why a committed output deserves a warning: its directory could not be synced, or the
+    temporary name of a hard-link commit could not be removed. ``what``: the output's kind."""
+    where = render.term(str(output), 300)
+    reason = render.term(exc.strerror or "unknown error", 200)
+    if isinstance(exc, LeftoverAfterCommit):
+        note = (
+            f"the {what} {where} was written, but the temporary file "
+            f"{render.term(exc.leftover, 100)} beside it could not be removed ({reason}); "
+            "remove it by hand"
+        )
+        if exc.sync_error is not None:
+            note += f"; the directory also could not be synced ({render.term(exc.sync_error, 200)})"
+        return note
+    return (
+        f"the directory of {where} could not be synced ({reason}); the {what} exists, "
+        "but its name may not survive a power loss"
+    )
+
+
+def _publish_failure(output: Path, exc: OSError, *, force: bool, directory: bool) -> IronbirdError:
+    """The error for a failed publish (anything but :class:`SyncAfterCommit`, which is a warning
+    about an output that exists)."""
+    assert not isinstance(exc, SyncAfterCommit)
+    name = render.term(str(output), 300)
+    if isinstance(exc, Locked) and not directory:
+        return IronbirdError(
+            Code.EXP_EXISTS,
+            f"{name} is in use by another process (it holds a lock on it); it was not "
+            "replaced, choose another output",
+            cause=exc,
+        )
+    if isinstance(exc, Collision):
+        if directory:
+            summary = (
+                f"{name} appeared while exporting; a directory export never replaces "
+                "anything, choose another output"
+            )
+        elif force:
+            summary = f"{name} is not a regular file; --force replaces only a regular file"
+        else:
+            summary = f"{name} appeared while exporting; it was not replaced (pass --force)"
+        return IronbirdError(Code.EXP_EXISTS, summary, cause=exc)
+    return _write_error(output, exc)
+
+
+def _replaced_failure(
+    output: Path, replaced: BaseException, *, force: bool, directory: bool, created: bool
+) -> BaseException | None:
+    """What the failure ``replaced`` (raw, from a held step of the write) is reported as when a
+    signal took its place: the error :func:`write_to_file` or :func:`write_to_directory` raises
+    for it without the signal, ``None`` for a committed output whose only trouble is a warning.
+    ``created``: the temporary output was made."""
+    match replaced:
+        case SyncAfterCommit():
+            return None
+        case OutputError():
+            return _write_error(output, replaced.cause)
+        case OSError() if not created:
+            return _write_error(output, replaced, created=False)
+        case OSError():
+            return _publish_failure(output, replaced, force=force, directory=directory)
+        case _:
+            return replaced
+
+
 def write_to_file(
     output: Path,
     *,
     force: bool,
     run: Callable[[Destination], ExportResult],
     fs: FileSystem = REAL_FS,
-    before_commit: Callable[[], None] | None = None,
+    before_publish: Callable[[], None] | None = None,
+    hold: Hold | None = None,
+    progress: WriteProgress | None = None,
 ) -> tuple[ExportResult, str | None]:
     """Run ``run`` against a temporary file beside ``output`` and give it the name ``output``
     when ``run`` returns: refused (``IB-EXP-002``) if the name is taken by then, unless ``force``
-    allows replacing a regular file of ours that no one else holds locked. ``before_commit``, if
-    given, runs just before the rename and may refuse. Any error leaves no file behind
-    (``IB-EXP-001`` for a failed write). The second value is the reason the directory could not
-    be synced after the commit (the file exists all the same), if any."""
-    name = render.term(str(output), 300)
+    allows replacing a regular file of ours that no one else holds locked. ``before_publish``,
+    if given, runs once the data is synced, just before the rename, and may refuse; ``hold`` is
+    begun right before the rename (see :meth:`~ironbird.atomicfile.TempOutput.publish`). Any
+    error leaves no file behind (``IB-EXP-001`` for a failed write). The second value is a
+    warning for a file that exists all the same: its directory could not be synced after the
+    commit, or the temporary name of a hard-link commit could not be removed. ``progress`` is
+    filled as the write goes."""
     sync: str | None = None
-    with contextlib.ExitStack() as stack:
+    entered = False  # the temporary file is made
+
+    def replaced_as(replaced: BaseException) -> BaseException | None:
+        return _replaced_failure(output, replaced, force=force, directory=False, created=entered)
+
+    with naming_replaced(replaced_as), contextlib.ExitStack() as stack:
         try:
-            temp = stack.enter_context(TempOutput(output, force=force, fs=fs))
+            # held until the stack holds the cleanup: a signal cannot leave the file behind
+            with signals_held():
+                temp = stack.enter_context(TempOutput(output, force=force, fs=fs))
+                if progress is not None:
+                    progress.temp = temp
         except OSError as exc:
             raise _write_error(output, exc, created=False) from exc
+        entered = True
         try:
             result = run(FileDestination(temp))
         except OutputError as exc:
             raise _write_error(output, exc.cause) from exc
-        if before_commit is not None:
-            before_commit()
+        if progress is not None:
+            progress.result = result
         try:
-            temp.commit()
+            temp.prepare()
+            if before_publish is not None:
+                before_publish()
+            temp.publish(hold=hold)
         except SyncAfterCommit as exc:
-            sync = exc.strerror or "directory sync failed"  # renamed all the same
-        except Locked as exc:
-            raise IronbirdError(
-                Code.EXP_EXISTS,
-                f"{name} is in use by another process (it holds a lock on it); it was not "
-                "replaced, choose another output",
-                cause=exc,
-            ) from exc
-        except Collision as exc:
-            raise IronbirdError(
-                Code.EXP_EXISTS,
-                f"{name} is not a regular file; --force replaces only a regular file"
-                if force
-                else f"{name} appeared while exporting; it was not replaced (pass --force)",
-                cause=exc,
-            ) from exc
+            sync = _after_commit_note(output, exc, "file")  # committed all the same
         except OSError as exc:
-            raise _write_error(output, exc) from exc
+            raise _publish_failure(output, exc, force=force, directory=False) from exc
     return result, sync
 
 
@@ -945,41 +1045,47 @@ def write_to_directory(
     run: Callable[[Destination], ExportResult],
     fs: FileSystem = REAL_FS,
     max_open: int | None = None,
-    before_commit: Callable[[], None] | None = None,
+    before_publish: Callable[[], None] | None = None,
+    hold: Hold | None = None,
+    progress: WriteProgress | None = None,
 ) -> tuple[ExportResult, str | None]:
     """:func:`write_to_file` for a directory of tables: the directory is built beside ``output``
     and renamed to it without replacing anything, whatever ``output`` has become meanwhile.
     ``max_open``: how many tables hold a descriptor at once (default: :func:`default_max_open`)."""
-    name = render.term(str(output), 300)
     sync: str | None = None
+    entered = False  # the temporary directory is made
     temp = TempDirOutput(
         output, fs=fs, max_open=default_max_open() if max_open is None else max_open
     )
+
+    def replaced_as(replaced: BaseException) -> BaseException | None:
+        return _replaced_failure(output, replaced, force=False, directory=True, created=entered)
+
     try:
-        with contextlib.ExitStack() as stack:
+        with naming_replaced(replaced_as), contextlib.ExitStack() as stack:
             try:
-                stack.enter_context(temp)
+                with signals_held():  # until the stack holds the cleanup (see write_to_file)
+                    stack.enter_context(temp)
+                    if progress is not None:
+                        progress.temp = temp
             except OSError as exc:
                 raise _write_error(output, exc, created=False) from exc
+            entered = True
             try:
                 result = run(DirDestination(temp))
             except OutputError as exc:
                 raise _write_error(output, exc.cause) from exc
-            if before_commit is not None:
-                before_commit()
+            if progress is not None:
+                progress.result = result
             try:
-                temp.commit()
+                temp.prepare()
+                if before_publish is not None:
+                    before_publish()
+                temp.publish(hold=hold)
             except SyncAfterCommit as exc:
-                sync = exc.strerror or "directory sync failed"
-            except Collision as exc:
-                raise IronbirdError(
-                    Code.EXP_EXISTS,
-                    f"{name} appeared while exporting; a directory export never replaces "
-                    "anything, choose another output",
-                    cause=exc,
-                ) from exc
+                sync = _after_commit_note(output, exc, "directory")
             except OSError as exc:
-                raise _write_error(output, exc) from exc
+                raise _publish_failure(output, exc, force=False, directory=True) from exc
     except IronbirdError as exc:
         if temp.leftover is None:
             raise
@@ -1002,6 +1108,7 @@ __all__ = [
     "OutputError",
     "Selection",
     "StdoutDestination",
+    "WriteProgress",
     "check_messages",
     "check_single_layout",
     "csv_line",

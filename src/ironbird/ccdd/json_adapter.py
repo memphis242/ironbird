@@ -1,4 +1,7 @@
-"""Placeholder JSON adapter (schema ``ironbird-ccdd/0``).
+"""Placeholder JSON adapter (schemas ``ironbird-ccdd/0`` and ``ironbird-ccdd/1``).
+
+``/1`` adds variable-length fields (``count``/``length``/``max``/``min`` on a ``T[]`` field);
+``/0`` files load as before and may not use them.
 
 The real CCDD export format is not final; when it is, a second adapter replaces this one
 and nothing else changes. See ``examples/ccdd/mock.json`` for the shape.
@@ -9,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
@@ -17,6 +21,7 @@ from typing import Any, Final
 from ironbird.ccdd.model import (
     MAX_ENUM_ENTRIES,
     MAX_PAYLOAD_BYTES,
+    MAX_VAR_FIELDS,
     SEVERITY_LABELS,
     Category,
     CcddModel,
@@ -28,11 +33,17 @@ from ironbird.ccdd.model import (
     Message,
     MessageKind,
     TypeClass,
+    VarSpec,
+    VarUnit,
+    parse_element_type,
     parse_type,
 )
 from ironbird.errors import Code, IronbirdError
 
-SCHEMA_ID: Final = "ironbird-ccdd/0"
+SCHEMA_ID: Final = "ironbird-ccdd/1"  # the schema new files are written in
+SCHEMA_IDS: Final = ("ironbird-ccdd/0", SCHEMA_ID)  # every schema that loads
+VARIABLE_SCHEMA: Final = SCHEMA_ID  # the only schema that may use variable-length fields
+REMAINING: Final = "remaining"  # a ``count``/``length`` value: the rest of the packet
 MAX_FILE_BYTES: Final = 8 * 1024 * 1024
 MAX_MESSAGES: Final = 20_000
 MAX_FIELDS: Final = 1024
@@ -65,8 +76,9 @@ def _no_duplicate_keys(source: str) -> Callable[[list[tuple[str, Any]]], dict[st
 
 
 class _Ctx:
-    def __init__(self, source: str) -> None:
+    def __init__(self, source: str, variable: bool = True) -> None:
         self.source = source
+        self.variable = variable  # whether the file's schema allows variable-length fields
 
     def fail(self, path: str, message: str, code: Code = Code.CCD_SCHEMA) -> IronbirdError:
         return IronbirdError(code, f"{self.source}: {path}: {message}")
@@ -146,25 +158,111 @@ def _parse_enum(ctx: _Ctx, raw: object, path: str, ftype: FieldType) -> Mapping[
     return MappingProxyType(out)
 
 
-def _parse_field(ctx: _Ctx, raw: object, path: str, next_offset: int, names: set[str]) -> FieldDef:
-    if not isinstance(raw, dict):
-        raise ctx.fail(path, "must be an object")
+def _parse_var_field(
+    ctx: _Ctx, raw: dict[str, Any], path: str, name: str, type_text: str, fixed: list[FieldDef]
+) -> FieldDef:
+    """A variable-length field (``type`` ends in ``[]``). ``fixed`` are the fixed fields declared
+    before it; its offset is set once the message's fixed fields are all known."""
+    if not ctx.variable:
+        raise ctx.fail(
+            f"{path}.type",
+            f"variable-length types need schema {VARIABLE_SCHEMA!r} (got {type_text[:40]!r})",
+        )
     _check_keys(
         ctx,
         raw,
         path,
-        {"name", "type", "offset", "endian", "enum", "units", "description"},
-        {"name", "type"},
+        {"name", "type", "count", "length", "max", "min", "endian", "units", "description"},
+        {"name", "type", "max"},
     )
-    name = raw["name"]
+    element = parse_element_type(type_text)
+    if isinstance(element, str):
+        raise ctx.fail(f"{path}.type", f"{element} (got {type_text[:40]!r})")
+    if ("count" in raw) == ("length" in raw):
+        raise ctx.fail(path, "needs exactly one of 'count' (elements) or 'length' (bytes)")
+    key = "count" if "count" in raw else "length"
+    target = raw[key]
+    if not isinstance(target, str):
+        raise ctx.fail(f"{path}.{key}", f'must be a field name or "{REMAINING}"')
+    maximum = _int(ctx, raw["max"], f"{path}.max", 1, MAX_PAYLOAD_BYTES)
+    minimum = _int(ctx, raw["min"], f"{path}.min", 0, maximum) if "min" in raw else 0
+    if maximum * element.size > MAX_PAYLOAD_BYTES:
+        raise ctx.fail(
+            f"{path}.max",
+            f"{maximum} x {element.size} bytes is larger than {MAX_PAYLOAD_BYTES} bytes",
+            Code.CCD_LAYOUT,
+        )
+    count_field: str | None = None
+    unit = VarUnit.REMAINING
+    if target != REMAINING:
+        unit = VarUnit.COUNT if key == "count" else VarUnit.LENGTH
+        count_field = target
+        holder = next((f for f in fixed if f.name == target), None)
+        if holder is None:
+            raise ctx.fail(
+                f"{path}.{key}",
+                f"no fixed field named {target[:40]!r} before this field; the count or length "
+                "field must be declared before the field it sizes",
+                Code.CCD_LAYOUT,
+            )
+        if holder.type.type_class is not TypeClass.INT or holder.type.signed:
+            raise ctx.fail(
+                f"{path}.{key}",
+                f"{target} must be an unsigned integer field, not {holder.type.text}",
+                Code.CCD_LAYOUT,
+            )
+        spec_max = maximum if unit is VarUnit.COUNT else maximum * element.size
+        if spec_max > holder.type.bit_range[1]:
+            raise ctx.fail(
+                f"{path}.max",
+                f"{spec_max} {'elements' if unit is VarUnit.COUNT else 'bytes'} cannot be "
+                f"expressed by the {holder.type.text} field {target}",
+                Code.CCD_LAYOUT,
+            )
+    endian_text = raw.get("endian", "little")
+    try:
+        endian = Endian(endian_text)
+    except ValueError:
+        raise ctx.fail(f"{path}.endian", "must be 'little' or 'big'") from None
+    spec = VarSpec(element, unit, count_field, minimum, maximum)
+    return FieldDef(
+        name=name,
+        type=spec.var_type(),
+        offset=0,
+        endian=endian,
+        units=_text(ctx, raw, "units", path),
+        description=_text(ctx, raw, "description", path),
+        var=spec,
+    )
+
+
+def _parse_field(
+    ctx: _Ctx, raw: object, path: str, next_offset: int, names: set[str], fixed: list[FieldDef]
+) -> FieldDef:
+    """One field. ``fixed`` are the fixed fields declared so far (a variable-length field names
+    one as its count)."""
+    if not isinstance(raw, dict):
+        raise ctx.fail(path, "must be an object")
+    name = raw.get("name")
+    type_text = raw.get("type")
+    is_var = isinstance(type_text, str) and type_text.endswith("[]")
+    if not is_var:
+        _check_keys(
+            ctx,
+            raw,
+            path,
+            {"name", "type", "offset", "endian", "enum", "units", "description"},
+            {"name", "type"},
+        )
     if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
         raise ctx.fail(f"{path}.name", "must be an identifier (letters, digits, underscore)")
     if name in names:
         raise ctx.fail(f"{path}.name", f"duplicate field name {name!r}", Code.CCD_LAYOUT)
     names.add(name)
-    type_text = raw["type"]
     if not isinstance(type_text, str):
         raise ctx.fail(f"{path}.type", "must be a string")
+    if is_var:
+        return _parse_var_field(ctx, raw, path, name, type_text, fixed)
     parsed = parse_type(type_text)
     if isinstance(parsed, str):
         raise ctx.fail(f"{path}.type", f"{parsed} (got {type_text[:40]!r})")
@@ -272,6 +370,97 @@ def _parse_event(ctx: _Ctx, raw: object, path: str, fields: tuple[FieldDef, ...]
     )
 
 
+def _parse_message_fields(
+    ctx: _Ctx, raw_fields: list[Any], path: str
+) -> tuple[list[FieldDef], list[FieldDef]]:
+    """The fixed and the variable-length fields of a message, in declaration order. Fixed fields
+    come first; a variable-length field's count or length field is one of them."""
+    fixed: list[FieldDef] = []
+    variable: list[FieldDef] = []
+    names: set[str] = set()
+    next_offset = 0
+    for i, rf in enumerate(raw_fields):
+        where = f"{path}.fields[{i}]"
+        fdef = _parse_field(ctx, rf, where, next_offset, names, fixed)
+        if fdef.var is None:
+            if variable:
+                raise ctx.fail(
+                    where,
+                    f"fixed field {fdef.name} follows the variable-length field "
+                    f"{variable[0].name}; declare every fixed field first",
+                    Code.CCD_LAYOUT,
+                )
+            fixed.append(fdef)
+            next_offset = fdef.end
+            continue
+        if len(variable) >= MAX_VAR_FIELDS:
+            raise ctx.fail(
+                where, f"more than {MAX_VAR_FIELDS} variable-length fields", Code.CCD_LAYOUT
+            )
+        variable.append(fdef)
+    return fixed, variable
+
+
+def _variable_payload(
+    ctx: _Ctx,
+    raw: Mapping[str, Any],
+    path: str,
+    extent: int,
+    fixed: list[FieldDef],
+    variable: list[FieldDef],
+) -> int:
+    """The largest payload of a message with variable-length fields, after checking how its
+    fields share count fields and where ``remaining`` may stand. ``min_payload`` and
+    ``max_payload`` may be given as a check against the values the fields imply."""
+    specs = [f.var for f in variable if f.var is not None]
+    assert len(specs) == len(variable)
+    if any(f.name == REMAINING for f in fixed):
+        pairs = zip(variable, specs, strict=True)
+        user = next((f for f, spec in pairs if spec.unit is VarUnit.REMAINING), None)
+        if user is not None:
+            raise ctx.fail(
+                path,
+                f'{user.name} uses "{REMAINING}" as the rest of the packet, but a fixed field '
+                f'is named "{REMAINING}" too; rename that field',
+                Code.CCD_LAYOUT,
+            )
+    users: dict[str, str] = {}
+    for i, (fdef, spec) in enumerate(zip(variable, specs, strict=True)):
+        if spec.unit is VarUnit.REMAINING and i != len(variable) - 1:
+            raise ctx.fail(
+                path,
+                f'"{REMAINING}" is only allowed on the last field, not {fdef.name}',
+                Code.CCD_LAYOUT,
+            )
+        if spec.count_field is not None:
+            if spec.count_field in users:
+                raise ctx.fail(
+                    path,
+                    f"{fdef.name} and {users[spec.count_field]} share the count field "
+                    f"{spec.count_field}",
+                    Code.CCD_LAYOUT,
+                )
+            users[spec.count_field] = fdef.name
+    smallest = extent + sum(spec.min_bytes for spec in specs)
+    largest = extent + sum(spec.max_bytes for spec in specs)
+    if "payload_size" in raw:
+        raise ctx.fail(
+            f"{path}.payload_size",
+            "not valid with variable-length fields; the size is implied by their min and max",
+            Code.CCD_LAYOUT,
+        )
+    for key, implied in (("min_payload", smallest), ("max_payload", largest)):
+        if key in raw:
+            given = _int(ctx, raw[key], f"{path}.{key}", 0, MAX_PAYLOAD_BYTES)
+            if given != implied:
+                raise ctx.fail(
+                    f"{path}.{key}",
+                    f"{given} disagrees with the {implied} bytes the fields imply",
+                    Code.CCD_LAYOUT,
+                )
+    return largest
+
+
 def _parse_message(ctx: _Ctx, raw: object, index: int) -> Message:
     path = f"messages[{index}]"
     if not isinstance(raw, dict):
@@ -294,6 +483,7 @@ def _parse_message(ctx: _Ctx, raw: object, index: int) -> Message:
             "category",
             "event",
             "header",
+            *(("min_payload", "max_payload") if ctx.variable else ()),
         },
         {"name", "kind", "mid"},
     )
@@ -318,16 +508,9 @@ def _parse_message(ctx: _Ctx, raw: object, index: int) -> Message:
         raise ctx.fail(f"{path}.fields", "must be an array")
     if len(raw_fields) > MAX_FIELDS:
         raise ctx.fail(f"{path}.fields", f"more than {MAX_FIELDS} fields")
-    fields: list[FieldDef] = []
-    names: set[str] = set()
-    next_offset = 0
-    for i, rf in enumerate(raw_fields):
-        fdef = _parse_field(ctx, rf, f"{path}.fields[{i}]", next_offset, names)
-        fields.append(fdef)
-        next_offset = fdef.end
-
-    # Layout: no overlaps, bounded size.
-    ordered = sorted(fields, key=lambda f: f.offset)
+    fixed, variable = _parse_message_fields(ctx, raw_fields, path)
+    # Layout: no overlaps among the fixed fields, bounded size.
+    ordered = sorted(fixed, key=lambda f: f.offset)
     for prev, cur in pairwise(ordered):
         if cur.offset < prev.end:
             raise ctx.fail(
@@ -336,18 +519,30 @@ def _parse_message(ctx: _Ctx, raw: object, index: int) -> Message:
                 f"(starting at byte {cur.offset}) overlap",
                 Code.CCD_LAYOUT,
             )
-    extent = max((f.end for f in fields), default=0)
-    payload_size = extent
-    if "payload_size" in raw:
-        payload_size = _int(ctx, raw["payload_size"], f"{path}.payload_size", 0, MAX_PAYLOAD_BYTES)
-        if payload_size < extent:
-            raise ctx.fail(
-                f"{path}.payload_size",
-                f"{payload_size} is smaller than the fields' extent ({extent})",
-                Code.CCD_LAYOUT,
+    extent = max((f.end for f in fixed), default=0)
+    if variable:
+        variable = [replace(f, offset=extent) for f in variable]
+        payload_size = _variable_payload(ctx, raw, path, extent, fixed, variable)
+    else:
+        for key in ("min_payload", "max_payload"):
+            if key in raw:
+                raise ctx.fail(
+                    f"{path}.{key}", "only valid on messages with variable-length fields"
+                )
+        payload_size = extent
+        if "payload_size" in raw:
+            payload_size = _int(
+                ctx, raw["payload_size"], f"{path}.payload_size", 0, MAX_PAYLOAD_BYTES
             )
+            if payload_size < extent:
+                raise ctx.fail(
+                    f"{path}.payload_size",
+                    f"{payload_size} is smaller than the fields' extent ({extent})",
+                    Code.CCD_LAYOUT,
+                )
     if payload_size > MAX_PAYLOAD_BYTES:
         raise ctx.fail(path, f"payload larger than {MAX_PAYLOAD_BYTES} bytes", Code.CCD_LAYOUT)
+    fields = [*fixed, *variable]
     category = _parse_category(ctx, raw, path, kind)
     event = (
         _parse_event(ctx, raw["event"], f"{path}.event", tuple(fields))
@@ -376,8 +571,10 @@ def parse_model(data: object, source: str) -> CcddModel:
     if not isinstance(data, dict):
         raise ctx.fail("<root>", "must be an object")
     _check_keys(ctx, data, "", {"schema", "target", "messages"}, {"schema", "target", "messages"})
-    if data["schema"] != SCHEMA_ID:
-        raise ctx.fail("schema", f"must be {SCHEMA_ID!r}, got {str(data['schema'])[:40]!r}")
+    if data["schema"] not in SCHEMA_IDS:
+        known = " or ".join(repr(known) for known in SCHEMA_IDS)
+        raise ctx.fail("schema", f"must be {known}, got {str(data['schema'])[:40]!r}")
+    ctx.variable = data["schema"] == VARIABLE_SCHEMA
     target = data["target"]
     if not isinstance(target, str) or not _NAME_RE.fullmatch(target):
         raise ctx.fail("target", "must be an identifier")
@@ -391,7 +588,7 @@ def parse_model(data: object, source: str) -> CcddModel:
 
 
 class JsonAdapter:
-    """Loads ``ironbird-ccdd/0`` JSON files."""
+    """Loads ``ironbird-ccdd/0`` and ``ironbird-ccdd/1`` JSON files."""
 
     name: str = "json"
 

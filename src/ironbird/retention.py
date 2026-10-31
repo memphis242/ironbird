@@ -31,7 +31,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
-from ironbird.atomicfile import Collision, SyncAfterCommit, TempOutput, rename_noreplace
+from ironbird.atomicfile import (
+    Collision,
+    LeftoverAfterCommit,
+    SyncAfterCommit,
+    TempOutput,
+    rename_noreplace,
+)
 from ironbird.fsops import (
     INSPECT_FLAGS,
     INSPECT_RW_FLAGS,
@@ -41,6 +47,7 @@ from ironbird.fsops import (
     try_stat_at,
 )
 from ironbird.ledgerstore import NAME_TRIES, part_name
+from ironbird.sigmask import naming_replaced
 from ironbird.units import MIB, format_size
 
 MAX_ENTRIES: Final = 100_000
@@ -213,7 +220,8 @@ class DirScan:
     unrecoverable: set[str] = field(default_factory=set)
     damaged_kept: set[str] = field(default_factory=set)  # saved, original kept as .damaged
     unreadable: set[str] = field(default_factory=set)  # a file that could not be examined
-    handled: set[str] = field(default_factory=set)  # .damaged files this scan produced or ended
+    # .damaged files this scan produced or ended, and salvage temporaries it already reported
+    handled: set[str] = field(default_factory=set)
     check_budget: int = field(default_factory=lambda: MAX_DAMAGED_CHECK_BYTES)
     messages: list[str] = field(default_factory=list)  # IB-RET-004 lines, ready to show
     recoveries: list[dict[str, Any]] = field(default_factory=list)  # ledger.recovered
@@ -786,18 +794,29 @@ def recover_directory(
         return False
     changed = False
     try:
-        for session in sorted(scan.sessions.values(), key=lambda s: s.id):
-            if control is not None and control.stop.is_set():
-                break
-            if session.id in live or session.id == own_session:
-                continue
-            if not (session.reserves or session.damaged):
-                continue
-            ctx = RecoveryContext(fs, dir_fd, scan, session, control=control, on_record=on_record)
-            changed |= _recover_session(ctx)
+        with naming_replaced(_not_a_failure):
+            for session in sorted(scan.sessions.values(), key=lambda s: s.id):
+                if control is not None and control.stop.is_set():
+                    break
+                if session.id in live or session.id == own_session:
+                    continue
+                if not (session.reserves or session.damaged):
+                    continue
+                ctx = RecoveryContext(
+                    fs, dir_fd, scan, session, control=control, on_record=on_record
+                )
+                changed |= _recover_session(ctx)
     finally:
         close_quietly(fs, dir_fd)
     return changed
+
+
+def _not_a_failure(replaced: BaseException) -> BaseException | None:
+    """What a signal that took the place of a raw file-system failure of a recovery step is
+    reported as: nothing. Each step handles such a failure itself (the session is protected and
+    a message says so) and the scan ends with the signal; the reserve is either untouched or
+    renamed whole, and the next scan finds it as it is."""
+    return None if isinstance(replaced, OSError) else replaced
 
 
 def _recover_session(ctx: RecoveryContext) -> bool:
@@ -935,14 +954,18 @@ def _recover_reserve(ctx: RecoveryContext, reserve: FileEntry, held: list[int]) 
 def _complete_interrupted_rename(
     ctx: RecoveryContext, reserve: FileEntry, fd: int, st: os.stat_result
 ) -> str | None:
-    """A reserve whose inode also carries a part name of the session is an interrupted rename
-    (the ``link`` path of the helper): the reserve name is unlinked, leaving the part name.
+    """A reserve whose inode also carries a part name of the session, or its own ``.damaged``
+    name, is an interrupted rename (the ``link`` path of the helper, cut short or with an unlink
+    that failed): the reserve name is unlinked, leaving the other name. A completed set-aside is
+    recorded with ``new`` ``None`` and the ``.damaged`` name, and is not a recovery: its records
+    are saved, or not yet, by the salvage of that file.
 
     Both names are looked at again now, and the inode must really have two links, so a stale
     listing cannot make this unlink a name that is not a second name of the file."""
     fs, scan, session, name = ctx.fs, ctx.scan, ctx.session, reserve.name
     for other in session.files:
-        if not other.is_part or (other.dev, other.ino) != (st.st_dev, st.st_ino):
+        set_aside = other.role == DAMAGED and other.name == f"{name}.damaged"
+        if not (other.is_part or set_aside) or (other.dev, other.ino) != (st.st_dev, st.st_ino):
             continue
         held = fs.fstat(fd)
         current = try_stat_at(fs, ctx.dir_fd, other.name)
@@ -956,6 +979,12 @@ def _complete_interrupted_rename(
         ):
             continue
         fs.unlink_at(ctx.dir_fd, name)  # completes the rename: one name remains
+        if set_aside:
+            ctx.dirty = True
+            scan.recoveries.append(
+                {"old": name, "new": None, "kept": 0, "cut": st.st_size, "damaged": other.name}
+            )
+            return "changed"
         scan.recovered += 1
         scan.recoveries.append({"old": name, "new": other.name, "kept": st.st_size, "cut": 0})
         return "changed"
@@ -967,6 +996,7 @@ def _commit_recovered(
 ) -> str:
     fs, scan, session, name = ctx.fs, ctx.scan, ctx.session, reserve.name
     new = part_name(_stamp_of(session), session.id, ctx.next_part)
+    record: dict[str, Any] = {"old": name, "new": new, "kept": cut, "cut": st.st_size - cut}
     try:
         fs.ftruncate(fd, cut)
         fs.fdatasync(fd)
@@ -974,13 +1004,17 @@ def _commit_recovered(
     except Collision:
         _unrecoverable(scan, session, name, f"a file already has the next part name {new}")
         return "stop"
-    except SyncAfterCommit:
-        pass  # renamed; the directory sync failed - the rename is not undone
+    except LeftoverAfterCommit as exc:
+        # renamed; the reserve name stays a second name of the part until the next scan
+        # completes the rename (_complete_interrupted_rename)
+        record.update(_leftover_fields(exc))
+    except SyncAfterCommit as exc:
+        record["sync_error"] = exc.strerror  # renamed; the rename is not undone
     except OSError as exc:
         _unrecoverable(scan, session, name, f"it could not be renamed: {exc.strerror}")
         return "stop"
     scan.recovered += 1
-    scan.recoveries.append({"old": name, "new": new, "kept": cut, "cut": st.st_size - cut})
+    scan.recoveries.append(record)
     ctx.next_part += 1
     return "changed"
 
@@ -1001,10 +1035,15 @@ def _salvage(
     damaged = f"{name}.damaged"
     if ctx.stopping:
         return "stop"  # nothing is committed to yet: the next scan salvages it
+    set_aside: dict[str, Any] = {}
     try:
         rename_noreplace(ctx.dir_fd, name, damaged, fd, fs=fs)
-    except SyncAfterCommit:
-        pass
+    except LeftoverAfterCommit as exc:
+        # set aside; the reserve name stays a second name of the .damaged file until the next
+        # scan completes the rename (_complete_interrupted_rename)
+        set_aside = _leftover_fields(exc)
+    except SyncAfterCommit as exc:
+        set_aside = {"sync_error": exc.strerror}
     except Collision:
         _unrecoverable(scan, session, name, f"a file named {damaged} already exists")
         return "stop"
@@ -1014,16 +1053,32 @@ def _salvage(
         )
         return "stop"
     ctx.dirty = True
-    return _finish_salvage(ctx, fd, name, damaged, st.st_size, cut)
+    return _finish_salvage(ctx, fd, name, damaged, st.st_size, cut, set_aside)
+
+
+def _leftover_fields(exc: LeftoverAfterCommit) -> dict[str, Any]:
+    """The record fields of a rename that was committed but left its old name behind."""
+    fields: dict[str, Any] = {"leftover": exc.leftover, "leftover_error": exc.strerror}
+    if exc.sync_error is not None:
+        fields["sync_error"] = exc.sync_error
+    return fields
 
 
 def _finish_salvage(
-    ctx: RecoveryContext, fd: int, name: str, damaged: str, size: int, cut: int
+    ctx: RecoveryContext,
+    fd: int,
+    name: str,
+    damaged: str,
+    size: int,
+    cut: int,
+    set_aside: dict[str, Any] | None = None,
 ) -> str:
     """Copy the first ``cut`` bytes of the set-aside original (``fd``) into the session's next
     part, and say how it ended: ``ledger.recovered`` when the part is committed,
     ``ledger.recovery_incomplete`` when it is not. Either record is handed out here, by whoever
-    ends the step, so a scan that outlives the process's exit wait still leaves its trace."""
+    ends the step, so a scan that outlives the process's exit wait still leaves its trace.
+    ``set_aside``: fields of a set-aside rename that committed with a leftover or an unsynced
+    directory, added to the record."""
     scan, session = ctx.scan, ctx.session
     scan.handled.add(damaged)
     control = ctx.control
@@ -1036,7 +1091,7 @@ def _finish_salvage(
         }  # cut = size - kept
         control.stepping.set()  # from here the copy runs to its end
     try:
-        new, error = _copy_prefix(ctx, fd, cut)
+        new, error, copied = _copy_prefix(ctx, fd, cut)
     finally:
         if control is not None:
             control.stepping.clear()
@@ -1047,7 +1102,10 @@ def _finish_salvage(
         "kept": cut if new else 0,
         "cut": size - (cut if new else 0),
         "damaged": damaged,
+        **(set_aside or {}),
     }
+    if copied:
+        record["copy"] = copied  # its commit left the temporary name, or the sync failed
     if new is None:
         record["error"] = error
         scan.incompletes.append(record)
@@ -1063,10 +1121,17 @@ def _finish_salvage(
     scan.recoveries.append(record)
     ctx.report("ledger.recovered", record)
     scan.damaged_kept.add(session.id)
-    scan.messages.append(
+    message = (
         f"reserve {name} was damaged: {format_size(cut)} saved as part "
         f"p{ctx.next_part:04d}, the rest kept as {damaged}; inspect or delete that file"
     )
+    if "leftover" in copied:
+        scan.handled.add(copied["leftover"])  # said here; the accounting pass need not repeat it
+        message += (
+            f"; the temporary file {copied['leftover']} of the copy could not be removed "
+            f"({copied['leftover_error']}); delete it"
+        )
+    scan.messages.append(message)
     ctx.next_part += 1
     return "changed"
 
@@ -1256,9 +1321,10 @@ def classify_damaged(fs: FileSystem, scan: DirScan) -> None:
                 unfinished = True
                 scan.unrecoverable.add(session.id)
                 scan.messages.append(_unfinished_message(entry, check))
-            if session.temps and not unfinished:
+            temps = [t for t in session.temps if t.name not in scan.handled]
+            if temps and not unfinished:
                 scan.unrecoverable.add(session.id)
-                first = session.temps[0]
+                first = temps[0]
                 scan.messages.append(
                     f"{first.name} ({format_size(first.size)}) is left over from an interrupted "
                     "salvage and nothing is waiting for it; inspect it and delete it; "
@@ -1281,9 +1347,11 @@ def _unfinished_message(entry: FileEntry, check: _Check) -> str:
     )
 
 
-def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, str]:
+def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, str, dict[str, Any]]:
     """Copy the first ``cut`` bytes of ``fd`` to the session's next free part name through a
-    temporary file. Returns ``(part name, "")``, or ``(None, why)``.
+    temporary file. Returns ``(part name, "", commit)``, or ``(None, why, {})``; ``commit``
+    holds the fields of a commit that renamed but left the temporary name behind
+    (``leftover``) or could not sync the directory (``sync_error``), else is empty.
 
     A temporary file an earlier attempt of this session left for that part is continued when its
     content is exactly the start of the source; any other file is left alone."""
@@ -1295,7 +1363,7 @@ def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, s
             break
         ctx.next_part += 1
     else:
-        return None, "no free part name"
+        return None, "no free part name", {}
     reusable = sorted(
         (t for t in session.temps if t.number == ctx.next_part), key=lambda t: -t.size
     )
@@ -1308,6 +1376,7 @@ def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, s
         resume_at[0] = have
         return True
 
+    commit: dict[str, Any] = {}
     try:
         with TempOutput(
             ctx.scan.path / new,
@@ -1322,13 +1391,17 @@ def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, s
                     raise OSError(errno.EIO, "the reserve ended early")
                 out.write(block)
                 offset += len(block)
-            with contextlib.suppress(SyncAfterCommit):
-                out.commit()  # a failed directory sync after the rename does not undo it
+            try:
+                out.commit()
+            except LeftoverAfterCommit as exc:  # renamed all the same
+                commit = _leftover_fields(exc)
+            except SyncAfterCommit as exc:  # renamed; the rename is not undone
+                commit = {"sync_error": exc.strerror}
     except Collision:
-        return None, f"a file appeared at {new}"
+        return None, f"a file appeared at {new}", {}
     except OSError as exc:
-        return None, exc.strerror or str(exc)
-    return new, ""
+        return None, exc.strerror or str(exc), {}
+    return new, "", commit
 
 
 def _stamp_of(session: Session) -> str:

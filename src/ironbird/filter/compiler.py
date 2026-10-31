@@ -198,14 +198,21 @@ def _word_literal(lit: Literal, table: Mapping[str, Any], *, fold: bool) -> Any:
     return table[key]
 
 
-def _bytes_literal(lit: Literal, size: int, op: str) -> bytes:
+def _bytes_literal(lit: Literal, size: int, op: str, *, variable: bool = False) -> bytes:
+    """Bytes from a hex literal. A fixed field is ``size`` bytes, so a comparison takes exactly
+    that many; a variable-length field is up to ``size`` bytes, so it takes any length up to it,
+    the empty value (a field with no bytes) included except as a ``contains`` needle."""
     text = _text_literal(lit)
-    if len(text) % 2 or not text or not _HEX_DIGITS.issuperset(text):
+    empty_ok = variable and op != "contains"
+    if len(text) % 2 or (not text and not empty_ok) or not _HEX_DIGITS.issuperset(text):
         raise _Reject('expected hexadecimal bytes in quotes, such as "0aff"')
     value = bytes.fromhex(text)
     if op == "contains":
         if len(value) > size:
             raise _Reject(f"{len(value)} bytes cannot occur in a {size}-byte field")
+    elif variable:
+        if len(value) > size:
+            raise _Reject(f"the field is at most {size} bytes; the value has {len(value)}")
     elif len(value) != size:
         raise _Reject(f"the field is {size} bytes; the value has {len(value)}")
     return value
@@ -785,6 +792,8 @@ class _Compiler:
         """What the predicate means for any field of the type and enum of ``fld``."""
         op = p.op
         klass = fld.type.type_class
+        if klass is TypeClass.ARRAY:
+            return _Plan(None, None, (), _Reject("an array of numbers cannot be filtered"))
         allowed = {
             TypeClass.INT: _NUMBER_OPS,
             TypeClass.FLOAT: _NUMBER_OPS,
@@ -828,7 +837,9 @@ class _Compiler:
             case TypeClass.CHAR:
                 return _text_literal(lit)
             case TypeClass.BYTES:
-                return _bytes_literal(lit, fld.type.size, op)
+                return _bytes_literal(lit, fld.type.size, op, variable=fld.var is not None)
+            case TypeClass.ARRAY:
+                raise AssertionError("an array has no literal; _plan rejects it first")
         raise AssertionError("unreachable")  # pragma: no cover
 
     # -- frame level -----------------------------------------------------------------
