@@ -3066,17 +3066,47 @@ As built (where the build differs from, or settles, the text above)
   changes the file system and records the change runs inside `sigmask.signals_held()` (SIGINT, SIGTERM,
   SIGHUP blocked; a signal that arrives waits and its handler runs as the step ends): creating a
   temporary file, directory or member together with recording it for removal; the removal of what was
-  created (`_discard`); and the commit's rename in `rename_noreplace` (renameat2, link and unlink, or
-  placeholder and rename, so NFS, which has no `RENAME_NOREPLACE`, never keeps an empty placeholder at
-  the final name; the directory sync after it is not held). `export.write_to_file` and
-  `write_to_directory` hold them across `ExitStack.enter_context` until the stack holds the cleanup.
-  A signal that lands in a commit's rename therefore ends the command (exit 128+n) with the export
-  complete under its final name. `signals_held` reads the mask before blocking, because
+  created (`_discard`); and the whole commit from the rename through the directory sync and the
+  `committed` flag (`TempOutput.commit`, `TempDirOutput.commit`, `rename_noreplace`: renameat2, link
+  and unlink, or placeholder and rename). `committed` is a read-only property of both. On NFS, which has
+  no `RENAME_NOREPLACE`, a regular file takes the hard-link path (link, then unlink of the temporary
+  name); the placeholder path (an empty file or directory at the final name, then a rename over it)
+  applies to directory exports and to file systems without hard links, and a held signal never leaves
+  the empty placeholder at the final name. `export.write_to_file` and `write_to_directory` hold the
+  signals across `ExitStack.enter_context` until the stack holds the cleanup, and take an optional
+  `WriteProgress` (the temporary output and the result, readable after any exit).
+  A signal that lands in a commit therefore ends the command (exit 128+n) with the export complete
+  under its final name, and the command says so:
+  1. `ib export` holds the signals from just before the commit (`before_commit`) through the
+     `export.stop` record and the summary, and releases them last, so the handler runs after the
+     export is recorded (`export.stop` with `committed`, `output` and the rows). Should a signal
+     still arrive after the commit by any other route, the `finally` writes `export.stop` with
+     `committed=true`, the output and the rows from `WriteProgress`, and the interruption line is
+     `interrupted (SIGTERM) after the export was written to X` (also in the `cli.signal` record);
+     the exit code stays 128+n.
+  2. A signal that raises over a failure that is unwinding (the cleanup after a failed commit is
+     where it landed) no longer replaces that failure: `_run` walks the `__cause__` and `__context__`
+     chain of the signal's exception (bounded; the first `Exception` on each branch), ledgers each
+     as an error (an `IronbirdError` as it is, any other exception as `IB-INT-001` with its
+     traceback) and shows one line for each `IronbirdError`, besides `interrupted`. This holds for
+     every command that runs through `_run`, not only `export`.
+  3. A hard-link commit whose link succeeded counts as committed even if removing the temporary name
+     fails: `ENOENT` (the retransmitted unlink after a lost reply, NFSv3) is success; any other error
+     is `LeftoverAfterCommit` (a `SyncAfterCommit`, so every caller already treats the rename as
+     done), which names the leftover temporary file and carries the directory-sync failure if that
+     failed too. The directory is still synced. An export prints
+     `warning IB-EXP-001: the file X was written, but the temporary file T beside it could not be
+     removed (reason); remove it by hand` (exit 0), never "the partial output was removed"; `rec
+     repair` reports the same as `IB-REC-011`.
+  `signals_held` reads the mask before blocking, because
   `pthread_sigmask` runs a pending handler before it returns: a handler that raises there leaves the
   mask as it was. Helper threads (ledger, retention, gate, output, recorder) start inside it and
   inherit the block. A member that `fstat` cannot identify right after its creation is removed by name
   at once (`TempDirOutput.create`, on the deletion allowlist). Tests: the signal at each window, sent
-  to a real `ib export` from a hook that stops there (`test_export_cli.py`), and `test_sigmask.py`.
+  to a real `ib export` from a hook that stops there (`test_export_cli.py`: temporary made, rename,
+  link, placeholder, cleanup of a failed commit, a signal after the commit), the in-process rename
+  with a signal and the directory sync after it, the lost and the failed unlink of a link commit, the
+  failure under a signal in `_run`, and `test_sigmask.py`.
 - Deferred: arrays of structs (D11); a filter operator over number arrays (`contains`, indexing); TOML
   arrays in response rules; `--allow-count-mismatch` has no counterpart in `respond` (a reply rule with a wrong count is refused); a real-cFS case
   against MD's dwell packet; the `ib_test` gcc 8 (EL8) build is covered by CI only. Signals: the

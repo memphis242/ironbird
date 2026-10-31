@@ -13,9 +13,10 @@ A signal handler that raises (the CLI's, outside an event loop) cannot split a s
 the file system from the record of that change, because each such step runs with the termination
 signals held (:func:`~ironbird.sigmask.signals_held`) and the handler only runs as the step ends:
 creating a temporary (file, directory or member) and recording it for removal, removing what was
-created, and the rename of a commit (renameat2, link and unlink, or placeholder and rename). A
-caller that registers the cleanup apart from a ``with`` statement (an
-:class:`contextlib.ExitStack`) holds them across the registration too.
+created, and a commit from the rename (renameat2, link and unlink, or placeholder and rename)
+through the sync of the directory and the note that it happened (``committed``). A caller that
+registers the cleanup apart from a ``with`` statement (an :class:`contextlib.ExitStack`) holds
+them across the registration too.
 
 Nothing here deletes a file this process did not create in the same call. Every system call goes
 through a :class:`~ironbird.fsops.FileSystem`, so tests can fail any step.
@@ -69,8 +70,20 @@ class Locked(Collision):
 
 
 class SyncAfterCommit(OSError):
-    """The rename was committed but syncing the directory failed: the new name may not survive
-    a power loss. The rename is not undone."""
+    """The rename was committed but a step after it failed: syncing the directory (the new name
+    may not survive a power loss) or, for :class:`LeftoverAfterCommit`, removing the old name.
+    The rename is not undone."""
+
+
+class LeftoverAfterCommit(SyncAfterCommit):
+    """A hard-link commit went through (the final name denotes the file) but the old, temporary
+    name could not be removed: ``leftover`` names it, and it is not removed by this process any
+    more. ``sync_error`` is the reason the directory sync that followed failed, if it did."""
+
+    def __init__(self, errno_: int, strerror: str, leftover: str) -> None:
+        super().__init__(errno_, strerror, leftover)
+        self.leftover = leftover
+        self.sync_error: str | None = None
 
 
 def rename_noreplace(dir_fd: int, old: str, new: str, fd: int, *, fs: FileSystem = REAL_FS) -> None:
@@ -78,28 +91,42 @@ def rename_noreplace(dir_fd: int, old: str, new: str, fd: int, *, fs: FileSystem
 
     ``fd`` is the open descriptor of the file (or directory) and ``old`` must still denote it.
     Raises :class:`Collision` when ``new`` exists, :class:`SyncAfterCommit` when only the
-    directory sync after a committed rename failed, and ``OSError`` for any other failure, in
-    which case nothing was changed (a placeholder this call made is removed again).
+    directory sync after a committed rename failed, :class:`LeftoverAfterCommit` when a hard-link
+    commit could not remove the old name, and ``OSError`` for any other failure, in which case
+    nothing was changed (a placeholder this call made is removed again).
+
+    The rename and the directory sync run with the termination signals held, so a signal that
+    lands in them is acted on only once the commit is durable.
     """
     held, named = fs.fstat(fd), try_stat_at(fs, dir_fd, old)
     if named is None or not same_file(held, named):
         raise OSError(errno.ENOENT, "the name no longer denotes the file", old)
     # One step a signal handler cannot split: the link without its unlink, or the placeholder
-    # without the rename over it, would be left behind. A handler that raises runs as it ends.
+    # without the rename over it, would be left behind, and a committed name must get its
+    # directory sync. A handler that raises runs as the scope ends.
     with signals_held():
+        leftover: LeftoverAfterCommit | None = None
         try:
             renamed = fs.renameat2_noreplace(dir_fd, old, new)
         except FileExistsError:
             raise Collision(new) from None
         # renameat2 unavailable here: a hard link for a regular file, else the placeholder rename
-        if renamed is None and not (
-            stat.S_ISREG(held.st_mode) and _link(fs, dir_fd, old, new, held)
-        ):
-            _placeholder_rename(fs, dir_fd, old, new, held)
-    try:
-        fs.fsync(dir_fd)
-    except OSError as exc:
-        raise SyncAfterCommit(exc.errno, exc.strerror or "directory sync failed", new) from exc
+        try:
+            if renamed is None and not (
+                stat.S_ISREG(held.st_mode) and _link(fs, dir_fd, old, new, held)
+            ):
+                _placeholder_rename(fs, dir_fd, old, new, held)
+        except LeftoverAfterCommit as exc:
+            leftover = exc  # the name is committed all the same: sync it, then report
+        try:
+            fs.fsync(dir_fd)
+        except OSError as exc:
+            reason = exc.strerror or "directory sync failed"
+            if leftover is None:
+                raise SyncAfterCommit(exc.errno, reason, new) from exc
+            leftover.sync_error = reason
+        if leftover is not None:
+            raise leftover
 
 
 def _link(fs: FileSystem, dir_fd: int, old: str, new: str, held: os.stat_result) -> bool:
@@ -120,7 +147,15 @@ def _link(fs: FileSystem, dir_fd: int, old: str, new: str, held: os.stat_result)
     if now_new is None or not same_file(held, now_new):
         raise OSError(errno.EIO, "the committed name does not denote the file", new)
     if now_old is not None and same_file(held, now_old):
-        fs.unlink_at(dir_fd, old)  # the second step of the link rename: our own old name
+        try:
+            fs.unlink_at(dir_fd, old)  # the second step of the link rename: our own old name
+        except FileNotFoundError:
+            pass  # a retransmitted unlink whose first reply was lost: the name is gone
+        except OSError as exc:
+            # The link went through: the final name is the export. Nothing is undone.
+            raise LeftoverAfterCommit(
+                exc.errno or errno.EIO, exc.strerror or "the old name was not removed", old
+            ) from exc
     return True
 
 
@@ -264,37 +299,49 @@ class TempOutput:
                 raise OSError(errno.EIO, "write made no progress", self.name)
             view = view[written:]
 
+    @property
+    def committed(self) -> bool:
+        """Whether the file has its final name (a failed directory sync or a leftover old name
+        after the rename counts: the rename is not undone)."""
+        return self._committed
+
     def commit(self) -> None:
         """Sync the file and give it its final name. An existing name is refused
         (:class:`Collision`) unless ``force`` and it is an existing regular file owned by this
-        user, which is replaced."""
+        user, which is replaced.
+
+        From the rename on, the termination signals are held until :attr:`committed` is set and
+        the directory is synced, so a handler that raises cannot report a finished commit as
+        interrupted; it runs as this method ends.
+        """
         fs = self._fs
         fs.fdatasync(self.fd)
         final = self.final.name
-        if self.force:
-            existing = try_stat_at(fs, self._dir_fd, final)
-            if (
-                existing is not None
-                and stat.S_ISREG(existing.st_mode)
-                and existing.st_uid == os.getuid()
-            ):
-                if self._in_use(final):
-                    raise Locked(final)
-                fs.rename_at(self._dir_fd, self.name, final)  # --force: the one replacement
-                self._committed = True
-                try:
-                    fs.fsync(self._dir_fd)
-                except OSError as exc:
-                    raise SyncAfterCommit(
-                        exc.errno, exc.strerror or "directory sync failed", final
-                    ) from exc
-                return
-        try:
-            rename_noreplace(self._dir_fd, self.name, final, self.fd, fs=fs)
-        except SyncAfterCommit:
-            self._committed = True  # renamed; only the directory sync failed
-            raise
-        self._committed = True
+        with signals_held():
+            if self.force:
+                existing = try_stat_at(fs, self._dir_fd, final)
+                if (
+                    existing is not None
+                    and stat.S_ISREG(existing.st_mode)
+                    and existing.st_uid == os.getuid()
+                ):
+                    if self._in_use(final):
+                        raise Locked(final)
+                    fs.rename_at(self._dir_fd, self.name, final)  # --force: the one replacement
+                    self._committed = True
+                    try:
+                        fs.fsync(self._dir_fd)
+                    except OSError as exc:
+                        raise SyncAfterCommit(
+                            exc.errno, exc.strerror or "directory sync failed", final
+                        ) from exc
+                    return
+            try:
+                rename_noreplace(self._dir_fd, self.name, final, self.fd, fs=fs)
+            except SyncAfterCommit:
+                self._committed = True  # renamed; only a step after it failed
+                raise
+            self._committed = True
 
     def _in_use(self, name: str) -> bool:
         """Whether another process holds ``name`` under ``flock`` (probed ``LOCK_EX | LOCK_NB``
@@ -499,9 +546,16 @@ class TempDirOutput:
         member.fd = fd
         self._open[handle] = None
 
+    @property
+    def committed(self) -> bool:
+        """Whether the directory has its final name (see :attr:`TempOutput.committed`)."""
+        return self._committed
+
     def commit(self) -> None:
         """Sync every member and the directory, then give the directory its final name. An
-        existing name is refused (:class:`Collision`), whatever it is."""
+        existing name is refused (:class:`Collision`), whatever it is. From the rename on, the
+        termination signals are held until :attr:`committed` is set (see
+        :meth:`TempOutput.commit`)."""
         fs = self._fs
         for member in self._members:
             if member.fd >= 0:
@@ -520,12 +574,13 @@ class TempDirOutput:
             close_quietly(fs, fd)
         self._open.clear()
         fs.fsync(self._dir_fd)
-        try:
-            rename_noreplace(self._parent_fd, self.name, self.final.name, self._dir_fd, fs=fs)
-        except SyncAfterCommit:
-            self._committed = True  # renamed; only the directory sync failed
-            raise
-        self._committed = True
+        with signals_held():
+            try:
+                rename_noreplace(self._parent_fd, self.name, self.final.name, self._dir_fd, fs=fs)
+            except SyncAfterCommit:
+                self._committed = True  # renamed; only a step after it failed
+                raise
+            self._committed = True
 
     def _discard(self) -> None:
         """Remove what this process created: its members, then the (then empty) directory."""

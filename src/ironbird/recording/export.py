@@ -44,7 +44,14 @@ from pathlib import Path
 from typing import Final, Protocol
 
 from ironbird import render
-from ironbird.atomicfile import Collision, Locked, SyncAfterCommit, TempDirOutput, TempOutput
+from ironbird.atomicfile import (
+    Collision,
+    LeftoverAfterCommit,
+    Locked,
+    SyncAfterCommit,
+    TempDirOutput,
+    TempOutput,
+)
 from ironbird.ccdd.model import FieldDef, Message, TypeClass
 from ironbird.codec import Codec
 from ironbird.engine import FrameDecoder
@@ -898,6 +905,41 @@ def _write_error(output: Path, exc: OSError, *, created: bool = True) -> Ironbir
     )
 
 
+@dataclass(slots=True)
+class WriteProgress:
+    """What a :func:`write_to_file` or :func:`write_to_directory` got done, readable after any
+    exit of it (an exception, a signal's included): the temporary output once it is made, and the
+    result once ``run`` has returned."""
+
+    temp: TempOutput | TempDirOutput | None = None
+    result: ExportResult | None = None
+
+    @property
+    def committed(self) -> bool:
+        """Whether the output has its final name (complete, whatever came after)."""
+        return self.temp is not None and self.temp.committed
+
+
+def _after_commit_note(output: Path, exc: SyncAfterCommit, what: str) -> str:
+    """Why a committed output deserves a warning: its directory could not be synced, or the
+    temporary name of a hard-link commit could not be removed. ``what``: the output's kind."""
+    where = render.term(str(output), 300)
+    reason = render.term(exc.strerror or "unknown error", 200)
+    if isinstance(exc, LeftoverAfterCommit):
+        note = (
+            f"the {what} {where} was written, but the temporary file "
+            f"{render.term(exc.leftover, 100)} beside it could not be removed ({reason}); "
+            "remove it by hand"
+        )
+        if exc.sync_error is not None:
+            note += f"; the directory also could not be synced ({render.term(exc.sync_error, 200)})"
+        return note
+    return (
+        f"the directory of {where} could not be synced ({reason}); the {what} exists, "
+        "but its name may not survive a power loss"
+    )
+
+
 def write_to_file(
     output: Path,
     *,
@@ -905,13 +947,15 @@ def write_to_file(
     run: Callable[[Destination], ExportResult],
     fs: FileSystem = REAL_FS,
     before_commit: Callable[[], None] | None = None,
+    progress: WriteProgress | None = None,
 ) -> tuple[ExportResult, str | None]:
     """Run ``run`` against a temporary file beside ``output`` and give it the name ``output``
     when ``run`` returns: refused (``IB-EXP-002``) if the name is taken by then, unless ``force``
     allows replacing a regular file of ours that no one else holds locked. ``before_commit``, if
     given, runs just before the rename and may refuse. Any error leaves no file behind
-    (``IB-EXP-001`` for a failed write). The second value is the reason the directory could not
-    be synced after the commit (the file exists all the same), if any."""
+    (``IB-EXP-001`` for a failed write). The second value is a warning for a file that exists
+    all the same: its directory could not be synced after the commit, or the temporary name of
+    a hard-link commit could not be removed. ``progress`` is filled as the write goes."""
     name = render.term(str(output), 300)
     sync: str | None = None
     with contextlib.ExitStack() as stack:
@@ -919,18 +963,22 @@ def write_to_file(
             # held until the stack holds the cleanup: a signal cannot leave the file behind
             with signals_held():
                 temp = stack.enter_context(TempOutput(output, force=force, fs=fs))
+                if progress is not None:
+                    progress.temp = temp
         except OSError as exc:
             raise _write_error(output, exc, created=False) from exc
         try:
             result = run(FileDestination(temp))
         except OutputError as exc:
             raise _write_error(output, exc.cause) from exc
+        if progress is not None:
+            progress.result = result
         if before_commit is not None:
             before_commit()
         try:
             temp.commit()
         except SyncAfterCommit as exc:
-            sync = exc.strerror or "directory sync failed"  # renamed all the same
+            sync = _after_commit_note(output, exc, "file")  # committed all the same
         except Locked as exc:
             raise IronbirdError(
                 Code.EXP_EXISTS,
@@ -958,6 +1006,7 @@ def write_to_directory(
     fs: FileSystem = REAL_FS,
     max_open: int | None = None,
     before_commit: Callable[[], None] | None = None,
+    progress: WriteProgress | None = None,
 ) -> tuple[ExportResult, str | None]:
     """:func:`write_to_file` for a directory of tables: the directory is built beside ``output``
     and renamed to it without replacing anything, whatever ``output`` has become meanwhile.
@@ -972,18 +1021,22 @@ def write_to_directory(
             try:
                 with signals_held():  # until the stack holds the cleanup (see write_to_file)
                     stack.enter_context(temp)
+                    if progress is not None:
+                        progress.temp = temp
             except OSError as exc:
                 raise _write_error(output, exc, created=False) from exc
             try:
                 result = run(DirDestination(temp))
             except OutputError as exc:
                 raise _write_error(output, exc.cause) from exc
+            if progress is not None:
+                progress.result = result
             if before_commit is not None:
                 before_commit()
             try:
                 temp.commit()
             except SyncAfterCommit as exc:
-                sync = exc.strerror or "directory sync failed"
+                sync = _after_commit_note(output, exc, "directory")
             except Collision as exc:
                 raise IronbirdError(
                     Code.EXP_EXISTS,
@@ -1015,6 +1068,7 @@ __all__ = [
     "OutputError",
     "Selection",
     "StdoutDestination",
+    "WriteProgress",
     "check_messages",
     "check_single_layout",
     "csv_line",

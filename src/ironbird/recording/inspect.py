@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
-from ironbird.atomicfile import Collision, Locked, SyncAfterCommit, TempOutput
+from ironbird.atomicfile import Collision, LeftoverAfterCommit, Locked, SyncAfterCommit, TempOutput
 from ironbird.errors import Code, IronbirdError
 from ironbird.frame import GapReason, Stream
 from ironbird.fsops import REAL_FS, FileSystem
@@ -542,6 +542,7 @@ class RepairResult:
     damage: Damage | None
     frames_beyond: int  # valid frames after mid-file damage, left only in the original
     sync_warning: str | None = None  # the output exists, but its directory could not be synced
+    leftover: str | None = None  # the output exists, but this temporary name was not removed
 
 
 def repair(
@@ -582,12 +583,16 @@ def repair(
         suffix = _closing_records(reader, prefix_end, chunk_offsets, frames, last_seq, tail)
         total = prefix_end + len(suffix)
         sync_warning: str | None = None
+        leftover: str | None = None
         try:
             with TempOutput(output, force=force, fs=fs) as out:
                 _copy(reader, out, prefix_end)
                 out.write(suffix)
                 try:
                     out.commit()
+                except LeftoverAfterCommit as left:  # renamed all the same
+                    leftover = f"{left.leftover} ({left.strerror})"
+                    sync_warning = left.sync_error
                 except SyncAfterCommit as sync:
                     sync_warning = sync.strerror or "directory sync failed"  # renamed all the same
         except Locked as exc:
@@ -613,7 +618,7 @@ def repair(
             ) from exc
         dropped = size - prefix_end if damage is not None else 0  # a clean file's index is rebuilt
         return RepairResult(
-            output, frames, prefix_end, total, dropped, damage, beyond, sync_warning
+            output, frames, prefix_end, total, dropped, damage, beyond, sync_warning, leftover
         )
     finally:
         reader.close()

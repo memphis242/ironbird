@@ -12,6 +12,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -742,11 +743,12 @@ atomicfile.TempDirOutput.__enter__ = hook_enter(atomicfile.TempDirOutput.__enter
 
 
 def _signal_at_window(
-    tmp_path: Path, env: dict[str, str], hooks: str, where: str, fmt: str
+    tmp_path: Path, env: dict[str, str], hooks: str, where: str, fmt: str, *, send: bool = True
 ) -> tuple[Path, str]:
     """Run an export of a small recording to ``tmp_path/out`` with ``hooks`` installed, send
     SIGTERM once the hooks report the window ``where`` reached, and check it ended by the
-    signal. Returns the output path and stderr."""
+    signal. ``send=False``: the hooks end the command by the signal themselves. Returns the
+    output path and stderr."""
     hk_and_status(tmp_path / "in.ibrec", 6, 4)
     out, mark = tmp_path / "out", tmp_path / "window-reached"
     proc = subprocess.Popen(
@@ -772,12 +774,13 @@ def _signal_at_window(
         text=True,
     )
     try:
-        deadline = time.monotonic() + 60
-        while not mark.exists():
-            assert proc.poll() is None, "the export ended without reaching the window"
-            assert time.monotonic() < deadline
-            time.sleep(0.002)
-        proc.send_signal(signal.SIGTERM)
+        if send:
+            deadline = time.monotonic() + 60
+            while not mark.exists():
+                assert proc.poll() is None, "the export ended without reaching the window"
+                assert time.monotonic() < deadline
+                time.sleep(0.002)
+            proc.send_signal(signal.SIGTERM)
         _, err = proc.communicate(timeout=60)
     finally:
         if proc.poll() is None:
@@ -807,9 +810,12 @@ def test_a_signal_just_as_a_temporary_is_made_leaves_nothing_behind(
 
 # Child-side hooks for the steps after the tables are written. ``discard_*``: the commit fails
 # (the data sync of a temporary gives EIO) and the signal lands while the cleanup is between
-# checking a temporary and removing it. ``placeholder_*``: the file system has neither a
-# non-replacing rename nor hard links (NFS has no RENAME_NOREPLACE), so the commit makes an empty
-# placeholder at the final name and renames over it; the signal lands between the two.
+# checking a temporary and removing it. ``renameat2`` and ``link``: the signal lands right after
+# the rename (or the hard link, whose unlink of the temporary name is still to come).
+# ``placeholder_*``: the file system has neither a non-replacing rename nor hard links (a
+# directory export on NFS), so the commit makes an empty placeholder at the final name and
+# renames over it; the signal lands between the two. ``after_commit``: the command is ended by
+# the signal after the commit, from the summary.
 _LATE_HOOKS = """
 import errno, os, time
 from pathlib import Path
@@ -851,6 +857,28 @@ def hook_open(real):
         return fd
     return open_at
 
+def hook_renameat2(real):
+    def renameat2_noreplace(self, dir_fd, old, new):
+        got = real(self, dir_fd, old, new)
+        if WHERE == "renameat2":
+            window()
+        return got
+    return renameat2_noreplace
+
+def hook_link(real):
+    def link_at(self, dir_fd, old, new):
+        real(self, dir_fd, old, new)
+        if WHERE == "link":
+            window()
+    return link_at
+
+def hook_fsync(real):
+    def fsync(self, fd):
+        real(self, fd)
+        if MARK.exists() and os.path.isdir(f"/proc/self/fd/{fd}"):
+            Path(str(MARK) + ".synced").touch()  # a directory synced after the window
+    return fsync
+
 def no_renameat2(self, dir_fd, old, new):
     return None
 
@@ -861,8 +889,23 @@ FS.fdatasync = hook_fdatasync(FS.fdatasync)
 FS.unlink_at = hook_unlink(FS.unlink_at)
 FS.mkdir_at = hook_mkdir(FS.mkdir_at)
 FS.open_at = hook_open(FS.open_at)
+FS.fsync = hook_fsync(FS.fsync)
+FS.renameat2_noreplace = hook_renameat2(FS.renameat2_noreplace)
+FS.link_at = hook_link(FS.link_at)
+if WHERE == "link":
+    FS.renameat2_noreplace = no_renameat2
 if WHERE.startswith("placeholder"):
     FS.renameat2_noreplace, FS.link_at = no_renameat2, no_link
+if WHERE == "after_commit":
+    # a signal that reaches the command after the commit, whatever held it off until then
+    import signal
+    from ironbird.cli import main as cli_main
+
+    def summary_then_signal(*args, **kwargs):
+        cli_main._STATE.signum = signal.SIGTERM
+        raise cli_main._Terminated(signal.SIGTERM)
+
+    cli_main._export_summary = summary_then_signal
 """
 
 
@@ -890,6 +933,224 @@ def test_a_signal_between_placeholder_and_rename_leaves_no_empty_output(
         assert any(out.iterdir()), err
     else:
         assert out.is_file() and out.stat().st_size > 0, err
+
+
+def _stops(tmp_path: Path) -> list[dict[str, Any]]:
+    return [e for e in ledger_events(tmp_path) if e["event"] == "export.stop"]
+
+
+def _errors(tmp_path: Path, code: Code) -> list[dict[str, Any]]:
+    return [e for e in ledger_events(tmp_path) if e["kind"] == "error" and e["event"] == code.value]
+
+
+def _assert_whole(out: Path, fmt: str) -> None:
+    if fmt == "csv":
+        assert out.is_dir() and sorted(p.name for p in out.iterdir()) == [
+            "MOCK_HK.csv",
+            "MOCK_STATUS.csv",
+            "malformed.csv",
+        ]
+    else:
+        assert out.is_file() and len(out.read_text().splitlines()) == 10
+
+
+@pytest.mark.parametrize(
+    ("where", "fmt"),
+    [
+        ("renameat2", "text"),
+        ("renameat2", "csv"),
+        ("link", "text"),
+        ("placeholder_file", "text"),
+        ("placeholder_dir", "csv"),
+    ],
+)
+def test_a_signal_in_the_commit_is_reported_as_after_the_export_was_written(
+    tmp_path: Path, env: dict[str, str], where: str, fmt: str
+) -> None:
+    """The export is whole under its final name when the signal is acted on: the directory is
+    still synced, the ledger has the finished export (rows, not 0), and the user is told the
+    export was written."""
+    out, err = _signal_at_window(tmp_path, env, _LATE_HOOKS, where, fmt)
+    assert temporaries(tmp_path) == [], err
+    _assert_whole(out, fmt)
+    assert (tmp_path / "window-reached.synced").exists(), "the directory sync was skipped"
+    (stop,) = _stops(tmp_path)
+    assert stop["rows"] == 10 and stop["committed"] is True and stop["output"] == str(out)
+    notice = next(e for e in ledger_events(tmp_path) if e["event"] == "cli.signal")["notice"]
+    assert "SIGTERM" in notice and "written to" in notice and str(out) in notice
+    assert notice in err
+
+
+@pytest.mark.parametrize(("fmt"), ["text", "csv"])
+def test_a_signal_after_the_commit_still_ledgers_the_finished_export(
+    tmp_path: Path, env: dict[str, str], fmt: str
+) -> None:
+    """Whatever lets a signal through after the commit, the stop record says committed, with the
+    output and the rows, and the line names the output."""
+    out, err = _signal_at_window(tmp_path, env, _LATE_HOOKS, "after_commit", fmt, send=False)
+    _assert_whole(out, fmt)
+    (stop,) = _stops(tmp_path)
+    assert stop["rows"] == 10 and stop["committed"] is True and stop["output"] == str(out)
+    assert stop["reason"] == "done"
+    assert "written to" in err and str(out) in err and temporaries(tmp_path) == []
+
+
+@pytest.mark.parametrize(("where", "fmt"), [("discard_file", "text"), ("discard_member", "csv")])
+def test_a_signal_in_the_cleanup_does_not_hide_the_error_that_caused_it(
+    tmp_path: Path, env: dict[str, str], where: str, fmt: str
+) -> None:
+    """The failed commit (EIO) is ledgered once and shown, besides the interruption."""
+    out, err = _signal_at_window(tmp_path, env, _LATE_HOOKS, where, fmt)
+    assert not out.exists() and temporaries(tmp_path) == [], err
+    failures = _errors(tmp_path, Code.EXP_WRITE)
+    assert len(failures) == 1, failures
+    assert Code.EXP_WRITE.value in err and "interrupted" in err
+    assert [e["reason"] for e in _stops(tmp_path)] == ["error"]
+
+
+class _Raised(BaseException):
+    pass
+
+
+@pytest.fixture
+def raising_hup() -> Any:
+    def handler(_signum: int, _frame: object) -> None:
+        raise _Raised
+
+    previous = signal.signal(signal.SIGHUP, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+
+def _hup_after(real: Any) -> Any:
+    """``real`` followed by a SIGHUP to this thread (its handler raises :class:`_Raised`)."""
+
+    def call(*args: Any) -> Any:
+        got = real(*args)
+        signal.pthread_kill(threading.get_ident(), signal.SIGHUP)
+        return got
+
+    return call
+
+
+_MAIN_THREAD_ONLY = pytest.mark.skipif(
+    threading.current_thread() is not threading.main_thread(),
+    reason="signal handlers can only be set in the main thread",
+)
+
+
+@_MAIN_THREAD_ONLY
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_a_signal_in_the_rename_is_acted_on_after_the_directory_sync_and_the_note(
+    tmp_path: Path, raising_hup: None, kind: str
+) -> None:
+    fs = FaultFs()
+    fs.override("renameat2_noreplace", _hup_after(fsops.REAL_FS.renameat2_noreplace))
+    out = tmp_path / "out"
+    output: TempOutput | TempDirOutput = (
+        TempOutput(out, fs=fs) if kind == "file" else TempDirOutput(out, fs=fs)
+    )
+    with pytest.raises(_Raised), output:
+        if isinstance(output, TempOutput):
+            output.write(b"x")
+        else:
+            output.write(output.create("a.csv"), b"x")
+        output.commit()
+    assert output.committed and out.exists() and temporaries(tmp_path) == []
+    renamed = next(i for i, (name, _) in enumerate(fs.calls) if name == "renameat2_noreplace")
+    dir_fd = fs.calls[renamed][1][0]
+    assert ("fsync", (dir_fd,)) in fs.calls[renamed:], "the directory sync was skipped"
+
+
+# -- committing by hard link: the unlink of the temporary name ----
+
+
+def _no_renameat2(fs: FaultFs) -> None:
+    fs.override("renameat2_noreplace", lambda dir_fd, old, new: None)  # as on NFS
+
+
+def test_a_link_commit_whose_unlink_reply_was_lost_is_a_success(tmp_path: Path, rec: Path) -> None:
+    """The unlink went through but its reply was lost, and the retransmit gets ENOENT."""
+    fs = FaultFs()
+    _no_renameat2(fs)
+
+    def lost_reply(dir_fd: int, name: str) -> None:
+        fsops.REAL_FS.unlink_at(dir_fd, name)
+        raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), name)
+
+    fs.override("unlink_at", lost_reply)
+    out = tmp_path / "out.txt"
+    result, note = write_to_file(out, force=False, run=run_into(rec), fs=fs)
+    assert note is None and result.rows == 10 and len(out.read_text().splitlines()) == 10
+    assert temporaries(tmp_path) == []
+
+
+def test_a_link_commit_that_cannot_remove_the_temporary_name_is_committed_and_names_it(
+    tmp_path: Path, rec: Path
+) -> None:
+    fs = FaultFs()
+    _no_renameat2(fs)
+    fs.fail("unlink_at", errno.EIO, when=lambda dir_fd, name: name.endswith(".tmp"))
+    out = tmp_path / "out.txt"
+    with TempOutput(out, fs=fs) as direct:
+        direct.write(b"complete\n")
+        with pytest.raises(atomicfile.LeftoverAfterCommit) as caught:
+            direct.commit()
+    left = direct.name
+    assert caught.value.leftover == left and direct.committed
+    assert out.read_bytes() == b"complete\n" and temporaries(tmp_path) == [left]
+    (tmp_path / left).unlink()
+
+    result, note = write_to_file(out.with_name("other.txt"), force=False, run=run_into(rec), fs=fs)
+    assert result.rows == 10 and len(out.with_name("other.txt").read_text().splitlines()) == 10
+    assert note is not None and "remove it by hand" in note
+    assert "partial output was removed" not in note
+    assert note.count(".other.txt.") == 1 and len(temporaries(tmp_path)) == 1
+
+
+@pytest.mark.parametrize("hidden", ["ironbird", "other"])
+def test_a_signal_that_replaces_a_failure_still_ledgers_the_failure(
+    tmp_path: Path, rec: Path, monkeypatch: pytest.MonkeyPatch, hidden: str
+) -> None:
+    """A signal raised while a failure unwinds (its cleanup is where it landed) leaves the
+    failure on the exception's context: the ledger has it, and the user is shown it once an
+    ``IronbirdError``, besides the interruption."""
+    from typer.testing import CliRunner
+
+    from ironbird.cli import main as cli_main
+
+    for name in ("state", "recordings"):
+        (tmp_path / name).mkdir(mode=0o700)
+    for key, value in child_env(tmp_path).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("IRONBIRD_CONFIG", raising=False)
+    for attr in ("signum", "announced", "_raises"):  # restored after the test
+        monkeypatch.setattr(cli_main._STATE, attr, getattr(cli_main._STATE, attr))
+
+    def unwinding(*args: Any, **kwargs: Any) -> None:
+        try:
+            if hidden == "ironbird":
+                raise IronbirdError(Code.EXP_WRITE, "cannot write the export: disk trouble")
+            raise ValueError("not an ironbird error")
+        except (IronbirdError, ValueError):
+            cli_main._STATE.signum = signal.SIGTERM
+            # the handler's exception, raised while the failure is being handled
+            raise cli_main._Terminated(signal.SIGTERM)  # noqa: B904
+
+    monkeypatch.setattr(cli_main, "write_to_file", unwinding)
+    out = tmp_path / "out.txt"
+    result = CliRunner().invoke(
+        cli_main.app, ["export", str(rec), "--format", "text", "-o", str(out)]
+    )
+    assert result.exit_code == 143, result.output
+    events = ledger_events(tmp_path)
+    code = Code.EXP_WRITE if hidden == "ironbird" else Code.INTERNAL
+    assert _errors(tmp_path, code), events
+    assert "interrupted" in result.output
+    assert (Code.EXP_WRITE.value in result.output) is (hidden == "ironbird")
+    assert Code.INTERNAL.value not in result.output
 
 
 def test_a_reader_that_goes_away_ends_a_stdout_export_quietly(

@@ -51,6 +51,7 @@ from ironbird.recording.export import (
     ExportResult,
     Selection,
     StdoutDestination,
+    WriteProgress,
     check_messages,
     check_single_layout,
     input_guard,
@@ -308,6 +309,7 @@ class _Run:
     config_error: IronbirdError | None = None
     config_missing: bool = False  # no configuration file at all (not an error for offline tools)
     retention: Retention | None = None
+    wrote: str | None = None  # an output already complete under its final name (named for a signal)
 
 
 Body = Callable[[Session, SystemConfig, "_Run"], Awaitable[int]]
@@ -400,6 +402,8 @@ def _interrupt_notice(name: str, signum: int, run: _Run) -> str:
     sig = signal.Signals(signum).name
     tx = run.session.last_tx if run.session is not None else None
     if name != "send":
+        if run.wrote is not None:
+            return f"interrupted ({sig}) after the export was written to {run.wrote}"
         return f"interrupted ({sig})"
     if tx is None:
         return f"interrupted ({sig}): no command was built, so nothing was sent"
@@ -691,6 +695,44 @@ def _usage_error(
     return None
 
 
+_HIDDEN_ERRORS_MAX: Final = 8
+
+
+def _hidden_errors(stop: BaseException) -> list[tuple[IronbirdError, bool]]:
+    """The failures that a signal's exception replaced.
+
+    A signal that lands while a failure is unwinding (in a cleanup that runs for it) raises
+    over it; the failure stays on the signal's ``__context__`` or ``__cause__`` chain. The first
+    ``Exception`` on each branch is returned as an error to ledger (an :class:`IronbirdError`
+    as it is, anything else as ``IB-INT-001`` with its traceback); its own chain is its detail.
+    Only the first kind is shown to the user (``True``): another exception may be one that was
+    being handled as expected when the signal landed, so it goes to the ledger alone. The walk
+    is bounded.
+    """
+    found: list[tuple[IronbirdError, bool]] = []
+    seen = {id(stop)}
+    pending: list[BaseException] = [stop]
+    while pending and len(found) < _HIDDEN_ERRORS_MAX:
+        current = pending.pop()
+        for link in (current.__cause__, current.__context__):
+            if link is None or id(link) in seen:
+                continue
+            seen.add(id(link))
+            if isinstance(link, IronbirdError):
+                found.append((link, True))
+            elif isinstance(link, Exception):
+                wrapped = IronbirdError(
+                    Code.INTERNAL,
+                    f"unexpected {type(link).__name__}: {link}",
+                    details="".join(traceback.format_exception(link)),
+                    cause=link,
+                )
+                found.append((wrapped, False))
+            else:
+                pending.append(link)  # a signal's or a cancellation's own context
+    return found
+
+
 def _run(
     ctx: typer.Context,
     as_node: str | None,
@@ -793,6 +835,10 @@ def _run(
             if not _STATE.signum:
                 raise
             signum = stop.signum if isinstance(stop, _Terminated) else _STATE.signum
+            for hidden, shown in _hidden_errors(stop):  # the failure the signal landed over
+                ledger.record_error(hidden)
+                if shown:
+                    _print_error(console, hidden, glob.verbose)
             code = _record_signal(name, signum, run, ledger, console)
         except IronbirdError as exc:
             ledger.record_error(exc)
@@ -1636,6 +1682,15 @@ def rec_repair(
             sync_warning = IronbirdError(Code.REC_DIRSYNC, warning)
             ledger.record_error(sync_warning, output=result.output)
             console.err(sync_warning.user_line())
+        if result.leftover is not None:
+            left = IronbirdError(
+                Code.REC_DIRSYNC,
+                f"the repaired file {term(str(result.output), 400, err=True)} was written, but "
+                f"the temporary file {term(result.leftover, 200, err=True)} beside it could not "
+                "be removed; remove it by hand",
+            )
+            ledger.record_error(left, output=result.output)
+            console.err(left.user_line())
         damage = result.damage
         if damage is None:
             return 0
@@ -2311,6 +2366,12 @@ def export_command(
         replaying: Replay | None = None
         ending = "interrupted"
         rows = 0
+        stopped = False  # export.stop is in the ledger
+        directory = False  # the output is a directory of tables
+        progress = WriteProgress()
+        # Held from just before the commit until the export is recorded and summarised, so a
+        # signal cannot cut that short; its handler runs when the hold is released.
+        hold = contextlib.ExitStack()
         try:
             start = parse_time_spec(from_, "--from") if from_ is not None else None
             end = parse_time_spec(to, "--to") if to is not None else None
@@ -2431,24 +2492,31 @@ def export_command(
             if output is None:
                 result = run_it(StdoutDestination(console.stdout.write_wait))
                 target = "stdout"
-            elif directory:
-                result, sync = write_to_directory(
-                    output, run=run_it, before_commit=input_guard(output, replaying)
-                )
-                target = f"directory {term(str(output), 300, err=True)}"
             else:
-                result, sync = write_to_file(
-                    output, force=force, run=run_it, before_commit=input_guard(output, replaying)
-                )
-                target = term(str(output), 300, err=True)
+                guard = input_guard(output, replaying)
+
+                def before_commit() -> None:
+                    guard()
+                    hold.enter_context(signals_held())
+
+                if directory:
+                    target = f"directory {term(str(output), 300, err=True)}"
+                    result, sync = write_to_directory(
+                        output, run=run_it, before_commit=before_commit, progress=progress
+                    )
+                else:
+                    target = term(str(output), 300, err=True)
+                    result, sync = write_to_file(
+                        output,
+                        force=force,
+                        run=run_it,
+                        before_commit=before_commit,
+                        progress=progress,
+                    )
             ending = result.ending.value
             rows = result.rows
             if sync is not None:
-                warning = (
-                    f"the directory of {term(str(output), 300, err=True)} could not be synced "
-                    f"({term(sync, 200, err=True)}); the export exists, but its name may not "
-                    "survive a power loss"
-                )
+                warning = term(sync, 600, err=True)
                 ledger.record("warning", Code.EXP_WRITE.value, summary=warning, output=output)
                 console.err(f"warning {Code.EXP_WRITE.value}: {warning}")
             _report_unclosed(replaying, ledger, console, "exported")
@@ -2470,6 +2538,8 @@ def export_command(
                 "export.stop",
                 reason=ending,
                 rows=result.rows,
+                committed=progress.committed,
+                output=output,
                 files=result.files,
                 tables=dict(list(result.per_table.items())[:64]),
                 decoded=result.decoded,
@@ -2487,6 +2557,7 @@ def export_command(
                 chunks_skipped=stats.chunks_skipped,
                 rejected=dict(result.rejected),
             )
+            stopped = True
             damaged = stats.mid_file_damage or bool(stats.missing_parts)
             return EXIT_DAMAGED_INPUT if damaged else 0
         except IronbirdError as exc:
@@ -2495,8 +2566,23 @@ def export_command(
         finally:
             if replaying is not None:
                 replaying.close()
-            if ending in ("interrupted", "error"):
-                ledger.record("state", "export.stop", reason=ending, rows=rows)
+            if progress.committed:
+                # A signal that lands after the commit finds the export whole under its final
+                # name; the notice says so.
+                assert output is not None
+                run.wrote = f"{'directory ' if directory else ''}{term(str(output), 300, err=True)}"
+            if not stopped:
+                if progress.result is not None:
+                    rows = progress.result.rows
+                ledger.record(
+                    "state",
+                    "export.stop",
+                    reason=ending,
+                    rows=rows,
+                    committed=progress.committed,
+                    output=output,
+                )
+            hold.close()  # a signal held since the commit acts now
 
     _run(ctx, None, verbose, None, "export", offline=work)
 
