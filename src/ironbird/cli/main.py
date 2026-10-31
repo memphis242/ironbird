@@ -551,10 +551,12 @@ def _apply_ledger_report(code: int, report: ExitReport) -> int:
 
 
 def _closing_news(report: ExitReport, closing: ExitReport) -> tuple[Notice, ...]:
-    """The exit lines of the final close that the earlier account did not already print (the
-    close may find more unwritten, or fail where the last write attempt did not)."""
-    seen = {notice.summary for notice in report.notices}
-    return tuple(notice for notice in closing.notices if notice.summary not in seen)
+    """The exit lines of the final close for a code the earlier account did not already print
+    (the close may fail where the last write attempt did not). A code that was shown is not shown
+    again with other figures: two lines that disagree on how many records were not written are
+    worse than one."""
+    seen = {notice.code for notice in report.notices}
+    return tuple(notice for notice in closing.notices if notice.code not in seen)
 
 
 def _report_ledger(report: ExitReport, run: _Run, console: Console, code: int) -> int:
@@ -648,13 +650,18 @@ def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -
     return code
 
 
+_EARLY_PREFIXES: Final = ("IB-CLI-", "IB-FLT-", "IB-EVT-")  # errors of the invocation itself
+
+
 def _usage_error(
     run: _Run, role: str | None, precheck: Callable[[Session], None] | None
 ) -> IronbirdError | None:
-    """The usage error (exit 2) that ``precheck`` finds in the invocation, else ``None``.
+    """The usage error that ``precheck`` finds in the invocation, else ``None``.
 
-    The check runs on a session with no ledger and no sockets; any other kind of error is left
-    to the command, which reports and ledgers it."""
+    Only an error of the command line itself (:data:`_EARLY_PREFIXES`) is answered here. The
+    check runs on a session with no ledger and no sockets, and any other error - a configuration,
+    CCDD or header file that fails to load included - is left to the command, which reports and
+    ledgers it like every other failure."""
     if precheck is None or run.config is None:
         return None
     try:
@@ -667,7 +674,7 @@ def _usage_error(
             )
         )
     except IronbirdError as exc:
-        return exc if exc.exit_code == 2 else None
+        return exc if exc.code.value.startswith(_EARLY_PREFIXES) else None
     return None
 
 
@@ -686,8 +693,9 @@ def _run(
     """Open the ledger, run ``body`` in an event loop, flush everything, exit with its code.
 
     ``precheck`` validates the invocation against the configuration before anything is opened: a
-    usage error (exit 2) it raises is reported alone, with no ledger, reserve or retention
-    scan opened for it.
+    error of the command line itself that it raises (``IB-CLI-``, ``IB-FLT-``, ``IB-EVT-``) is
+    reported alone, with no ledger, reserve or retention scan opened for it; any other error
+    is left to the command, which ledgers it.
 
     ``transmits`` commands (they put packets on a link) refuse to run without a ledger.
     ``offline`` runs instead of ``body``, synchronously and with no configuration or session: it

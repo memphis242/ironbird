@@ -35,11 +35,6 @@ from ironbird.fsops import (
 
 _NO_HARD_LINKS: Final = frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV})
 _NAME_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-# An earlier attempt's temporary file, picked up again: read to check it, appended to, never
-# truncated.
-_ADOPT_FLAGS: Final = (
-    os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
-)
 
 
 class Collision(OSError):
@@ -202,11 +197,13 @@ class TempOutput:
             raise
 
     def _adopt(self, name: str) -> bool:
-        """Take over ``name`` if it is a plain file of ours that the caller accepts."""
+        """Take over ``name`` if it is a plain file of ours that the caller accepts. It is opened
+        for reading (to check it) and appending, never truncated."""
         fs, accept = self._fs, self._accept
         assert accept is not None
+        flags = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
         try:
-            fd = fs.open_at(self._dir_fd, name, _ADOPT_FLAGS)
+            fd = fs.open_at(self._dir_fd, name, flags)
         except OSError:
             return False
         try:

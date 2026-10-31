@@ -232,3 +232,31 @@ def test_a_listen_that_is_fine_still_opens_its_ledger(
     done = _ib(mock_config_path, state, "listen", "fc", "--timeout", "0.3")
     assert done.returncode == 0, done.stderr
     assert list(state.glob("*.jsonl"))
+
+
+# -- the early path is for usage errors only ----
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("events",), ("listen", "fc", "--mid", "MOCK_HK")],
+    ids=["events", "listen-mid"],
+)
+def test_a_broken_ccdd_found_by_the_precheck_is_ledgered_like_any_other_error(
+    mock_config_path: Path, tmp_path: Path, args: tuple[str, ...]
+) -> None:
+    ccdd = tmp_path / "mock.json"
+    ccdd.write_bytes((REPO / "examples" / "ccdd" / "mock.json").read_bytes()[:200])  # truncated
+    config = tmp_path / "broken.toml"
+    config.write_text(
+        mock_config_path.read_text().replace(f"{REPO / 'examples'}/ccdd/mock.json", str(ccdd))
+    )
+    assert str(ccdd) in config.read_text()
+    state = tmp_path / "state"
+    done = _ib(config, state, *args)
+    assert done.returncode == 2, done.stderr
+    errors = [r for r in session_records(state) if r["kind"] == "error"]
+    assert errors and errors[0]["event"].startswith("IB-CCD-"), done.stderr
+    assert any(r["event"] == "cli.invoke" for r in session_records(state))
+    lines = [x for x in done.stderr.splitlines() if x.startswith("error IB-CCD-")]
+    assert len(lines) == 1, done.stderr  # reported once, by the command itself

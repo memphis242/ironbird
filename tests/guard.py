@@ -56,6 +56,19 @@ RENAME_ATTRS = {
 }
 #: Attributes generic enough to name a field or a method of anything: judged only when called.
 CALL_ONLY_ATTRS = {"rename"}
+#: Names that make ``.rename`` the file operation even when it is only referenced (passed on as a
+#: value, or bound to a name): the modules, and the file system seam as its parameter or field.
+FILE_RECEIVERS = {
+    "os",
+    "shutil",
+    "pathlib",
+    "Path",
+    "PurePath",
+    "PosixPath",
+    "fs",
+    "_fs",
+    "REAL_FS",
+}
 TRUNCATE_FUNCS = {"os.truncate", "os.ftruncate"}
 TRUNCATE_ATTRS = {"truncate", "ftruncate", "write_text", "write_bytes"}
 TEMPFILE_NAMES = {"tempfile.NamedTemporaryFile", "tempfile.TemporaryDirectory"}
@@ -227,7 +240,11 @@ class _Visitor(ast.NodeVisitor):
         # References count as well as calls: ``self._call(fs.ftruncate, ...)`` passes the
         # function as a value, and must not escape the guard.
         target = self.dotted(node)
-        if node.attr in CALL_ONLY_ATTRS and id(node) not in self._callees:
+        if (
+            node.attr in CALL_ONLY_ATTRS
+            and id(node) not in self._callees
+            and not (set((target or "").split(".")[:-1]) & FILE_RECEIVERS)
+        ):
             pass  # a field or a method of some other object, until it is called
         elif target == "sys.modules" or (
             node.attr in ("__dict__", "__builtins__")

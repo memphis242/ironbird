@@ -21,6 +21,7 @@ from typing import Final
 from ironbird.ledgerstore import SHUTDOWN_SIGNALS
 
 SLICE_S: Final = 0.05
+FINAL_WRITE_FLOOR_S: Final = 0.2  # what the ledger's last write may still wait after a signal
 
 
 def start_thread(thread: threading.Thread) -> None:
@@ -42,7 +43,9 @@ class WaitBudget:
     wait of the exit, not just the one it interrupted.
 
     A wait may name ``keep`` seconds that it leaves unspent, for the waits that come after it
-    (the ledger's last write and close must not be starved by a scan or a rate limit).
+    (the ledger's last write and close must not be starved by a scan or a rate limit), and a
+    ``floor``: the seconds it may still wait after the budget was aborted (a signal), counted from
+    the abort - the ledger's last write is worth that much, a scan's is not.
     """
 
     def __init__(self, total_s: float, abort: Callable[[], bool] | None = None) -> None:
@@ -60,20 +63,32 @@ class WaitBudget:
     def left(self) -> float:
         return self._left
 
-    def wait(self, event: threading.Event, cap: float | None = None, keep: float = 0.0) -> bool:
-        """Wait for ``event`` (at most ``cap`` seconds, if given, and leaving ``keep`` seconds of
-        the budget); ``True`` when it was set."""
-        return self._wait(event.wait, cap, keep)
+    def wait(
+        self,
+        event: threading.Event,
+        cap: float | None = None,
+        keep: float = 0.0,
+        floor: float = 0.0,
+    ) -> bool:
+        """Wait for ``event`` (at most ``cap`` seconds, if given, leaving ``keep`` seconds of
+        the budget, and ``floor`` seconds past an abort); ``True`` when it was set."""
+        return self._wait(event.wait, cap, keep, floor)
 
-    def join(self, thread: threading.Thread, cap: float | None = None, keep: float = 0.0) -> bool:
-        """Wait for ``thread`` to end (at most ``cap`` seconds, if given, and leaving ``keep``
-        seconds of the budget); ``True`` when it has."""
+    def join(
+        self,
+        thread: threading.Thread,
+        cap: float | None = None,
+        keep: float = 0.0,
+        floor: float = 0.0,
+    ) -> bool:
+        """Wait for ``thread`` to end (at most ``cap`` seconds, if given, leaving ``keep``
+        seconds of the budget, and ``floor`` seconds past an abort); ``True`` when it has."""
 
         def poll(timeout: float) -> bool:
             thread.join(timeout)
             return not thread.is_alive()
 
-        return self._wait(poll, cap, keep)
+        return self._wait(poll, cap, keep, floor)
 
     def _asked_to_stop(self) -> bool:
         if not self.aborted and self._abort is not None and self._abort():
@@ -81,21 +96,29 @@ class WaitBudget:
         return self.aborted
 
     def _wait(
-        self, poll: Callable[[float], bool], cap: float | None = None, keep: float = 0.0
+        self,
+        poll: Callable[[float], bool],
+        cap: float | None = None,
+        keep: float = 0.0,
+        floor: float = 0.0,
     ) -> bool:
+        assert floor >= 0
         start = time.monotonic()
-        limit = 0.0 if self.aborted else max(0.0, self._left - keep)
+        limit = floor if self.aborted else max(0.0, self._left - keep)
         if cap is not None:
             limit = min(cap, limit)
         try:
             while True:
-                left = limit - (time.monotonic() - start)
+                elapsed = time.monotonic() - start
+                left = limit - elapsed
                 if poll(max(0.0, min(SLICE_S, left)) if left > 0 else 0.0):
                     return True
                 if left <= 0:
                     return False
-                if self._asked_to_stop():
-                    return False
+                if not self.aborted and self._asked_to_stop():
+                    if floor <= 0:
+                        return False
+                    limit = min(limit, time.monotonic() - start + floor)  # the floor, from now
         finally:
             self._left = max(0.0, self._left - (time.monotonic() - start))
 

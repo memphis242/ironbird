@@ -1340,8 +1340,12 @@ Deliverables
        `.damaged` file under the session's lock: a leftover temporary of that session and part
        that is a regular file of the user, with one link, whose bytes are exactly the start of the
        source is continued and committed; any other file is left alone and reported. A scan
-       reads at most 256 MiB to tell whether a salvage ended; past that a file counts as
-       unchecked, which protects and reports it too.
+       reads at most 256 MiB to tell whether a salvage ended, charged before each read. The copy
+       is resumed only when the comparison ran to its end and found no part holding the prefix;
+       a budget that ran out, a part that could not be opened or read, or more than 8 parts of
+       the prefix's size leave the file `unverified` (protected and reported like a pending
+       one, never copied), so a repeated scan cannot write a second part of records already
+       saved.
     6. Anything else (another session's header, no valid header, larger than 1 GiB, not
        ours, a collision, a salvage that fails) is left untouched and reported
        (`IB-RET-004`) with a message that names the file and the action:
@@ -2046,6 +2050,19 @@ As built (where the build differs from, or settles, the text above)
   removal-named `getattr` on any object, the asyncio subprocess calls, `multiprocessing`, `pty`,
   `exec*` / `spawn*` / `posix_spawn*`, `copy_file_range`, `sendfile`, `mmap`, `builtins.open`
   and `os.fdopen` write modes, and no longer flags a `.rename` that is not called.
+- **PR #10 review, round 3 (fixed).** The salvage check resumes a copy only when its comparison
+  finished (rule 5: `unverified` otherwise, the budget charged before reading, the layout read
+  bounded by it); `listen` and `events` answer early only with `IB-CLI-`, `IB-FLT-` and `IB-EVT-`
+  errors, so a configuration, CCDD or header file that fails to load is ledgered like any other
+  command's; the guard flags `.rename` whenever it is referenced through `os`, `shutil`,
+  `pathlib` or an `fs` (passed as a value or bound to a name), not only when called; after a
+  signal the ledger's last write and close may still wait 0.2 s and the line they print names
+  the signal, not the disk; the append to the final file after the close checks that the name
+  still holds a regular file of the user with the closed file's device and inode, else skips
+  and counts (`Ledger.late_skipped`, and a transmission among them as lost); the in-place flags
+  of an adopted temporary file sit in `TempOutput._adopt`, which the guard's allowlist names;
+  an abandoned salvage record has the same `kept` + `cut` = size as the others, and the close
+  never prints a second stall or unlogged line with other figures than the first.
 - **Deferred.** The stderr line for exit 6 found only at the final close is written through a
   bounded late writer. A `.damaged` file keeps its session protected until the user deletes it:
   there is no command that does that for them. The 1000-run `ib send` loops against a no-lock file system are covered by the

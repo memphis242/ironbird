@@ -255,6 +255,11 @@ def test_a_scan_that_outlives_the_exit_wait_writes_its_own_recovered_record(
     events = [r["event"] for r in _final_records(state)]
     assert "ledger.recovery_incomplete" in events  # the exit abandoned the wait, and said so
     assert "ledger.recovered" in events  # the scan finished later and wrote its own record
+    # every record of the one salvage splits the same file into what was kept and what was cut
+    size = 4096
+    for row in _final_records(state):
+        if row["event"].startswith("ledger.recover"):
+            assert row["kept"] + row["cut"] == size, row
 
 
 def test_the_scan_thread_hands_its_record_over_as_each_step_ends(tmp_path: Path) -> None:

@@ -295,6 +295,8 @@ class LedgerStore:
         self._stall_start_ns = 0
         self.config_failure: OSError | None = None  # a lazy first open found the location wrong
         self.final_name: str | None = None  # the file the session ended in (its name after close)
+        # (device, inode) of that file as it was closed; ``None`` when it could not be read
+        self.final_identity: tuple[int, int] | None = None
 
     # -- shared reads -----------------------------------------------------------------
 
@@ -1133,6 +1135,13 @@ class LedgerStore:
     def _finish_files(self) -> None:
         fs = self.fs
         active = self._active
+        identity: tuple[int, int] | None = None  # taken before a retirement closes the file
+        if active is not None and active.fd >= 0:
+            try:
+                found = fs.fstat(active.fd)
+                identity = (found.st_dev, found.st_ino)
+            except OSError:
+                pass  # unknown: nothing is appended to the file later
         if active is not None and active.is_reserve and not self.stalled:
             self._retire(active)
         elif active is not None and active.is_reserve:
@@ -1146,6 +1155,7 @@ class LedgerStore:
             self._retire(standby)  # an unused reserve becomes a part, never a leftover
         if active is not None:
             self.final_name = active.name  # after a retirement: the part it became
+            self.final_identity = identity
         for f in (self._standby, active, self._part1):
             if f is not None and f.fd >= 0:
                 close_quietly(fs, f.fd)

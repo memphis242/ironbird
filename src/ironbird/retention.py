@@ -212,7 +212,7 @@ class DirScan:
     damaged_kept: set[str] = field(default_factory=set)  # saved, original kept as .damaged
     unreadable: set[str] = field(default_factory=set)  # a file that could not be examined
     handled: set[str] = field(default_factory=set)  # .damaged files this scan produced or ended
-    check_budget: int = MAX_DAMAGED_CHECK_BYTES
+    check_budget: int = field(default_factory=lambda: MAX_DAMAGED_CHECK_BYTES)
     messages: list[str] = field(default_factory=list)  # IB-RET-004 lines, ready to show
     recoveries: list[dict[str, Any]] = field(default_factory=list)  # ledger.recovered
     incompletes: list[dict[str, Any]] = field(default_factory=list)  # ledger.recovery_incomplete
@@ -689,16 +689,24 @@ class _Facts:
     last_newline: int  # before the first NUL (or in the whole file); -1 when there is none
     junk_after_nul: int | None  # offset of the first non-NUL byte after the first NUL
     read: int = 0  # bytes read to find these out
+    cut_short: bool = False  # the read limit ended the scan of the file before its answer
 
 
-def _read_facts(fs: FileSystem, fd: int, size: int) -> _Facts:
+def _read_facts(fs: FileSystem, fd: int, size: int, limit: int | None = None) -> _Facts:
+    """The facts of a reserve's layout, reading at most ``limit`` bytes (``None``: no limit);
+    ``cut_short`` says the limit stopped the read before the facts were settled."""
     first_nul: int | None = None
     last_nl = -1
     junk: int | None = None
     offset = 0
     read = 0
     while offset < size:
-        block = fs.pread(fd, min(READ_BLOCK, size - offset), offset)
+        want = min(READ_BLOCK, size - offset)
+        if limit is not None:
+            want = min(want, limit - read)
+            if want <= 0:
+                return _Facts(size, first_nul, last_nl, junk, read, cut_short=True)
+        block = fs.pread(fd, want, offset)
         if not block:
             break
         read += len(block)
@@ -1018,7 +1026,12 @@ def _finish_salvage(
     scan.handled.add(damaged)
     control = ctx.control
     if control is not None:
-        control.step = {"old": name, "damaged": damaged, "cut": size - cut, "kept": 0}
+        control.step = {
+            "old": name,
+            "damaged": damaged,
+            "cut": size,
+            "kept": 0,
+        }  # cut = size - kept
         control.stepping.set()  # from here the copy runs to its end
     try:
         new, error = _copy_prefix(ctx, fd, cut)
@@ -1076,10 +1089,13 @@ def _check_damaged(
 
     A salvage commits its copy by one rename, so a part exists only when the copy is whole: the
     file is ``saved`` when some part of the session has exactly the bytes of its prefix (up to
-    the last complete line before the damage). Reads are charged to the scan's budget."""
+    the last complete line before the damage). Reads are charged to the scan's budget before they
+    are made. Only a comparison that ran to its end and found no part makes a file ``pending``;
+    a budget that ran out, a candidate that could not be read and too many candidates leave it
+    ``unverified``, because copying then could write a second part of records already saved."""
     check = _Check()
     if scan.check_budget <= 0:
-        check.why = "too many bytes to check in one scan"
+        check.why = BUDGET_WHY
         return check
     try:
         fd = fs.open_at(dir_fd, entry.name, INSPECT_FLAGS)
@@ -1106,16 +1122,22 @@ def _check_damaged(
             check.why = "it does not start with a ledger.reserve record of its session"
             return check
         header_len = first.find(b"\n") + 1
-        facts = _read_facts(fs, fd, st.st_size)
+        facts = _read_facts(fs, fd, st.st_size, scan.check_budget)
         scan.check_budget -= facts.read
+        if facts.cut_short:
+            check.why = BUDGET_WHY
+            return check
         check.size = st.st_size
         check.cut = facts.last_newline + 1
         if check.cut <= header_len:
             check.state = "saved"  # no record after the header: nothing to save
             return check
-        part = _saved_part(fs, dir_fd, scan, session, fd, check.cut)
+        part, why = _saved_part(fs, dir_fd, scan, session, fd, check.cut)
         if part:
             check.state, check.part = "saved", part
+            return check
+        if why:
+            check.why = why
             return check
         check.state = "pending"
         keep_fd = keep
@@ -1130,38 +1152,45 @@ def _check_damaged(
 
 
 MAX_PART_CANDIDATES: Final = 8  # parts of the right size compared per file
+BUDGET_WHY: Final = "too many bytes to check in one scan"
 
 
 def _saved_part(
     fs: FileSystem, dir_fd: int, scan: DirScan, session: Session, fd: int, cut: int
-) -> str:
-    """The part of ``session`` that holds exactly the first ``cut`` bytes of ``fd``, else ``""``."""
+) -> tuple[str, str]:
+    """Look for the part of ``session`` that holds exactly the first ``cut`` bytes of ``fd``.
+
+    Returns ``(part, "")`` when one does, ``("", "")`` when every candidate was compared and none
+    matches, and ``("", why)`` when the comparison could not be finished: a candidate was too
+    large for the remaining budget, could not be opened or read, or there were more candidates
+    than are compared. The budget is charged for a candidate before it is read."""
     candidates = [f for f in session.files if f.is_part and f.number >= 2 and f.size == cut]
-    for candidate in candidates[:MAX_PART_CANDIDATES]:
-        if scan.check_budget <= 0:
-            break
+    if len(candidates) > MAX_PART_CANDIDATES:
+        return "", f"more than {MAX_PART_CANDIDATES} parts have the size of its records"
+    for candidate in candidates:
+        if cut > scan.check_budget:
+            return "", BUDGET_WHY
+        scan.check_budget -= cut
         try:
             other = fs.open_at(dir_fd, candidate.name, INSPECT_FLAGS)
-        except OSError:
-            continue
+        except OSError as exc:
+            return "", f"{candidate.name} cannot be opened: {exc.strerror or exc}"
         try:
-            if _same_prefix(fs, other, fd, cut, scan):
-                return candidate.name
-        except OSError:
-            continue
+            if _same_prefix(fs, other, fd, cut):
+                return candidate.name, ""
+        except OSError as exc:
+            return "", f"{candidate.name} cannot be read: {exc.strerror or exc}"
         finally:
             close_quietly(fs, other)
-    return ""
+    return "", ""
 
 
-def _same_prefix(fs: FileSystem, a: int, b: int, length: int, scan: DirScan | None = None) -> bool:
+def _same_prefix(fs: FileSystem, a: int, b: int, length: int) -> bool:
     """Whether the first ``length`` bytes of ``a`` and ``b`` are equal (``OSError`` propagates)."""
     offset = 0
     while offset < length:
         want = min(READ_BLOCK, length - offset)
         left, right = fs.pread(a, want, offset), fs.pread(b, want, offset)
-        if scan is not None:
-            scan.check_budget -= len(left)
         if not left or left != right:
             return False
         offset += len(left)
@@ -1173,6 +1202,9 @@ def _resume_salvage(ctx: RecoveryContext, entry: FileEntry) -> str:
     cut short by the process's exit, a kill, or a failing disk). The original is only read."""
     fs, scan, session = ctx.fs, ctx.scan, ctx.session
     check = _check_damaged(fs, ctx.dir_fd, scan, session, entry, keep=True)
+    if check.state == "saved":
+        scan.handled.add(entry.name)  # the accounting pass need not read it again
+        scan.damaged_kept.add(session.id)
     if check.state != "pending":
         return "unchanged"  # saved already, or not judgeable: the report says which
     try:

@@ -68,7 +68,7 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
     ("retnotices.py", "overwrite"): {"Notices._transaction"},
     ("ledger.py", "overwrite"): {"Ledger._append_final"},
     # a salvage's own leftover temporary file, picked up again and appended to (checked first)
-    ("atomicfile.py", "overwrite"): {""},
+    ("atomicfile.py", "overwrite"): {"TempOutput._adopt"},
     # attribute lookups by a computed name on the program's own record types
     ("config.py", "dynamic"): {"parse_config"},
     ("frame.py", "dynamic"): {"Frame._replace"},
@@ -156,6 +156,16 @@ def test_every_allowlist_entry_is_still_used() -> None:
         ("import os\ndef f(a, b):\n    os.link(a, b)", "rename"),
         ("import shutil\ndef f(a, b):\n    shutil.move(a, b)", "rename"),
         ("def f(p, q):\n    p.rename(q)", "rename"),
+        ("import os\ndef f(self, a, b):\n    self._call(os.rename, a, b)", "rename"),
+        ("import os\ndef f(a, b):\n    r = os.rename\n    r(a, b)", "rename"),
+        ("import os as o\ndef f(self, a, b):\n    self._call(o.rename, a, b)", "rename"),
+        ("def f(self, fs, a, b):\n    self._call(fs.rename, a, b)", "rename"),
+        ("def f(self, a, b):\n    self._call(self.fs.rename, a, b)", "rename"),
+        ("import shutil\ndef f(self, a, b):\n    self._call(shutil.rename, a, b)", "rename"),
+        (
+            "from pathlib import Path\ndef f(self, a, b):\n    self._call(Path.rename, a, b)",
+            "rename",
+        ),
         ("def f(p, q):\n    p.hardlink_to(q)", "rename"),
         ("import os\ndef f(p):\n    os.truncate(p, 0)", "truncation"),
         ("import os\ndef f(fd):\n    os.ftruncate(fd, 0)", "truncation"),
@@ -265,6 +275,7 @@ def test_the_guard_flags_every_removal_form_with_aliases_resolved(
         "def f(text):\n    return text.replace('a', 'b', 1)",
         "import os\ndef f(p):\n    return getattr(os, 'sep')",
         "def f(s):\n    return s.rename",  # a field called rename is not a call
+        "def f(self):\n    return self.spec.rename",
         "def f(d):\n    return d.replace(tzinfo=None)",
         "def f(cfg):\n    return getattr(cfg, 'name')",
         "import os\ndef f(fd):\n    return os.fdopen(fd, 'rb')",

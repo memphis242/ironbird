@@ -34,6 +34,7 @@ import json
 import math
 import os
 import pwd
+import stat
 import threading
 import time
 import uuid
@@ -50,7 +51,7 @@ from ironbird.config import LedgerConfig
 from ironbird.errors import Code, IronbirdError
 from ironbird.fsops import REAL_FS, FileSystem, close_quietly, write_all
 from ironbird.header import DEFAULT_MAX_PACKET_BYTES
-from ironbird.ledgergate import GateWorker, WaitBudget
+from ironbird.ledgergate import FINAL_WRITE_FLOOR_S, GateWorker, WaitBudget
 from ironbird.ledgerstore import (
     POLL_S as WRITER_POLL_S,
 )
@@ -482,6 +483,7 @@ class Ledger:
         self._tx_refused = TxTally()
         self._fs = fs
         self._late_lost = TxTally()
+        self._late_skipped = 0  # late lines not appended: the final file was not the one closed
         self._withheld = 0
         self._refused = False  # a transmission was refused (its error line names the stall)
         self._hung_reported = False
@@ -634,11 +636,12 @@ class Ledger:
     def join_timeout_s(self) -> float:
         return self._join_timeout_s
 
-    def _wait(self, event: threading.Event, cap: float | None = None) -> bool:
+    def _wait(self, event: threading.Event, cap: float | None = None, floor: float = 0.0) -> bool:
         """Wait for a writer job: against the exit budget when it is armed, else on its own
-        (``cap`` seconds at most)."""
+        (``cap`` seconds at most). ``floor`` is what the wait may still take after a signal
+        aborted the budget."""
         if self._budget is not None:
-            return self._budget.wait(event, cap)
+            return self._budget.wait(event, cap, floor=floor)
         return event.wait(self._join_timeout_s if cap is None else min(cap, self._join_timeout_s))
 
     def set_warn_gate(self, gate: Callable[[Code], bool]) -> None:
@@ -894,14 +897,19 @@ class Ledger:
 
     # -- transmissions ---------------------------------------------------------------------------
 
-    def cause_text(self, *, hung: bool | None = None) -> str:
+    def cause_text(self, *, hung: bool | None = None, cut: bool = False) -> str:
         """Why the ledger cannot be written: the failure the writer met, or that a call has not
-        returned (``hung``; by default whether one is outstanding right now)."""
+        returned (``hung``; by default whether one is outstanding right now), or that a signal
+        ended the exit before the last write finished (``cut``)."""
+        if cut:
+            return "the exit was cut short by a signal"
         if self._hung(hung):
             return "the disk or file server is not responding"
         return self._store.stall_text or "the ledger is stalled"
 
-    def remedy(self, *, hung: bool | None = None) -> str:
+    def remedy(self, *, hung: bool | None = None, cut: bool = False) -> str:
+        if cut:
+            return f"the ledger in {self._directory} may lack its last records"
         if self._hung(hung):
             return f"check the disk or file server of {self._directory}"
         if self._store.stall_internal:
@@ -1591,7 +1599,7 @@ class Ledger:
         self._jobs_lines.append(lines)
         done = threading.Event()
         self._writer.submit("finish", (lines, done))
-        finished = self._wait(done)
+        finished = self._wait(done, floor=FINAL_WRITE_FLOOR_S)
         self._check_config_failure()
         self._pump_events()
         return self._build_report(finished=finished)
@@ -1625,7 +1633,7 @@ class Ledger:
         self._jobs_lines.append(lines)
         done = threading.Event()
         self._writer.submit("close", (lines, done))
-        finished = self._wait(done)
+        finished = self._wait(done, floor=FINAL_WRITE_FLOOR_S)
         self._check_config_failure()
         self._pump_events()
         report = self._build_report(finished=finished)
@@ -1643,9 +1651,19 @@ class Ledger:
             return
         self._append_final(name, lines)
 
+    @property
+    def late_skipped(self) -> int:
+        """Lines made after the close that were not appended to the final file because what the
+        name now holds is not the file the session closed (or is not the user's)."""
+        return self._late_skipped
+
     def _append_final(self, name: str, lines: list[Line]) -> None:
         """Append ``lines`` to the file ``name`` the session ended in (best effort: a
-        transmission among lines that cannot be written is counted as lost)."""
+        transmission among lines that cannot be written is counted as lost).
+
+        The file is opened by name, so what the name holds now is checked before anything is
+        written: a regular file of this user with the device and inode of the file the session
+        closed. Anything else is left alone and the lines are counted as skipped."""
         fs = self._fs
         try:
             dir_fd = fs.open_dir(self._directory)
@@ -1653,6 +1671,14 @@ class Ledger:
                 flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC
                 fd = fs.open_at(dir_fd, name, flags)
                 try:
+                    found = fs.fstat(fd)
+                    if (
+                        not stat.S_ISREG(found.st_mode)
+                        or found.st_uid != os.getuid()
+                        or (found.st_dev, found.st_ino) != self._store.final_identity
+                    ):
+                        self._skip_late(lines)
+                        return
                     write_all(fs, fd, b"".join(line.data for line in lines))
                 finally:
                     close_quietly(fs, fd)
@@ -1662,6 +1688,12 @@ class Ledger:
             for line in lines:
                 if line.tx is not None:
                     self._late_lost.add(line.tx)
+
+    def _skip_late(self, lines: list[Line]) -> None:
+        self._late_skipped += len(lines)
+        for line in lines:
+            if line.tx is not None:
+                self._late_lost.add(line.tx)
 
     def _build_report(self, *, finished: bool) -> ExitReport:
         """The account of what is not written, from the store's own picture of it.
@@ -1704,15 +1736,18 @@ class Ledger:
                 )
             )
         hung = not finished
+        # A signal that ended the wait is the reason when no call is known to be stuck.
+        cut = hung and self._budget is not None and self._budget.aborted and not self._hung_now()
         if tally.count:
-            notices.append(self._unlogged_notice(tally, hung=hung))
+            notices.append(self._unlogged_notice(tally, hung=hung, cut=cut))
         elif stalled and not (self._refused and not self._long):
             notices.append(
                 _exit_notice(
                     Code.LED_WRITE,
                     Level.WARNING,
                     f"ledger stalled at exit; {records} records not written"
-                    + (f"; {self.remedy(hung=True)}" if hung else ""),
+                    + (f"; {self.cause_text(cut=True)}" if cut else "")
+                    + (f"; {self.remedy(hung=True, cut=cut)}" if hung else ""),
                 )
             )
         return ExitReport(
@@ -1724,16 +1759,16 @@ class Ledger:
             stalled=stalled,
         )
 
-    def _unlogged_notice(self, tally: TxTally, *, hung: bool) -> Notice:
+    def _unlogged_notice(self, tally: TxTally, *, hung: bool, cut: bool = False) -> Notice:
         """The one line that goes with exit code 6: what was sent and not logged, and why."""
         first, last = tally.first, tally.last
         assert first is not None and last is not None
-        cause = self.cause_text(hung=hung) if hung else self._store.stall_text
+        cause = self.cause_text(hung=hung, cut=cut) if hung else self._store.stall_text
         cause = cause or "a write or sync failed"
         if tally.count == 1:
             text = (
                 f"{first.sent()} but not logged (ledger not writable: {cause}); "
-                f"{self.remedy(hung=hung)}"
+                f"{self.remedy(hung=hung, cut=cut)}"
             )
             return _exit_notice(Code.LED_UNLOGGED, Level.WARNING, text)
         noun = "commands" if tally.kinds == {"command"} else "transmissions"
