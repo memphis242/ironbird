@@ -1,0 +1,17 @@
+# An epoch without a zone names no instant.
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+[time]
+epoch = "1980-01-01T00:00:00"
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+
+[[fields]]
+name = "s"
+bits = 32
+computed = "time_seconds"

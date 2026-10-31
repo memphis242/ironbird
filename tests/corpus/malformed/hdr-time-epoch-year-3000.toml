@@ -1,0 +1,17 @@
+# An epoch outside 1900..2200.
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+[time]
+epoch = "3000-01-01T00:00:00Z"
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+
+[[fields]]
+name = "s"
+bits = 32
+computed = "time_seconds"

@@ -1,0 +1,21 @@
+# One checksum per profile: a header one and a trailer one.
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+
+[[fields]]
+name = "hck"
+bits = 8
+computed = "checksum"
+algorithm = "xor8_cfs"
+
+[[trailer.fields]]
+name = "tck"
+bits = 16
+computed = "checksum"
+algorithm = "crc16_ccitt"

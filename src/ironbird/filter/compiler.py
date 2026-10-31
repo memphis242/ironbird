@@ -71,7 +71,7 @@ SCALAR_NAMES: Final[Mapping[str, str]] = {
     "msg": "the message name",
     "status": "the frame's check status",
     "fc": "the command function code",
-    "htime": "the header time",
+    "htime": "the header time (UTC, from the header profile's time fields)",
 }
 NAMESPACES: Final[Mapping[str, str]] = {
     "hdr": "the header namespace (hdr.<field>)",
@@ -498,9 +498,17 @@ class _Env:
         widest: dict[str, int] = {}
         for codec in self.codecs.values():
             for kind in MessageKind:
-                for hf in codec.profile(kind).fields:
+                for hf in codec.profile(kind).all_fields:
                     widest[hf.name] = max(widest.get(hf.name, 0), hf.mask)
         return widest
+
+    def has_header_time(self) -> bool:
+        """Whether any header profile in use turns its time fields into a time."""
+        return any(
+            codec.profile(kind).time is not None
+            for codec in self.codecs.values()
+            for kind in MessageKind
+        )
 
 
 class _Compiler:
@@ -1051,9 +1059,24 @@ class _Compiler:
         return _Node(Cost.DECODE, all_mids, fn)
 
     def _htime(self, p: Predicate) -> _Node:
-        raise self._name_error(
-            p.pos, "htime (header time) is reserved and not available in this build", (), ""
-        )
+        if not self.env.has_header_time():
+            raise self._name_error(
+                p.pos,
+                "htime: no header profile in use has a time field (computed = 'time_seconds')",
+                (),
+                "",
+            )
+        values = self._convert(p, "htime", _NUMBER_OPS, lambda lit, op: _time_literal(lit))
+        test = _make_test(p.op, values)
+
+        def fn(frame: Frame, probe: Matcher) -> bool:
+            decoded = probe.decoded(frame)
+            if isinstance(decoded, DecodeError):
+                return False
+            when = decoded.packet.header.time_ns
+            return when is not None and test(when)
+
+        return _Node(Cost.DECODE, None, fn)
 
     def _header(self, p: Predicate, field_name: str) -> _Node:
         widest = self.env.header_fields()

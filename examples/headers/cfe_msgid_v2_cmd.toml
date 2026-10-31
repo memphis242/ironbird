@@ -1,0 +1,106 @@
+# cFE command header with the MsgId V2 layout: see cfe_msgid_v2_tlm.toml for the message ID.
+# Secondary header: function code + checksum (cfe/modules/msg/option_inc/default_cfe_msg_sechdr.h)
+# and the 4 spare bytes that keep a 64-bit payload aligned.
+
+name = "cfe_msgid_v2_cmd"
+kind = "command"
+description = "CCSDS primary + extended header, cFE MsgId V2 message ID, function code + checksum"
+byte_order = "big"
+function_code_field = "function_code"
+mid_fields = ["subsystem_lo", "packet_type", "apid_lo"]
+
+[[fields]]
+name = "version"
+bits = 3
+value = 0
+
+[[fields]]
+name = "packet_type"
+bits = 1
+value = 1            # 1 = command
+
+[[fields]]
+name = "sec_hdr_flag"
+bits = 1
+value = 1
+
+[[fields]]
+name = "apid_hi"
+bits = 4
+value = 0
+check = false
+
+[[fields]]
+name = "apid_lo"
+bits = 7
+computed = "from_mid"
+
+[[fields]]
+name = "seq_flags"
+bits = 2
+value = 3
+check = false
+
+[[fields]]
+name = "sequence"
+bits = 14
+computed = "sequence"
+
+[[fields]]
+name = "length"
+bits = 16
+computed = "length"
+bias = -7
+
+[[fields]]
+name = "eds_version"
+bits = 5
+default = 0
+
+[[fields]]
+name = "endian_flag"
+bits = 1
+default = 0
+
+[[fields]]
+name = "playback"
+bits = 1
+default = 0
+
+[[fields]]
+name = "subsystem_hi"
+bits = 1
+value = 0
+check = false
+
+[[fields]]
+name = "subsystem_lo"
+bits = 8
+computed = "from_mid"
+
+[[fields]]
+name = "system_id"
+bits = 16
+default = 0
+
+[[fields]]
+name = "reserved"
+bits = 1
+value = 0
+check = false
+
+[[fields]]
+name = "function_code"
+bits = 7
+
+[[fields]]
+name = "checksum"
+bits = 8
+computed = "checksum"
+algorithm = "xor8_cfs"
+
+[[fields]]
+name = "spare"
+bits = 32
+value = 0
+check = false

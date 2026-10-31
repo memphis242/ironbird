@@ -80,6 +80,41 @@ origination action (`cfe_msg_integrity.c:41`). Payload starts
 at packet offset **16, not 12**: this 4-byte spare is the one surprise versus the common
 "6 + 6" expectation. Verified live: ES HK is 184 bytes = 16 + 168.
 
+### Telemetry header time: epoch, scale and leap seconds
+
+Read from the checked-out source (bundle v7.0.1, cFE `c5fb2b4`), not from memory. The native
+build sets none of these in `sample_defs`, so the cFE defaults apply:
+
+| Setting | Value | Where |
+|---------|-------|-------|
+| Epoch | 1980, day 1, 00:00:00.000000 = **1980-01-01T00:00:00** (not the GPS epoch 1980-01-06) | `CFE_MISSION_TIME_EPOCH_YEAR/DAY/HOUR/MINUTE/SECOND/MICROS` (`cfe/modules/time/fsw/inc/cfe_time_interface_cfg.h:186-202`, same in `cfe/cmake/sample_defs/example_mission_cfg.h:543-548`) |
+| Epoch as Unix seconds | 315532800 | `CFE_MISSION_TIME_EPOCH_SECONDS` (`cfe_time_interface_cfg.h:205-206`); `CFE_TIME_Print` adds it to the seconds (`cfe_time_api.c:579`) |
+| Time scale | TAI by default (`CFE_MISSION_TIME_CFG_DEFAULT_TAI true`) | `cfe_time_interface_cfg.h:53-54` |
+| Leap seconds | 37 (`CFE_MISSION_TIME_DEF_LEAPS`); UTC = TAI - leap seconds (`CFE_TIME_GetUTC`) | `cfe_time_interface_cfg.h:162-163` |
+| Initial MET / STCF | 1000 s / 1000000 s | `CFE_MISSION_TIME_DEF_MET_SECS`, `..._DEF_STCF_SECS` (`:150`, `:156`) |
+
+The packet's time is `CFE_TIME_GetTime()` = MET + STCF, a TAI count of seconds since the epoch.
+So a header seconds value S is the UTC instant `1980-01-01T00:00:00Z + S - 37 s`, and a fresh
+`run.sh` (STCF 1000000, MET from 1000) should stamp packets with S near 1001000 = about
+**1980-01-12T14:00Z**, in line with the simulated `1980-...` console lines (derived from the
+defaults; the acceptance case below checks it against the live build). The profile
+`examples/headers/ccsds_v1_cfs_tlm_cfe_time.toml` carries `[time] epoch = "1980-01-01T00:00:00Z"`
+and `leap_seconds = 37`; `ccsds_v1_cfs_tlm.toml` keeps the Unix epoch the mock vehicle stamps
+its own telemetry with. The `cfs` acceptance case
+`test_time_hk_header_time_decodes_with_the_cfe_epoch` selects TIME HK with
+`htime >= 1980-01-01T00:00:00Z and htime < 1981-01-01T00:00:00Z` using the first profile.
+If the mission configuration changes `EPOCH_*`, `CFG_DEFAULT_TAI` or `DEF_LEAPS`, edit the
+`[time]` table to match; a UTC-scale mission uses `leap_seconds = 0`.
+
+### MsgId V2 layout (not exercised by this build)
+
+This build uses MsgId V1 (`cfe_msg_msgid_v1.c`). The V2 layout (`cfe_msg_msgid_v2.c:20-47`,
+header `cfe/modules/msg/fsw/inc/ccsds_hdr.h:55-87`) builds the 16-bit MID from three places:
+APID low 7 bits (primary header byte 1), the command/telemetry bit (primary header bit 3)
+and the Subsystem low byte (extended header byte 7): `MID = subsystem << 8 | type << 7 | apid`.
+`examples/headers/cfe_msgid_v2_{cmd,tlm}.toml` express it with
+`mid_fields = ["subsystem_lo", "packet_type", "apid_lo"]`; unit tests only.
+
 ### Byte order
 
 - Primary header and telemetry time: **big-endian** (network order).

@@ -1,0 +1,16 @@
+# end counts back from the packet end, so it is zero or negative.
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+
+[[fields]]
+name = "ck"
+bits = 8
+computed = "checksum"
+algorithm = "xor8_cfs"
+span = { start = 0, end = 4 }

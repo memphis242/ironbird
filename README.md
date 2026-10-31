@@ -357,6 +357,40 @@ are reported at ingest as before and `listen` shows decoded packets only, so
 `--where 'status == malformed'` selects them for replay and
 export, not for `listen`.
 
+## Header profiles
+
+A header profile (`examples/headers/*.toml`) declares the header fields in wire order, as
+big-endian bitfields packed MSB-first. What a profile can say beyond a field's width and value:
+
+| Key | Where | Meaning |
+|-----|-------|---------|
+| `endian = "little"` | a field | stored least significant byte first; only for a field that starts on a byte boundary and fills whole bytes (a little-endian bitfield is ambiguous and refused) |
+| `[[trailer.fields]]` | the profile | fields after the payload, fixed (`value = N`) or the one checksum; the payload is the packet minus header minus trailer |
+| `span` | a checksum field | the bytes it covers: `"packet"` (default), `"header"`, `"payload"`, or `{ start = N, end = -M }` (byte N up to M bytes before the packet end); the checksum field is zeroed if it lies inside the span |
+| `mid_fields` | the profile | any fields in any position; the MID is their values joined in list order, first listed most significant (cFE MsgId V2 spreads it over three places), at most 32 bits for a codec |
+| `[time]` | the profile | `epoch = "1980-01-01T00:00:00Z"` (the instant the counter is zero; a zone is required, whole second, 1900..2200) and `leap_seconds = N` (counter = UTC - epoch + leap; a TAI counter has 37); applies to the `computed = "time_seconds"` and `"time_subseconds"` fields. Without `[time]` the counter is Unix seconds |
+
+`crc16_ccitt` (CRC-16/CCITT-FALSE) is the CCSDS packet error control code; with the PEC as a trailer
+it covers `{ start = 0, end = -2 }` (`examples/headers/ccsds_pec_tlm.toml`). At most one checksum per
+profile. `ccsds_v1_cfs_tlm_cfe_time.toml` is `ccsds_v1_cfs_tlm.toml` with the cFE mission epoch
+(1980-01-01, TAI, 37 leap seconds; `tools/cfs/NOTES.md`), for reading the header time of real cFS
+telemetry; `cfe_msgid_v2_{cmd,tlm}.toml` are the cFE MsgId V2 headers.
+
+The decoded header time is `htime` in a filter (`--where 'htime >= 2026-10-29T12:00:00Z'`, UTC, with
+the same time literals as `time`); it is false for a packet whose profile has no seconds field.
+Trailer fields are `hdr.<name>` like header fields.
+
+An input field of a profile (`default = N`) takes, highest priority first, `ib send NODE CMD --header field=N` (repeatable), the message's CCDD
+`"header": {"field": N}`, and the profile default. Names must be input fields (the function code
+field comes from the command); values must fit the field. A bad name or width is `IB-HDR-003` for
+`--header` and `IB-ENC-004` when a CCDD is paired with the profile.
+
+A profile is untrusted input like any other file: unknown keys, overlapping or repeated MID fields,
+a span that cuts through its own checksum field or cannot fit any packet, a trailer that is not a
+whole number of bytes, a contradictory byte order and a bad epoch are all `IB-HDR-002` with the
+field path; a span that does not fit one particular packet is `IB-ENC-004` for a CCDD message and
+`IB-DEC-005` for a received packet.
+
 ## Configuration
 
 - `examples/ironbird.toml` - ground plus a real cFS flight computer (CI_LAB 1234, TO_LAB 2234).

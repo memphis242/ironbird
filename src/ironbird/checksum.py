@@ -1,12 +1,14 @@
 """Named checksum algorithms selectable from a header profile.
 
-Every algorithm is computed over the *whole packet with the checksum field zeroed* and
-returns the value to store in the field. Verification recomputes the same way, so a new
-algorithm needs only ``compute``.
+Every algorithm is computed over the bytes a checksum field's span covers (default: the whole
+packet) with the checksum field zeroed if it lies inside the span, and returns the value to
+store in the field. Verification recomputes the same way, so a new algorithm needs only
+``compute``.
 """
 
 from __future__ import annotations
 
+import binascii
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import reduce
@@ -20,36 +22,21 @@ class ChecksumAlgorithm:
     name: str
     width_bits: int
     description: str
-    compute: Callable[[bytes | memoryview], int]
+    compute: Callable[[bytes | bytearray | memoryview], int]
 
     def __post_init__(self) -> None:
         assert self.width_bits in (8, 16, 32)
 
 
-def _xor8_cfs(data: bytes | memoryview) -> int:
-    """cFE command checksum: stored byte makes the XOR of the whole packet equal 0xFF."""
+def _xor8_cfs(data: bytes | bytearray | memoryview) -> int:
+    """cFE command checksum: stored byte makes the XOR of the covered bytes equal 0xFF."""
     return reduce(xor, data, 0xFF)
 
 
-def _build_crc16_table() -> tuple[int, ...]:
-    table: list[int] = []
-    for byte in range(256):
-        crc = byte << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
-        table.append(crc)
-    return tuple(table)
-
-
-_CRC16_TABLE: Final = _build_crc16_table()
-
-
-def _crc16_ccitt(data: bytes | memoryview) -> int:
-    """CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, no final XOR."""
-    crc = 0xFFFF
-    for byte in data:
-        crc = ((crc << 8) & 0xFFFF) ^ _CRC16_TABLE[(crc >> 8) ^ byte]
-    return crc
+def _crc16_ccitt(data: bytes | bytearray | memoryview) -> int:
+    """CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, no final XOR. This is the
+    CCSDS / ECSS packet error control code."""
+    return binascii.crc_hqx(data, 0xFFFF)
 
 
 REGISTRY: Final[Mapping[str, ChecksumAlgorithm]] = MappingProxyType(
@@ -57,10 +44,13 @@ REGISTRY: Final[Mapping[str, ChecksumAlgorithm]] = MappingProxyType(
         algo.name: algo
         for algo in (
             ChecksumAlgorithm(
-                "xor8_cfs", 8, "8-bit XOR of the whole packet equals 0xFF (cFE commands)", _xor8_cfs
+                "xor8_cfs",
+                8,
+                "8-bit XOR of the covered bytes equals 0xFF (cFE commands)",
+                _xor8_cfs,
             ),
             ChecksumAlgorithm(
-                "crc16_ccitt", 16, "CRC-16/CCITT-FALSE over the whole packet", _crc16_ccitt
+                "crc16_ccitt", 16, "CRC-16/CCITT-FALSE over the covered bytes", _crc16_ccitt
             ),
         )
     }

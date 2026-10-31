@@ -1,0 +1,14 @@
+# The trailer is not a whole number of bytes.
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+
+[[trailer.fields]]
+name = "tag"
+bits = 7
+value = 1

@@ -792,6 +792,50 @@ def test_listen_where_selects_one_apps_housekeeping(ground: Ground, tmp_path: Pa
     )
 
 
+def test_time_hk_header_time_decodes_with_the_cfe_epoch(ground: Ground, tmp_path: Path) -> None:
+    """The telemetry header time of TIME HK read with the cFE mission epoch (1980-01-01, TAI,
+    37 leap seconds: tools/cfs/NOTES.md) lands in 1980, which only that epoch can do: the
+    default stamp is a few million seconds since 1980, a few days after the epoch."""
+    examples = REPO / "examples"
+    config = tmp_path / "cfe-time.toml"
+    text = CONFIG.read_text().replace('"ccdd/', f'"{examples}/ccdd/')
+    text = text.replace('"headers/', f'"{examples}/headers/')
+    text = text.replace("ccsds_v1_cfs_tlm.toml", "ccsds_v1_cfs_tlm_cfe_time.toml")
+    assert "cfe_time" in text
+    config.write_text(text)
+    where = "msg == TIME_HK and htime >= 1980-01-01T00:00:00Z and htime < 1981-01-01T00:00:00Z"
+    ib = [sys.executable, "-m", "ironbird.cli.main", "-c", str(config)]
+    env = {**ground.env, "IRONBIRD_STATE_DIR": str(tmp_path / "state")}
+    fmt = ["--format", "json"]
+    with ground.listener_paused():  # one process owns UDP 2234
+        proc = subprocess.Popen(
+            [*ib, "listen", "fc", "--where", where, "--count", "1", "--timeout", "40", *fmt],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        try:
+            assert proc.stderr is not None
+            for line in iter(proc.stderr.readline, ""):
+                if "listening for fc" in line:
+                    break
+            else:
+                raise AssertionError("no listen banner")
+            deadline = time.monotonic() + 30
+            while proc.poll() is None and time.monotonic() < deadline:
+                ground.send("TIME_SEND_HK")
+                time.sleep(1.0)
+            out, err = proc.communicate(timeout=15)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+    assert proc.returncode == 0, err
+    record = json.loads(out.splitlines()[0])
+    assert record["name"] == "TIME_HK"
+
+
 def test_events_where_type_matches_min_type(ground: Ground, tmp_path: Path) -> None:
     """``--where 'event.type >= error'`` shows the same events as ``--min-type error``."""
 

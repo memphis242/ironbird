@@ -1,0 +1,104 @@
+# cFE telemetry header with the MsgId V2 layout (cfe_msg_msgid_v2.c): the primary header plus
+# the extended header, then a 6-byte time. The 16-bit message ID is NOT contiguous on the wire:
+#
+#   MID bits 15..8  Subsystem low byte   (extended header, byte 7)
+#   MID bit  7      packet type          (primary header, bit 3; 1 = command)
+#   MID bits  6..0  APID low 7 bits      (primary header, byte 1)
+#
+# `mid_fields` lists the fields in MID order, most significant first, wherever they sit.
+# Layout from cfe/modules/msg/fsw/inc/ccsds_hdr.h. This build of cFS uses MsgId V1, so no cFS
+# run exercises this profile; the unit tests do.
+
+name = "cfe_msgid_v2_tlm"
+kind = "telemetry"
+description = "CCSDS primary + extended header, cFE MsgId V2 message ID, 6-byte time"
+byte_order = "big"
+mid_fields = ["subsystem_lo", "packet_type", "apid_lo"]
+
+[time]
+epoch = "1980-01-01T00:00:00Z"   # CFE_MISSION_TIME_EPOCH_* in the mission configuration
+leap_seconds = 37                # CFE_MISSION_TIME_DEF_LEAPS; cFE time is TAI by default
+
+[[fields]]
+name = "version"
+bits = 3
+value = 0
+
+[[fields]]
+name = "packet_type"
+bits = 1
+value = 0            # 0 = telemetry
+
+[[fields]]
+name = "sec_hdr_flag"
+bits = 1
+value = 1
+
+[[fields]]
+name = "apid_hi"
+bits = 4
+value = 0
+check = false        # not part of the MsgId
+
+[[fields]]
+name = "apid_lo"
+bits = 7
+computed = "from_mid"
+
+[[fields]]
+name = "seq_flags"
+bits = 2
+value = 3
+check = false
+
+[[fields]]
+name = "sequence"
+bits = 14
+computed = "sequence"
+
+[[fields]]
+name = "length"
+bits = 16
+computed = "length"
+bias = -7
+
+[[fields]]
+name = "eds_version"
+bits = 5
+default = 0
+
+[[fields]]
+name = "endian_flag"
+bits = 1
+default = 0
+
+[[fields]]
+name = "playback"
+bits = 1
+default = 0
+
+[[fields]]
+name = "subsystem_hi"
+bits = 1
+value = 0
+check = false        # not part of the MsgId
+
+[[fields]]
+name = "subsystem_lo"
+bits = 8
+computed = "from_mid"
+
+[[fields]]
+name = "system_id"
+bits = 16
+default = 0
+
+[[fields]]
+name = "seconds"
+bits = 32
+computed = "time_seconds"
+
+[[fields]]
+name = "subseconds"
+bits = 16
+computed = "time_subseconds"

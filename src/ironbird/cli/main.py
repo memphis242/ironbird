@@ -863,6 +863,24 @@ def _parse_args(items: list[str] | None) -> dict[str, str]:
     return args
 
 
+def _parse_header_values(items: list[str] | None) -> dict[str, int]:
+    """``--header FIELD=N`` options as header field values (the codec checks the names)."""
+    values: dict[str, int] = {}
+    for item in items or []:
+        key, sep, text = item.partition("=")
+        if not sep or not key:
+            raise IronbirdError(Code.CLI_USAGE, f"--header {item[:40]!r} must look like field=N")
+        if key in values:
+            raise IronbirdError(Code.CLI_USAGE, f"--header {key[:40]!r} given more than once")
+        try:
+            values[key] = int(text, 0)
+        except ValueError:
+            raise IronbirdError(
+                Code.CLI_USAGE, f"--header {key[:40]}={text[:40]!r}: the value must be an integer"
+            ) from None
+    return values
+
+
 class _RecordingScope:
     """``--record`` for one command: a recording that lives for the ``async with`` block.
 
@@ -1025,6 +1043,15 @@ def send(
         int | None,
         typer.Option("--length-delta", help="Fault injection: add N to the length field."),
     ] = None,
+    header: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--header",
+            metavar="FIELD=N",
+            help="Set an input field of the command header profile for this packet "
+            "(repeatable); wins over the command's CCDD header values and the profile default.",
+        ),
+    ] = None,
     as_node: AsOption = None,
     verbose: VerboseOption = False,
 ) -> None:
@@ -1032,6 +1059,7 @@ def send(
 
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
         parsed = _parse_args(args)
+        header_values = _parse_header_values(header)
         tamper: dict[str, int] = {}
         profile = session.codec_for(session.route(node, link_name=link).server.name).profile(
             MessageKind.COMMAND
@@ -1045,7 +1073,9 @@ def send(
                 raise IronbirdError(Code.CLI_USAGE, f"profile {profile.name} has no length field")
             _check_length_delta(length_delta, profile.length_field.bits, profile.name)
             tamper[profile.length_field.name] = length_delta
-        sent = await session.send_command(node, command, parsed, tamper=tamper, link=link)
+        sent = await session.send_command(
+            node, command, parsed, tamper=tamper, link=link, header=header_values
+        )
         run.console.out(
             f"sent {term(sent.command)} to {term(sent.node)} via udp {term(sent.endpoint)} "
             f"(mid 0x{sent.mid:04X} fc {sent.function_code} seq {sent.sequence}, "

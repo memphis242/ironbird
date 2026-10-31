@@ -1,0 +1,21 @@
+# The span ends 3 bytes before the packet end, inside the 2-byte trailer checksum that is 3..4 bytes from the end.
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+
+[[trailer.fields]]
+name = "ck"
+bits = 16
+computed = "checksum"
+algorithm = "crc16_ccitt"
+span = { start = 0, end = -3 }
+
+[[trailer.fields]]
+name = "tail"
+bits = 16
+value = 0

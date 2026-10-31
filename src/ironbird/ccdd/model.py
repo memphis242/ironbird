@@ -203,6 +203,9 @@ class Message:
     payload_size: int
     category: Category = Category.OTHER  # telemetry only
     event: EventSpec | None = None  # set exactly when category is EVENT
+    # Values for the header profile's input fields, by name (the profile default applies to the
+    # rest); the codec checks the names and widths against the profile.
+    header: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
         assert (self.function_code is not None) == (self.kind is MessageKind.COMMAND)

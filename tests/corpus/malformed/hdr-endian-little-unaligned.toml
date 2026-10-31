@@ -1,0 +1,20 @@
+# A little-endian field must start on a byte boundary (this one starts at bit 4).
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+[[fields]]
+name = "flags"
+bits = 4
+value = 0
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+endian = "little"
+
+[[fields]]
+name = "pad"
+bits = 4
+value = 0
