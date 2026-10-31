@@ -33,7 +33,22 @@ _NAME_RE: Final = re.compile(r"[A-Za-z][A-Za-z0-9_\-]{0,31}")
 _IDENT_RE: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 _HOST_RE: Final = re.compile(r"[A-Za-z0-9._\-:\[\]]{1,253}")
 MAX_PORT_DIGITS: Final = 5
-SUPPORTED_TRANSPORTS: Final = ("udp",)
+SUPPORTED_TRANSPORTS: Final = ("udp", "serial")
+UDP_TRANSPORT: Final = "udp"
+SERIAL_TRANSPORT: Final = "serial"
+
+# The serial line settings a link may name, each with the values the transport can apply.
+MIN_BAUD: Final = 50
+MAX_BAUD: Final = 12_000_000
+DATA_BITS: Final = (5, 6, 7, 8)
+PARITIES: Final = ("none", "even", "odd", "mark", "space")
+STOP_BITS: Final = (1.0, 1.5, 2.0)
+FLOW_CONTROLS: Final = ("none", "rtscts", "xonxoff")
+MAX_SYNC_BYTES: Final = 8
+MIN_IDLE_MS: Final = 1
+MAX_IDLE_MS: Final = 10_000
+DEFAULT_IDLE_MS: Final = 50
+FRAMING_KINDS: Final = ("header_length",)
 
 
 def format_hostport(host: str, port: int) -> str:
@@ -93,18 +108,39 @@ class UdpLinkSpec:
 
 @dataclass(frozen=True, slots=True)
 class SerialLinkSpec:
-    """The serial shape of a link: one device carries both directions.
+    """The serial shape of a link: one device carries both directions."""
 
-    The config does not accept serial links yet (``SUPPORTED_TRANSPORTS``); the serial
-    transport step parses and validates the ``serial`` table into this.
-    """
-
-    device: str
+    device: str  # absolute path, free of control characters
     baud: int
     data_bits: int = 8
     parity: str = "none"
-    stop_bits: str = "1"
+    stop_bits: float = 1.0
     flow: str = "none"
+
+    def __post_init__(self) -> None:
+        assert self.device.startswith("/") and MIN_BAUD <= self.baud <= MAX_BAUD
+        assert self.data_bits in DATA_BITS and self.parity in PARITIES
+        assert self.stop_bits in STOP_BITS and self.flow in FLOW_CONTROLS
+
+    @property
+    def bits_per_char(self) -> float:
+        """Line bits one byte takes: start bit, data bits, parity bit if any, stop bits."""
+        return 1 + self.data_bits + (0 if self.parity == "none" else 1) + self.stop_bits
+
+
+@dataclass(frozen=True, slots=True)
+class FramingSpec:
+    """How a serial byte stream is cut into packets (``kind = "header_length"``: the header
+    profile's length field)."""
+
+    kind: str = "header_length"
+    sync: bytes = b""  # a marker before every packet, consumed by the framer; empty: none
+    max_idle_ms: int = DEFAULT_IDLE_MS
+    require_known_mid: bool = True
+
+    def __post_init__(self) -> None:
+        assert self.kind in FRAMING_KINDS and len(self.sync) <= MAX_SYNC_BYTES
+        assert MIN_IDLE_MS <= self.max_idle_ms <= MAX_IDLE_MS
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +148,8 @@ class Link:
     """Directional link. Commands flow ``source`` -> ``destination``; telemetry back.
 
     The ``destination`` node owns the CCDD and header profiles describing both directions.
-    Exactly one of ``udp`` and ``serial`` is set, the one ``transport`` names.
+    Exactly one of ``udp`` and ``serial`` is set, the one ``transport`` names; a serial link
+    also has its ``framing``.
     """
 
     name: str
@@ -121,10 +158,14 @@ class Link:
     transport: str
     udp: UdpLinkSpec | None = None
     serial: SerialLinkSpec | None = None
+    framing: FramingSpec | None = None
 
     def __post_init__(self) -> None:
         assert (self.udp is None) != (self.serial is None), "exactly one transport spec is set"
-        assert (self.transport == "udp") == (self.udp is not None), "the spec matches the transport"
+        assert (self.transport == UDP_TRANSPORT) == (self.udp is not None), (
+            "the spec matches the transport"
+        )
+        assert (self.serial is None) == (self.framing is None), "a serial link has its framing"
 
     @property
     def command_endpoint(self) -> Endpoint:
@@ -137,6 +178,20 @@ class Link:
         """UDP links only: where ``source`` receives telemetry."""
         assert self.udp is not None, f"link {self.name} is not a UDP link"
         return self.udp.telemetry_endpoint
+
+    @property
+    def command_target(self) -> str:
+        """Where ``destination`` receives commands, as display text (the device for serial)."""
+        if self.serial is not None:
+            return self.serial.device
+        return str(self.command_endpoint)
+
+    @property
+    def telemetry_target(self) -> str:
+        """Where ``source`` receives telemetry, as display text (the device for serial)."""
+        if self.serial is not None:
+            return self.serial.device
+        return str(self.telemetry_endpoint)
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +328,16 @@ class _Ctx:
         if not 1 <= port <= 65535:
             raise self.fail(path, f"port must be 1..65535, got {port}")
         return Endpoint(host.strip("[]"), port)
+
+    def device(self, value: object, path: str) -> str:
+        if (
+            not isinstance(value, str)
+            or not value.startswith("/")
+            or len(value) > 1024
+            or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value)
+        ):
+            raise self.fail(path, "must be an absolute device path without control characters")
+        return value
 
 
 def _parse_response(ctx: _Ctx, raw: object, path: str) -> ResponseRule:
@@ -565,6 +630,117 @@ def _parse_retention(ctx: _Ctx, raw: object) -> RetentionConfig:
     )
 
 
+def _parse_serial(ctx: _Ctx, raw: object, path: str) -> SerialLinkSpec:
+    if not isinstance(raw, dict):
+        raise ctx.fail(path, "must be a table")
+    ctx.keys(
+        raw,
+        path,
+        {"device", "baud", "data_bits", "parity", "stop_bits", "flow"},
+        {"device", "baud"},
+    )
+    defaults = SerialLinkSpec(device="/", baud=MIN_BAUD)
+
+    def word(key: str, allowed: tuple[str, ...], default: str) -> str:
+        value = raw.get(key, default)
+        if not isinstance(value, str) or value not in allowed:
+            raise ctx.fail(f"{path}.{key}", f"must be one of {', '.join(allowed)}")
+        return value
+
+    data_bits = raw.get("data_bits", defaults.data_bits)
+    if isinstance(data_bits, bool) or not isinstance(data_bits, int) or data_bits not in DATA_BITS:
+        raise ctx.fail(f"{path}.data_bits", f"must be one of {', '.join(map(str, DATA_BITS))}")
+    stop_bits = raw.get("stop_bits", defaults.stop_bits)
+    if (
+        isinstance(stop_bits, bool)
+        or not isinstance(stop_bits, int | float)
+        or float(stop_bits) not in STOP_BITS
+    ):
+        raise ctx.fail(f"{path}.stop_bits", "must be one of 1, 1.5, 2")
+    return SerialLinkSpec(
+        device=ctx.device(raw["device"], f"{path}.device"),
+        baud=_config_int(ctx, raw, "baud", path, MIN_BAUD, MAX_BAUD),
+        data_bits=data_bits,
+        parity=word("parity", PARITIES, defaults.parity),
+        stop_bits=float(stop_bits),
+        flow=word("flow", FLOW_CONTROLS, defaults.flow),
+    )
+
+
+def _parse_sync(ctx: _Ctx, value: object, path: str) -> bytes:
+    """A sync marker: hex digits (an even number, at most ``MAX_SYNC_BYTES`` bytes), or empty."""
+    digits = len(value) if isinstance(value, str) else 0
+    if (
+        not isinstance(value, str)
+        or digits > 2 * MAX_SYNC_BYTES
+        or digits % 2
+        or not value.isascii()
+        or not all(c in "0123456789abcdefABCDEF" for c in value)
+    ):
+        raise ctx.fail(
+            path,
+            f'must be hex digits for at most {MAX_SYNC_BYTES} bytes (e.g. "1ACFFC1D"), or empty',
+        )
+    return bytes.fromhex(value)
+
+
+def _parse_framing(ctx: _Ctx, raw: object, path: str) -> FramingSpec:
+    if not isinstance(raw, dict):
+        raise ctx.fail(path, "must be a table")
+    ctx.keys(raw, path, {"kind", "sync", "max_idle_ms", "require_known_mid"}, set())
+    defaults = FramingSpec()
+    kind = raw.get("kind", defaults.kind)
+    if not isinstance(kind, str) or kind not in FRAMING_KINDS:
+        raise ctx.fail(f"{path}.kind", f"must be one of {', '.join(FRAMING_KINDS)}")
+    require = raw.get("require_known_mid", defaults.require_known_mid)
+    if not isinstance(require, bool):
+        raise ctx.fail(f"{path}.require_known_mid", "must be true or false")
+    return FramingSpec(
+        kind=kind,
+        sync=_parse_sync(ctx, raw["sync"], f"{path}.sync") if "sync" in raw else defaults.sync,
+        max_idle_ms=(
+            _config_int(ctx, raw, "max_idle_ms", path, MIN_IDLE_MS, MAX_IDLE_MS)
+            if "max_idle_ms" in raw
+            else defaults.max_idle_ms
+        ),
+        require_known_mid=require,
+    )
+
+
+def _parse_link_transport(
+    ctx: _Ctx, raw: dict[str, Any], lpath: str
+) -> tuple[str, UdpLinkSpec | None, SerialLinkSpec | None, FramingSpec | None]:
+    """The transport of one link table and its transport-specific part. Keys of the other
+    transport are refused by name, not as unknown."""
+    transport = ctx.string(raw, "transport", lpath, UDP_TRANSPORT)
+    if transport not in SUPPORTED_TRANSPORTS:
+        raise ctx.fail(
+            f"{lpath}.transport",
+            f"unsupported transport {transport[:20]!r}; "
+            f"supported: {', '.join(SUPPORTED_TRANSPORTS)}",
+        )
+    common = {"name", "from", "to", "transport"}
+    if transport == SERIAL_TRANSPORT:
+        ctx.keys(raw, lpath, common | {"serial", "framing"}, {"from", "to", "serial"})
+        return (
+            transport,
+            None,
+            _parse_serial(ctx, raw["serial"], f"{lpath}.serial"),
+            _parse_framing(ctx, raw.get("framing", {}), f"{lpath}.framing"),
+        )
+    ctx.keys(
+        raw,
+        lpath,
+        common | {"command_endpoint", "telemetry_endpoint"},
+        {"from", "to", "command_endpoint", "telemetry_endpoint"},
+    )
+    udp = UdpLinkSpec(
+        command_endpoint=ctx.endpoint(raw["command_endpoint"], f"{lpath}.command_endpoint"),
+        telemetry_endpoint=ctx.endpoint(raw["telemetry_endpoint"], f"{lpath}.telemetry_endpoint"),
+    )
+    return transport, udp, None, None
+
+
 def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
     """Validate a parsed TOML mapping (paths resolve against ``path.parent``)."""
     ctx = _Ctx(path)
@@ -617,16 +793,12 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
         raise ctx.fail("links", "must be an array of tables")
     links: list[Link] = []
     seen_names: set[str] = set()
+    devices: dict[str, str] = {}
     for i, raw in enumerate(raw_links):
         lpath = f"links[{i}]"
         if not isinstance(raw, dict):
             raise ctx.fail(lpath, "must be a table")
-        ctx.keys(
-            raw,
-            lpath,
-            {"name", "from", "to", "transport", "command_endpoint", "telemetry_endpoint"},
-            {"from", "to", "command_endpoint", "telemetry_endpoint"},
-        )
+        transport, udp, serial, framing = _parse_link_transport(ctx, raw, lpath)
         ends: list[str] = []
         for key in ("from", "to"):
             value = raw[key]
@@ -639,31 +811,27 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
             ends.append(claimed[value])
         if ends[0] == ends[1]:
             raise ctx.fail(lpath, "'from' and 'to' must be different nodes")
-        transport = ctx.string(raw, "transport", lpath, "udp")
-        if transport not in SUPPORTED_TRANSPORTS:
-            raise ctx.fail(
-                f"{lpath}.transport",
-                f"unsupported transport {transport[:20]!r}; "
-                f"supported: {', '.join(SUPPORTED_TRANSPORTS)}",
-            )
         lname = ctx.name(raw["name"], f"{lpath}.name") if "name" in raw else f"{ends[0]}-{ends[1]}"
         if lname in seen_names:
             raise ctx.fail(f"{lpath}.name", f"duplicate link name {lname!r}")
         seen_names.add(lname)
+        if serial is not None:
+            owner = devices.setdefault(serial.device, lname)
+            if owner != lname:
+                raise ctx.fail(
+                    f"{lpath}.serial.device",
+                    f"{serial.device} is already the device of link {owner!r}; one device "
+                    "carries one link",
+                )
         links.append(
             Link(
                 name=lname,
                 source=ends[0],
                 destination=ends[1],
                 transport=transport,
-                udp=UdpLinkSpec(
-                    command_endpoint=ctx.endpoint(
-                        raw["command_endpoint"], f"{lpath}.command_endpoint"
-                    ),
-                    telemetry_endpoint=ctx.endpoint(
-                        raw["telemetry_endpoint"], f"{lpath}.telemetry_endpoint"
-                    ),
-                ),
+                udp=udp,
+                serial=serial,
+                framing=framing,
             )
         )
         dest = nodes[ends[1]]

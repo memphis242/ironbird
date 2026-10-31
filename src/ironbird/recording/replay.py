@@ -37,7 +37,7 @@ from typing import Final
 from ironbird.errors import Code, IronbirdError
 from ironbird.filter.diag import FilterError
 from ironbird.filter.lexer import parse_time
-from ironbird.frame import Frame
+from ironbird.frame import Frame, GapReason
 from ironbird.recording import format as fmt
 from ironbird.recording.defs import Head, label_of, read_head
 from ironbird.recording.format import RecordType
@@ -619,7 +619,8 @@ class Replay:
         """Count a GAP record if the frames it says were lost overlap the selected range."""
         if (start is None or gap.last_ns >= start) and (end is None or gap.first_ns < end):
             self.stats.gaps += 1
-            self.stats.gap_frames += gap.lost
+            if gap.reason is not GapReason.LINK_DOWN:  # an outage's frames cannot be counted
+                self.stats.gap_frames += gap.lost
 
     def _damage(self, damage: Damage, reader: RecordingReader, path: Path) -> None:
         stats = self.stats

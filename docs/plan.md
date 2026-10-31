@@ -133,7 +133,7 @@ lazily, only what is looked at.
 
 Processes:
 1. **Engine** (owns the hardware): one `asyncio` loop, UDP and serial both driven by the
-   loop's selector (Stage 2 2k; a reader thread only for a device that cannot be polled).
+   loop's selector (Stage 2 2k; a reader thread only for a device that cannot be polled, none was needed).
    Per packet it does only cheap work:
    `time.time_ns()` timestamp, peek MID at a fixed header offset, append the raw frame
    to the recording buffer (flushed by size or every ~250 ms on a writer thread - the
@@ -3224,6 +3224,177 @@ Verification
   the serial link, and bridge-injected garbage yields resync notices without losing the
   packets around it.
 - Real UART hardware: decision D7.
+
+As built (where the build differs from, or settles, the text above)
+- Modules: `transport/framing.py` (`Framer`, `HeaderLengthFramer`, `Emit`, `Episode`, `FramerStats`,
+  `WorkBudget`, `validate_stream_profile`), `transport/serial.py` (`SerialTransport`), `config.py`
+  (`SerialLinkSpec`, `FramingSpec`, `Link.framing`, `Link.command_target`/`telemetry_target`),
+  `transport/__init__.py` (the factories take a `TransportParams`: report, failure handler, cap, the
+  destination node's `Codec`, and the link-state handler), `codec.py` (`Codec.payload_bounds`),
+  `engine.py` (serial streams, `_link_state`, `LinkSink`), `errors.py` (`IB-TX-006/007/008`),
+  `recording/writer.py` (`Recorder.link_event`), `tools/cfs/serial_bridge.py`, `examples/cfs-serial.toml`,
+  `tools/fuzz/fuzz_framer.py` (nightly CI, 10 min; the job's timeout is 55 min now).
+- Loop-driven, no reader thread. As the deliverables say, pyserial opens and configures the port
+  (`exclusive=True` is the `flock`) and the loop owns the descriptor (`add_reader`, `add_writer`,
+  `os.read`/`os.write`, non-blocking: pyserial opens with `O_NONBLOCK`). A pty and the device classes
+  tried (`/dev/null`, a regular file: `ENOTTY`, refused as "not a serial device") needed no fallback, so
+  the reader-thread fallback of the execution model is not built. The only helper thread is the
+  `tcdrain` of `send(confirm=True)`, started with `ledgergate.start_thread` (the shutdown signals blocked),
+  one per confirmed send, with a timeout from the byte count and `bits_per_char / baud` (doubled, plus
+  0.5 s, at least 1 s); on a timeout the output queue is flushed (`tcflush(TCOFLUSH)`, which also wakes the
+  thread) and `IB-TX-002` says the rest was discarded. A read returns up to 4096 bytes and a wakeup takes up
+  to 16 reads before the loop gets a turn; the idle timer is one `call_later` armed from the framer's deadline.
+- `queue_drop` is not emitted. The plan defines the reason for "a transport-side queue overflowed"; with the
+  loop reading the descriptor there is no such queue on the receive side (a read goes straight through the
+  framer into ingest), and the TX buffer is not a loss of captured frames: a send that does not fit the 64 KiB
+  buffer is refused up front (`IB-TX-002`, "refused: N byte(s) are still waiting"), one that waits longer than
+  the drain timeout for the device to take its bytes fails with the unsent bytes discarded. A consumer queue
+  overflow stays what 2e decided (not a recording gap). The reason stays defined for a transport that has a
+  queue (the reader-thread fallback would). Kernel-side serial overruns (`TIOCGICOUNT` `overrun`/`buf_overrun`)
+  are not counted: a pty has none and the real-hardware case is D7 (deferred).
+- Config. `serial = {...}` and `framing = {...}` are parsed per link by transport: a serial link takes
+  `from`, `to`, `name`, `serial` (required) and `framing` (optional, all defaults), a UDP link its two
+  endpoints; a key of the other transport is refused as an unknown key. Rules beyond the text: `device` is
+  an absolute path of at most 1024 characters without control characters, and one device carries one link
+  (a second link naming it is `IB-CFG-003`); `baud` is an integer (a float or a bool is refused);
+  `stop_bits` is 1, 1.5 or 2 in TOML as an integer or a float (kept as a float; Linux has no 1.5, pyserial
+  sets two); `sync` is an even number of hex digits, at most 16, no `0x` prefix, or empty. `framing.kind` has
+  one value, `header_length`. 23 corpus files `cfg-serial-*` and `cfg-udp-with-serial-table`, each checked for its
+  reason in `test_serial_config.py`.
+- Whether the profile can frame a stream is checked when the transport is built, not at config load
+  (profiles load lazily with the CCDD): `validate_stream_profile` refuses, as `IB-CFG-005` naming the link, a
+  header profile without a length field, with the field outside the header, or whose smallest packet exceeds
+  `max_packet_bytes`. The end receives what the other end sends, so the source is framed with the telemetry
+  profile and the destination with the command profile of the destination node.
+- Framer. The rules are the plan's. What the text leaves open:
+  - Sync. A configured `sync` precedes every packet and is consumed: a `PACKET` frame holds the packet
+    without it. The byte invariant is therefore "the input equals, in order, `sync + data` for each
+    `PACKET` frame and `data` for `GARBAGE` and `STALE`" (without a sync it is the plain statement). Garbage
+    and stale runs keep any sync bytes they contain; the recording of a sync-framed line shows packets
+    without their markers. A partial marker at the end of the held bytes waits for more.
+  - Judging a candidate. With `length_window` bytes the claimed total must lie in `min_bytes ..
+    max_packet_bytes` (rejected before the header is complete); with the whole header the fixed-field mask must
+    match and, with `require_known_mid`, `Codec.payload_bounds(kind, mid)` must exist and hold
+    `total - min_bytes` (commands that share a MID: the widest range among them). A complete candidate then
+    passes `header.check_word` (length, fixed fields in header and trailer, checksum), the same checks the
+    codec makes, so a false sync is refused on the evidence the decode boundary would use.
+  - Confirmation (no checksum in the profile). A sane header (after `sync`) must follow at `total`, or the
+    line must be silent for `max_idle_ms`. The limit, pinned by `ser-length-lands-on-next-header.bin`: a sane
+    header whose claimed end lands exactly on a real header is taken for a packet and swallows what is
+    between; and a real packet followed at once by bytes that are not a header is not believed (it is
+    garbage), because nothing tells it from a false header followed by noise. A checksum (`examples/headers/
+    ccsds_pec_tlm.toml`) removes both. The README says so.
+  - Stale. A candidate whose header is sane and whose bytes the line does not complete is a `STALE` frame
+    when the idle time ends, after the bytes inside it are searched for complete packets the lying header
+    covered (so a low-rate link with a lying header costs no packet); a header that cannot be judged yet
+    (fewer than `size_bytes` bytes) is `GARBAGE`. `expire` and `flush` (link lost, transport closed) run the
+    same final scan, so the bytes read before a loss or a close are all delivered.
+  - Garbage is emitted in pieces of exactly the cap from the start of a run as soon as it holds one, and the
+    rest when a packet follows or on expiry, so the frames are the same whatever the chunking (tested
+    without expiry). Each emission of a run is one `Episode` (size, the first 32 bytes, time); the transport
+    reports at most one `IB-TX-007` per read or expiry, with up to four samples in the details (hex).
+  - Clocks. `feed(chunk, wall_ns, mono_ns)`: frames are stamped with the wall time of the read that completed
+    them (the expiry time for those an expiry settles); the idle logic uses the monotonic clock, so a
+    clock step cannot flush early or hang.
+  - Work budget. Scanning is paid in units of about a quarter of a microsecond: 8 per candidate looked at, half
+    a unit per byte checksummed; each input byte earns 24, the balance is capped at 2^18 and starts at 2^16.
+    When it runs out, the bytes not yet looked at except the last `len(sync) + header - 1` become garbage
+    (`stats().work_exhausted`) and the debt is written off with a grant of `8 * (keep + 2)`, so a run's
+    spending is at most what it earned plus one candidate (`work_spent <= work_earned + cap/2 + 4 * 8`,
+    asserted by the tests and the fuzz target). Measured on the 4-core dev host: 32 MB/s for clean 200-byte
+    checksummed packets (160k packets/s), 4 MB/s for the checksum-less mock telemetry, 0.95 MB/s for random
+    noise (no header is believed), 1.4 MB/s for the hostile stream (a plausible header claiming 1000 bytes at
+    every offset) with the budget exhausted every few KB. At 12 Mbaud (1.2 MB/s) random noise alone would take
+    the loop's time; 115200 baud (11.5 kB/s) takes 1%.
+  - Memory. Held bytes are at most the cap plus a header plus the read (asserted by the tests: no more than
+    `cap + 100` held after 100-byte reads of noise).
+- Ingest of `GARBAGE` and `STALE` frames. The engine does not run `Codec.check` on them and does not report
+  one `IB-DEC-*` each: they are counted (`Engine.resync_frames`), recorded, delivered to consumers (which
+  show them as non-packets) and announced by the transport's coalesced `IB-TX-007` (evidence tier, ledger
+  details with the first bytes). A `GARBAGE` frame that happens to look like a valid packet is therefore never
+  counted as one and carries no MID (`test_serial_engine.py`). Replay still reports them through
+  `FrameDecoder` (2g).
+- Errors. Open failures are `IB-TX-001` with the remedy in the line: missing (`ENOENT`: "check the cable, and
+  list /dev/serial/by-id"), permission (`EACCES`/`EPERM`: "ask an admin to add your user to the device's group
+  (usually dialout); ironbird never needs root"), not a serial device (`ENOTTY`/`EINVAL`), not responding
+  (`ENODEV`/`ENXIO`/`EIO`); a device `flock`ed by another process (`EAGAIN`) or exclusively opened (`EBUSY`) is
+  `IB-TX-006`. A device that cannot be opened is raised and nothing is retried: the reconnect loop is only for
+  a link that was up. `IB-TX-007` and `IB-TX-008` are errors by default (`WARNING_CODES` is unchanged) and
+  evidence-tier in the ledger (`EVIDENCE_ERRORS`: the line, not ironbird, drives their rate).
+- Link down and up. `EIO`, `ENXIO`, `ENODEV`, `EBADF`, `EPIPE` on a read or a write, or end of file (a pty
+  whose master closed reads 0 bytes; its writes fail with `EIO`) make the transport flush the framer
+  (the bytes read before the loss are delivered first), close the port, fail the sends waiting for the TX
+  buffer and report `IB-TX-008` through the link-state handler. It reopens the device with a backoff of 0.5 s
+  doubling to 5 s until it succeeds or the transport closes; a failed attempt is reported (`IB-TX-008` "still
+  down after N attempt(s): <why>") for attempts 1, 2, 3 and every 12th, so a long outage is about one line a
+  minute in the ledger and, coalesced, in the terminal. A `send` while down is refused with `IB-TX-008`
+  (raised, so `ib send` exits 1). Send-only transports reconnect the same way (they have no reader, so a loss
+  is noticed by a write).
+- Engine side. `_link_state` ledgers `link.down` / `link.up` (evidence tier: a flapping cable drives the rate)
+  and `link.down_at_close` (essential), shows the down as the `IB-TX-008` error notice and the return as an
+  info notice (`Session.report` accepts `Level.INFO` and ledgers it as a `notice.info` state record, since an
+  error record is a warning or an error), tells sinks that have `link_event` (the `LinkSink` protocol; the
+  recorder turns it into a `link_down` / `link_up` MARK at the event time, the staging sink replays it in
+  order), and, when the link is back, tells gap sinks about one `GapReason.LINK_DOWN` GAP on the receive
+  stream from the down time to the up time, with the engine's sequence number at the down and now
+  (`first_seq .. last_seq`, no sequence hole behind it: `info` finds no `hole_frames`). A link still down
+  when its transport closes ends the gap at the close. Decision (the user's): UDP never emits it; a UDP
+  transport takes no link-state handler (`test_an_udp_link_end_never_reports_a_link_state`).
+- What `lost` means for `link_down`. The frames an outage cost are unknown, so the GAP counts the
+  interruption (`lost = 1`, as the format needs at least 1). `ib rec info` shows it as
+  `link_down: stream N down <t1> to <t2> (X s)` and `lost_by_reason` counts outages; `ib replay` and
+  `ib export` count the gap but add nothing to "frame(s) lost" (`1 gap(s)`).
+- One process owns the device. The `flock` makes a second `ib` on it fail with `IB-TX-006` ("close it, then
+  retry"), so `ib listen` and `ib send` take turns on a serial link (`respond` on the flight side keeps its end
+  open and answers on the same descriptor). A command session that sends and listens at once is the TUI's
+  (Stage 3); until then a serial test drives the other direction by hand (the bridge's UDP side or the
+  relay). The device may drop DTR when it closes (the Linux `HUPCL` default); documented in the README.
+- CLI. `ib send` prints `via serial <device>`; `ib nodes` shows `<device> at <baud> baud`; the listen and
+  respond banners name the device (`on serial <device>`); the `send.request`/`tx.command` records and
+  `Stream.endpoint` carry `serial <device>`. `Link.command_target` / `telemetry_target` are the display text
+  of where each direction goes (the endpoint, or the device) and replace `str(link.command_endpoint)` where
+  the code did not care about the transport. `SentCommand` has a `transport` field.
+- pyserial and the deletion guard. `tests/guard.py` lists third-party code among its known gaps. Reviewed by
+  hand for this change: pyserial 3.5's POSIX backend (the only one imported here) opens with
+  `os.open(path, O_RDWR | O_NOCTTY | O_NONBLOCK)` (no create, no truncate), `flock`s, sets termios and
+  `ioctl`s modem lines, makes two `os.pipe`s for its cancel calls, and does not unlink, rename, link, spawn
+  or load `ctypes`; `SerialTransport` calls only `Serial.open/fileno/close`. The dependency is
+  `pyserial>=3.5,<4` (and pinned in `constraints-dev.txt`).
+- Tests. `test_serial_framing.py` (77 cases: the rules on hand-made streams; Hypothesis: every byte accounted
+  for in order for any chunking, idle gaps, sync, both profiles; the same frames for any chunking; checksummed
+  packets separated by headerless garbage all recovered; checksum-less packets recovered when the line
+  pauses after each; a false header embedded in garbage whose length covers real packets costs none; a lying
+  length never swallows more than the cap or a packet behind it; hostile input within the work budget; the
+  11 corpus streams `ser-*.bin` at four chunkings, with the output pinned for nine), built by `ser_corpus.py`
+  (`python tests/ser_corpus.py` regenerates; a test proves the files are its output). Mutants of the framer
+  that rescan from the end of a rejected candidate, drop the confirmation, drop the garbage run or drop the
+  cap check each fail a test. `test_serial_config.py` (63), `test_serial_transport.py` (33, on a pty: frames,
+  idle timer, garbage reports, large reads, close delivers the last bytes, send and handed_off, the TX buffer
+  refusal, a stalled peer, the drain timeout, unplug and replug, bytes delivered before the down event, a stale
+  frame cut by the unplug, close while down, retry reports, a raising handler, missing device, busy,
+  not a serial device, `open_error` for nine errnos, the registry), `test_serial_engine.py` (6),
+  `test_serial_bridge.py` (7), `test_serial_e2e.py` (9, `ib` subprocesses over two ptys and the relay in
+  `tests/support/ptybridge.py`: `respond` answering a command that `listen` decodes, `send` reaching a
+  `respond`, a second process refused as busy, a missing device, a profile without a length field,
+  `record` byte-exact against the relay's log with 12 garbage bursts announced fewer times than they
+  happened, an unplug and replug during `record` giving a `link_down` GAP, two marks, the ledger states and
+  the replay and export summaries, `listen` decoding after a replug with one down notice, UDP having no link
+  marks). Every wait is for a condition; the pty is read through a stable symlink the bridge repoints on a
+  replug. Benchmarks in `test_benchmarks.py`: the framer on clean, noisy and hostile streams, and
+  `ib record` over a pty at the 1k packets/s floor with 200-byte packets for 4 s: 4000/4000 recorded, no gap,
+  the sender never held back (0.59 s CPU, 147 us a packet on the dev host); enforced in the serial run like
+  the other host-timing guards.
+- Real cFS (`tests/cfs/test_serial_cfs.py`, `serial_bridge.py` between a pty and CI_LAB / TO_LAB): `ib send`
+  of `TO_LAB_ENABLE_OUTPUT` and `SAMPLE_APP_NOOP` over serial is accepted by cFS (the console shows the NOOP
+  event) and the bridge's own header-length framing agrees with ironbird's; `ib listen` over serial decodes
+  `ES_HK` and the NOOP event; with the bridge injecting 7 noise bytes after every third packet (with 120 ms of
+  silence each side) all 12 requested `ES_HK` packets arrive, `IB-TX-007` is reported and no `IB-DEC-*` is.
+  The 28 Stage 1 cases and these 2 pass together on the dev host (the 6 `ib_test` cases need a cFS built with
+  that app, which this host's default build lacks; they passed with it in 2j).
+- Deferred: real UART hardware and an FTDI latency check (D7); kernel serial overrun counters
+  (`TIOCGICOUNT`); a session that sends and listens on one device at once (needs a long-lived process: the
+  TUI); `sync` bytes are not kept in the recording; a serial `--follow`-style `ib send` that stays up to
+  catch the reply; RS-485 direction control; `2l`'s throughput gate for serial at line rates above a pty's.
 
 ### 2l - Stage 2 acceptance, throughput gate, docs
 

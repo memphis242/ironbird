@@ -376,6 +376,62 @@ system, a path through a file. When the directory is usable but the disk or the 
 (`IB-LED-004`, exit 6 if the record is never written) under the default `on_full = "continue"`,
 or refuse (exit 1) under `on_full = "refuse_commands"`.
 
+## Serial links
+
+A link with `transport = "serial"` carries both directions over one device (a UART, or a USB
+adapter such as `/dev/serial/by-id/usb-FTDI_...`). You need access to the device (usually the
+`dialout` group); ironbird never needs root. `examples/cfs-serial.toml` is a full example.
+
+```toml
+[[links]]
+name = "fc-uart"
+from = "ground"
+to = "fc"
+transport = "serial"
+serial = { device = "/dev/serial/by-id/usb-FTDI_...", baud = 115200, data_bits = 8,
+           parity = "none", stop_bits = 1, flow = "none" }
+framing = { kind = "header_length", sync = "", max_idle_ms = 50, require_known_mid = true }
+```
+
+| Key | Values |
+|-----|--------|
+| `serial.device` | absolute path, required |
+| `serial.baud` | 50 to 12000000, required |
+| `serial.data_bits` | 5, 6, 7, 8 (default 8) |
+| `serial.parity` | `none` (default), `even`, `odd`, `mark`, `space` |
+| `serial.stop_bits` | 1 (default), 1.5, 2 (Linux sends 2 for 1.5) |
+| `serial.flow` | `none` (default), `rtscts`, `xonxoff` |
+| `framing.kind` | `header_length` (the only one): the header profile's length field cuts the stream |
+| `framing.sync` | hex marker of up to 8 bytes that precedes every packet (consumed, not recorded); default none |
+| `framing.max_idle_ms` | 1 to 10000 (default 50): silence after which a pending packet is settled |
+| `framing.require_known_mid` | default `true`: a header is only believed if its MID is in the CCDD and the length fits that MID's payload range |
+
+How the stream is cut. A byte stream has no packet boundaries, so a candidate header must look
+right (length between the smallest and the largest packet, the fixed fields, a known MID with a
+payload size its CCDD allows) and, with a checksum in the profile, the whole packet must pass it.
+A profile without a checksum proves less, so a packet is also confirmed by a plausible header
+right behind it or by `max_idle_ms` of silence: the last packet before a pause waits that long, and
+a packet followed at once by line noise is not believed (use a header profile with a trailer
+checksum, such as `examples/headers/ccsds_pec_tlm.toml`, where that matters). Bytes that are not
+packets are kept, not dropped: they are recorded as `garbage` frames, a partial packet the line
+leaves incomplete is a `stale` frame, and each run is reported as `IB-TX-007` (coalesced; the
+ledger has the first bytes). A recording therefore holds the line byte for byte.
+
+Frame times are taken when the read that completed a frame returns; a USB adapter adds its own
+latency timer (an FTDI defaults to 16 ms). That is documented, not corrected.
+
+One process owns the device at a time (`flock`): a second `ib` on it fails with `IB-TX-006`, so a
+`listen` and a `send` take turns (a `respond` on the flight side answers on the same device).
+Errors a user can act on: a missing device (`IB-TX-001`: check the cable, list
+`/dev/serial/by-id`), no permission (`IB-TX-001`: ask an admin to add you to the device's group),
+a device already in use (`IB-TX-006`). If the device goes away after it was opened (an unplugged
+adapter, `EIO`/`ENXIO`), the link is down, not the command: `IB-TX-008` is shown once, the device is
+reopened with a backoff of 0.5 s to 5 s, a recording gets `link_down` and `link_up` marks and one
+`link_down` gap for the outage (its frame count is unknown, so the gap counts the interruption), and
+`IB-TX-008` is shown once more as an info line when the link is back. A `send` while the link is down is
+not sent (`IB-TX-008`). Closing the device may drop DTR on real hardware (the Linux default); a
+device that resets on DTR needs that handled on its side.
+
 ## Events and telemetry categories
 
 cFS events are the most important telemetry. `ib events [--node X ...] [--min-type error]
@@ -507,6 +563,7 @@ field path; a span that does not fit one particular packet is `IB-ENC-004` for a
 
 - `examples/ironbird.toml` - ground plus a real cFS flight computer (CI_LAB 1234, TO_LAB 2234), telemetry header time in the cFE epoch.
 - `examples/mock.toml` - ironbird-vs-ironbird on distinct ports, with response rules, telemetry header time in Unix seconds.
+- `examples/cfs-serial.toml` - ground plus a real cFS over a serial link, through `tools/cfs/serial_bridge.py` (a pty joined to CI_LAB / TO_LAB).
 - `examples/headers/*.toml` - header profiles (bit widths, fixed/computed fields, checksum).
 - `examples/ccdd/*.json` - placeholder CCDD JSON (`ironbird-ccdd/1`; `ironbird-ccdd/0` files still load).
 

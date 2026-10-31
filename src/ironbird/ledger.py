@@ -126,11 +126,15 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "rx.command.summary": Tier.EVIDENCE,
         "rx.queue_drops": Tier.EVIDENCE,
         "rx.kernel_drops": Tier.EVIDENCE,
+        "link.down": Tier.EVIDENCE,  # a flapping cable drives the rate
+        "link.up": Tier.EVIDENCE,
+        "notice.info": Tier.EVIDENCE,  # info notices follow link flaps and similar environment
         # events: received cFS events, never sampled
         "rx.event": Tier.EVENTS,
         # essential: bounded by the user's actions or ironbird's own timers
         "rx.unread_at_close": Tier.ESSENTIAL,
         "rx.failed": Tier.ESSENTIAL,
+        "link.down_at_close": Tier.ESSENTIAL,
         "cli.invoke": Tier.ESSENTIAL,
         "cli.signal": Tier.ESSENTIAL,
         "session.start": Tier.ESSENTIAL,
@@ -227,6 +231,8 @@ EVIDENCE_ERRORS: Final = frozenset(
         Code.RSP_RULE,
         Code.TX_RECV,
         Code.TX_OVERRUN,
+        Code.TX_RESYNC,
+        Code.TX_DOWN,
         Code.ENG_LAG,
     }
 )

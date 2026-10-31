@@ -1023,11 +1023,17 @@ def nodes(ctx: typer.Context, as_node: AsOption = None, verbose: VerboseOption =
         if config.links:
             out("links:")
             for link in config.links:
-                out(
+                head = (
                     f"  {term(link.name)}: {term(link.source)} -> {term(link.destination)} "
-                    f"{term(link.transport)}  commands {term(str(link.command_endpoint))}  "
-                    f"telemetry {term(str(link.telemetry_endpoint))}"
+                    f"{term(link.transport)}"
                 )
+                if link.serial is not None:
+                    out(f"{head}  {term(link.serial.device)} at {link.serial.baud} baud")
+                else:
+                    out(
+                        f"{head}  commands {term(str(link.command_endpoint))}  "
+                        f"telemetry {term(str(link.telemetry_endpoint))}"
+                    )
         return 0
 
     _run(ctx, as_node, verbose, body, "nodes")
@@ -1148,7 +1154,8 @@ def send(
             allow_count_mismatch=allow_count_mismatch,
         )
         run.console.out(
-            f"sent {term(sent.command)} to {term(sent.node)} via udp {term(sent.endpoint)} "
+            f"sent {term(sent.command)} to {term(sent.node)} via "
+            f"{term(sent.transport)} {term(sent.endpoint)} "
             f"(mid 0x{sent.mid:04X} fc {sent.function_code} seq {sent.sequence}, "
             f"{sent.size} bytes)"
         )
@@ -1239,7 +1246,7 @@ def listen(
         io = run.console
         mids = _parse_mids(session, node, mid, link)
         listener = await session.listen(node, mids=mids, link=link, where=where)
-        io.err(render.listen_banner(node, listener.local_address))
+        io.err(render.listen_banner(node, listener.local_address, listener.device))
         shown = 0
         show_hex = session_verbose(ctx, verbose)
 
@@ -1374,7 +1381,7 @@ def respond(
     ) -> int:
         io = run.console
         responder = await session.respond(peer=peer, link=link)
-        io.err(render.respond_banner(session.node.name, responder.local_address))
+        io.err(render.respond_banner(session.node.name, responder.local_address, responder.device))
         handled = 0
 
         async def consume() -> None:
@@ -1968,7 +1975,10 @@ def _replay_summary(
     if stats.chunks_skipped:
         parts.append(f"{stats.chunks_skipped} chunk(s) skipped by the index and not checked")
     if stats.gaps:
-        parts.append(f"{stats.gaps} gap(s) ({stats.gap_frames} frame(s) lost)")
+        parts.append(
+            f"{stats.gaps} gap(s)"
+            + (f" ({stats.gap_frames} frame(s) lost)" if stats.gap_frames else "")
+        )
     if stats.damage:
         parts.append(f"{stats.damage} damaged stretch(es), {stats.damage_bytes} byte(s)")
     return ", ".join(part for part in parts if part)
@@ -2214,7 +2224,10 @@ def _export_summary(replay: Replay, result: ExportResult, where: str) -> str:
     if stats.chunks_skipped:
         parts.append(f"{stats.chunks_skipped} chunk(s) skipped by the index and not checked")
     if stats.gaps:
-        parts.append(f"{stats.gaps} gap(s) ({stats.gap_frames} frame(s) lost)")
+        parts.append(
+            f"{stats.gaps} gap(s)"
+            + (f" ({stats.gap_frames} frame(s) lost)" if stats.gap_frames else "")
+        )
     if stats.damage:
         parts.append(f"{stats.damage} damaged stretch(es), {stats.damage_bytes} byte(s)")
     return ", ".join(part for part in parts if part)

@@ -51,6 +51,9 @@ class Code(StrEnum):
     TX_RECV = "IB-TX-003"  # receive failed: a socket read errored (may end the capture)
     TX_OVERRUN = "IB-TX-004"  # datagrams dropped by the kernel socket buffer (or left unread)
     TX_RCVBUF = "IB-TX-005"  # kernel granted a smaller receive buffer than requested (warning)
+    TX_BUSY = "IB-TX-006"  # serial device locked by another process
+    TX_RESYNC = "IB-TX-007"  # serial stream resynchronised: bytes skipped
+    TX_DOWN = "IB-TX-008"  # link lost (serial unplug or I/O error): reconnecting
     # Events
     EVT_NONE = "IB-EVT-001"  # no event telemetry is defined for the selected node(s)
     # Responder

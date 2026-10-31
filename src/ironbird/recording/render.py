@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from typing import Any, Final
 
 from ironbird.errors import Code
+from ironbird.frame import GapReason
 from ironbird.ledger import format_ts
 from ironbird.recording import format as fmt
 from ironbird.recording.inspect import Report
@@ -80,6 +81,12 @@ def damage_summary(report: Report) -> str:
 
 
 def _gap_text(gap: fmt.Gap) -> str:
+    if gap.reason is GapReason.LINK_DOWN:  # the frames lost are unknown: the GAP is the outage
+        seconds = max(0, gap.last_ns - gap.first_ns) / 1e9
+        return (
+            f"link_down: stream {gap.stream} down {format_ts(gap.first_ns)} to "
+            f"{format_ts(gap.last_ns)} ({seconds:.1f} s)"
+        )
     return (
         f"{gap.reason.name.lower()}: {gap.lost} frame(s) of stream {gap.stream}, "
         f"{format_ts(gap.first_ns)} to {format_ts(gap.last_ns)}, "

@@ -176,12 +176,15 @@ def event_record(event: Event) -> dict[str, Any]:
 # -- command output built from config/CCDD strings -----------------------------------------
 
 
-def _where(addr: tuple[str, int] | None) -> str:
-    return f" on udp {format_hostport(*addr)}" if addr else ""
+def _where(addr: tuple[str, int] | None, device: str | None = None) -> str:
+    """`` on udp host:port``, or `` on serial /dev/...`` for a device-bound end, else nothing."""
+    if addr:
+        return f" on udp {format_hostport(*addr)}"
+    return f" on {term(device, 200, err=True)}" if device else ""
 
 
-def listen_banner(node: str, addr: tuple[str, int] | None) -> str:
-    return f"listening for {term(node, err=True)}{_where(addr)}"
+def listen_banner(node: str, addr: tuple[str, int] | None, device: str | None = None) -> str:
+    return f"listening for {term(node, err=True)}{_where(addr, device)}"
 
 
 def events_banner(endpoints: Sequence[tuple[str, tuple[str, int] | None]]) -> str:
@@ -192,8 +195,8 @@ def events_banner(endpoints: Sequence[tuple[str, tuple[str, int] | None]]) -> st
     return f"listening for events from {where}"
 
 
-def respond_banner(node: str, addr: tuple[str, int] | None) -> str:
-    return f"{term(node, err=True)} responding{_where(addr)}"
+def respond_banner(node: str, addr: tuple[str, int] | None, device: str | None = None) -> str:
+    return f"{term(node, err=True)} responding{_where(addr, device)}"
 
 
 def respond_line(node: str, command: str, sequence: int | None, reply: str | None) -> str:

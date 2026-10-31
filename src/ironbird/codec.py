@@ -436,11 +436,33 @@ class Codec:
         )
         self._sequence: dict[int, int] = {}
         self._command_mids: frozenset[int] = frozenset(m for m, _ in model.commands_by_key)
+        self._payload_bounds: Mapping[MessageKind, Mapping[int, tuple[int, int]]] = (
+            MappingProxyType(
+                {
+                    MessageKind.TELEMETRY: MappingProxyType(
+                        {
+                            mid: (msg.min_payload, msg.payload_size)
+                            for mid, msg in model.telemetry_by_mid.items()
+                        }
+                    ),
+                    MessageKind.COMMAND: MappingProxyType(self._command_payload_bounds(model)),
+                }
+            )
+        )
         layouts: dict[str, _Layout] = {}
         for msg in model.messages:
             self._validate_fit(msg)
             layouts[msg.name] = _compile_layout(msg)
         self._layouts: Mapping[str, _Layout] = MappingProxyType(layouts)
+
+    @staticmethod
+    def _command_payload_bounds(model: CcddModel) -> dict[int, tuple[int, int]]:
+        """Per command MID, the widest payload range of the commands that share it."""
+        bounds: dict[int, tuple[int, int]] = {}
+        for (mid, _code), msg in model.commands_by_key.items():
+            low, high = bounds.get(mid, (msg.min_payload, msg.payload_size))
+            bounds[mid] = (min(low, msg.min_payload), max(high, msg.payload_size))
+        return bounds
 
     @staticmethod
     def _validate_profile(profile: HeaderProfile) -> None:
@@ -744,6 +766,12 @@ class Codec:
         if kind is MessageKind.TELEMETRY:
             return mid in self.model.telemetry_by_mid
         return mid in self._command_mids
+
+    def payload_bounds(self, kind: MessageKind, mid: int) -> tuple[int, int] | None:
+        """The fewest and most payload bytes a packet of ``kind`` with this MID may carry
+        (commands sharing a MID: the widest range among them), or ``None`` when the CCDD does
+        not define the MID. A stream framer uses it to tell a plausible header from noise."""
+        return self._payload_bounds[kind].get(mid)
 
     def oversize_error(
         self, kind: MessageKind, data: bytes | bytearray | memoryview, orig_len: int
