@@ -34,6 +34,11 @@ _LABELS: Final[Mapping[Level, str]] = MappingProxyType(
 assert _LABELS.keys() == set(Level), "every level needs a label"
 
 
+def level_of(code: Code) -> Level:
+    """The level a code is reported at unless the reporter says otherwise."""
+    return Level.WARNING if code.is_warning else Level.ERROR
+
+
 @dataclass(frozen=True, slots=True)
 class Notice:
     code: Code

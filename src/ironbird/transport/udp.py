@@ -203,13 +203,18 @@ class UdpTransport:
         return self._ovfl_active
 
     @property
-    def rcvbuf_below_target(self) -> bool:
-        """The kernel granted less receive buffer than requested (``net.core.rmem_max``).
+    def rcvbuf_granted(self) -> int:
+        """The usable receive buffer the kernel granted, in bytes.
 
         Linux reports twice the usable size, which accounts for per-datagram overhead.
         """
         factor = 2 if sys.platform.startswith("linux") else 1
-        return self.rcvbuf_effective < factor * self.rcvbuf_requested
+        return self.rcvbuf_effective // factor
+
+    @property
+    def rcvbuf_below_target(self) -> bool:
+        """The kernel granted less receive buffer than requested (``net.core.rmem_max``)."""
+        return self.rcvbuf_granted < self.rcvbuf_requested
 
     @property
     def local_address(self) -> tuple[str, int] | None:
@@ -479,9 +484,9 @@ class UdpTransport:
                     self._report(
                         IronbirdError(
                             Code.TX_RCVBUF,
-                            f"{self.description}: kernel receive buffer is "
-                            f"{self.rcvbuf_effective} bytes, below the {self.rcvbuf_requested} "
-                            "requested; bursts may be lost - raise net.core.rmem_max (sysctl)",
+                            f"{self.description}: kernel granted a {self.rcvbuf_granted} byte "
+                            f"receive buffer, below the {self.rcvbuf_requested} requested; "
+                            "bursts may be lost - ask an admin to raise net.core.rmem_max",
                         )
                     )
             if self._remote is not None:
