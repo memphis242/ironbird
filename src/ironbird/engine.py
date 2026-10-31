@@ -1212,13 +1212,19 @@ class Engine:
         )
 
     def _note_unread(self, io: _LinkIO, transport: Transport) -> None:
-        """Account for datagrams still in the socket buffer when ``transport`` closed (they are
+        """Ledger the packets a framing transport emitted although the CCDD disagrees with them,
+        and account for datagrams still in the socket buffer when ``transport`` closed (they are
         discarded unread). Always ledgered; reported only on a link end that was already losing
         frames, where the count completes the picture rather than adding noise."""
-        left = transport.stats().unread_at_close
+        stats = transport.stats()
+        label = io.description
+        if stats.ccdd_mismatched:  # the decode reports each one; this is the total for the ledger
+            self._ledger.record(
+                "state", "rx.ccdd_mismatch", label=label, packets=stats.ccdd_mismatched
+            )
+        left = stats.unread_at_close
         if not left:
             return
-        label = io.description
         self._ledger.record("state", "rx.unread_at_close", label=label, datagrams=left)
         # Datagrams the OS discards unread are lost before the transport read them, like a kernel
         # drop: sinks that record gaps get one, bracketing the loss by the last poll and now.
@@ -1232,7 +1238,7 @@ class Engine:
             watch.last_seq,
             self._seq,
         )
-        if io.lossy or transport.stats().kernel_dropped:
+        if io.lossy or stats.kernel_dropped:
             self._report(
                 IronbirdError(
                     Code.TX_OVERRUN,

@@ -147,6 +147,8 @@ class FramingSpec:
     kind: str = "header_length"
     sync: bytes = b""  # a marker before every packet, consumed by the framer; empty: none
     max_idle_ms: int = DEFAULT_IDLE_MS
+    # True: a header may not claim more than CLAIM_MARGIN times the largest packet the CCDD defines
+    # for the link end (framing.CLAIM_MARGIN); MIDs and sizes the CCDD lacks are still framed.
     require_known_mid: bool = True
 
     def __post_init__(self) -> None:

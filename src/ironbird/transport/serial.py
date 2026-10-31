@@ -260,6 +260,7 @@ class SerialTransport:
             tx_frames=self._tx_frames,
             tx_bytes=self._tx_bytes,
             rx_errors=self._rx_errors,
+            ccdd_mismatched=self._framer.stats().mismatched,
         )
 
     def facts(self) -> Mapping[str, object]:

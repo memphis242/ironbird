@@ -95,6 +95,7 @@ def _serial(link: Link, end: LinkEnd, params: TransportParams) -> Transport:
         sync=framing.sync,
         max_idle_ns=framing.max_idle_ms * NS_PER_MS,
         payload_bounds=bounds if framing.require_known_mid else None,
+        largest_payload=codec.largest_payload(kind) if framing.require_known_mid else None,
     )
     return SerialTransport(
         spec,

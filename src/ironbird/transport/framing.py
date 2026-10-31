@@ -10,14 +10,17 @@ The rules, for a candidate that starts at the current position (after ``sync``, 
 configured):
 
 1. Read the length field once :attr:`HeaderProfile.length_window` bytes are there. The total it
-   claims must lie in ``min_bytes .. max_packet_bytes`` or the candidate is rejected before any
-   buffer is sized by it.
+   claims must lie in ``min_bytes .. max_packet_bytes`` (and under the CCDD claim limit of
+   rule 2, when there is one) or the candidate is rejected before any buffer is sized by it.
 2. With the whole header: the fixed-field mask must match. The MID and the payload size the
    CCDD allows for it are supporting evidence, not a veto: a packet whose MID is unknown or
    whose size disagrees (a flight software struct that grew, a CCDD not yet updated) is still a
    packet when the rest of the evidence holds, so the decode boundary reports the mismatch
-   (``IB-DEC-006``/``IB-DEC-007``) and the packets around it survive. A lying length is
-   refused by rules 1, 3 and 4 and never by the CCDD.
+   (``IB-DEC-006``/``IB-DEC-007``) and the packets around it survive. The CCDD bounds only how
+   much a header may claim: given ``largest_payload`` (the largest payload the CCDD defines for
+   this kind of packet), a claim above ``(min_bytes + largest_payload) * CLAIM_MARGIN`` (and
+   never above the cap) is refused by rule 1, so a false header with an unknown MID cannot
+   swallow hundreds of real packets, while a struct that grew a little still reaches decode.
 3. With the whole candidate: the header and trailer checks of :func:`ironbird.header.check_word`
    (checksum included) must pass. A candidate that fails any step is a false sync: its first
    byte joins the garbage run and scanning restarts at the next byte, never after the candidate,
@@ -44,6 +47,7 @@ frames' stamps and a monotonic time for the idle logic.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final, NamedTuple, Protocol
@@ -56,6 +60,10 @@ from ironbird.header import HeaderProfile
 NS_PER_MS: Final = 1_000_000
 SAMPLE_BYTES: Final = 32  # bytes of a skipped run kept for the ledger
 MAX_PENDING_EPISODES: Final = 4096  # episodes held between two drains; more are counted
+# A claim up to this multiple of the largest CCDD packet is believed (a payload that grew a little
+# is a packet); above it the header is refused. Applies only when the framer has CCDD bounds.
+CLAIM_MARGIN: Final = 1.25
+assert CLAIM_MARGIN >= 1.0, "the largest CCDD packet must itself be believed"
 
 # Work units: about a quarter of a microsecond each. A candidate looked at costs EVAL_COST, a
 # checksum pass half a unit per byte; input earns ``per_byte`` units a byte.
@@ -179,10 +187,12 @@ class HeaderLengthFramer:
         sync: bytes = b"",
         max_idle_ns: int = 50 * NS_PER_MS,
         payload_bounds: Callable[[int], tuple[int, int] | None] | None = None,
+        largest_payload: int | None = None,
         budget: WorkBudget = WorkBudget(),  # noqa: B008 - frozen
     ) -> None:
         validate_stream_profile(profile, max_packet_bytes, "framer")
         assert max_idle_ns > 0
+        assert largest_payload is None or largest_payload >= 0
         self._profile = profile
         self._cap = max_packet_bytes
         self._sync = sync
@@ -194,6 +204,14 @@ class HeaderLengthFramer:
         self._window: int = window
         self._hsize: int = profile.size_bytes
         self._min: int = profile.min_bytes
+        self._claim_max = (
+            max_packet_bytes
+            if largest_payload is None
+            else min(
+                max_packet_bytes, math.ceil((profile.min_bytes + largest_payload) * CLAIM_MARGIN)
+            )
+        )
+        assert self._claim_max >= self._min
         self._mask = profile.fixed_mask
         self._value = profile.fixed_value
         self._confirm = profile.checksum_field is None
@@ -258,7 +276,7 @@ class HeaderLengthFramer:
     def _judge(self, buf: bytearray, head: int, n: int) -> int:
         """What the header at ``buf[head:]`` (``n`` bytes are held) says: ``_REJECT``, ``_WAIT``
         for more bytes, or the total packet size it claims when the header is sane (rules 1
-        and 2: the MID is not looked at)."""
+        and 2: the MID is not looked at, only the size the claim may have)."""
         avail = n - head
         if avail < self._window:
             return _WAIT
@@ -266,7 +284,7 @@ class HeaderLengthFramer:
         prefix = buf[head : head + size]
         total = self._profile.frame_length(prefix)
         assert total is not None, "the prefix holds the length window"
-        if total < self._min or total > self._cap:
+        if total < self._min or total > self._claim_max:
             return _REJECT
         if avail < size:
             return _WAIT

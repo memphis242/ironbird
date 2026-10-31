@@ -404,12 +404,14 @@ framing = { kind = "header_length", sync = "", max_idle_ms = 50, require_known_m
 | `framing.kind` | `header_length` (the only one): the header profile's length field cuts the stream |
 | `framing.sync` | hex marker of up to 8 bytes that precedes every packet (consumed, not recorded); default none |
 | `framing.max_idle_ms` | 1 to 10000 (default 50): silence after which a pending packet is settled; at least 4 character times at the baud rate (the default is raised for a slow line, a smaller value in the file is refused) |
-| `framing.require_known_mid` | default `true`: the framer counts the packets whose MID or payload size the CCDD does not define; they are framed like any other and the decode reports them (`IB-DEC-006`, `IB-DEC-007`). `false`: the CCDD is not consulted |
+| `framing.require_known_mid` | default `true`: the CCDD bounds what a header may claim. A length above 1.25 times the largest packet the CCDD defines for this end (telemetry or commands) is not a packet header, so a false header cannot swallow the real packets behind it; a MID the CCDD lacks, or a size it disagrees with, is still framed (a packet that grew a little is not lost) and the decode reports it (`IB-DEC-006`, `IB-DEC-007`). The framer counts those packets and the ledger records the total when the link closes (`rx.ccdd_mismatch`). `false`: the CCDD is not consulted and only `max_packet_bytes` bounds a claim |
 
 How the stream is cut. A byte stream has no packet boundaries, so a candidate header must look
 right (length between the smallest and the largest packet, the fixed fields) and, with a checksum
-in the profile, the whole packet must pass it. The CCDD does not decide: a packet whose MID or
-payload size it does not define is still a packet, and the decode reports the mismatch.
+in the profile, the whole packet must pass it. The CCDD does not decide what a packet is: one
+whose MID or payload size it does not define is still a packet, and the decode reports the
+mismatch. With `require_known_mid` it only limits how long a header may claim to be (see above),
+and a real packet larger than that limit is skipped as garbage (`IB-TX-007`).
 A profile without a checksum proves less, so a packet is also confirmed by a plausible header
 right behind it or by `max_idle_ms` of silence: the last packet before a pause waits that long, and
 a packet followed at once by line noise is not believed (use a header profile with a trailer

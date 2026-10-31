@@ -129,12 +129,15 @@ def test_a_packet_the_ccdd_disagrees_with_reaches_the_decode_boundary_with_its_n
         assert engine.malformed_total == 1 and engine.resync_frames == 0
 
     try:
-        notices, _ = run_ground(tmp_path, device.path, scenario, monkeypatch=monkeypatch)
+        notices, ledger = run_ground(tmp_path, device.path, scenario, monkeypatch=monkeypatch)
     finally:
         device.close()
     assert [n.code for n in notices if n.code.value.startswith(("IB-DEC", "IB-TX-007"))] == [
         Code.DEC_PAYLOAD
     ]
+    # the framer's count of such packets is ledgered when the link closes
+    counted = [e for e in events(ledger) if e["event"] == "rx.ccdd_mismatch"]
+    assert [e["packets"] for e in counted] == [1]
 
 
 def test_a_send_only_end_lets_go_of_the_device_before_a_capture_of_the_same_end_opens_it(

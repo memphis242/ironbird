@@ -63,6 +63,7 @@ class Line:
             sync=self.sync,
             max_idle_ns=self.idle_ms * NS_PER_MS,
             payload_bounds=lambda mid: CODEC.payload_bounds(TLM, mid),
+            largest_payload=CODEC.largest_payload(TLM),
             budget=UNLIMITED,
         )
         low, high = (0.02, 0.1) if self.fast_reconnect else (0.5, 5.0)

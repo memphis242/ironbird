@@ -133,6 +133,7 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "rx.event": Tier.EVENTS,
         # essential: bounded by the user's actions or ironbird's own timers
         "rx.unread_at_close": Tier.ESSENTIAL,
+        "rx.ccdd_mismatch": Tier.ESSENTIAL,  # once per close
         "rx.failed": Tier.ESSENTIAL,
         "link.down_at_close": Tier.ESSENTIAL,
         "cli.invoke": Tier.ESSENTIAL,

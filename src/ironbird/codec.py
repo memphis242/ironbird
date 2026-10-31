@@ -773,6 +773,11 @@ class Codec:
         not define the MID. A stream framer uses it to tell a plausible header from noise."""
         return self._payload_bounds[kind].get(mid)
 
+    def largest_payload(self, kind: MessageKind) -> int:
+        """The most payload bytes any message of ``kind`` may carry (0 when the CCDD has none).
+        A stream framer bounds what a header may claim by it."""
+        return max((high for _, high in self._payload_bounds[kind].values()), default=0)
+
     def oversize_error(
         self, kind: MessageKind, data: bytes | bytearray | memoryview, orig_len: int
     ) -> DecodeError:

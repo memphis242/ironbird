@@ -3302,14 +3302,25 @@ As built (where the build differs from, or settles, the text above)
     `Codec.payload_bounds(kind, mid)` turned a grown payload or a MID the CCDD lacks into `IB-TX-007` garbage,
     hiding `IB-DEC-006`/`IB-DEC-007`, and (without a checksum) lost the packet before it. With
     `require_known_mid` (default) the framer is given the bounds (commands that share a MID: the widest range
-    among them) and counts the packets it emitted that disagree (`stats().mismatched`); without it the CCDD is
+    among them) and counts the packets it emitted that disagree (`stats().mismatched`, exposed as
+    `TransportStats.ccdd_mismatched` and ledgered once per close as `rx.ccdd_mismatch`); without it the CCDD is
     not consulted. Either way the packet is emitted, and the decode boundary reports the mismatch like any
     other (`test_a_packet_the_ccdd_disagrees_with_reaches_the_decode_boundary_with_its_neighbours`).
-    The cost, accepted: a lying length on a checksum-less profile is no longer refused up front for a MID
-    outside the CCDD, so it can hold the packets behind it until its claimed bytes arrive or the line is idle
-    (nothing is lost: when the look-ahead finds no header the candidate is rescanned from the next byte), and
-    a noise burst that holds a sane small header followed by silence can be framed as a packet that then
-    fails decode (the bytes are the same either way). A checksum removes both.
+    Review 2k (M1) then showed that with no CCDD limit at all a false header with an unknown MID could claim up
+    to `max_packet_bytes` and, on a checksum-less profile, swallow hundreds of real packets when its end landed
+    on a sane header. `require_known_mid` therefore also bounds the claim: a length above `CLAIM_MARGIN` (1.25)
+    times the largest packet the CCDD defines for the link end's kind (`Codec.largest_payload(kind)` plus the
+    header's `min_bytes`; never above the cap) is refused by rule 1, so slightly wrong sizes still reach decode
+    as `IB-DEC-007` and huge bogus claims do not. The bound depends on the header alone, so the frames stay
+    independent of the chunking. A real packet above the limit is framed as garbage (`IB-TX-007`); set
+    `require_known_mid = false` for a CCDD that is known to lag the flight software by more than the margin.
+    The cost, accepted: a lying length at or under the limit on a checksum-less profile can still hold the
+    packets behind it until its claimed bytes arrive or the line is idle (nothing is lost: when the look-ahead
+    finds no header the candidate is rescanned from the next byte), and a noise burst that holds a sane small
+    header followed by silence can be framed as a packet that then fails decode (the bytes are the same either
+    way). A checksum removes both. Swallow loss on a checksum-less profile (300 packets, 5% noise bursts, cap
+    32768) is 5% (the damaged packets themselves) with the limit and was 12% before it
+    (`test_swallow_loss_at_a_large_cap_stays_near_the_noise_baseline`).
   - Confirmation (no checksum in the profile). A sane header (after `sync`, by the mask and length alone: the
     CCDD does not enter, so packets the CCDD disagrees with may follow each other) must follow at `total`, or
     the line must be silent for `max_idle_ms`. The limit, pinned by `ser-length-lands-on-next-header.bin`: a sane
@@ -3462,6 +3473,12 @@ As built (where the build differs from, or settles, the text above)
   (`TIOCGICOUNT`); a session that sends and listens on one device at once (needs a long-lived process: the
   TUI); `sync` bytes are not kept in the recording; a serial `--follow`-style `ib send` that stays up to
   catch the reply; RS-485 direction control; `2l`'s throughput gate for serial at line rates above a pty's.
+- Deferred (review 2k, L1): a send-only close before the capture loop loses replies during the reopen and
+  drops DTR; better to attach a receiver to the transport that is already open.
+- Deferred (review 2k, L2, with D7): a real UART close can block the event loop up to `closing_wait`.
+- Deferred (review 2k, L3): a guard against a descriptor that reads as readable with 0 bytes and no hang-up
+  (it spins the loop).
+- Deferred (review 2k, L5, with D7): an FTDI's 16 ms latency timer against the idle floor.
 
 ### 2l - Stage 2 acceptance, throughput gate, docs
 

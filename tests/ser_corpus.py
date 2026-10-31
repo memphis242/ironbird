@@ -8,7 +8,8 @@ files are exactly these; a new bug adds a case and regenerates: ``python tests/s
 
 The framer is the mock node's telemetry framer (header profile ``ccsds_v1_cfs_tlm``, which has no
 checksum), the packet cap is 1024, it knows the CCDD's MIDs and payload sizes (evidence, not a
-veto), and the stream ends in silence.
+veto; the largest packet the CCDD defines bounds what a header may claim), and the stream ends in
+silence.
 """
 
 from __future__ import annotations
@@ -64,11 +65,11 @@ def unknown_mid(c: Codec, mid: int = 0x8FF, size: int = 6) -> bytes:
     return header.pack(c.profile(MessageKind.TELEMETRY), bytes(range(size)), mid=mid)
 
 
-def _data_header(c: Codec, total: int) -> bytes:
-    """The header of a MOCK_DATA packet that claims ``total`` bytes (it is shorter or longer
-    than what follows: the length field lies)."""
+def _data_header(c: Codec, total: int, mid: int = 0x893) -> bytes:
+    """The header of a packet of ``mid`` (default MOCK_DATA) that claims ``total`` bytes (it is
+    shorter or longer than what follows: the length field lies)."""
     profile = c.profile(MessageKind.TELEMETRY)
-    full = header.pack(profile, bytes(total - profile.min_bytes), mid=0x893)
+    full = header.pack(profile, bytes(total - profile.min_bytes), mid=mid)
     return full[: profile.size_bytes]
 
 
@@ -114,6 +115,15 @@ def cases() -> dict[str, Case]:
     out["ser-length-lands-on-next-header.bin"] = Case(
         lands + hk[0] + hk[1] + hk[2],
         ((PACKET, lands + hk[0] + hk[1]), (PACKET, hk[2])),
+    )
+
+    # The same lie from a MID the CCDD does not define, claiming more than the largest packet the
+    # CCDD defines (with its margin) but less than the cap: the claim limit refuses the header, so
+    # the 30 real packets it would swallow (its end lands on a sane header) are all framed.
+    many = [_hk(c, i) for i in range(1, 32)]
+    forged = _data_header(c, profile.size_bytes + len(b"".join(many[:30])), mid=0x8FE)
+    out["ser-length-lands-unknown-mid.bin"] = Case(
+        forged + b"".join(many), ((GARBAGE, forged), *((PACKET, p) for p in many))
     )
 
     # Packets the CCDD disagrees with (a grown payload, a MID it does not define) are still

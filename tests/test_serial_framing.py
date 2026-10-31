@@ -10,6 +10,8 @@ packet; hostile input stays within the work budget), and replay the checked-in c
 
 from __future__ import annotations
 
+import math
+import random
 import tomllib
 from collections.abc import Iterable, Sequence
 from pathlib import Path
@@ -26,6 +28,7 @@ from ironbird.ccdd.model import MessageKind
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.frame import FLAG_GARBAGE, FLAG_STALE
 from ironbird.transport.framing import (
+    CLAIM_MARGIN,
     EVAL_COST,
     NS_PER_MS,
     Emit,
@@ -56,6 +59,7 @@ def tlm_framer(**kw: object) -> HeaderLengthFramer:
     options: dict[str, object] = {
         "max_packet_bytes": CAP,
         "payload_bounds": lambda mid: CODEC.payload_bounds(TLM, mid),
+        "largest_payload": CODEC.largest_payload(TLM),
         "budget": UNLIMITED,
     }
     return HeaderLengthFramer(TLM_PROFILE, **(options | kw))  # type: ignore[arg-type]
@@ -331,6 +335,79 @@ def test_packets_the_ccdd_disagrees_with_may_follow_each_other(sizes: list[int])
     assert packets(got) == [unknown(), grown(), unknown(), hk(2)]
 
 
+def test_the_claim_limit_is_the_largest_ccdd_packet_with_its_margin() -> None:
+    profile, largest = TLM_PROFILE, CODEC.largest_payload(TLM)
+    limit = math.ceil((profile.min_bytes + largest) * CLAIM_MARGIN)
+    assert limit < CAP, "the test needs a cap above the limit"
+
+    def lie(total: int) -> bytes:  # an unknown MID claiming ``total`` bytes, then real packets
+        return ser_corpus._data_header(CODEC, total, mid=0x8FE)
+
+    framer = tlm_framer()
+    got = finish(framer, framer.feed(lie(limit + 1) + hk(1) + hk(2), 1, 0))
+    assert [(e.flags, e.data) for e in got] == [
+        (FLAG_GARBAGE, lie(limit + 1)),
+        (0, hk(1)),
+        (0, hk(2)),
+    ]
+    # at the limit the claim is believed, and the packet is held until its bytes arrive
+    framer = tlm_framer()
+    assert (
+        framer.feed(lie(limit), 1, 0) == [] and framer.stats().pending_bytes == profile.size_bytes
+    )
+    # a payload that grew by less than the margin is a packet the decode boundary reports
+    framer = tlm_framer()
+    assert packets(finish(framer, framer.feed(grown() + hk(2), 1, 0))) == [grown(), hk(2)]
+    assert framer.stats().mismatched == 1
+    # without the CCDD only the cap refuses a claim
+    framer = tlm_framer(payload_bounds=None, largest_payload=None)
+    assert framer.feed(lie(limit + 1), 1, 0) == []
+
+
+@pytest.mark.parametrize("chunk", [1, 5, 4096], ids=lambda c: f"chunk{c}")
+def test_a_forged_header_cannot_swallow_the_real_packets_its_claim_ends_on(chunk: int) -> None:
+    """Review 2k (M1): an unknown MID claiming a length that ends on a sane header, with no
+    checksum to refute it, used to take the 100 real packets in between."""
+    real = [hk(i) for i in range(101)]
+    body = b"".join(real[:100])
+    cap = 4096
+    forged = ser_corpus._data_header(CODEC, TLM_PROFILE.size_bytes + len(body), mid=0x8FE)
+    stream = forged + body + real[100]
+    framer = tlm_framer(max_packet_bytes=cap)
+    got = finish(framer, feed(framer, split(stream, [chunk] * (len(stream) // chunk + 1))))
+    assert packets(got) == real and wire(got) == stream
+
+
+def test_swallow_loss_at_a_large_cap_stays_near_the_noise_baseline() -> None:
+    """Checksum-less profile, 5% of packets followed by a noise burst, cap 32768: the loss is the
+    damaged packets (about 5%), not the hundreds a false header could swallow (12% without the
+    claim limit, over the whole run)."""
+    lost = total = 0
+    for seed in range(12):
+        rng = random.Random(seed)
+        real = [
+            hk(rng.randrange(256))
+            if rng.random() < 0.5
+            else CODEC.encode_telemetry(
+                "MOCK_DATA",
+                {"Entries": [rng.randrange(100) for _ in range(rng.randint(0, 46))], "Text": "x"},
+            ).data
+            for _ in range(300)
+        ]
+        parts: list[bytes] = []
+        for packet in real:
+            parts.append(packet)
+            if rng.random() < 0.05:
+                parts.append(bytes(rng.randrange(256) for _ in range(rng.randint(1, 64))))
+        stream = b"".join(parts)
+        framer = tlm_framer(max_packet_bytes=32768)
+        got = packets(finish(framer, feed(framer, split(stream, [64] * (len(stream) // 64 + 1)))))
+        kept = set(got)
+        lost += sum(1 for p in real if p not in kept)
+        total += len(real)
+    assert lost / total < 0.065, f"{lost} of {total} real packets lost"
+
+
 def test_a_checksummed_packet_with_a_mid_the_ccdd_lacks_does_not_cost_its_neighbours() -> None:
     good = [pec(0x100, b"a" * 10) for _ in range(3)]
     other = pec(0x101, b"a" * 10)  # a valid checksum, a MID the CCDD does not define yet
@@ -399,7 +476,7 @@ def test_pending_bytes_stay_within_two_caps_plus_a_header(
     (under one cap) and the candidate (up to one cap), not the cap alone."""
     profile = PEC_PROFILE if kind == "pec" else TLM_PROFILE
     stream = _late_header_stream(profile, sync, 0xFF)
-    framer = make(kind, sync=sync, budget=WorkBudget())
+    framer = make(kind, sync=sync, budget=WorkBudget(), largest_payload=None)  # the cap alone
     held = 0
     for n in range(0, len(stream), step):
         framer.feed(stream[n : n + step], n, n)
