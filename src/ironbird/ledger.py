@@ -876,8 +876,9 @@ class Ledger:
     ) -> int | None:
         """Record an error in full and hand it to the writer promptly (rate-limited under
         floods). Returns the record number as :meth:`record` does. ``tier`` defaults from the
-        code: errors that received bytes can cause at will are evidence. ``level`` (default from
-        the code) is the record kind: ``warning`` or ``error``."""
+        code: errors that received bytes can cause at will are evidence. ``level`` is the record
+        kind, ``warning`` or ``error``; it defaults from the code (``WARNING_CODES``), and an
+        explicit ``level`` overrides that default in either direction."""
         if tier is None:
             tier = Tier.EVIDENCE if error.code in EVIDENCE_ERRORS else Tier.ESSENTIAL
         if level is None:

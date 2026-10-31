@@ -27,7 +27,9 @@ Stage 1 is CLI send + receive.
     A code in `WARNING_CODES` (`Code.is_warning`) is a non-fatal condition: the work
     continues, it is never raised (so it never decides an exit code), the user line starts
     `warning` instead of `error`, and its ledger record has kind `warning` instead of `error`.
-    `Session.report` takes the level from the code unless the caller passes one.
+    `Session.report` and `Ledger.record_error` take the level from the code unless the caller
+    passes one; an explicit level wins and sets the ledger kind (so a code outside
+    `WARNING_CODES` reported at `Level.WARNING` is ledgered as `warning`, and the reverse).
   - `ledger.py` - action ledger: JSON Lines, one record per action/state change/error,
     UTC ISO 8601 with microseconds, session id. Default `$XDG_STATE_HOME/ironbird/`.
   - `config.py` - `ironbird.toml` describing the **system as a set of nodes** (ground,

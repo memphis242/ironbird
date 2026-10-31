@@ -108,10 +108,13 @@ class Code(StrEnum):
         return self in WARNING_CODES
 
 
-#: Codes reported as warnings (``warning IB-XXX-NNN: ...``, ledger kind ``warning``) because
-#: the operation continues. Every other code is an error. A warning code is never raised, so it
-#: never decides an exit code.
-WARNING_CODES: Final[frozenset[Code]] = frozenset({Code.TX_RCVBUF})
+#: Codes whose default report level is warning (``warning IB-XXX-NNN: ...``, ledger kind
+#: ``warning``) because the operation continues. Every other code defaults to error. The default
+#: is only a default: a reporter that passes an explicit level (``Session.report(level=...)``,
+#: ``Ledger.record_error(level=...)``) sets the ledger kind and the displayed label, so a code
+#: outside this set can be reported as a warning and a member can be reported as an error. A
+#: warning code is never raised, so it never decides an exit code.
+WARNING_CODES: Final[frozenset[Code]] = frozenset({Code.TX_RCVBUF, Code.REC_DIRSYNC})
 
 
 MAX_SUMMARY_LEN = 600
