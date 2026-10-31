@@ -47,18 +47,17 @@ def test_a_signal_that_ended_one_wait_ends_the_ones_after_it() -> None:
     assert budget.wait(done)  # a job that has finished is still seen
 
 
-def test_the_signal_poll_of_the_exit_keeps_answering_after_it_took_the_signal(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    taken = iter([int(signal.SIGTERM)])
-    monkeypatch.setattr(cli, "_poll_signal", lambda _wait: next(taken, 0))
-    monkeypatch.setattr(cli._STATE, "signum", 0)
-    budget = WaitBudget(5.0, abort=cli._signal_during_wait)
+def test_the_signal_poll_of_the_exit_keeps_answering_after_it_saw_the_signal() -> None:
+    state = cli._STATE
+    budget = WaitBudget(5.0, abort=cli._signal_since(state.received))
+    state.detach()  # the exit is under way: a signal is only recorded
+    state._handle(int(signal.SIGTERM), None)
     never = threading.Event()
     assert not budget.wait(never)
     start = time.monotonic()
     assert not budget.wait(never)
     assert time.monotonic() - start < 0.2
+    assert state.signum == signal.SIGTERM and state.unannounced() == signal.SIGTERM
 
 
 # -- B2: retention may not spend the ledger's share; gates have their own cap ----

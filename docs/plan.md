@@ -2476,8 +2476,8 @@ As built (where the build differs from, or settles, the text above)
   skipped chunk is not seen (the summary counts the chunks skipped unchecked), the GAP records at
   a skipped chunk's head are still counted when they overlap the range, and a bad index is
   `IB-REC-008` (info) and a full read.
-- Pace: `Pacer` anchors a schedule at the first frame and sleeps in 100 ms slices (so a closed output
-  or a signal ends it at once); the schedule advances by `max(0, t - previous t)` for each frame, so
+- Pace: `Pacer` anchors a schedule at the first frame and sleeps in 100 ms slices (a closed output
+  ends it within a slice, a signal within 50 ms: the sleep is a `sigmask.sleep`); the schedule advances by `max(0, t - previous t)` for each frame, so
   every backward step counts as zero and the frames after it keep their spacing (a step back by an
   hour does not leave the next hour unpaced); a late consumer is not waited for,
   `--speed` is 0 or 1e-6..1e9. Frames outside the filter still count for time. A forward clock step
@@ -3061,34 +3061,69 @@ As built (where the build differs from, or settles, the text above)
   error counter, nothing stored) for a count beyond the packet and one above the maximum, the ledger
   marking the injected fault, no `IB-DEC-*` report from the listener) pass with the 28 earlier cFS
   cases on the dev host.
-- Signals around temporaries (a 2h/2e fix made in this stage). Outside an event loop the CLI's signal
-  handler raises `sigmask.Interrupted` (`_Terminated`), so it can land between any two lines. The
-  design has three parts, all in `sigmask.py` and `atomicfile.py`:
-  1. Held scopes. `signals_held()` blocks SIGINT, SIGTERM and SIGHUP; a signal that arrives waits,
-     and its handler runs as the scope ends. Every step that changes the file system and records the
-     change runs in one: creating a temporary file, directory or member together with recording it
-     for removal, the removal of what was created (`_discard`), and the publish below. Scopes end in
-     the reverse order they began (asserted per thread). The mask is read before blocking, because
-     `pthread_sigmask` runs a pending handler before it returns. Helper threads (ledger, retention,
-     gate, output, recorder) start inside one and inherit the block.
-  2. Two-phase commit. `prepare()` syncs the data (a file; every member and the temporary
-     directory) and renames nothing, so it is interruptible: a signal there aborts, the cleanup
-     removes the temporary, and the interruption claims no output. `publish(hold=)` is held from the
-     rename (renameat2, link and unlink, or placeholder and rename, or the `--force` replacement)
-     through the directory sync and the `committed` flag, so a signal is acted on only once the
-     output is durable and known committed. `commit()` is both. A `sigmask.Hold` is the one helper
-     for a caller that must also finish its own record first: `with Hold() as hold:` around the
-     command's work, passed down to `publish`, which calls `hold.begin()` right before the rename;
-     the signal then acts as the block ends. `ib export` (through `write_to_file`/`write_to_directory`,
-     whose `before_publish` input guard runs after the syncs) and `ib rec repair` use it identically:
+- Signals around temporaries (a 2h/2e fix made in this stage), and where a signal is acted on.
+  The CLI's handler for SIGINT, SIGTERM and SIGHUP never raises. While the event loop runs a
+  command it cancels the main task; outside a loop (before a command, and in the commands that run
+  without one: `export`, `replay`, `rec ...`, `ledger prune`, `rec prune`) it calls
+  `sigmask.deliver`, which records the signal as owed, and the main thread raises the owed
+  `sigmask.Interrupted` itself at defined points only, so the exception never lands where Python
+  would swallow it (a weakref callback or `__del__` the garbage collector runs, an unraisable hook)
+  and never between two lines that were not written to take it. The design has four parts, all in
+  `sigmask.py` and `atomicfile.py`:
+  1. Where a signal is acted on. `sigmask.checkpoint()` raises the owed signal; it is called once per
+     record by the recording reader (every reading loop: replay, export, `rec info/check/repair`)
+     and per block of a long damage scan, per block of the repair copy, per member sync of a
+     directory export, and per session a prune deletes. Every wait of the main thread runs in
+     slices of `sigmask.WAIT_SLICE_S` (50 ms) with a checkpoint before the first and after each:
+     `sigmask.sleep` (replay pacing; `--follow`'s waits for growth, for the next part and for the
+     head of a new part), `sigmask.wait_readable` (the read of every named configuration, CCDD,
+     header profile and embedded definition file that is not a regular file, by
+     `fsops.read_capped`, which opens it `O_NONBLOCK`, so a FIFO without a writer waits for one
+     and a terminal for a line; the prune prompt, which reads its answer from the descriptor once
+     it has data), and the wait for room on stdout (`write_wait`: replay and export to stdout
+     behind a reader that does not read), and the ledger's own waits while no exit is under way
+     (`sigmask.wait_event`: the open of the ledger directory and a `flush` end at a slice, as a
+     timeout would, once a signal is owed; the ledger then starts stalled and retries, and the
+     command acts on the signal at its next checkpoint, the first being right before the command
+     starts). The loops of the retention recovery that the prune command runs in the main thread
+     (the layout read, the prefix comparison and the copy of a reserve) take a checkpoint per
+     block; an interrupted copy leaves no temporary of its own behind, and a reused temporary of
+     an earlier attempt is kept. So no wait outlasts a signal by more than a slice,
+     whenever it arrives: a signal whose handler runs just before a wait's system call begins
+     (too late to interrupt it with `EINTR`, which Python would retry anyway) is seen as that
+     slice ends. Only the first signal acts; repeats are ignored. Every thread the tool starts
+     blocks the signals (`sigmask.start_thread`), so they reach the main thread only.
+     `install()` sets the handlers with the signals blocked (one that arrives meanwhile waits for
+     them instead of taking its default action) and runs inside `main()`'s `try`; it starts no
+     thread and changes no hook. A run on the loop acts on a signal owed from before the loop as
+     its main task starts.
+  2. Held scopes. `signals_held()` defers the owed signal to the end of the outermost scope of the
+     main thread (a depth per thread; entering a scope never raises, so a cleanup that opens one
+     always runs). Every step that changes the file system and records the change runs in one:
+     creating a temporary file, directory or member together with recording it for removal, the
+     removal of what was created (`_discard`), and the publish below. Scopes end in the reverse
+     order they began (asserted per thread; the depth is restored before the assertion).
+  3. Two-phase commit. `prepare()` syncs the data (a file; every member and the temporary
+     directory) and renames nothing, so it is interruptible: a signal there aborts (before the next
+     member's sync), the cleanup removes the temporary, and the interruption claims no output.
+     `publish(hold=)` begins at the commit point: a signal owed by then is acted on there
+     (`Hold.begin`, or a `checkpoint` without a hold), so a signal that came before the commit
+     publishes nothing, whatever the timing. From the rename (renameat2, link and unlink, or
+     placeholder and rename, or the `--force` replacement) through the directory sync and the
+     `committed` flag it is held, so a signal is acted on only once the output is durable and
+     known committed. `commit()` is both. A `sigmask.Hold` is the one helper for a caller that must
+     also finish its own record first: `with Hold() as hold:` around the command's work, passed
+     down to `publish`, which calls `hold.begin()` right before the rename; the signal then acts as
+     the block ends. `ib export` (through `write_to_file`/`write_to_directory`, whose
+     `before_publish` input guard runs after the syncs) and `ib rec repair` use it identically:
      after the rename the done record (`export.stop` with `committed`, the output and the rows;
      `rec.repair.done`), the result line and any warning are written, then the signal acts, exit
      128+n, with `interrupted (SIGTERM) after the export was written to X` (or `after the repaired
      recording was written to X`), also in the `cli.signal` record. `Hold.begin` asserts that no held
      scope opened since the block began is still open, so an inner scope can never lift it.
-  3. What a signal replaced. When a held scope ends while an exception leaves it (its body raised,
-     or a cleanup passes `unwinding=` the exception its `__exit__` runs for), the `Interrupted` that
-     the handler raises records that exception in `replaced`. A plain step scope (a temporary
+  4. What a signal replaced. When a held scope ends while an exception leaves it (its body raised,
+     or a cleanup passes `unwinding=` the exception its `__exit__` runs for), the `Interrupted`
+     raised there records that exception in `replaced`. A plain step scope (a temporary
      created, a rename) raises a raw `OSError`, `Collision` or `SyncAfterCommit` that the code one
      level up maps to its error, so that code wraps itself in `sigmask.naming_replaced(mapper)`,
      which passes `replaced` through the same mapping: `write_to_file` and `write_to_directory` name
@@ -3098,10 +3133,32 @@ As built (where the build differs from, or settles, the text above)
      (the session is protected, a message says so) and name nothing. `_run` ledgers and shows the
      one failure that is named besides the interruption (an `IronbirdError` as it is, anything else
      as `IB-INT-001` with its traceback) and nothing from the `__context__` chain, so an error
-     handled on purpose when the signal arrived (the `replay --follow` head-wait retry) is not
-     reported, and nothing is reported twice. `ib export` records `export.stop` with reason `error`
-     whenever a failure is shown that way, `interrupted` otherwise. `signals_held` restores the mask
-     before it asserts the scope order.
+     handled on purpose when the signal was acted on (the `replay --follow` head-wait retry, in
+     whose sleep it is) is not reported, and nothing is reported twice. `ib export`
+     records `export.stop` with reason `error` whenever a failure is shown that way, `interrupted`
+     otherwise.
+  The exit (`_finish`) runs after `detach()`: from there a signal is only recorded (a signal still
+  owed is the exit's to announce, ledgered as `cli.signal`, exit 128+n), no flush or close can be
+  cut in two, every signal (repeats counted) ends the waits on a slow disk at once, and the first
+  ends an unbounded drain of stdout within 20 ms. Repeats change nothing else: the handlers stay
+  until the very end of `_finish`, when the default actions come back, so only a signal after that
+  ends the process by the signal. The last check, the direct record of a signal that arrived while
+  the ledger closed, and the return of the default actions happen together with the signals
+  blocked, so a late signal is either announced and ledgered or waits and takes the default
+  action as the block ends (the process ends by that signal). A `typer.Exit` raised inside `_run`
+  (a usage error, the ledger being required) gives its code to `_finish`, so the exit code of a
+  signal recorded meanwhile (128+n) wins. `main()` returns 128+n for a signal recorded where no
+  command acted on it (argument parsing, `--help`), and prints the one-line `interrupted
+  (SIGxxx)` notice for an `Interrupted` that left `_run` before any ledger existed (a signal
+  during the read of a configuration that is a FIFO). A prune interrupted between two sessions
+  says how many of the N it had deleted (`deleted K of N ... before the interruption`, and a
+  `prune.interrupted` record) before the interruption notice.
+  The session facts a recording keeps are read once: `load_config` digests the bytes it parsed
+  (`SystemConfig.sha256`, read-only) and `Session.codec_for` keeps the bytes of the CCDD and the
+  two header profiles it built the codec from (`Session.definitions_of`); META and the embedded
+  definitions use those, so nothing reopens a configuration, CCDD or header file inside the
+  loop, a FIFO or `<(...)` file is digested as parsed, and the digest cannot disagree with the
+  parsed content.
   On NFS, which has no `RENAME_NOREPLACE`, a regular file takes the hard-link path (link, then unlink
   of the old name); the placeholder path applies to directory exports and to file systems without
   hard links, and a held signal never leaves the empty placeholder at the final name. `ENOENT` from
@@ -3121,26 +3178,45 @@ As built (where the build differs from, or settles, the text above)
   `fstat` cannot identify right after its creation is removed by name at once
   (`TempDirOutput.create`, on the deletion allowlist). Tests: the signal at each window, sent to a
   real `ib export` from a hook that stops there (`test_export_cli.py`: temporary made, data sync,
-  rename, link, placeholder, cleanup of a failed commit, after the commit), the same for `rec repair`
-  (rename, leftover; `test_recording_tools.py`), Ctrl-C in the `replay --follow` head wait
-  (`test_replay_cli.py`), the replaced, unexpected and handled failure under a signal in `_run`, the
-  in-process rename with a signal and the directory sync after it, the lost and the failed unlink of
-  a link commit, the leftover paths of retirement, recovery and salvage (`test_ledger_store.py`,
-  `test_ledger_recovery.py`), and `test_sigmask.py` (`replaced`, `unwinding`, `Hold`, `naming_replaced`, the order assert), and
-  `test_signal_replaced.py` (the replaced failure of each step named as the error without a signal, for
-  export, repair and recovery) with the CLI cases in `test_export_cli.py`.
+  rename, link, placeholder, cleanup of a failed commit, after the commit), a signal whose handler
+  runs inside a weakref callback at the first write, right before the commit point, before the
+  command's work and as the command detaches (nothing waits after it: the command acts on it by
+  itself), a signal while the handlers are being set (one whose own handler is not set yet, and
+  one whose is), a repeated signal during the ledger's last write and its close (still 143, one
+  `cli.signal`), the same for `rec repair` (rename, leftover; `test_recording_tools.py`), Ctrl-C in
+  the `replay --follow` head wait, SIGTERM in the follow's waits for growth and for the next part
+  and in a replay behind a reader that never reads (`test_replay_cli.py`), SIGINT and SIGTERM at
+  the prune prompt (`test_retention_cli.py`), a configuration that is a FIFO nobody writes
+  (`test_cli_signal_state.py`, with the handler's states: install starts no thread, delivery outside
+  the loop, a cancel inside it, a record only after `detach`), the replaced, unexpected and handled
+  failure under a signal in `_run`, the in-process rename with a signal and the directory sync
+  after it, the lost and the failed unlink of a link commit, the leftover paths of retirement,
+  recovery and salvage (`test_ledger_store.py`, `test_ledger_recovery.py`), `test_sigmask.py`
+  (`replaced`, `unwinding`, `Hold` and its commit point, `naming_replaced`, the order assert,
+  sleeps and FIFO reads ended by a signal, a signal recorded just before a wait's system call
+  ended at its slice, a capped read of a FIFO and of a file, a signal handled inside a weakref
+  callback and inside a Python unraisable hook, other threads), `test_signal_replaced.py` (the replaced failure of each step
+  named as the error without a signal, for export, repair and recovery) with the CLI cases in
+  `test_export_cli.py`, `test_signal_windows.py` (a FIFO configuration, the exit code of a usage
+  error under a signal, the ledger's open wait, a prune recovery's copy, the loop's boundaries, the
+  last window of the exit, a signal before any ledger exists, a prune interrupted between
+  sessions, the configuration and definition bytes held from the load) and
+  `test_harness_isolation.py` (an in-process command, or a signal left owed, in one test never
+  reaches the next; no `signals_held` scope is left open).
 - Deferred: arrays of structs (D11); a filter operator over number arrays (`contains`, indexing); TOML
   arrays in response rules; `--allow-count-mismatch` has no counterpart in `respond` (a reply rule with a wrong count is refused); a real-cFS case
   against MD's dwell packet; the `ib_test` gcc 8 (EL8) build is covered by CI only. Signals: the
   default executor threads of `asyncio.to_thread` (UDP drop scan) start without the signal block;
-  harmless while the loop runs (the handler cancels, it does not raise) and gone after `asyncio.run`,
-  but a held scope inside a running loop does not stop the handler from running in it. An `fstat`
+  harmless (the handler never raises, and a signal such a thread receives still runs the main
+  thread's handler), and gone after `asyncio.run`. A system call of the main thread that blocks
+  outside a sliced wait holds a signal until it returns: none is known in the commands that run
+  without a loop besides disk I/O (a hung NFS server), and on the loop the cancel waits for such
+  a call as well: a session command whose CCDD or header file is a FIFO nobody writes waits for a
+  writer with the loop held up, so a signal does not end it (`kill -9` does). An `fstat`
   failure on a held temporary inside `TempOutput._discard` at `__exit__` raises a bare `OSError` and
   keeps the file unreported (`TempOutput` has no `leftover` like `TempDirOutput`).
 - Deferred (signals): in the failed-cleanup case the ledger has `export.stop` with reason `error` before
   the `IB-EXP-001` record (the replaced failure is ledgered by `_run` after the command's `finally`).
-- Deferred (signals): `test_replay_cli.py::test_a_signal_ends_a_replay_that_is_blocked_on_a_reader_that_never_reads`
-  fails under extreme load (40 CPU burners) with exit -15, also on `main`.
 - Deferred (signals): a signal acted on in a main-thread prune recovery after a rename committed loses the
   `ledger.recovered` record of that step (the scan is abandoned with the exception); the next scan finds the
   part under its new name.

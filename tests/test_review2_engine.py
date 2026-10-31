@@ -166,10 +166,14 @@ SLOW_OPEN = """
     UdpTransport.open = slow_open
 """
 SLOW_START = """
+    import ironbird.cli.main as _m
     _orig_run = asyncio.run
     def slow_run(coro, *a, **k):
         print("READY", file=sys.stderr, flush=True)
-        time.sleep(60)
+        deadline = time.monotonic() + 60
+        while not _m._STATE.signum and time.monotonic() < deadline:
+            time.sleep(0.01)  # a slow start; the signal arrives before the loop runs
+        return _orig_run(coro, *a, **k)
     asyncio.run = slow_run
 """
 SLOW_CONFIRM = """

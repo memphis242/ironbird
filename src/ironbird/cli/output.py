@@ -32,7 +32,7 @@ from collections import deque
 from collections.abc import Callable
 from typing import Final, TextIO
 
-from ironbird.sigmask import HANDLED_SIGNALS, signals_held
+from ironbird.sigmask import HANDLED_SIGNALS, WAIT_SLICE_S, checkpoint, start_thread
 
 MAX_QUEUED_BYTES: Final = 512 * 1024
 CHUNK_BYTES: Final = 64 * 1024
@@ -122,8 +122,7 @@ class BoundedWriter:
             self._fd = fd
             self._slice = write_slice_for(fd)
             self._thread = threading.Thread(target=self._pump, name="ib-output", daemon=True)
-            with signals_held():  # the thread starts with the shutdown signals blocked
-                self._thread.start()
+            start_thread(self._thread)  # it starts with the shutdown signals blocked
 
     def set_on_closed(self, callback: Callable[[], None] | None) -> None:
         self._on_closed = callback
@@ -163,8 +162,9 @@ class BoundedWriter:
         full (a reader that stops reading stops the producer, so nothing is lost).
 
         For a command that reads a file and so has no clock to keep: ``replay`` and the like
-        must not drop lines the way a live listener does. The wait is a timed condition wait on
-        the calling thread, so a shutdown signal's handler still runs and ends it. Returns
+        must not drop lines the way a live listener does. The wait is a condition wait in slices
+        of :data:`~ironbird.sigmask.WAIT_SLICE_S`, each followed by a
+        :func:`~ironbird.sigmask.checkpoint`, so a shutdown signal ends it within a slice. Returns
         ``False`` once the output is gone for good (the reader left, the stream failed or was
         never there, or the close began) and the line was not delivered. A line longer than the
         queue is accepted into an empty one.
@@ -192,9 +192,10 @@ class BoundedWriter:
                     return True
                 self._room_waiters += 1
                 try:
-                    self._cond.wait(0.25)
+                    self._cond.wait(WAIT_SLICE_S)
                 finally:
                     self._room_waiters -= 1
+                checkpoint()  # an owed signal ends the wait (leaving the block frees the lock)
 
     def take_new_drops(self) -> int:
         """Lines dropped since the previous call."""

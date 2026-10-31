@@ -27,7 +27,7 @@ from exportutil import (
     read_dicts,
     two_node_recording,
 )
-from ironbird import atomicfile, fsops
+from ironbird import atomicfile, fsops, sigmask
 from ironbird.atomicfile import Collision, TempDirOutput, TempOutput
 from ironbird.errors import Code, IronbirdError
 from ironbird.recording.defs import embedded_codecs
@@ -901,12 +901,197 @@ if WHERE == "after_commit":
     import signal
     from ironbird.cli import main as cli_main
 
+    from ironbird.sigmask import Interrupted
+
     def summary_then_signal(*args, **kwargs):
         cli_main._STATE.signum = signal.SIGTERM
-        raise cli_main._Terminated(signal.SIGTERM)
+        raise Interrupted(signal.SIGTERM)
 
     cli_main._export_summary = summary_then_signal
 """
+
+
+# Child-side hooks that catch SIGTERM where Python swallows whatever a handler raises: inside a
+# weakref callback (on a busy host the garbage collector runs such callbacks, threading's
+# WeakSet among them, at any line of the command). ``write``: the first write to the export's
+# temporary; ``commit``: right before the commit point; ``start``: right before the command's
+# work begins; ``detach``: as the command ends, after the commit. Nothing waits after the
+# signal: the command must act on it by itself.
+_SWALLOWING_HOOKS = """
+import os, signal, threading, weakref
+from ironbird import fsops, sigmask
+import ironbird.cli.main as cli_main
+WHERE = os.environ["IB_TEST_WINDOW"]
+TEMPORARIES, SENT = set(), []
+
+class Garbage:
+    pass
+
+def signal_inside_a_weakref_callback():
+    if SENT or threading.current_thread() is not threading.main_thread():
+        return
+    SENT.append(WHERE)
+    garbage = Garbage()
+    ref = weakref.ref(garbage, lambda _: signal.pthread_kill(threading.get_ident(), signal.SIGTERM))
+    del garbage  # the callback runs here, and the handler inside it
+    assert ref() is None
+
+_open_at, _write = fsops.FileSystem.open_at, fsops.FileSystem.write
+
+def open_at(self, dir_fd, name, flags, mode=0o600):
+    fd = _open_at(self, dir_fd, name, flags, mode)
+    if flags & os.O_CREAT and name.endswith(".tmp"):
+        TEMPORARIES.add(fd)
+    return fd
+
+def write(self, fd, data):
+    if WHERE == "write" and fd in TEMPORARIES:
+        signal_inside_a_weakref_callback()
+    return _write(self, fd, data)
+
+def before(where, real):
+    def call(*args, **kwargs):
+        if WHERE == where:
+            signal_inside_a_weakref_callback()
+        return real(*args, **kwargs)
+    return call
+
+fsops.FileSystem.open_at, fsops.FileSystem.write = open_at, write
+sigmask.Hold.begin = before("commit", sigmask.Hold.begin)
+cli_main._check_descriptors = before("start", cli_main._check_descriptors)
+cli_main._SignalState.detach = before("detach", cli_main._SignalState.detach)
+"""
+
+
+@pytest.mark.parametrize("where", ["write", "commit", "start"])
+def test_a_signal_whose_handler_runs_inside_a_weakref_callback_ends_the_export_unpublished(
+    tmp_path: Path, env: dict[str, str], where: str
+) -> None:
+    """A signal that arrives before the commit point publishes nothing, wherever its handler
+    runs: the handler only records it, and the command acts on it by itself, with no help and no
+    delay (nothing waits after the signal in the hooks)."""
+    out, err = _signal_at_window(tmp_path, env, _SWALLOWING_HOOKS, where, "text", send=False)
+    assert not out.exists() and temporaries(tmp_path) == [], err
+    assert "Exception ignored" not in err and "Traceback" not in err, err
+    # a signal owed before the export began ends the command at the checkpoint that precedes it,
+    # so no export was started to be stopped
+    expected = [] if where == "start" else ["interrupted"]
+    assert [e["reason"] for e in _stops(tmp_path)] == expected, err
+    signals = [e["signal"] for e in ledger_events(tmp_path) if e["event"] == "cli.signal"]
+    assert signals == ["SIGTERM"], err
+
+
+def test_a_signal_whose_handler_runs_inside_a_weakref_callback_as_the_command_ends_is_announced(
+    tmp_path: Path, env: dict[str, str]
+) -> None:
+    """After the commit, as the command detaches: the export stands, the signal is still the
+    exit (143, not a kill by the signal), ledgered and announced as after the export."""
+    out, err = _signal_at_window(tmp_path, env, _SWALLOWING_HOOKS, "detach", "text", send=False)
+    assert out.is_file() and len(out.read_text().splitlines()) == 10, err
+    assert "Exception ignored" not in err and "Traceback" not in err, err
+    (stop,) = _stops(tmp_path)
+    assert stop["reason"] == "done" and stop["committed"] is True
+    notices = [e["notice"] for e in ledger_events(tmp_path) if e["event"] == "cli.signal"]
+    assert len(notices) == 1 and "written to" in notices[0] and notices[0] in err
+
+
+# Child-side hooks: ``signal.signal`` sends a signal to the process while the CLI is setting its
+# handlers, just before the one for SIGTERM is set: ``SIGHUP`` (its own handler not set yet)
+# or ``SIGINT`` (its handler set a moment before).
+_INSTALL_HOOKS = """
+import os, signal
+SEND = getattr(signal, os.environ["IB_TEST_WINDOW"])
+_set, _sent = signal.signal, []
+
+def set_handler(sig, handler):
+    if sig == signal.SIGTERM and callable(handler) and not _sent:
+        _sent.append(sig)
+        os.kill(os.getpid(), SEND)
+    return _set(sig, handler)
+
+signal.signal = set_handler
+"""
+
+
+@pytest.mark.parametrize("sent", ["SIGHUP", "SIGINT"])
+def test_a_signal_while_the_handlers_are_set_ends_the_command_by_it(
+    tmp_path: Path, env: dict[str, str], sent: str
+) -> None:
+    """Not a kill by the signal's default action, not a traceback out of ``main``: the command
+    ends by the signal, 128+n, ledgered, and publishes nothing."""
+    hk_and_status(tmp_path / "in.ibrec", 6, 4)
+    out = tmp_path / "out"
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _INSTALL_HOOKS + CLI_MAIN,
+            "export",
+            str(tmp_path / "in.ibrec"),
+            "--format",
+            "text",
+            "-o",
+            str(out),
+        ],
+        env={**env, "IB_TEST_WINDOW": sent},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    signum = int(getattr(signal, sent))
+    assert done.returncode == 128 + signum, done.stderr
+    assert "Traceback" not in done.stderr and not out.exists() and temporaries(tmp_path) == []
+    signals = [e["signal"] for e in ledger_events(tmp_path) if e["event"] == "cli.signal"]
+    assert signals == [sent], done.stderr
+
+
+# Child-side hooks: the first write to the export's temporary sends SIGTERM to the process, and
+# a second SIGTERM comes while the exit is under way: as the ledger makes its last write
+# (``finish``) or closes (``close``). Process-directed, as kill(1) sends them.
+_REPEAT_HOOKS = """
+import os, signal, threading
+from ironbird import fsops, ledger
+WHERE = os.environ["IB_TEST_WINDOW"]
+TEMPORARIES, SENT = set(), []
+_open_at, _write = fsops.FileSystem.open_at, fsops.FileSystem.write
+
+def open_at(self, dir_fd, name, flags, mode=0o600):
+    fd = _open_at(self, dir_fd, name, flags, mode)
+    if flags & os.O_CREAT and name.endswith(".tmp"):
+        TEMPORARIES.add(fd)
+    return fd
+
+def write(self, fd, data):
+    if fd in TEMPORARIES and not SENT and threading.current_thread() is threading.main_thread():
+        SENT.append("first")
+        os.kill(os.getpid(), signal.SIGTERM)
+    return _write(self, fd, data)
+
+def again(where, real):
+    def call(self, *args, **kwargs):
+        if WHERE == where and len(SENT) == 1:
+            SENT.append("again")
+            os.kill(os.getpid(), signal.SIGTERM)
+        return real(self, *args, **kwargs)
+    return call
+
+fsops.FileSystem.open_at, fsops.FileSystem.write = open_at, write
+ledger.Ledger.finish = again("finish", ledger.Ledger.finish)
+ledger.Ledger.close = again("close", ledger.Ledger.close)
+"""
+
+
+@pytest.mark.parametrize("where", ["finish", "close"])
+def test_a_repeated_signal_during_the_exit_changes_nothing(
+    tmp_path: Path, env: dict[str, str], where: str
+) -> None:
+    """Repeats while shutting down are ignored: the exit is still 143 (not a kill by the
+    signal), with one interruption ledgered and nothing published."""
+    out, err = _signal_at_window(tmp_path, env, _REPEAT_HOOKS, where, "text", send=False)
+    assert not out.exists() and temporaries(tmp_path) == [], err
+    signals = [e["signal"] for e in ledger_events(tmp_path) if e["event"] == "cli.signal"]
+    assert signals == ["SIGTERM"], err
 
 
 @pytest.mark.parametrize(("where", "fmt"), [("discard_file", "text"), ("discard_member", "csv")])
@@ -1122,24 +1307,23 @@ def test_a_step_that_fails_is_reported_as_the_export_failure_with_or_without_a_s
     assert not out.exists() and temporaries(tmp_path) == []
 
 
-class _Raised(BaseException):
-    pass
-
-
 @pytest.fixture
-def raising_hup() -> Any:
-    def handler(_signum: int, _frame: object) -> None:
-        raise _Raised
+def delivering_hup() -> Any:
+    """SIGHUP runs a handler that delivers it, as the CLI's does outside an event loop."""
+
+    def handler(signum: int, _frame: object) -> None:
+        sigmask.deliver(signum)
 
     previous = signal.signal(signal.SIGHUP, handler)
     try:
         yield
     finally:
         signal.signal(signal.SIGHUP, previous)
+        sigmask.discard()
 
 
 def _hup_after(real: Any) -> Any:
-    """``real`` followed by a SIGHUP to this thread (its handler raises :class:`_Raised`)."""
+    """``real`` followed by a SIGHUP to this thread (its handler delivers it)."""
 
     def call(*args: Any) -> Any:
         got = real(*args)
@@ -1158,7 +1342,7 @@ _MAIN_THREAD_ONLY = pytest.mark.skipif(
 @_MAIN_THREAD_ONLY
 @pytest.mark.parametrize("kind", ["file", "directory"])
 def test_a_signal_in_the_rename_is_acted_on_after_the_directory_sync_and_the_note(
-    tmp_path: Path, raising_hup: None, kind: str
+    tmp_path: Path, delivering_hup: None, kind: str
 ) -> None:
     fs = FaultFs()
     fs.override("renameat2_noreplace", _hup_after(fsops.REAL_FS.renameat2_noreplace))
@@ -1166,7 +1350,7 @@ def test_a_signal_in_the_rename_is_acted_on_after_the_directory_sync_and_the_not
     output: TempOutput | TempDirOutput = (
         TempOutput(out, fs=fs) if kind == "file" else TempDirOutput(out, fs=fs)
     )
-    with pytest.raises(_Raised), output:
+    with pytest.raises(sigmask.Interrupted), output:
         if isinstance(output, TempOutput):
             output.write(b"x")
         else:
@@ -1257,9 +1441,10 @@ def test_only_a_failure_that_a_signal_replaced_is_reported_with_the_interruption
             try:
                 raise IronbirdError(Code.EXP_WRITE, "cannot write the export: retried")
             except IronbirdError:
-                sigterm()  # the handler raises here, inside the except block
+                sigterm()
+                sigmask.sleep(0)  # the retry's wait, inside the except block, acts on it
             raise AssertionError("not reached")
-        with signals_held():  # held: the handler runs as the failure leaves the scope
+        with signals_held():  # held: acted on as the failure leaves the scope
             sigterm()
             if case == "ironbird":
                 raise IronbirdError(Code.EXP_WRITE, "cannot write the export: disk trouble")

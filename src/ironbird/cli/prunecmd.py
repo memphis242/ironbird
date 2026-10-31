@@ -9,6 +9,7 @@ leave a trace), so with ``IB-LED-002`` it refuses to delete; ``--dry-run`` still
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -22,6 +23,7 @@ from ironbird.errors import Code, IronbirdError
 from ironbird.fsops import REAL_FS, FileSystem
 from ironbird.ledger import Ledger, default_state_dir
 from ironbird.prune import (
+    Outcome,
     Plan,
     confirmed,
     execute_plan,
@@ -33,9 +35,11 @@ from ironbird.prune import (
 from ironbird.recording.session import default_recording_dir
 from ironbird.render import term
 from ironbird.retention import DirScan, full_scan, recording_blocks
+from ironbird.sigmask import Interrupted, wait_readable
 from ironbird.units import format_size, parse_count, parse_duration, parse_size
 
 MAX_SKIPS_SHOWN: Final = 5
+MAX_ANSWER_BYTES: Final = 4096  # an answer at the prompt is read up to its line end or this
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,7 +245,22 @@ def _confirm_and_delete(
     def record(event: str, **fields: Any) -> None:
         ledger.record("action", event, **fields)
 
-    outcome = execute_plan(fs, plan, record)
+    outcome = Outcome()
+    try:
+        execute_plan(fs, plan, record, outcome)
+    except Interrupted:
+        ledger.record(
+            "action",
+            "prune.interrupted",
+            deleted_sessions=outcome.deleted_sessions,
+            of=len(plan.candidates),
+            deleted_bytes=outcome.deleted_bytes,
+        )
+        console.err(
+            f"deleted {outcome.deleted_sessions} of {len(plan.candidates)} {what} "
+            f"({format_size(outcome.deleted_bytes)}) before the interruption"
+        )
+        raise
     summary = (
         f"deleted {outcome.deleted_sessions} {what} ({format_size(outcome.deleted_bytes)}, "
         f"{outcome.deleted_files} files)"
@@ -263,9 +282,21 @@ def _confirm_and_delete(
 
 
 def _ask(question: str) -> str:
+    """The answer typed at the terminal, up to its line end (``""`` at its end or failure).
+
+    Read from the descriptor once it has data, so a shutdown signal ends the wait for the
+    answer (see :func:`~ironbird.sigmask.wait_readable`)."""
     sys.stderr.write(question)
     sys.stderr.flush()
+    answer = b""
     try:
-        return sys.stdin.readline()
-    except (OSError, ValueError):
+        fd = sys.stdin.fileno()
+        while b"\n" not in answer and len(answer) < MAX_ANSWER_BYTES:
+            wait_readable(fd)
+            chunk = os.read(fd, MAX_ANSWER_BYTES)
+            if not chunk:
+                break
+            answer += chunk
+    except (AttributeError, OSError, ValueError):
         return ""
+    return answer.split(b"\n", 1)[0].decode("utf-8", "replace")  # the first line only

@@ -22,7 +22,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Final
 
-from ironbird.ccdd.loader import load_ccdd
+from ironbird.ccdd.loader import load_ccdd_bytes, read_ccdd
 from ironbird.ccdd.model import (
     CcddModel,
     EventSeverity,
@@ -46,7 +46,7 @@ from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
 from ironbird.filter import Filter, FilterError, Matcher, compile_filter
 from ironbird.frame import Decoded, Frame, Stream
-from ironbird.header import load_profile
+from ironbird.header import parse_profile_file, read_profile
 from ironbird.ledger import Ledger
 from ironbird.ledgertiers import Tier
 from ironbird.notice import Level, Notice, level_of
@@ -108,6 +108,16 @@ class TxAttempt:
 
 
 @dataclass(frozen=True, slots=True)
+class DefinitionBytes:
+    """The content of a node's definition files, as read once when its codec was loaded: what
+    a recording embeds and digests, so it names exactly what the codec was built from."""
+
+    ccdd: bytes
+    command_header: bytes
+    telemetry_header: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class Match:
     tier: str  # "exact" | "name" | "description"
     node: str
@@ -138,6 +148,7 @@ class Session:
         self._coalescer: Coalescer = Coalescer(notify)
         ledger.set_notifier(notify)
         self._codecs: dict[str, Codec] = {}
+        self._definitions: dict[str, DefinitionBytes] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._last_tx: TxAttempt | None = None
         self._engine: Engine = Engine(
@@ -317,11 +328,16 @@ class Session:
                 f"node {node_name!r} has no ccdd/command_header/telemetry_header in "
                 f"{self.config.path}",
             )
-        model = load_ccdd(node.ccdd, node.ccdd_adapter)
+        definitions = DefinitionBytes(
+            read_ccdd(node.ccdd, node.ccdd_adapter),
+            read_profile(node.command_header),
+            read_profile(node.telemetry_header),
+        )
+        model = load_ccdd_bytes(definitions.ccdd, str(node.ccdd), node.ccdd_adapter)
         codec = Codec(
             model,
-            load_profile(node.command_header),
-            load_profile(node.telemetry_header),
+            parse_profile_file(definitions.command_header, node.command_header),
+            parse_profile_file(definitions.telemetry_header, node.telemetry_header),
             max_packet_bytes=self.config.max_packet_bytes,
         )
         self.ledger.record(
@@ -332,7 +348,13 @@ class Session:
             messages=len(model.messages),
         )
         self._codecs[node_name] = codec
+        self._definitions[node_name] = definitions
         return codec
+
+    def definitions_of(self, node_name: str) -> DefinitionBytes:
+        """The definition files ``node_name``'s codec was built from (loading it if need be)."""
+        self.codec_for(node_name)
+        return self._definitions[node_name]
 
     def models(self) -> Mapping[str, CcddModel]:
         return {

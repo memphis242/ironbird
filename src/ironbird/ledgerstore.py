@@ -49,7 +49,7 @@ from ironbird.fsops import (
     write_all,
 )
 from ironbird.ledgertiers import TIER_COUNT, Tier
-from ironbird.sigmask import signals_held
+from ironbird.sigmask import start_thread
 
 MAX_PART_NUMBER: Final = 999_999_999
 NAME_TRIES: Final = 16  # part or reserve names tried per attempt
@@ -1195,8 +1195,7 @@ class LedgerWriter:
             self._started = True
             # A thread started with the shutdown signals blocked never receives one: they are
             # handled by the main thread, which must see them all.
-            with signals_held():
-                self._thread.start()
+            start_thread(self._thread)
 
     @property
     def pending_jobs(self) -> int:

@@ -10,7 +10,6 @@ signal.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hashlib
 import os
 import pwd
@@ -40,7 +39,6 @@ from ironbird.recording.writer import (
 from ironbird.sanitize import clean
 from ironbird.session import Route, Session
 
-MAX_PROFILE_BYTES: Final = 64 * 1024
 MAX_ARGV: Final = 64
 MAX_STAGED_EVENTS: Final = 1 << 16  # frames kept between the capture opening and the file
 _SPLIT_RE: Final = re.compile(r"([0-9]{1,12}(?:\.[0-9]{1,6})?)([a-z]{1,3})")
@@ -134,26 +132,6 @@ def resolve_path(
     return path / name if path.is_dir() else path
 
 
-def _read_definition(path: Path, limit: int, what: str) -> bytes:
-    try:
-        with path.open("rb") as handle:
-            raw = handle.read(limit + 1)
-    except OSError as exc:
-        raise IronbirdError(
-            Code.REC_CREATE,
-            f"cannot read the {what} {path} to embed it: {exc.strerror or exc}; set "
-            "recording.embed_definitions = false to record without definitions",
-            cause=exc,
-        ) from exc
-    if len(raw) > limit:
-        raise IronbirdError(
-            Code.REC_CREATE,
-            f"the {what} {path} is larger than {limit // 1024} KiB and cannot be embedded; set "
-            "recording.embed_definitions = false to record without definitions",
-        )
-    return raw
-
-
 def collect_definitions(
     session: Session, nodes: Sequence[str], *, embed: bool
 ) -> tuple[list[BlobSpec], dict[str, Any]]:
@@ -165,31 +143,20 @@ def collect_definitions(
     for name in nodes:
         node = session.config.nodes[name]
         entry: dict[str, Any] = {"adapter": node.ccdd_adapter}
+        table[name] = entry
+        if node.ccdd is None or node.command_header is None or node.telemetry_header is None:
+            continue
+        held = session.definitions_of(name)  # the bytes the codec was built from, never re-read
         files = (
-            (BlobKind.CCDD, node.ccdd, node.ccdd_adapter, fmt.MAX_BLOB_CONTENT, "CCDD file"),
-            (
-                BlobKind.COMMAND_PROFILE,
-                node.command_header,
-                "toml",
-                MAX_PROFILE_BYTES,
-                "command header profile",
-            ),
-            (
-                BlobKind.TELEMETRY_PROFILE,
-                node.telemetry_header,
-                "toml",
-                MAX_PROFILE_BYTES,
-                "telemetry header profile",
-            ),
+            (BlobKind.CCDD, held.ccdd, node.ccdd_adapter),
+            (BlobKind.COMMAND_PROFILE, held.command_header, "toml"),
+            (BlobKind.TELEMETRY_PROFILE, held.telemetry_header, "toml"),
         )
-        for kind, path, adapter, limit, what in files:
-            if path is None:
-                continue
-            content = _read_definition(path, limit, what)
+        for kind, content, adapter in files:
+            assert len(content) <= fmt.MAX_BLOB_CONTENT, "the loaders refuse larger definitions"
             entry[f"{kind.name.lower()}_sha256"] = hashlib.sha256(content).hexdigest()
             if embed:
                 blobs.append(BlobSpec(kind, name, adapter, content))
-        table[name] = entry
     return blobs, table
 
 
@@ -204,9 +171,6 @@ def build_meta(
     session: Session, command: str, nodes: Mapping[str, Any], created_ns: int
 ) -> dict[str, Any]:
     """The session facts META records (the writer adds the creation time and the part)."""
-    config_hash: str | None = None
-    with contextlib.suppress(OSError):
-        config_hash = hashlib.sha256(session.config.path.read_bytes()).hexdigest()
     return {
         "schema": fmt.META_SCHEMA,
         "session": session.ledger.session_id,
@@ -217,7 +181,7 @@ def build_meta(
         "command": command,
         "argv": [clean(arg, 256) for arg in sys.argv[1 : MAX_ARGV + 1]],
         "acts_as": session.node.name,
-        "config": {"path": str(session.config.path), "sha256": config_hash},
+        "config": {"path": str(session.config.path), "sha256": session.config.sha256},
         "max_packet_bytes": session.config.max_packet_bytes,
         "nodes": dict(nodes),
         "created_ns": created_ns,

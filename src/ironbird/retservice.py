@@ -30,7 +30,6 @@ from ironbird.config import RetentionConfig
 from ironbird.errors import Code
 from ironbird.fsops import REAL_FS, FileSystem
 from ironbird.ledger import Ledger
-from ironbird.ledgergate import start_thread
 from ironbird.retention import (
     DirScan,
     ScanControl,
@@ -39,6 +38,7 @@ from ironbird.retention import (
     recording_blocks,
 )
 from ironbird.retnotices import Notices
+from ironbird.sigmask import start_thread
 from ironbird.units import MIB, compact_duration, format_duration, format_size
 
 PROJECTION_INTERVAL_S: Final = 10.0

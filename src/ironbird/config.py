@@ -6,16 +6,18 @@ a stable code. Relative paths are resolved against the config file's directory.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final
 
 from ironbird.errors import Code, IronbirdError
+from ironbird.fsops import read_capped
 from ironbird.header import DEFAULT_MAX_PACKET_BYTES
 from ironbird.units import (
     DURATION_FORMS,
@@ -190,6 +192,7 @@ class SystemConfig:
     recording: RecordingConfig = RecordingConfig()
     ledger: LedgerConfig = LedgerConfig()
     retention: RetentionConfig = RetentionConfig()
+    sha256: str | None = None  # of the bytes load_config parsed; None for a config built elsewhere
 
     def resolve(self, name_or_alias: str) -> Node:
         """Look a node up by name or alias."""
@@ -714,8 +717,7 @@ def find_config(explicit: Path | None, environ: Mapping[str, str] | None = None)
 
 def load_config(path: Path) -> SystemConfig:
     try:
-        with path.open("rb") as handle:
-            raw = handle.read(MAX_CONFIG_BYTES + 1)
+        raw = read_capped(path, MAX_CONFIG_BYTES)
     except OSError as exc:
         raise IronbirdError(
             Code.CFG_FILE, f"{path}: cannot read config ({exc.strerror or exc})", cause=exc
@@ -728,4 +730,4 @@ def load_config(path: Path) -> SystemConfig:
         # TOMLDecodeError and UnicodeDecodeError are ValueErrors; so is the int-digit limit.
         # RecursionError is deeply nested arrays/tables.
         raise IronbirdError(Code.CFG_SYNTAX, f"{path}: invalid TOML ({exc})", cause=exc) from exc
-    return parse_config(data, path)
+    return replace(parse_config(data, path), sha256=hashlib.sha256(raw).hexdigest())
