@@ -4,6 +4,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -145,6 +146,21 @@ def _isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("IRONBIRD_RECORD_DIR", str(tmp_path / "recordings"))  # never the user's
     monkeypatch.delenv("IRONBIRD_CONFIG", raising=False)
     return state
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cli_signal_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test sees the CLI's signal state as a fresh process has it.
+
+    The state is a module global: a command run in-process (``CliRunner``) ends with
+    ``_STATE.detach()``, after which the handler only records a signal instead of raising it.
+    Without a fresh state per test, a test that runs that handler would behave according to
+    whichever in-process command ran before it in the same worker, which xdist decides. Not
+    imported yet means not used yet, so its state is fresh already.
+    """
+    cli_main = sys.modules.get("ironbird.cli.main")
+    if cli_main is not None:
+        monkeypatch.setattr(cli_main, "_STATE", cli_main._SignalState())
 
 
 @pytest.fixture

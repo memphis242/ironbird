@@ -6,14 +6,17 @@ Ports are in 58000-58999; nothing here touches the fixed cFS ports.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
+import struct
 import subprocess
 import sys
+import termios
 import time
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import pytest
 
@@ -42,6 +45,11 @@ def env(tmp_path: Path) -> dict[str, str]:
     environment["IRONBIRD_CONFIG"] = str(path)
     environment["PORTS"] = f"{command_port},{telemetry_port}"
     return environment
+
+
+def pipe_bytes(pipe: IO[bytes]) -> int:
+    """Bytes written into ``pipe`` and not yet read (the reading end of a child's stdout)."""
+    return struct.unpack("i", fcntl.ioctl(pipe.fileno(), termios.FIONREAD, b"\0" * 4))[0]
 
 
 def ports(env: dict[str, str]) -> tuple[int, int]:
@@ -546,7 +554,15 @@ def test_a_signal_ends_a_replay_that_is_blocked_on_a_reader_that_never_reads(
     )
     assert proc.stdout is not None and proc.stderr is not None
     try:
-        time.sleep(2.0)
+        # Output in the pipe means the command runs, its signal handlers in place since before
+        # it began. A wait timed from the spawn would race the interpreter's start on a busy
+        # host: a signal that lands before the handlers ends the process by the signal (-15).
+        deadline = time.monotonic() + 60
+        while not pipe_bytes(proc.stdout):
+            assert proc.poll() is None, proc.stderr.read().decode()
+            assert time.monotonic() < deadline, "the replay wrote nothing"
+            time.sleep(0.01)
+        time.sleep(2.0)  # the pipe and the output queue fill
         assert proc.poll() is None  # held up by the reader, not finished and not dropping lines
         started = time.monotonic()
         proc.send_signal(signal.SIGTERM)

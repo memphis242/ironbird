@@ -13,9 +13,11 @@ import inspect
 import json
 import math
 import os
+import queue
 import resource
 import signal
 import sys
+import threading
 import time
 import traceback
 from collections.abc import Awaitable, Callable, Coroutine
@@ -36,6 +38,7 @@ from ironbird.errors import Code, IronbirdError
 from ironbird.filter import Filter
 from ironbird.fsops import REAL_FS
 from ironbird.ledger import ExitReport, Ledger, default_state_dir
+from ironbird.ledgergate import start_thread
 from ironbird.notice import Notice
 from ironbird.recording import inspect as rec_inspect
 from ironbird.recording.defs import (
@@ -95,6 +98,7 @@ DRAIN_NOTICE_S: Final = 2.0  # waiting this long for the reader of stdout earns 
 SIGNAL_POLL_S: Final = 0.02
 MIN_FREE_FDS: Final = 8  # event loop (3), UDP sockets, ledger, resolver threads, margin
 _SIGNALS: Final = HANDLED_SIGNALS
+RESEND_DELAY_S: Final = 0.001  # a swallowed signal is sent again this long after the hook
 # Keyword arguments for the ledger of this process (``fs``, ``clock``, ``join_timeout_s``, ...).
 # Production leaves it empty; a test wrapper module assigns it before calling ``main()``.
 LEDGER_OPTIONS: Final[dict[str, Any]] = {}
@@ -237,6 +241,16 @@ class _SignalState:
     shutdown remains) it just records the signal, so none can escape the shutdown unannounced:
     :func:`_finish` announces whatever was recorded and not yet :attr:`announced`. Only the
     first signal acts; repeats while shutting down are ignored.
+
+    Python runs a handler between any two lines of the main thread, including the lines of a
+    weakref callback or a ``__del__`` that the garbage collector runs in the middle of the
+    command. What a handler raises there cannot propagate: Python passes it to
+    ``sys.unraisablehook`` and carries on. While installed, :meth:`_unraisable` takes such a
+    :class:`_Terminated` and asks a helper thread to send the signal to the main thread again,
+    so its handler runs once the interpreter is back in the command's own code (or at the end of
+    a held scope, as for any signal) and the command still ends by it. The helper exists from
+    :meth:`install` on: a thread started in the hook could wait on a lock the interrupted code
+    holds.
     """
 
     def __init__(self) -> None:
@@ -244,16 +258,31 @@ class _SignalState:
         self.announced = False  # the ledger and the user were told about ``signum``
         self._installed = False  # the handlers are ours (``main`` ran, not an in-process caller)
         self._raises = True
+        self._again = False  # the handler's raise for ``signum`` was swallowed: raise it again
+        self._in_hook = False  # :meth:`_unraisable` is running: a raise now would be lost too
+        self._previous_unraisable: Callable[[sys.UnraisableHookArgs], Any] | None = None
+        self._resend: queue.SimpleQueue[int] = queue.SimpleQueue()  # reentrant ``put``
+        self._resender: threading.Thread | None = None
         self._task: asyncio.Task[Any] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def install(self) -> None:
-        self.signum, self.announced, self._raises = 0, False, True
+        self.signum, self.announced, self._raises, self._again = 0, False, True, False
         self._task = self._loop = None
         for sig in _SIGNALS:
             with contextlib.suppress(ValueError, OSError):  # not the main thread
                 signal.signal(sig, self._handle)
                 self._installed = True
+        if not self._installed:
+            return
+        if self._resender is None:
+            self._resender = threading.Thread(
+                target=self._resend_loop, name="ib-signal-resend", daemon=True
+            )
+            start_thread(self._resender)
+        if self._previous_unraisable is None:
+            self._previous_unraisable = sys.unraisablehook
+            sys.unraisablehook = self._unraisable
 
     def restore_default(self) -> None:
         """Give the signals their default action back, once the shutdown is complete.
@@ -268,6 +297,9 @@ class _SignalState:
         for sig in _SIGNALS:
             with contextlib.suppress(ValueError, OSError):
                 signal.signal(sig, signal.SIG_DFL)
+        if self._previous_unraisable is not None:
+            sys.unraisablehook = self._previous_unraisable
+            self._previous_unraisable = None
 
     def attach(self, task: asyncio.Task[Any], loop: asyncio.AbstractEventLoop) -> None:
         self._task, self._loop = task, loop
@@ -277,14 +309,44 @@ class _SignalState:
         self._task = self._loop = None
 
     def _handle(self, signum: int, _frame: object) -> None:
-        if self.signum:
+        if self.signum and not self._again:
             return
-        self.signum = signum
+        if self._again and self._in_hook:  # still where the raise would be swallowed
+            self._resend.put(self.signum)
+            return
+        self._again = False
+        if not self.signum:
+            self.signum = signum
         task, loop = self._task, self._loop
         if task is not None and loop is not None and not task.done():
             loop.call_soon_threadsafe(task.cancel)
         elif self._raises:
-            raise _Terminated(signum)
+            raise _Terminated(self.signum)
+
+    def _unraisable(self, unraisable: sys.UnraisableHookArgs) -> None:
+        """Catch the signal again when its handler's raise was swallowed (see the class); pass
+        everything else to the hook that was there before."""
+        stop = unraisable.exc_value
+        if isinstance(stop, _Terminated) and self._raises and stop.signum == self.signum:
+            assert threading.current_thread() is threading.main_thread(), "handlers run there"
+            assert self._resender is not None, "the hook is set after the helper starts"
+            self._in_hook = self._again = True
+            self._resend.put(stop.signum)
+            self._in_hook = False
+            return
+        previous = self._previous_unraisable
+        (previous if previous is not None else sys.__unraisablehook__)(unraisable)
+
+    def _resend_loop(self) -> None:
+        """The helper thread: send each requested signal to the main thread again, a moment
+        later (the main thread is leaving the hook), while its raise is still owed."""
+        main = threading.main_thread().ident
+        assert main is not None
+        while True:
+            signum = self._resend.get()
+            time.sleep(RESEND_DELAY_S)
+            if self._again and self._installed:
+                signal.pthread_kill(main, signum)
 
 
 _STATE = _SignalState()

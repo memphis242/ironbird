@@ -909,6 +909,57 @@ if WHERE == "after_commit":
 """
 
 
+# Child-side hooks: the first write to the export's temporary drops the last reference to an
+# object with a weakref callback, and the callback catches SIGTERM. The handler then runs inside
+# the callback, where Python only prints what it raises (on a busy host the garbage collector
+# runs such callbacks, threading's WeakSet among them, at any line of the command). The write
+# then takes a moment, as a large export's writing does.
+_SWALLOWING_HOOKS = """
+import os, signal, threading, time, weakref
+from ironbird import fsops
+
+TEMPORARIES, SENT = set(), []
+_open_at, _write = fsops.FileSystem.open_at, fsops.FileSystem.write
+
+class Garbage:
+    pass
+
+def signal_inside_a_weakref_callback():
+    garbage = Garbage()
+    ref = weakref.ref(garbage, lambda _: signal.pthread_kill(threading.get_ident(), signal.SIGTERM))
+    del garbage  # the callback runs here
+    assert ref() is None
+
+def open_at(self, dir_fd, name, flags, mode=0o600):
+    fd = _open_at(self, dir_fd, name, flags, mode)
+    if flags & os.O_CREAT and name.endswith(".tmp"):
+        TEMPORARIES.add(fd)
+    return fd
+
+def write(self, fd, data):
+    if fd in TEMPORARIES and not SENT and threading.current_thread() is threading.main_thread():
+        SENT.append(fd)
+        signal_inside_a_weakref_callback()
+        time.sleep(0.5)
+    return _write(self, fd, data)
+
+fsops.FileSystem.open_at, fsops.FileSystem.write = open_at, write
+"""
+
+
+def test_a_signal_whose_handler_runs_inside_a_weakref_callback_still_ends_the_export(
+    tmp_path: Path, env: dict[str, str]
+) -> None:
+    """A handler's raise that Python swallows (a weakref callback, a ``__del__``) does not
+    lose the signal: the export still ends by it, with nothing published."""
+    out, err = _signal_at_window(tmp_path, env, _SWALLOWING_HOOKS, "", "text", send=False)
+    assert not out.exists() and temporaries(tmp_path) == [], err
+    assert "Exception ignored" not in err, err
+    assert [e["reason"] for e in ledger_events(tmp_path) if e["event"] == "export.stop"] == [
+        "interrupted"
+    ], err
+
+
 @pytest.mark.parametrize(("where", "fmt"), [("discard_file", "text"), ("discard_member", "csv")])
 def test_a_signal_during_the_cleanup_of_a_failed_commit_leaves_nothing_behind(
     tmp_path: Path, env: dict[str, str], where: str, fmt: str
