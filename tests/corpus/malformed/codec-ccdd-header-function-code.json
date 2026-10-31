@@ -1,0 +1,16 @@
+{
+ "schema": "ironbird-ccdd/0",
+ "target": "t",
+ "messages": [
+  {
+   "name": "T",
+   "kind": "command",
+   "mid": "0x1801",
+   "header": {
+    "function_code": 1
+   },
+   "fields": [],
+   "function_code": 0
+  }
+ ]
+}

@@ -308,7 +308,7 @@ def test_literal_suggestions(codecs: dict[str, Codec]) -> None:
 
 
 def test_reserved_and_unavailable_names(codecs: dict[str, Codec]) -> None:
-    assert error_of(codecs, "htime > 1").code is Code.FLT_NAME
+    assert error_of(codecs, "htime > 1").code is Code.FLT_TYPE  # the header time wants a time
     assert error_of(codecs, "hdr == 1").code is Code.FLT_NAME  # a namespace on its own
     assert error_of(codecs, "event == 1").code is Code.FLT_NAME
 
@@ -1079,3 +1079,26 @@ def test_node_accepts_a_nodes_alias_and_a_name_wins_over_an_alias(codecs: dict[s
     with pytest.raises(FilterError) as info:  # an alias of a node that is not in use
         compile_filter("node == elsewhere", codecs, aliases=aliases)
     assert info.value.code is Code.FLT_TYPE
+
+
+@pytest.mark.parametrize(
+    ("text", "nodes"),
+    [
+        ("node == n1", {"n1"}),
+        ("node in [n1, n2]", {"n1", "n2"}),
+        ("node != n1", {"n2"}),
+        ("node == n1 and seq > 3", {"n1"}),
+        ("node == n1 and node == n2", set()),
+        ("node == n1 or node == n2", {"n1", "n2"}),
+        ("(node == n1 or node == n2) and node != n1", {"n2"}),
+        ("node == n1 or seq > 3", None),
+        ("not node == n1", None),
+        ("seq > 3", None),
+        ('node contains "n"', None),
+    ],
+)
+def test_the_candidate_nodes_of_a_filter(
+    codecs: dict[str, Codec], text: str, nodes: set[str] | None
+) -> None:
+    found = compiled(codecs, text).nodes
+    assert found == (None if nodes is None else frozenset(nodes))

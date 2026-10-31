@@ -1,0 +1,71 @@
+# ccsds_v1_cfs_tlm.toml with the time epoch of the checked-out cFE mission configuration:
+# CFE_MISSION_TIME_EPOCH_YEAR/DAY/... = 1980, day 1 (1980-01-01T00:00:00), 315532800 Unix
+# seconds (cfe/modules/time/fsw/inc/cfe_time_interface_cfg.h), and the time is TAI by default
+# (CFE_MISSION_TIME_CFG_DEFAULT_TAI) with CFE_MISSION_TIME_DEF_LEAPS = 37 leap seconds.
+#
+# Use this profile to read the header time of cFS telemetry as UTC (`htime` in a filter,
+# `pkt_time_utc` in an export). ccsds_v1_cfs_tlm.toml keeps the Unix epoch, which is what the
+# mock vehicle (`ib respond`) stamps its own telemetry with. See tools/cfs/NOTES.md.
+
+name = "ccsds_v1_cfs_tlm_cfe_time"
+kind = "telemetry"
+description = "CCSDS v1 primary header + cFS telemetry secondary header, cFE time epoch"
+byte_order = "big"
+mid_fields = ["version", "packet_type", "sec_hdr_flag", "apid"]
+
+[time]
+epoch = "1980-01-01T00:00:00Z"
+leap_seconds = 37
+
+[[fields]]
+name = "version"
+bits = 3
+value = 0
+
+[[fields]]
+name = "packet_type"
+bits = 1
+value = 0            # 0 = telemetry
+
+[[fields]]
+name = "sec_hdr_flag"
+bits = 1
+value = 1
+
+[[fields]]
+name = "apid"
+bits = 11
+computed = "from_mid"
+
+[[fields]]
+name = "seq_flags"
+bits = 2
+value = 3
+check = false
+
+[[fields]]
+name = "sequence"
+bits = 14
+computed = "sequence"
+
+[[fields]]
+name = "length"
+bits = 16
+computed = "length"
+bias = -7
+
+[[fields]]
+name = "seconds"
+bits = 32
+computed = "time_seconds"
+
+[[fields]]
+name = "subseconds"
+bits = 16
+computed = "time_subseconds"
+
+[[fields]]
+name = "spare"
+bits = 32
+value = 0
+check = false

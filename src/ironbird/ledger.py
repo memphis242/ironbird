@@ -160,6 +160,12 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "replay.no_definitions": Tier.ESSENTIAL,
         "replay.defs_compare_skipped": Tier.ESSENTIAL,
         "replay.defs_differ": Tier.ESSENTIAL,
+        "export.start": Tier.ESSENTIAL,
+        "export.stop": Tier.ESSENTIAL,
+        "export.note": Tier.ESSENTIAL,
+        "export.no_definitions": Tier.ESSENTIAL,
+        "export.defs_compare_skipped": Tier.ESSENTIAL,
+        "export.defs_differ": Tier.ESSENTIAL,
         "recording.start": Tier.ESSENTIAL,
         "recording.not_started": Tier.ESSENTIAL,
         "recording.overrun": Tier.ESSENTIAL,
@@ -556,6 +562,8 @@ class Ledger:
 
     @property
     def pending(self) -> int:
+        """Records queued and not yet handed to the writer thread. Records already handed over
+        may still be unwritten: :meth:`flush` waits (bounded) for the writer to catch up."""
         return len(self._queue)
 
     @property

@@ -26,10 +26,17 @@ import time
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from ironbird.ccdd.loader import load_ccdd
+from ironbird.ccdd.model import MessageKind
+from ironbird.codec import Codec, DecodedPacket
+from ironbird.config import load_config
+from ironbird.header import load_profile
 
 pytestmark = pytest.mark.cfs
 
@@ -792,6 +799,109 @@ def test_listen_where_selects_one_apps_housekeeping(ground: Ground, tmp_path: Pa
     )
 
 
+def test_listen_where_htime_selects_time_hk_in_the_cfe_epoch(
+    ground: Ground, tmp_path: Path
+) -> None:
+    """The shipped ground config reads the telemetry header time with the cFE mission epoch
+    (1980-01-01, TAI, 37 leap seconds: tools/cfs/NOTES.md), so ``htime`` of TIME HK is a
+    1980 date, which the Unix epoch (1970 plus a million seconds) cannot be."""
+    where = "msg == TIME_HK and htime >= 1980-01-01T00:00:00Z and htime < 1981-01-01T00:00:00Z"
+    with (
+        ground.listener_paused(),  # one process owns UDP 2234
+        _listen_where(ground, tmp_path / "state", "--where", where, "--count", "1") as out,
+    ):
+        deadline = time.monotonic() + 30
+        while not out.snapshot() and time.monotonic() < deadline:
+            ground.send("TIME_SEND_HK")
+            time.sleep(1.0)
+        lines = out.snapshot()
+    assert lines, "no TIME_HK passed the htime filter"
+    assert json.loads(lines[0])["name"] == "TIME_HK"
+
+
+CFE_EPOCH = datetime(1980, 1, 1, tzinfo=UTC)  # CFE_MISSION_TIME_EPOCH_* (tools/cfs/NOTES.md)
+HTIME_TOLERANCE_S = 2.0  # the packet is stamped a few ms after its fields are sampled
+
+
+def _fc_codec() -> Codec:
+    """The ``fc`` codec exactly as the shipped ground config builds it."""
+    node = load_config(CONFIG).nodes["fc"]
+    assert node.ccdd is not None
+    assert node.command_header is not None and node.telemetry_header is not None
+    return Codec(
+        load_ccdd(node.ccdd, node.ccdd_adapter),
+        load_profile(node.command_header),
+        load_profile(node.telemetry_header),
+    )
+
+
+def _capture(ground: Ground, codec: Codec, requests: dict[str, str]) -> dict[str, DecodedPacket]:
+    """Raw TO_LAB datagrams decoded in-process: one packet per message of ``requests``
+    (message name -> the command that makes cFS send it), asked for about once a second."""
+    found: dict[str, DecodedPacket] = {}
+    with ground.listener_paused(), socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.bind(("127.0.0.1", TO_LAB_PORT))
+        sock.settimeout(0.2)
+        deadline = time.monotonic() + 30
+        next_request = 0.0
+        while len(found) < len(requests) and time.monotonic() < deadline:
+            if time.monotonic() >= next_request:
+                for command in requests.values():
+                    ground.send(command)
+                next_request = time.monotonic() + 1.0
+            try:
+                data, _ = sock.recvfrom(4096)
+            except TimeoutError:
+                continue
+            packet = codec.decode(MessageKind.TELEMETRY, data)
+            if isinstance(packet, DecodedPacket) and packet.message.name in requests:
+                found[packet.message.name] = packet
+    assert found.keys() == requests.keys(), f"no packet of {requests.keys() - found.keys()}"
+    return found
+
+
+def _seconds(fields: dict[str, object], name: str) -> float:
+    """Seconds plus 2^-32 s subseconds of the ``<name>_Seconds`` / ``<name>_Subseconds`` pair."""
+    whole, sub = fields[f"{name}_Seconds"], fields[f"{name}_Subseconds"]
+    assert isinstance(whole, int) and isinstance(sub, int)
+    return whole + sub / SUBSEC
+
+
+def _htime_error_s(packet: DecodedPacket, cfe_utc_s: float) -> float:
+    """Decoded header time minus the UTC instant ``CFE_EPOCH + cfe_utc_s``, in seconds."""
+    htime_ns = packet.header.time_ns
+    assert htime_ns is not None, "the telemetry profile has no header time"
+    expected_ns = round((CFE_EPOCH.timestamp() + cfe_utc_s) * 1e9)
+    return (htime_ns - expected_ns) / 1e9
+
+
+def test_header_time_equals_the_cfe_time_in_the_time_packets(ground: Ground) -> None:
+    """The decoded ``htime`` of TIME HK and DIAG, with the shipped config, is the cFE time the
+    same packet reports in its payload: HK carries MET, STCF and the leap seconds (time =
+    MET + STCF, a TAI count since the epoch, UTC = time - leaps); DIAG carries cFE's own UTC.
+    A wrong epoch (the GPS 1980-01-06 or Unix 1970) or zero leap seconds is days or 37 s off."""
+    packets = _capture(
+        ground,
+        _fc_codec(),
+        {"TIME_HK": "TIME_SEND_HK", "TIME_DIAG": "TIME_SEND_DIAGNOSTIC"},
+    )
+
+    hk = packets["TIME_HK"].as_dict()
+    assert hk["LeapSeconds"] == 37  # CFE_MISSION_TIME_DEF_LEAPS, nothing in this suite changes it
+    leaps = hk["LeapSeconds"]
+    assert isinstance(leaps, int)
+    hk_utc_s = _seconds(hk, "MET") + _seconds(hk, "STCF") - leaps
+    assert abs(_htime_error_s(packets["TIME_HK"], hk_utc_s)) < HTIME_TOLERANCE_S
+
+    diag = packets["TIME_DIAG"].as_dict()
+    assert diag["AtToneLeapSeconds"] == 37
+    tai_s = _seconds(diag, "CurrentTAI")
+    assert abs(tai_s - 37 - _seconds(diag, "CurrentUTC")) < 1e-3  # cFE's own TAI -> UTC
+    assert abs(_htime_error_s(packets["TIME_DIAG"], _seconds(diag, "CurrentUTC"))) < (
+        HTIME_TOLERANCE_S
+    )
+
+
 def test_events_where_type_matches_min_type(ground: Ground, tmp_path: Path) -> None:
     """``--where 'event.type >= error'`` shows the same events as ``--min-type error``."""
 
@@ -906,6 +1016,84 @@ def test_a_live_session_records_to_a_clean_recording_with_the_periodic_housekeep
 # -- stage 2g: replay a recording of a live session -----------------------------------------
 
 REPLAY_NOOPS = 3
+RECORDED_TIMEOUT_S = 30.0
+NOOP_EVENT = 'event.app == "SAMPLE_APP" and event.id == 3'  # SAMPLE_APP's NOOP information event
+
+
+def _replayed(
+    ib: list[str], recording: Path, env: dict[str, str], where: str
+) -> list[dict[str, Any]]:
+    """The records ``ib replay --format json --where WHERE`` shows for ``recording``.
+
+    The recording may still be being written: replay then reads what the recorder has handed
+    to the disk so far (its flush interval is 250 ms) and says the file is still open."""
+    done = subprocess.run(
+        [*ib, "replay", str(recording), "--format", "json", "--where", where],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    return [json.loads(line) for line in done.stdout.splitlines()]
+
+
+def _await_recorded(
+    ground: Ground,
+    ib: list[str],
+    recording: Path,
+    env: dict[str, str],
+    where: str,
+    predicate: Callable[[list[dict[str, Any]]], bool],
+    *,
+    request: str,
+) -> None:
+    """Re-send ``request`` about once a second until the records of the live ``recording``
+    selected by ``where`` satisfy ``predicate``.
+
+    A recording session cannot watch ``ib listen`` (the recorder owns UDP 2234), so each step
+    of the session waits on what the recording itself holds rather than on a fixed sleep: under
+    load a requested packet can take longer than any sleep to arrive, and a recorder stopped
+    before it arrives leaves it out of the recording."""
+    deadline = time.monotonic() + RECORDED_TIMEOUT_S
+    next_request = 0.0
+    seen: list[dict[str, Any]] = []
+    while time.monotonic() < deadline:
+        if time.monotonic() >= next_request:
+            ground.send(request)
+            next_request = time.monotonic() + 1.0
+        seen = _replayed(ib, recording, env, where)
+        if predicate(seen):
+            return
+        time.sleep(0.2)
+    shown = [(r["name"], r["fields"]) for r in seen[-6:]]
+    raise AssertionError(
+        f"the recording never held the expected records for {where!r} within "
+        f"{RECORDED_TIMEOUT_S} s; last recorded: {shown}"
+    )
+
+
+def _zero_sample_app_counters(ground: Ground) -> None:
+    """Reset SAMPLE_APP's counters and see the zero on the running listener.
+
+    Earlier tests leave the counter non-zero, and SCH_LAB publishes SAMPLE_APP_HK on its own
+    every 5.4 s: one published between a recorder starting and a reset sent after it being
+    executed carries the old counter into the recording legitimately. SB delivers one MID's
+    packets in order, so once a zero-counter HK has arrived no older one is still in flight,
+    and every SAMPLE_APP_HK recorded afterwards counts from zero."""
+    ground.send("SAMPLE_APP_RESET_COUNTERS")
+    ground.wait_for(
+        "SAMPLE_APP_HK", lambda f: f["CommandCounter"] == 0, request="SAMPLE_APP_SEND_HK"
+    )
+
+
+def _runs(values: list[int]) -> list[int]:
+    """``values`` with consecutive repeats collapsed: ``[0, 0, 1, 2, 2, 0]`` -> ``[0, 1, 2, 0]``.
+
+    SCH_LAB's periodic housekeeping repeats whatever the counter holds at the time, so what a
+    command sequence fixes is the order of distinct values, not how often each is seen."""
+    return [v for i, v in enumerate(values) if i == 0 or values[i - 1] != v]
 
 
 def test_replaying_a_live_recording_selects_exactly_what_was_sent(
@@ -924,6 +1112,16 @@ def test_replaying_a_live_recording_selects_exactly_what_was_sent(
     env = {**ground.env, "IRONBIRD_CONFIG": str(config), "IRONBIRD_STATE_DIR": str(tmp_path / "s")}
     ib = [sys.executable, "-m", "ironbird.cli.main"]
     err_path = tmp_path / "record.stderr"
+
+    def all_sent_is_recorded(records: list[dict[str, Any]]) -> bool:
+        # The K-th NOOP event, then an HK counting it (SAMPLE_APP answers in pipe order).
+        events = [i for i, r in enumerate(records) if r["category"] == "event"]
+        return len(events) >= REPLAY_NOOPS and any(
+            r["name"] == "SAMPLE_APP_HK" and r["fields"]["CommandCounter"] == REPLAY_NOOPS
+            for r in records[events[-1] :]
+        )
+
+    _zero_sample_app_counters(ground)  # no recorded HK can count NOOPs from before the reset
     with ground.listener_paused(), err_path.open("w") as err:  # one process owns UDP 2234
         recorder = subprocess.Popen([*ib, "record", "-o", str(out), "--quiet"], stderr=err, env=env)
         try:
@@ -935,9 +1133,15 @@ def test_replaying_a_live_recording_selects_exactly_what_was_sent(
             ground.send("SAMPLE_APP_RESET_COUNTERS")
             for _ in range(REPLAY_NOOPS):
                 ground.send("SAMPLE_APP_NOOP")
-                time.sleep(0.5)
-            ground.send("SAMPLE_APP_SEND_HK")
-            time.sleep(2.0)
+            _await_recorded(
+                ground,
+                ib,
+                out,
+                env,
+                f"msg == SAMPLE_APP_HK or ({NOOP_EVENT})",
+                all_sent_is_recorded,
+                request="SAMPLE_APP_SEND_HK",
+            )
         finally:
             recorder.send_signal(signal.SIGINT)
             code = recorder.wait(timeout=20)
@@ -953,7 +1157,7 @@ def test_replaying_a_live_recording_selects_exactly_what_was_sent(
             timeout=60,
         )
 
-    events = replay("--format", "json", "--where", 'event.app == "SAMPLE_APP" and event.id == 3')
+    events = replay("--format", "json", "--where", NOOP_EVENT)
     assert events.returncode == 0, events.stderr
     event_records = [json.loads(line) for line in events.stdout.splitlines()]
     assert len(event_records) == REPLAY_NOOPS, events.stdout
@@ -965,6 +1169,7 @@ def test_replaying_a_live_recording_selects_exactly_what_was_sent(
         json.loads(line)["fields"]["CommandCounter"] for line in housekeeping.stdout.splitlines()
     ]
     assert counters and counters[-1] == REPLAY_NOOPS, counters
+    assert counters == sorted(counters), counters  # counted up from the reset, never back
 
     everything = replay("--format", "hex")
     info = subprocess.run(
@@ -978,3 +1183,91 @@ def test_replaying_a_live_recording_selects_exactly_what_was_sent(
     assert len(everything.stdout.splitlines()) == json.loads(info.stdout)["frames"] > 0
     undecoded = replay("--where", "status != ok")  # what a live listen would have hidden
     assert undecoded.returncode == 0, undecoded.stderr
+
+
+# -- stage 2h: export a recording of a live session -----------------------------------------
+
+EXPORT_NOOPS = 3
+
+
+def test_exporting_a_live_recording_counts_the_noops_and_matches_rec_info(
+    ground: Ground, tmp_path: Path
+) -> None:
+    """Record a session in which SAMPLE_APP is reset, sent K NOOPs (each followed by a housekeeping
+    request) and reset again, then export it to CSV: in ``SAMPLE_APP_HK.csv`` the CommandCounter
+    rises by exactly K across the NOOPs and is back to 0 after the second reset, and the table has
+    as many rows as ``ib rec info`` counts for the MID."""
+    import csv
+
+    config = tmp_path / "ironbird.toml"
+    examples = REPO / "examples"
+    text = CONFIG.read_text().replace('"ccdd/', f'"{examples}/ccdd/')
+    text = text.replace('"headers/', f'"{examples}/headers/')
+    config.write_text(text + "\n[recording]\nmin_free_bytes = 0\n")
+    out = tmp_path / "export-live.ibrec"
+    env = {**ground.env, "IRONBIRD_CONFIG": str(config), "IRONBIRD_STATE_DIR": str(tmp_path / "s")}
+    ib = [sys.executable, "-m", "ironbird.cli.main"]
+    err_path = tmp_path / "record.stderr"
+    expected = [*range(EXPORT_NOOPS + 1), 0]  # the distinct counter values, in order
+
+    def recorded(*values: int) -> None:
+        """Request housekeeping until the recording's SAMPLE_APP_HK counters are ``values``."""
+        _await_recorded(
+            ground,
+            ib,
+            out,
+            env,
+            "msg == SAMPLE_APP_HK",
+            lambda hk: _runs([r["fields"]["CommandCounter"] for r in hk]) == list(values),
+            request="SAMPLE_APP_SEND_HK",
+        )
+
+    _zero_sample_app_counters(ground)  # no recorded HK can count NOOPs from before the reset
+    with ground.listener_paused(), err_path.open("w") as err:  # one process owns UDP 2234
+        recorder = subprocess.Popen([*ib, "record", "-o", str(out), "--quiet"], stderr=err, env=env)
+        try:
+            deadline = time.monotonic() + 15
+            while "listening" not in err_path.read_text():
+                assert recorder.poll() is None, err_path.read_text()
+                assert time.monotonic() < deadline, "ib record never reported it was listening"
+                time.sleep(0.05)
+            ground.send("SAMPLE_APP_RESET_COUNTERS")
+            recorded(*expected[:1])
+            for n in range(1, EXPORT_NOOPS + 1):
+                ground.send("SAMPLE_APP_NOOP")
+                recorded(*expected[: n + 1])  # this NOOP counted before the next is sent
+            ground.send("SAMPLE_APP_RESET_COUNTERS")
+            recorded(*expected)  # the zero after the reset is in before the recorder stops
+        finally:
+            recorder.send_signal(signal.SIGINT)
+            code = recorder.wait(timeout=20)
+    assert code == 128 + signal.SIGINT, err_path.read_text()
+
+    tables = tmp_path / "tables"
+    done = subprocess.run(
+        [*ib, "export", str(out), "-o", str(tables)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    with (tables / "SAMPLE_APP_HK.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    counters = [int(r["CommandCounter"]) for r in rows]
+    # 0, up by one per NOOP to K, back to 0: nothing skipped, repeated out of order or left over
+    assert _runs(counters) == expected, counters
+    info = subprocess.run(
+        [*ib, "rec", "info", str(out), "--format", "json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert info.returncode == 0, info.stderr
+    by_mid = {m["mid"]: m["count"] for m in json.loads(info.stdout)["mids"]}
+    assert len(rows) == by_mid[int(rows[0]["mid"], 16)] > 0
+    # every decoded frame of the recording is in exactly one table
+    total = sum(sum(1 for _ in csv.reader(p.open(newline=""))) - 1 for p in tables.iterdir())
+    assert total == json.loads(info.stdout)["frames"]

@@ -1,0 +1,14 @@
+# A MID field must be in the header.
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid", "tag"]
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+
+[[trailer.fields]]
+name = "tag"
+bits = 8
+value = 1

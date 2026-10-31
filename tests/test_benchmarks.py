@@ -25,6 +25,7 @@ import yaml
 from conftest import EXAMPLES, REPO
 from filter_defs import make_frame
 from ironbird import render
+from ironbird.ccdd.json_adapter import parse_model
 from ironbird.ccdd.loader import load_ccdd
 from ironbird.ccdd.model import MessageKind
 from ironbird.coalesce import Coalescer
@@ -115,6 +116,112 @@ def test_check_valid_frame_rate(benchmark: Any, mock_codec: Codec) -> None:
 def test_check_rejects_garbage_cheaply(benchmark: Any, mock_codec: Codec) -> None:
     assert benchmark(mock_codec.check, MessageKind.TELEMETRY, b"\xff" * 200) is not None
     _check_ceiling(benchmark, DECODE_CEILING_S)
+
+
+@pytest.fixture
+def v2_codec() -> Codec:
+    """The mock CCDD on the cFE MsgId V2 header: the MID is read from three places in the
+    header (``examples/headers/cfe_msgid_v2_*.toml``)."""
+    doc = json.loads((EXAMPLES / "ccdd" / "mock.json").read_text())
+    for message in doc["messages"]:
+        if message["kind"] == "command":
+            message["mid"] = 0x2A90
+        else:
+            message["mid"] = 0x2A10 + (int(message["mid"], 0) & 0xF)
+    return Codec(
+        parse_model(doc, "mock-msgid-v2.json"),
+        load_profile(EXAMPLES / "headers" / "cfe_msgid_v2_cmd.toml"),
+        load_profile(EXAMPLES / "headers" / "cfe_msgid_v2_tlm.toml"),
+        clock=lambda: 1_700_000_000.0,
+    )
+
+
+@pytest.fixture
+def pec_codec() -> Codec:
+    """A telemetry message on a header with a CRC-16 trailer (packet error control)."""
+    model = parse_model(
+        {
+            "schema": "ironbird-ccdd/0",
+            "target": "pec",
+            "messages": [
+                {
+                    "name": "PEC_HK",
+                    "kind": "telemetry",
+                    "mid": 0x0123,
+                    "category": "housekeeping",
+                    "fields": [
+                        {"name": "counter", "type": "uint32"},
+                        {"name": "volts", "type": "float32"},
+                        {"name": "label", "type": "char[16]"},
+                    ],
+                }
+            ],
+        },
+        "pec.json",
+    )
+    return Codec(
+        model,
+        load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_cmd.toml"),
+        load_profile(EXAMPLES / "headers" / "ccsds_pec_tlm.toml"),
+    )
+
+
+def test_decode_msgid_v2_telemetry_rate(benchmark: Any, v2_codec: Codec) -> None:
+    wire = v2_codec.encode_telemetry("MOCK_HK").data
+    result = benchmark(v2_codec.decode, MessageKind.TELEMETRY, wire)
+    assert isinstance(result, DecodedPacket) and result.header.mid == 0x2A10
+    _check_ceiling(benchmark, DECODE_CEILING_S)
+
+
+def test_decode_msgid_v2_command_with_checksum_rate(benchmark: Any, v2_codec: Codec) -> None:
+    wire = v2_codec.encode_command("MOCK_SET_LABEL", {"label": "abc"}).data
+    result = benchmark(v2_codec.decode, MessageKind.COMMAND, wire)
+    assert isinstance(result, DecodedPacket) and result.header.mid == 0x2A90
+    _check_ceiling(benchmark, DECODE_CEILING_S)
+
+
+def test_check_msgid_v2_frame_rate(benchmark: Any, v2_codec: Codec) -> None:
+    wire = v2_codec.encode_telemetry("MOCK_HK").data
+    assert benchmark(v2_codec.check, MessageKind.TELEMETRY, wire) is None
+    _check_ceiling(benchmark, DECODE_CEILING_S)
+
+
+def test_peek_msgid_v2_mid_rate(benchmark: Any, v2_codec: Codec) -> None:
+    wire = v2_codec.encode_telemetry("MOCK_HK").data
+    assert benchmark(v2_codec.peek_mid, MessageKind.TELEMETRY, wire) == 0x2A10
+    _check_ceiling(benchmark, 5e-6)
+
+
+def test_check_and_decode_with_a_crc_trailer_rate(benchmark: Any, pec_codec: Codec) -> None:
+    wire = pec_codec.encode_telemetry("PEC_HK", {"counter": 7, "label": "x"}).data
+    assert pec_codec.check(MessageKind.TELEMETRY, wire) is None
+    result = benchmark(pec_codec.decode, MessageKind.TELEMETRY, wire)
+    assert isinstance(result, DecodedPacket) and result.values[0] == 7
+    _check_ceiling(benchmark, DECODE_CEILING_S)
+
+
+def _per_call(function: Any, *args: Any, calls: int = 20_000) -> float:
+    best = float("inf")
+    for _ in range(5):
+        start = time.perf_counter()
+        for _ in range(calls):
+            function(*args)
+        best = min(best, (time.perf_counter() - start) / calls)
+    return best
+
+
+@needs_a_quiet_host
+def test_the_new_header_features_cost_little_over_the_plain_header(
+    mock_codec: Codec, v2_codec: Codec, pec_codec: Codec
+) -> None:
+    """Relative guards (any host): a three-window MID, and a CRC trailer, check a frame at no
+    more than 2.5x the cost of the plain 16-bit MID with no trailer."""
+    tlm = MessageKind.TELEMETRY
+    plain = _per_call(mock_codec.check, tlm, mock_codec.encode_telemetry("MOCK_HK").data)
+    v2 = _per_call(v2_codec.check, tlm, v2_codec.encode_telemetry("MOCK_HK").data)
+    pec = _per_call(pec_codec.check, tlm, pec_codec.encode_telemetry("PEC_HK").data)
+    assert v2 < 2.5 * plain, f"msgid v2 {v2 * 1e6:.2f} us vs plain {plain * 1e6:.2f} us"
+    assert pec < 2.5 * plain, f"crc trailer {pec * 1e6:.2f} us vs plain {plain * 1e6:.2f} us"
 
 
 def test_ingest_only_per_frame_cost(benchmark: Any, tmp_path: Path) -> None:
@@ -856,6 +963,71 @@ def test_replay_cli_writes_every_line_at_the_target_rate(replay_file: Path, tmp_
     print(f"\nib replay: {lines:,} lines in {took:.2f} s, {lines / took:,.0f} lines/s")
     assert done.returncode == 0, done.stderr
     assert lines == REPLAY_FRAMES and lines / took >= TARGET_PPS
+
+
+# -- export --
+
+EXPORT_OVERHEAD_RATIO = 2.5  # export (decode + format + write) vs. the bare reader + decode
+
+
+@needs_a_quiet_host
+def test_export_writes_every_row_at_the_target_rate_in_every_format(
+    replay_file: Path, tmp_path: Path
+) -> None:
+    """Reading, decoding, formatting and writing a file: CSV tables, text lines and JSON records,
+    each to a real temporary file that is committed at the end."""
+    from exportutil import export_in_process
+    from ironbird.recording.export import ExportFormat
+    from ironbird.recording.reader import RecordingReader
+    from replayutil import mock_codec
+
+    codec = mock_codec()
+    start = time.perf_counter()
+    with RecordingReader(replay_file) as reader:
+        for item in reader.frames():
+            assert not isinstance(codec.decode(item.stream.kind, item.data), DecodeErrorType)
+    bare = time.perf_counter() - start
+    rates = {}
+    for fmt_ in ExportFormat:
+        out = tmp_path / f"out-{fmt_.value}"
+        start = time.perf_counter()
+        result, _ = export_in_process(replay_file, out, fmt_)
+        took = time.perf_counter() - start
+        assert result.rows == REPLAY_FRAMES
+        rates[fmt_.value] = REPLAY_FRAMES / took
+        if fmt_ is ExportFormat.CSV:
+            assert took <= bare * EXPORT_OVERHEAD_RATIO
+    print(
+        f"\nexport {rates['csv']:,.0f} rows/s as CSV tables, {rates['text']:,.0f} as text, "
+        f"{rates['jsonl']:,.0f} as JSON Lines; the bare read + decode is "
+        f"{REPLAY_FRAMES / bare:,.0f} frames/s"
+    )
+    assert min(rates.values()) >= TARGET_PPS * 1.5  # the design target leaves most of a core free
+
+
+@needs_a_quiet_host
+def test_export_cli_writes_a_csv_directory_at_the_target_rate(
+    replay_file: Path, tmp_path: Path
+) -> None:
+    """The whole command: start-up, definitions, read, decode, CSV, sync and commit."""
+    from recutil import CLI_MAIN
+    from replayutil import child_env
+
+    out = tmp_path / "tables"
+    start = time.perf_counter()
+    done = subprocess.run(
+        [sys.executable, "-c", CLI_MAIN, "export", str(replay_file), "-o", str(out)],
+        capture_output=True,
+        text=True,
+        env=child_env(tmp_path),
+        check=False,
+        timeout=300,
+    )
+    took = time.perf_counter() - start
+    rows = sum(p.read_bytes().count(b"\n") - 1 for p in out.iterdir())
+    print(f"\nib export: {rows:,} rows in {took:.2f} s, {rows / took:,.0f} rows/s")
+    assert done.returncode == 0, done.stderr
+    assert rows == REPLAY_FRAMES and rows / took >= TARGET_PPS
 
 
 # -- the serial run that enforces the guards above --

@@ -6,6 +6,7 @@ import dataclasses
 import json
 import os
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from ironbird.coalesce import MAX_NEW_PER_GROUP, Coalescer
 from ironbird.codec import Codec, DecodedPacket
 from ironbird.errors import Code, IronbirdError
 from ironbird.ledger import Ledger, default_state_dir, format_ts
+from ironbird.ledgerstore import LedgerStore, Line
 from ironbird.notice import Level, Notice
 from ironbird.sanitize import clean
 from ledgerutil import records
@@ -190,14 +192,34 @@ def test_ledger_write_failure_is_reported_once(tmp_path: Path) -> None:
     assert len(seen) == 1 and seen[0].code is Code.LED_DIR  # a configuration failure
 
 
-def test_ledger_idle_drain_task_writes_without_explicit_flush(tmp_path: Path) -> None:
+def _slow_ledger_writes(monkeypatch: pytest.MonkeyPatch, delay_s: float) -> None:
+    """Make every write job of the ledger's writer thread take ``delay_s`` longer, as on a
+    loaded host, where the writer runs well behind the records handed to it."""
+    real_write = LedgerStore.write
+
+    def slow_write(self: LedgerStore, lines: list[Line], *, force: bool = False) -> None:
+        time.sleep(delay_s)
+        real_write(self, lines, force=force)
+
+    monkeypatch.setattr(LedgerStore, "write", slow_write)
+
+
+@pytest.mark.parametrize("write_delay_s", [0.0, 0.2])
+def test_ledger_idle_drain_task_writes_without_explicit_flush(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_delay_s: float
+) -> None:
+    _slow_ledger_writes(monkeypatch, write_delay_s)
+
     async def scenario() -> None:
         ledger = Ledger(tmp_path, session_id="s")
         task = asyncio.create_task(ledger.drain_task())
         ledger.record("action", "hello")
-        for _ in range(100):
+        # The record reaches the file through the drain task and then the writer thread, both
+        # of which a loaded host may run late: wait for the record itself, generously.
+        give_up = time.monotonic() + 60.0
+        while time.monotonic() < give_up:
             await asyncio.sleep(0.02)
-            if ledger.path.exists() and ledger.path.read_text():
+            if ledger.path.exists() and "hello" in ledger.path.read_text():
                 break
         task.cancel()
         assert "hello" in ledger.path.read_text()
@@ -303,25 +325,34 @@ def test_ledger_unformattable_record_falls_back_to_repr(tmp_path: Path) -> None:
     assert [r["event"] for r in records] == ["hostile", "after"]
 
 
-def test_record_error_flushes_in_bounded_slices_and_drain_task_finishes(tmp_path: Path) -> None:
-    ledger = Ledger(tmp_path, session_id="s")
+@pytest.mark.parametrize("write_delay_s", [0.0, 0.05])
+def test_record_error_flushes_in_bounded_slices_and_drain_task_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_delay_s: float
+) -> None:
+    """The drain task hands the whole queue to the writer thread on its own; the file holds
+    every record once the writer has caught up."""
+    _slow_ledger_writes(monkeypatch, write_delay_s)
+    # Generous bounds: both waits below end as soon as their condition holds.
+    ledger = Ledger(tmp_path, session_id="s", join_timeout_s=60.0)
     for i in range(5000):
         ledger.record("packet", "rx", i=i)
     ledger.record_error(IronbirdError(Code.DEC_CHECKSUM, "bad"))
-    assert 0 < ledger.pending < 5001  # one bounded slice written, the rest left to the loop
+    assert 0 < ledger.pending < 5001  # one bounded slice handed over, the rest left to the loop
 
     async def finish() -> None:
         task = asyncio.get_running_loop().create_task(ledger.drain_task())
-        for _ in range(500):
-            if not ledger.pending:
-                break
+        give_up = time.monotonic() + 60.0
+        while ledger.pending and time.monotonic() < give_up:
             await asyncio.sleep(0.01)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
     asyncio.run(finish())
-    assert ledger.pending == 0
+    assert ledger.pending == 0  # the drain task, not the flush below, emptied the queue
+    # Handed over is not yet written: wait for the writer thread (with the queue empty, this
+    # flush hands over nothing of its own).
+    ledger.flush()
     lines = ledger.path.read_text().splitlines()
     assert len(lines) == 5002 and json.loads(lines[-1])["event"] == "IB-DEC-005"  # + ledger.open
 

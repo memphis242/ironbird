@@ -1,0 +1,16 @@
+# The span starts in the middle of its own 16-bit checksum field (byte 3 of 2..4).
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+
+[[fields]]
+name = "ck"
+bits = 16
+computed = "checksum"
+algorithm = "crc16_ccitt"
+span = { start = 3, end = 0 }

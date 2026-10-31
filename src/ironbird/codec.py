@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Final, NamedTuple
+from typing import Final, NamedTuple, cast
 
 from ironbird import header as hdr
 from ironbird.ccdd.model import (
@@ -308,7 +308,7 @@ class Codec:
             raise IronbirdError(
                 Code.ENC_FIT, f"{where}: MID 0x{msg.mid:04X} {split}", details=profile.source
             )
-        total = profile.size_bytes + msg.payload_size
+        total = profile.min_bytes + msg.payload_size
         if total > self.max_packet_bytes:
             raise IronbirdError(
                 Code.ENC_FIT,
@@ -322,6 +322,15 @@ class Codec:
                 f"{lf.name} field of profile {profile.name}",
                 details=profile.source,
             )
+        cf = profile.checksum_field
+        if cf is not None:
+            plan = hdr.checksum_plan(profile, cf, total)
+            if isinstance(plan, str):
+                raise IronbirdError(
+                    Code.ENC_FIT,
+                    f"{where}: {plan} (profile {profile.name})",
+                    details=profile.source,
+                )
         if msg.kind is MessageKind.COMMAND:
             assert profile.function_code_field is not None and msg.function_code is not None
             fc_field = profile.by_name[profile.function_code_field]
@@ -330,6 +339,49 @@ class Codec:
                     Code.ENC_FIT,
                     f"{where}: function code {msg.function_code} does not fit "
                     f"{fc_field.bits}-bit field {fc_field.name}",
+                )
+        try:
+            self._check_header_values(profile, msg.header, "header")
+        except IronbirdError as exc:
+            raise IronbirdError(
+                Code.ENC_FIT, f"{where}: {exc.summary}", details=profile.source, cause=exc
+            ) from exc
+
+    @staticmethod
+    def _check_header_values(profile: HeaderProfile, header_values: object, what: str) -> None:
+        """Every name in ``values`` is a header field the caller may set and its value fits.
+        The argument comes from a public API, so its shape is checked too."""
+        if not isinstance(header_values, Mapping):
+            raise IronbirdError(
+                Code.HDR_PACK,
+                f"{what} must be a mapping of field name to value, "
+                f"not a {type(header_values).__name__}",
+            )
+        values = cast("Mapping[object, object]", header_values)
+        settable = [f.name for f in profile.input_fields if f.name != profile.function_code_field]
+        for name, value in values.items():
+            if type(name) is not str:
+                raise IronbirdError(
+                    Code.HDR_PACK,
+                    f"{what} field names must be strings, not {type(name).__name__}",
+                )
+            f = profile.by_name.get(name)
+            if name == profile.function_code_field:
+                raise IronbirdError(
+                    Code.HDR_PACK,
+                    f"{what} {name[:40]!r}: the function code comes from the command definition",
+                )
+            if f is None or f.kind is not hdr.FieldKind.INPUT:
+                available = ", ".join(settable) if settable else "none"
+                raise IronbirdError(
+                    Code.HDR_PACK,
+                    f"{what} {name[:40]!r} is not an input field of profile {profile.name} "
+                    f"(settable: {available})",
+                )
+            if type(value) is not int or not 0 <= value <= f.mask:
+                raise IronbirdError(
+                    Code.HDR_PACK,
+                    f"{what} {name}={str(value)[:40]} does not fit {f.bits} bits (max {f.mask})",
                 )
 
     def reset_sequences(self) -> None:
@@ -387,14 +439,20 @@ class Codec:
         payload: bytes,
         inputs: Mapping[str, int],
         tamper: Mapping[str, int] | None,
+        header: Mapping[str, int] | None,
     ) -> EncodedPacket:
         profile = self._profiles[msg.kind]
+        values: dict[str, int] = {**msg.header}
+        if header:
+            self._check_header_values(profile, header, "header")
+            values.update(header)
+        values.update(inputs)
         sequence = self._next_sequence(msg.mid)
         data = hdr.pack(
             profile,
             payload,
             mid=msg.mid,
-            inputs=inputs,
+            inputs=values,
             sequence=sequence,
             now=self._clock(),
             tamper=tamper,
@@ -410,12 +468,18 @@ class Codec:
         args: Mapping[str, object] | None = None,
         *,
         tamper: Mapping[str, int] | None = None,
+        header: Mapping[str, int] | None = None,
     ) -> EncodedPacket:
+        """Encode a command. ``header`` sets input fields of the command header profile for this
+        packet; it wins over the message's own ``header`` values, which win over the profile's
+        defaults."""
         msg = self._lookup(name, MessageKind.COMMAND)
         payload = self._encode_payload(msg, args or {}, strict=True)
         profile = self._profiles[MessageKind.COMMAND]
         assert profile.function_code_field is not None and msg.function_code is not None
-        return self._frame(msg, payload, {profile.function_code_field: msg.function_code}, tamper)
+        return self._frame(
+            msg, payload, {profile.function_code_field: msg.function_code}, tamper, header
+        )
 
     def encode_telemetry(
         self,
@@ -423,11 +487,13 @@ class Codec:
         values: Mapping[str, object] | None = None,
         *,
         tamper: Mapping[str, int] | None = None,
+        header: Mapping[str, int] | None = None,
     ) -> EncodedPacket:
-        """Encode telemetry; fields not given are zero-filled."""
+        """Encode telemetry; fields not given are zero-filled. ``header`` is as for
+        :meth:`encode_command`."""
         msg = self._lookup(name, MessageKind.TELEMETRY)
         payload = self._encode_payload(msg, values or {}, strict=False)
-        return self._frame(msg, payload, {}, tamper)
+        return self._frame(msg, payload, {}, tamper, header)
 
     # -- check and decode (the boundary) -------------------------------------------
 
@@ -473,7 +539,7 @@ class Codec:
         if kind is MessageKind.COMMAND:
             assert profile.function_code_field is not None
             fc_field = profile.by_name[profile.function_code_field]
-            fc = (word >> fc_field.shift) & fc_field.mask
+            fc = hdr.read_field(fc_field, word)
             msg = self.model.commands_by_key.get((mid, fc))
             if msg is None:
                 return DecodeError(
@@ -485,12 +551,12 @@ class Codec:
         else:
             msg = self.model.telemetry_by_mid.get(mid)
             assert msg is not None  # the MID was found in the CCDD above
-        expected = profile.size_bytes + msg.payload_size
+        expected = profile.min_bytes + msg.payload_size
         if size != expected:
             return DecodeError(
                 Code.DEC_PAYLOAD,
                 profile.size_bytes,
-                f"{msg.name} payload is {size - profile.size_bytes} bytes, "
+                f"{msg.name} payload is {size - profile.min_bytes} bytes, "
                 f"CCDD says {msg.payload_size}",
                 mid,
             )
@@ -542,7 +608,8 @@ class Codec:
         msg, word = resolved.message, resolved.word
         size = len(data)
         profile = self._profiles[kind]
-        parsed = hdr.parse_word(profile, word, msg.mid)
+        trailer = hdr.trailer_word(profile, data) if profile.trailer_size else 0
+        parsed = hdr.parse_word(profile, word, msg.mid, trailer)
         layout = self._layouts[msg.name]
         base = parsed.size
         try:

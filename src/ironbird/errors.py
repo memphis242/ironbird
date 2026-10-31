@@ -89,6 +89,9 @@ class Code(StrEnum):
     REC_DEFS = "IB-REC-009"  # embedded definitions differ from the config, or cannot be loaded
     REC_SPACE = "IB-REC-010"  # low disk space for the recording
     REC_DIRSYNC = "IB-REC-011"  # the recording's directory cannot be synced (name not durable)
+    # Export
+    EXP_WRITE = "IB-EXP-001"  # the export output could not be written
+    EXP_EXISTS = "IB-EXP-002"  # the export output exists, is the input, or is a managed file
     # Engine
     ENG_LAG = "IB-ENG-001"  # a consumer fell behind: frames not shown to it (sinks still saw them)
     # System resources

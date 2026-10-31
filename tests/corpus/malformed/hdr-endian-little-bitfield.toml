@@ -1,0 +1,15 @@
+# Little-endian is ambiguous on a bitfield (12 bits).
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+[[fields]]
+name = "mid"
+bits = 12
+computed = "from_mid"
+endian = "little"
+
+[[fields]]
+name = "pad"
+bits = 4
+value = 0

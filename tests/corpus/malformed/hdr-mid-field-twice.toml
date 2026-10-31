@@ -1,0 +1,9 @@
+# A field listed twice in mid_fields: its window would overlap itself.
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid", "mid"]
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"

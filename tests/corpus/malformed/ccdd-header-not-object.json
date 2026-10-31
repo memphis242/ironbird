@@ -1,0 +1,19 @@
+{
+ "schema": "ironbird-ccdd/0",
+ "target": "t",
+ "messages": [
+  {
+   "name": "T",
+   "kind": "telemetry",
+   "mid": "0x0801",
+   "category": "status",
+   "header": [
+    [
+     "priority",
+     1
+    ]
+   ],
+   "fields": []
+  }
+ ]
+}

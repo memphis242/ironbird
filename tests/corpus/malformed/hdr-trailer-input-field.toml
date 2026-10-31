@@ -1,0 +1,13 @@
+# A trailer field is fixed or a checksum; nothing supplies an input there.
+name = "p"
+kind = "telemetry"
+mid_fields = ["mid"]
+
+[[fields]]
+name = "mid"
+bits = 16
+computed = "from_mid"
+
+[[trailer.fields]]
+name = "tag"
+bits = 8
