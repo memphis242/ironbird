@@ -27,6 +27,7 @@ import ironbird
 from ironbird.config import RecordingConfig
 from ironbird.errors import Code, IronbirdError
 from ironbird.frame import Frame, GapReason, Stream
+from ironbird.fsops import read_capped
 from ironbird.recording import format as fmt
 from ironbird.recording.format import BlobKind, MarkKind
 from ironbird.recording.writer import (
@@ -136,8 +137,7 @@ def resolve_path(
 
 def _read_definition(path: Path, limit: int, what: str) -> bytes:
     try:
-        with path.open("rb") as handle:
-            raw = handle.read(limit + 1)
+        raw = read_capped(path, limit)
     except OSError as exc:
         raise IronbirdError(
             Code.REC_CREATE,

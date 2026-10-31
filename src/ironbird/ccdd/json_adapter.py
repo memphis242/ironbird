@@ -39,6 +39,7 @@ from ironbird.ccdd.model import (
     parse_type,
 )
 from ironbird.errors import Code, IronbirdError
+from ironbird.fsops import read_capped
 
 SCHEMA_ID: Final = "ironbird-ccdd/1"  # the schema new files are written in
 SCHEMA_IDS: Final = ("ironbird-ccdd/0", SCHEMA_ID)  # every schema that loads
@@ -594,8 +595,7 @@ class JsonAdapter:
 
     def load(self, path: Path) -> CcddModel:
         try:
-            with path.open("rb") as handle:
-                raw = handle.read(MAX_FILE_BYTES + 1)
+            raw = read_capped(path, MAX_FILE_BYTES)
         except OSError as exc:
             raise IronbirdError(
                 Code.CCD_FILE, f"{path}: cannot read CCDD file ({exc.strerror or exc})", cause=exc

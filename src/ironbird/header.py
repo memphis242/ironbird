@@ -31,6 +31,7 @@ from typing import Any, Final, Literal
 
 from ironbird import checksum
 from ironbird.errors import Code, DecodeError, IronbirdError
+from ironbird.fsops import read_capped
 
 DEFAULT_MAX_PACKET_BYTES: Final = 2048
 MAX_PACKET_BYTES: Final = 65535  # the CCSDS 16-bit length field bounds any packet
@@ -779,8 +780,7 @@ def parse_profile(data: Mapping[str, Any], source: str = "<memory>") -> HeaderPr
 def load_profile(path: Path) -> HeaderProfile:
     """Read, parse and validate a header profile TOML file."""
     try:
-        with path.open("rb") as handle:
-            raw = handle.read(MAX_PROFILE_FILE_BYTES + 1)
+        raw = read_capped(path, MAX_PROFILE_FILE_BYTES)
     except OSError as exc:
         raise IronbirdError(
             Code.HDR_FILE, f"{path}: cannot read header profile ({exc.strerror or exc})", cause=exc

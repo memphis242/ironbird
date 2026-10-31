@@ -34,6 +34,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Final
 
+from ironbird import sigmask
 from ironbird.errors import Code, IronbirdError
 from ironbird.filter.diag import FilterError
 from ironbird.filter.lexer import parse_time
@@ -154,7 +155,7 @@ class Pacer:
         speed: float,
         *,
         clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], None] = sigmask.sleep,
         slice_s: float = POLL_S,
     ) -> None:
         assert speed >= 0
@@ -207,7 +208,7 @@ class Follower:
         *,
         stop: Callable[[], bool] = lambda: False,
         clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], None] = sigmask.sleep,
         poll_s: float = POLL_S,
     ) -> None:
         self._idle_s = idle_s
@@ -564,7 +565,7 @@ class Replay:
                     or self._stop()
                 ):
                     raise
-                time.sleep(POLL_S)
+                sigmask.sleep(POLL_S)  # a signal is acted on here (not a failure)
         self.parts.append(path)
 
     def _part(

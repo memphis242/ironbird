@@ -17,9 +17,12 @@ import ctypes
 import errno
 import fcntl
 import os
+import stat
 import sys
 from pathlib import Path
 from typing import Final
+
+from ironbird.sigmask import wait_readable
 
 OPEN_DIR_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
 # What a file we only inspect is opened with: a FIFO or device with a matching name must not
@@ -49,6 +52,36 @@ def _libc() -> ctypes.CDLL | None:
 
 
 _LIBC: Final = _libc()
+_READ_CHUNK: Final = 1 << 20
+
+
+def read_capped(path: Path, limit: int) -> bytes:
+    """The first ``limit + 1`` bytes of the file ``path`` (fewer at its end), as
+    ``open(path, "rb").read(limit + 1)`` gives them: the byte past ``limit`` tells a file that
+    is too large. Anything but a regular file (a FIFO, a terminal) is read only once it has data
+    or its writer hung up, a wait that a shutdown signal ends (see
+    :func:`~ironbird.sigmask.wait_readable`): a FIFO without a writer named here waits for one
+    and cannot hold the command. Raises ``OSError``."""
+    assert limit >= 0
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
+    try:
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+        parts: list[bytes] = []
+        left = limit + 1
+        while left > 0:
+            if not regular:
+                wait_readable(fd)
+            try:
+                chunk = os.read(fd, min(left, _READ_CHUNK))
+            except BlockingIOError:  # a writer that has not written yet
+                continue
+            if not chunk:
+                break
+            parts.append(chunk)
+            left -= len(chunk)
+        return b"".join(parts)
+    finally:
+        os.close(fd)
 
 
 class FileSystem:

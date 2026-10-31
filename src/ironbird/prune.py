@@ -30,6 +30,7 @@ from ironbird.retention import (
     describe_reasons,
     protected_bytes_by_reason,
 )
+from ironbird.sigmask import checkpoint
 from ironbird.units import format_duration, format_size
 
 LIST_HEADER: Final = "START (UTC)        SESSION       PARTS  SIZE       AGE     REASON"
@@ -172,6 +173,7 @@ def execute_plan(
         return outcome
     try:
         for cand in plan.candidates:
+            checkpoint()  # a shutdown signal ends the prune between two sessions
             _delete_session(fs, dir_fd, cand.session, outcome, record)
     finally:
         close_quietly(fs, dir_fd)

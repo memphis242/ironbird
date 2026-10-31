@@ -11,19 +11,21 @@ the name still denotes the descriptor this process holds open.
 
 A commit has two phases. :meth:`TempOutput.prepare` (and :meth:`TempDirOutput.prepare`) syncs
 the data, the members and the temporary directory; it changes no name, so a signal there simply
-aborts and the cleanup removes the temporary. :meth:`~TempOutput.publish` gives the final name:
+aborts and the cleanup removes the temporary. :meth:`~TempOutput.publish` is the commit point: a
+signal owed by then is acted on as it begins (:func:`~ironbird.sigmask.checkpoint`, or
+:meth:`~ironbird.sigmask.Hold.begin`), so nothing is published. It then gives the final name:
 the rename (renameat2, link and unlink, or placeholder and rename), the directory sync and the
-note that it happened (``committed``), with the termination signals held
-(:func:`~ironbird.sigmask.signals_held`), so a signal is acted on only once the output is
-durable and known to be committed. A caller that must also finish its own record of the output
-before a signal acts passes a :class:`~ironbird.sigmask.Hold`, which ``publish`` begins right
-before the rename and the caller ends.
+note that it happened (``committed``), in a held scope (:func:`~ironbird.sigmask.signals_held`),
+so a signal that arrives meanwhile is acted on only once the output is durable and known to be
+committed. A caller that must also finish its own record of the output before a signal acts
+passes a :class:`~ironbird.sigmask.Hold`, which ``publish`` begins right before the rename and
+the caller ends.
 
-A signal handler that raises (the CLI's, outside an event loop) cannot split any other step that
-changes the file system from the record of that change either, because each runs held too:
-creating a temporary (file, directory or member) and recording it for removal, and removing what
-was created. A caller that registers the cleanup apart from a ``with`` statement (an
-:class:`contextlib.ExitStack`) holds them across the registration too.
+A signal cannot split any other step that changes the file system from the record of that
+change either, because each runs held too: creating a temporary (file, directory or member) and
+recording it for removal, and removing what was created. A caller that registers the cleanup
+apart from a ``with`` statement (an :class:`contextlib.ExitStack`) holds them across the
+registration too.
 
 Nothing here deletes a file this process did not create in the same call. Every system call goes
 through a :class:`~ironbird.fsops.FileSystem`, so tests can fail any step.
@@ -53,7 +55,7 @@ from ironbird.fsops import (
     same_file,
     try_stat_at,
 )
-from ironbird.sigmask import Hold, signals_held
+from ironbird.sigmask import Hold, checkpoint, signals_held
 
 _NO_HARD_LINKS: Final = frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV})
 _NAME_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -109,9 +111,9 @@ def rename_noreplace(dir_fd: int, old: str, new: str, fd: int, *, fs: FileSystem
     held, named = fs.fstat(fd), try_stat_at(fs, dir_fd, old)
     if named is None or not same_file(held, named):
         raise OSError(errno.ENOENT, "the name no longer denotes the file", old)
-    # One step a signal handler cannot split: the link without its unlink, or the placeholder
-    # without the rename over it, would be left behind, and a committed name must get its
-    # directory sync. A handler that raises runs as the scope ends.
+    # One step a signal cannot split: the link without its unlink, or the placeholder without
+    # the rename over it, would be left behind, and a committed name must get its directory
+    # sync. A signal is acted on as the scope ends.
     with signals_held():
         leftover: LeftoverAfterCommit | None = None
         try:
@@ -249,9 +251,8 @@ class TempOutput:
                     return self
             for _ in range(8):
                 name = f".{self.final.name}.{os.urandom(8).hex()}.tmp"
-                # The file is created and recorded as ours in one step no signal handler can
-                # split; a handler that raises runs as the step ends, and the cleanup below
-                # removes the file.
+                # The file is created and recorded as ours in one step no signal can split; a
+                # signal is acted on as the step ends, and the cleanup below removes the file.
                 with signals_held():
                     try:
                         fd = fs.open_at(self._dir_fd, name, _NAME_FLAGS, 0o600)
@@ -332,14 +333,17 @@ class TempOutput:
         (:class:`Collision`) unless ``force`` and it is an existing regular file owned by this
         user, which is replaced.
 
-        ``hold`` (begun first) keeps the termination signals held past this call, until the
-        caller's ``with`` block ends. In any case they are held until the directory is synced
-        and :attr:`committed` set, so a handler that raises cannot report a finished commit as
-        interrupted; it runs as this method ends (or the hold does).
+        A signal owed as this begins is acted on first, so nothing is published. ``hold``
+        (begun first) keeps a later signal held past this call, until the caller's ``with``
+        block ends. In any case it is held until the directory is synced and :attr:`committed`
+        set, so a finished commit is never reported as interrupted; it is acted on as this
+        method ends (or the hold does).
         """
         assert self._prepared and not self._committed, "publish once, after prepare"
         if hold is not None:
             hold.begin()
+        else:
+            checkpoint()  # the commit point: a signal that came before it publishes nothing
         fs = self._fs
         final = self.final.name
         with signals_held():
@@ -470,7 +474,7 @@ class TempDirOutput:
         try:
             for _ in range(8):
                 name = f".{self.final.name}.{os.urandom(8).hex()}.tmp"
-                # created and recorded as ours in one step no signal handler can split (see
+                # created and recorded as ours in one step no signal can split (see
                 # TempOutput); the cleanup below removes the directory
                 with signals_held():
                     try:
@@ -506,7 +510,7 @@ class TempDirOutput:
         assert name not in self._by_name, "a member is created once"
         assert not self._prepared, "nothing is created after prepare"
         fs = self._fs
-        # created and recorded as a member in one step no signal handler can split, so leaving
+        # created and recorded as a member in one step no signal can split, so leaving
         # the block removes it (see TempOutput)
         with signals_held():
             fd = self._with_room(lambda: fs.open_at(self._dir_fd, name, _NAME_FLAGS, 0o600))
@@ -597,6 +601,7 @@ class TempDirOutput:
         assert self.name and not self._committed
         fs = self._fs
         for member in self._members:
+            checkpoint()  # a signal ends the syncs here: the cleanup removes the directory
             if member.fd >= 0:
                 fs.fdatasync(member.fd)
                 continue
@@ -622,6 +627,8 @@ class TempDirOutput:
         assert self._prepared and not self._committed, "publish once, after prepare"
         if hold is not None:
             hold.begin()
+        else:
+            checkpoint()  # the commit point: a signal that came before it publishes nothing
         with signals_held():
             try:
                 rename_noreplace(

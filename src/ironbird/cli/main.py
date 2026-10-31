@@ -13,11 +13,9 @@ import inspect
 import json
 import math
 import os
-import queue
 import resource
 import signal
 import sys
-import threading
 import time
 import traceback
 from collections.abc import Awaitable, Callable, Coroutine
@@ -38,7 +36,6 @@ from ironbird.errors import Code, IronbirdError
 from ironbird.filter import Filter
 from ironbird.fsops import REAL_FS
 from ironbird.ledger import ExitReport, Ledger, default_state_dir
-from ironbird.ledgergate import start_thread
 from ironbird.notice import Notice
 from ironbird.recording import inspect as rec_inspect
 from ironbird.recording.defs import (
@@ -85,7 +82,15 @@ from ironbird.retention import LONG_COMMANDS
 from ironbird.retnotices import Notices
 from ironbird.retservice import Retention
 from ironbird.session import Route, Session, Side
-from ironbird.sigmask import HANDLED_SIGNALS, Hold, Interrupted, signals_held
+from ironbird.sigmask import (
+    HANDLED_SIGNALS,
+    Hold,
+    Interrupted,
+    checkpoint,
+    deliver,
+    discard,
+    masked,
+)
 
 EXIT_TIMEOUT: Final = 3  # --count was given and not reached before --timeout
 EXIT_OUTPUT_LOST: Final = 4  # the command completed but stdout lines were lost
@@ -98,7 +103,6 @@ DRAIN_NOTICE_S: Final = 2.0  # waiting this long for the reader of stdout earns 
 SIGNAL_POLL_S: Final = 0.02
 MIN_FREE_FDS: Final = 8  # event loop (3), UDP sockets, ledger, resolver threads, margin
 _SIGNALS: Final = HANDLED_SIGNALS
-RESEND_DELAY_S: Final = 0.001  # a swallowed signal is sent again this long after the hook
 # Keyword arguments for the ledger of this process (``fs``, ``clock``, ``join_timeout_s``, ...).
 # Production leaves it empty; a test wrapper module assigns it before calling ``main()``.
 LEDGER_OPTIONS: Final[dict[str, Any]] = {}
@@ -228,125 +232,80 @@ def _root(
 # -- signals ------------------------------------------------------------------------------
 
 
-class _Terminated(Interrupted):
-    """Raised by the signal handler when no event loop is running to cancel instead."""
-
-
 class _SignalState:
     """SIGINT/SIGTERM/SIGHUP end the command orderly, whatever it is doing.
 
-    While the event loop runs, the handler cancels the main task, so ``finally`` blocks and
-    ``async with`` exits unwind normally; before the command and while the loop is torn down it
-    raises :class:`_Terminated`. From :meth:`detach` on (the command is over and only the
-    shutdown remains) it just records the signal, so none can escape the shutdown unannounced:
+    The handler never raises. While the event loop runs the command, it cancels the main task,
+    so ``finally`` blocks and ``async with`` exits unwind normally. Otherwise (before the
+    command, and in a command that runs without a loop) it hands the signal to
+    :func:`ironbird.sigmask.deliver`, and the command acts on it at its next checkpoint, a held
+    scope's end, a commit point or the next slice of a wait (see :mod:`ironbird.sigmask`); an
+    :class:`~ironbird.sigmask.Interrupted` therefore never lands where Python would swallow it
+    (a weakref callback, a ``__del__``, an unraisable hook). From :meth:`attach` on, a signal
+    after the main task ended, and from :meth:`detach` on any signal, is only recorded:
     :func:`_finish` announces whatever was recorded and not yet :attr:`announced`. Only the
-    first signal acts; repeats while shutting down are ignored.
-
-    Python runs a handler between any two lines of the main thread, including the lines of a
-    weakref callback or a ``__del__`` that the garbage collector runs in the middle of the
-    command. What a handler raises there cannot propagate: Python passes it to
-    ``sys.unraisablehook`` and carries on. While installed, :meth:`_unraisable` takes such a
-    :class:`_Terminated` and asks a helper thread to send the signal to the main thread again,
-    so its handler runs once the interpreter is back in the command's own code (or at the end of
-    a held scope, as for any signal) and the command still ends by it. The helper exists from
-    :meth:`install` on: a thread started in the hook could wait on a lock the interrupted code
-    holds.
+    first signal acts; repeats are ignored, except that every signal (:attr:`received` counts
+    them) cuts the waits of the exit short.
     """
 
     def __init__(self) -> None:
         self.signum = 0
+        self.received = 0  # signals handled since install, repeats included
         self.announced = False  # the ledger and the user were told about ``signum``
         self._installed = False  # the handlers are ours (``main`` ran, not an in-process caller)
-        self._raises = True
-        self._again = False  # the handler's raise for ``signum`` was swallowed: raise it again
-        self._in_hook = False  # :meth:`_unraisable` is running: a raise now would be lost too
-        self._previous_unraisable: Callable[[sys.UnraisableHookArgs], Any] | None = None
-        self._resend: queue.SimpleQueue[int] = queue.SimpleQueue()  # reentrant ``put``
-        self._resender: threading.Thread | None = None
+        self._raises = True  # a signal is delivered to the command (until :meth:`detach`)
         self._task: asyncio.Task[Any] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def install(self) -> None:
-        self.signum, self.announced, self._raises, self._again = 0, False, True, False
+        """Handle the signals from here on. A signal that arrives while the handlers are set
+        waits for them (the signals are blocked meanwhile) instead of taking its default
+        action."""
+        self.signum, self.received, self.announced, self._raises = 0, 0, False, True
         self._task = self._loop = None
-        for sig in _SIGNALS:
-            with contextlib.suppress(ValueError, OSError):  # not the main thread
-                signal.signal(sig, self._handle)
-                self._installed = True
-        if not self._installed:
-            return
-        if self._resender is None:
-            self._resender = threading.Thread(
-                target=self._resend_loop, name="ib-signal-resend", daemon=True
-            )
-            start_thread(self._resender)
-        if self._previous_unraisable is None:
-            self._previous_unraisable = sys.unraisablehook
-            sys.unraisablehook = self._unraisable
+        discard()
+        with masked():
+            for sig in _SIGNALS:
+                with contextlib.suppress(ValueError, OSError):  # not the main thread
+                    signal.signal(sig, self._handle)
+                    self._installed = True
 
     def restore_default(self) -> None:
-        """Give the signals their default action back, once the shutdown is complete.
-
-        Called with the signals still blocked: one that is pending then ends the process by that
-        signal when the mask is lifted, instead of landing in a handler that has nothing left to
-        record it in. A no-op where :meth:`install` did not run.
-        """
+        """Give the signals their default action back, once the shutdown is complete: a later
+        signal ends the process by that signal instead of landing in a handler that has nothing
+        left to record it in. A no-op where :meth:`install` did not run."""
         if not self._installed:
             return
         self._installed = False
         for sig in _SIGNALS:
             with contextlib.suppress(ValueError, OSError):
                 signal.signal(sig, signal.SIG_DFL)
-        if self._previous_unraisable is not None:
-            sys.unraisablehook = self._previous_unraisable
-            self._previous_unraisable = None
 
     def attach(self, task: asyncio.Task[Any], loop: asyncio.AbstractEventLoop) -> None:
         self._task, self._loop = task, loop
 
     def detach(self) -> None:
+        """The command is over: from here a signal is only recorded, and one still owed to the
+        command (it ended before acting on it) is :func:`_finish`'s to announce."""
         self._raises = False
         self._task = self._loop = None
+        discard()
+
+    def unannounced(self) -> int:
+        """The signal that ended the run and was not announced (0: none)."""
+        return 0 if self.announced else self.signum
 
     def _handle(self, signum: int, _frame: object) -> None:
-        if self.signum and not self._again:
+        self.received += 1
+        if self.signum:
             return
-        if self._again and self._in_hook:  # still where the raise would be swallowed
-            self._resend.put(self.signum)
-            return
-        self._again = False
-        if not self.signum:
-            self.signum = signum
+        self.signum = signum
         task, loop = self._task, self._loop
-        if task is not None and loop is not None and not task.done():
-            loop.call_soon_threadsafe(task.cancel)
+        if loop is not None:  # the event loop runs the command
+            if task is not None and not task.done():
+                loop.call_soon_threadsafe(task.cancel)
         elif self._raises:
-            raise _Terminated(self.signum)
-
-    def _unraisable(self, unraisable: sys.UnraisableHookArgs) -> None:
-        """Catch the signal again when its handler's raise was swallowed (see the class); pass
-        everything else to the hook that was there before."""
-        stop = unraisable.exc_value
-        if isinstance(stop, _Terminated) and self._raises and stop.signum == self.signum:
-            assert threading.current_thread() is threading.main_thread(), "handlers run there"
-            assert self._resender is not None, "the hook is set after the helper starts"
-            self._in_hook = self._again = True
-            self._resend.put(stop.signum)
-            self._in_hook = False
-            return
-        previous = self._previous_unraisable
-        (previous if previous is not None else sys.__unraisablehook__)(unraisable)
-
-    def _resend_loop(self) -> None:
-        """The helper thread: send each requested signal to the main thread again, a moment
-        later (the main thread is leaving the hook), while its raise is still owed."""
-        main = threading.main_thread().ident
-        assert main is not None
-        while True:
-            signum = self._resend.get()
-            time.sleep(RESEND_DELAY_S)
-            if self._again and self._installed:
-                signal.pthread_kill(main, signum)
+            deliver(signum)
 
 
 _STATE = _SignalState()
@@ -406,7 +365,8 @@ async def _main(glob: Globals, ledger: Ledger, body: Body, run: _Run) -> int:
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
     assert task is not None
-    _STATE.attach(task, loop)
+    _STATE.attach(task, loop)  # from here a signal cancels this task
+    checkpoint()  # one that came before the loop ran ends the command now
     console = run.console
     pipe_closed = run.pipe_closed
 
@@ -510,8 +470,8 @@ def _record_signal(
     ``direct`` writes the notice to the process's stderr instead of the console, for when the
     console's stderr writer is already closed. The record is on disk before the notice is
     written, and the notice goes through a fresh :class:`BoundedWriter` closed after
-    :data:`CLOSE_WAIT_S`: the signals are held here, so a stderr nobody reads must not be able
-    to stall the exit.
+    :data:`CLOSE_WAIT_S`: the exit is under way, so a stderr nobody reads must not be able to
+    stall it.
     """
     _STATE.announced = True
     notice = _interrupt_notice(name, signum, run)
@@ -534,25 +494,10 @@ def _record_signal(
     return 128 + int(signum)
 
 
-def _poll_signal(wait_s: float) -> int:
-    """Take one held shutdown signal if it is (or becomes, within ``wait_s``) pending; else 0."""
-    take = getattr(signal, "sigtimedwait", None)
-    if take is None:  # pragma: no cover - not Linux
-        time.sleep(wait_s)
-        return 0
-    info = take(_SIGNALS, wait_s)
-    return int(info.si_signo) if info is not None else 0
-
-
-def _signal_during_wait() -> bool:
-    """Whether a shutdown signal arrived while the exit was waiting for the ledger (the wait
-    ends at once; the signal is kept for the exit code)."""
-    got = _poll_signal(0)
-    if not got:
-        return False
-    if not _STATE.signum:
-        _STATE.signum = got
-    return True
+def _signal_since(received: int) -> Callable[[], bool]:
+    """Whether a shutdown signal arrived after :attr:`_SignalState.received` was ``received``
+    (asked by the waits of the exit, which end at once; the signal is kept for the exit code)."""
+    return lambda: _STATE.received != received
 
 
 def _late_err(ledger: Ledger, text: str) -> None:
@@ -568,21 +513,19 @@ def _late_err(ledger: Ledger, text: str) -> None:
 def _drain(writer: BoundedWriter, on_slow: Callable[[], None] | None = None) -> int:
     """Wait with no deadline until ``writer`` has written every line it accepted.
 
-    Runs with the shutdown signals held, so one that arrives is taken here and returned (the
-    wait is over, the caller abandons what is left); 0 means everything was written.
-    ``on_slow`` runs once if the wait lasts :data:`DRAIN_NOTICE_S`.
+    For a run that no signal ended yet: the first signal is recorded by the handler and seen
+    here within :data:`SIGNAL_POLL_S`, and returned (the wait is over, the caller abandons what
+    is left); 0 means everything was written. ``on_slow`` runs once if the wait lasts
+    :data:`DRAIN_NOTICE_S`.
     """
     writer.begin_close()
-    if not hasattr(signal, "sigtimedwait"):  # pragma: no cover - not Linux
-        writer.wait(CLOSE_WAIT_S)
-        return 0
     slow_at = time.monotonic() + DRAIN_NOTICE_S
-    while not writer.wait(0.001):
+    while not writer.wait(SIGNAL_POLL_S):
         if on_slow is not None and time.monotonic() >= slow_at:
             on_slow()
             on_slow = None
-        if signum := _poll_signal(SIGNAL_POLL_S):
-            return signum
+        if _STATE.signum:
+            return _STATE.signum
     return 0
 
 
@@ -649,80 +592,80 @@ def _report_ledger(report: ExitReport, run: _Run, console: Console, code: int) -
 def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -> int:
     """Write out everything still queued, close the ledger and return the exit code.
 
-    A normal end waits for the reader of stdout with no deadline, so a slow reader loses
-    nothing; a signal (taken with ``sigtimedwait`` while the signals are held, so it can never
-    run a handler mid-flush) cuts the wait short and the rest is abandoned and counted. After a
+    Runs after :meth:`_SignalState.detach`, so a signal here is only recorded and nothing it
+    does can cut a flush or a close in two. A normal end waits for the reader of stdout with no
+    deadline, so a slow reader loses nothing; a signal cuts the wait short and the rest is
+    abandoned and counted, and every signal ends the waits on a slow disk at once. After a
     signal already ended the run, the drain is bounded by :data:`CLOSE_WAIT_S`. A signal that
-    was recorded but not yet announced (it arrived after the loop ended) is announced here.
-    Anything lost
-    on stdout is reported once, ledgered with its counts, and turns an exit code of 0 into
-    :data:`EXIT_OUTPUT_LOST`.
+    was recorded but not yet announced (it arrived after the command could act on it) is
+    announced here. Anything lost on stdout is reported once, ledgered with its counts, and
+    turns an exit code of 0 into :data:`EXIT_OUTPUT_LOST`. Repeated signals change nothing:
+    the handlers stay in place until the very end, when the default actions come back.
     """
     out, err = console.stdout, console.stderr
-    with signals_held():
-        ledger.begin_exit(_signal_during_wait)  # one bound for every wait on a slow disk
-        if run.retention is not None:
-            run.retention.finish()  # a scan in flight reports before the account is made
-        report = ledger.finish()  # the last write attempt, and the account of what is unwritten
-        signum = _STATE.signum
-        fresh = 0 if _STATE.announced else signum  # a signal that still has to be ledgered
+    ledger.begin_exit(_signal_since(_STATE.received))  # one bound for every wait on a slow disk
+    if run.retention is not None:
+        run.retention.finish()  # a scan in flight reports before the account is made
+    report = ledger.finish()  # the last write attempt, and the account of what is unwritten
+    signum = _STATE.signum
+    fresh = _STATE.unannounced()  # a signal that still has to be ledgered
 
-        def waiting() -> None:
-            queued = out.queued_lines
-            summary = (
-                f"stdout is not being read: {queued} line(s) still queued; "
-                "waiting for the reader (send a signal to abandon them)"
-            )
-            # A wait, not a failure: nothing is lost unless a signal cuts it short. Ledgered and
-            # on disk first, because the wait has no deadline and may end in SIGKILL.
-            ledger.record("warning", Code.OUT_WAITING.value, summary=summary, stdout_queued=queued)
-            ledger.flush()
-            console.err(f"warning {Code.OUT_WAITING.value}: {summary}")
+    def waiting() -> None:
+        queued = out.queued_lines
+        summary = (
+            f"stdout is not being read: {queued} line(s) still queued; "
+            "waiting for the reader (send a signal to abandon them)"
+        )
+        # A wait, not a failure: nothing is lost unless a signal cuts it short. Ledgered and
+        # on disk first, because the wait has no deadline and may end in SIGKILL.
+        ledger.record("warning", Code.OUT_WAITING.value, summary=summary, stdout_queued=queued)
+        ledger.flush()
+        console.err(f"warning {Code.OUT_WAITING.value}: {summary}")
 
-        if not signum and (got := _drain(out, waiting)):
-            signum = fresh = _STATE.signum = got
-        out.close()  # bounded when a signal ended things; abandons what is left
-        if not signum and (got := _poll_signal(0)):
-            signum = fresh = _STATE.signum = got
-        if fresh:
-            code = _record_signal(name, fresh, run, ledger, console)
-        loss = _stdout_loss(console, name, run)
-        if loss is not None:
-            ledger.record_error(
-                loss,
-                stdout_lost=out.lost,
-                stdout_dropped=out.dropped_total,
-                stdout_abandoned=out.abandoned_total,
-                stdout_undelivered=out.undelivered_total,
-                stdout_unavailable=out.unavailable,
-            )
-            console.err(loss.user_line())
-            if code == 0:
-                code = EXIT_OUTPUT_LOST
-        code = _report_ledger(report, run, console, code)
-        if not signum and (got := _drain(err)):
-            signum = fresh = _STATE.signum = got
-            code = _record_signal(name, got, run, ledger, console)
-        err.close()
-        if out.reader_gone:
-            ledger.record("state", "output.pipe_closed", stream="stdout")
-        if err.lost or err.reader_gone:
-            ledger.record(
-                "state",
-                "output.stderr_lost",
-                lost=err.lost,
-                unavailable=err.unavailable,
-                reader_gone=err.reader_gone,
-            )
-        closing = ledger.close()
-        ledger.set_notifier(None)
-        code = _apply_ledger_report(code, closing)  # a sync error at close; the exit says so
-        for notice in _closing_news(report, closing):  # and never without its line
-            _late_err(ledger, term(notice.line(verbose=run.verbose), 1000, err=True))
-        if not signum and (got := _poll_signal(0)):  # arrived while the ledger was closing
-            code = _record_signal(name, got, run, ledger, console, direct=True)
-            ledger.close()
-        _STATE.restore_default()  # a later signal ends the process by that signal, not silently
+    if not signum and (got := _drain(out, waiting)):
+        signum = fresh = got
+    out.close()  # bounded when a signal ended things; abandons what is left
+    if not signum and (got := _STATE.signum):
+        signum = fresh = got
+    if fresh:
+        code = _record_signal(name, fresh, run, ledger, console)
+    loss = _stdout_loss(console, name, run)
+    if loss is not None:
+        ledger.record_error(
+            loss,
+            stdout_lost=out.lost,
+            stdout_dropped=out.dropped_total,
+            stdout_abandoned=out.abandoned_total,
+            stdout_undelivered=out.undelivered_total,
+            stdout_unavailable=out.unavailable,
+        )
+        console.err(loss.user_line())
+        if code == 0:
+            code = EXIT_OUTPUT_LOST
+    code = _report_ledger(report, run, console, code)
+    if not signum and (got := _drain(err)):
+        signum = got
+        code = _record_signal(name, got, run, ledger, console)
+    err.close()
+    if out.reader_gone:
+        ledger.record("state", "output.pipe_closed", stream="stdout")
+    if err.lost or err.reader_gone:
+        ledger.record(
+            "state",
+            "output.stderr_lost",
+            lost=err.lost,
+            unavailable=err.unavailable,
+            reader_gone=err.reader_gone,
+        )
+    closing = ledger.close()
+    ledger.set_notifier(None)
+    code = _apply_ledger_report(code, closing)  # a sync error at close; the exit says so
+    for notice in _closing_news(report, closing):  # and never without its line
+        _late_err(ledger, term(notice.line(verbose=run.verbose), 1000, err=True))
+    if not signum and (got := _STATE.signum):  # arrived while the ledger was closing
+        code = _record_signal(name, got, run, ledger, console, direct=True)
+        ledger.close()
+    _STATE.restore_default()  # a later signal ends the process by that signal, not silently
     return code
 
 
@@ -886,10 +829,10 @@ def _run(
                 assert body is not None
                 main_coro = _main(glob, ledger, body, run)
                 code = asyncio.run(main_coro)
-        except (_Terminated, asyncio.CancelledError) as stop:
+        except (Interrupted, asyncio.CancelledError) as stop:
             if not _STATE.signum:
                 raise
-            signum = stop.signum if isinstance(stop, _Terminated) else _STATE.signum
+            signum = stop.signum if isinstance(stop, Interrupted) else _STATE.signum
             _report_replaced(stop, ledger, console, glob.verbose)
             code = _record_signal(name, signum, run, ledger, console)
         except IronbirdError as exc:
@@ -2425,7 +2368,7 @@ def export_command(
 
     def work(ledger: Ledger, console: Console, run: _Run) -> int:
         # Begun by the publish of the output and released as this block ends, after the export
-        # is recorded and summarised: a signal cannot cut that short; its handler runs then.
+        # is recorded and summarised: a signal cannot cut that short; it is acted on then.
         with Hold() as hold:
             return work_holding(ledger, console, run, hold)
 
@@ -2689,26 +2632,34 @@ def main() -> int:
     """Console-script entry. Usage errors become coded one-liners (exit 2).
 
     Signals are handled from here on: during a command they unwind it orderly (ledger flushed,
-    exit 128+n); before one starts they end the process the same way. Typer's bundled click
-    moved between releases, so exceptions are recognised by shape (``format_message``) rather
-    than by importing click classes.
+    exit 128+n); one that arrives outside a command (while the arguments are parsed, or with
+    ``--help``) ends the process the same way, unannounced. Typer's bundled click moved between
+    releases, so exceptions are recognised by shape (``format_message``) rather than by
+    importing click classes.
     """
-    _fill_standard_descriptors()
-    for stream in (sys.stdout, sys.stderr):
-        with contextlib.suppress(AttributeError, OSError, ValueError):
-            stream.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
-    _STATE.install()
     try:
+        _STATE.install()
+        _fill_standard_descriptors()
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(AttributeError, OSError, ValueError):
+                stream.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
         result: Any = app(standalone_mode=False)
-    except _Terminated as stop:
+    except Interrupted as stop:
         return 128 + stop.signum
+    except KeyboardInterrupt:  # SIGINT's default handler, before ours was in place
+        return 128 + int(signal.SIGINT)
     except Exception as exc:
         format_message = getattr(exc, "format_message", None)
         if callable(format_message):
             _stderr_line(f"error {Code.CLI_USAGE.value}: {format_message()}")
-            return 2
-        _stderr_line(f"error {Code.INTERNAL.value}: unexpected {type(exc).__name__}: {exc}")
-        return 1
+            result = 2
+        else:
+            _stderr_line(f"error {Code.INTERNAL.value}: unexpected {type(exc).__name__}: {exc}")
+            result = 1
+    finally:
+        _STATE.restore_default()  # a no-op once a command's exit did it
+    if signum := _STATE.unannounced():  # recorded where no command could act on it
+        return 128 + signum
     return result if isinstance(result, int) else 0
 
 

@@ -16,6 +16,7 @@ from types import MappingProxyType
 from typing import Any, Final
 
 from ironbird.errors import Code, IronbirdError
+from ironbird.fsops import read_capped
 from ironbird.header import DEFAULT_MAX_PACKET_BYTES
 from ironbird.units import (
     DURATION_FORMS,
@@ -714,8 +715,7 @@ def find_config(explicit: Path | None, environ: Mapping[str, str] | None = None)
 
 def load_config(path: Path) -> SystemConfig:
     try:
-        with path.open("rb") as handle:
-            raw = handle.read(MAX_CONFIG_BYTES + 1)
+        raw = read_capped(path, MAX_CONFIG_BYTES)
     except OSError as exc:
         raise IronbirdError(
             Code.CFG_FILE, f"{path}: cannot read config ({exc.strerror or exc})", cause=exc
