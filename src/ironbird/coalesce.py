@@ -35,6 +35,9 @@ class _Entry:
     ledger_n: int | None  # of the latest occurrence that had one
     started: float
     suppressed: int
+    window_s: float = DEFAULT_WINDOW_S
+    ledger_part: int = 1
+    ledger_file: str = ""
 
 
 class Coalescer:
@@ -66,6 +69,8 @@ class Coalescer:
                     count=entry.suppressed + 1,
                     window_s=max(0.0, now - entry.started),
                     ledger_n=entry.ledger_n,
+                    ledger_part=entry.ledger_part,
+                    ledger_file=entry.ledger_file,
                 )
             )
 
@@ -78,12 +83,16 @@ class Coalescer:
         *,
         ledger_n: int | None = None,
         group: Code | None = None,
+        window_s: float | None = None,
+        ledger_part: int = 1,
+        ledger_file: str = "",
     ) -> None:
         """Report one occurrence.
 
         ``key`` groups repeats (e.g. code plus MID). ``group`` (e.g. the error code) rate-limits
         distinct keys: after ``MAX_NEW_PER_GROUP`` new keys per window the rest fold into one
         "more distinct occurrences" notice, so unique-garbage floods cannot spam the user.
+        ``window_s`` overrides the window for this key (the ledger's slow warnings use 10 min).
         """
         now = self._clock()
         entry = self._entries.get(key)
@@ -98,11 +107,12 @@ class Coalescer:
             else:
                 self._groups[group] = (started, count + 1)
         if entry is not None:
-            if now - entry.started < self._window:
+            if now - entry.started < entry.window_s:
                 entry.suppressed += 1
                 entry.summary = summary
                 if ledger_n is not None:  # a later occurrence without a record keeps the pointer
                     entry.ledger_n = ledger_n
+                    entry.ledger_part, entry.ledger_file = ledger_part, ledger_file
                 return
             self._summary(entry, now)
             del self._entries[key]
@@ -110,13 +120,34 @@ class Coalescer:
             old_key, old = self._entries.popitem(last=False)
             self._summary(old, now)
             assert old_key not in self._entries
-        self._emit(Notice(code, level, key, summary, ledger_n=ledger_n))
-        self._entries[key] = _Entry(code, level, key, summary, ledger_n, now, 0)
+        self._emit(
+            Notice(
+                code,
+                level,
+                key,
+                summary,
+                ledger_n=ledger_n,
+                ledger_part=ledger_part,
+                ledger_file=ledger_file,
+            )
+        )
+        self._entries[key] = _Entry(
+            code,
+            level,
+            key,
+            summary,
+            ledger_n,
+            now,
+            0,
+            window_s or self._window,
+            ledger_part,
+            ledger_file,
+        )
 
     def tick(self) -> None:
         """Close expired windows; call about once a second from the owning loop."""
         now = self._clock()
-        expired = [k for k, e in self._entries.items() if now - e.started >= self._window]
+        expired = [k for k, e in self._entries.items() if now - e.started >= e.window_s]
         for key in expired:
             self._summary(self._entries[key], now)
             del self._entries[key]

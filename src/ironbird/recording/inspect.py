@@ -17,12 +17,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
-from ironbird.atomicfile import Collision, TempOutput
+from ironbird.atomicfile import Collision, Locked, SyncAfterCommit, TempOutput
 from ironbird.errors import Code, IronbirdError
 from ironbird.frame import GapReason, Stream
+from ironbird.fsops import REAL_FS, FileSystem
 from ironbird.recording import format as fmt
 from ironbird.recording.format import RecordType
 from ironbird.recording.reader import Damage, Item, RecordingReader
+from ironbird.retention import is_managed_name
 from ironbird.sanitize import clean
 
 MAX_FINDINGS: Final = 100
@@ -539,9 +541,12 @@ class RepairResult:
     dropped_bytes: int  # bytes of the original after the valid prefix
     damage: Damage | None
     frames_beyond: int  # valid frames after mid-file damage, left only in the original
+    sync_warning: str | None = None  # the output exists, but its directory could not be synced
 
 
-def repair(source: Path, output: Path, *, force: bool = False) -> RepairResult:
+def repair(
+    source: Path, output: Path, *, force: bool = False, fs: FileSystem = REAL_FS
+) -> RepairResult:
     """Write the valid prefix of ``source`` plus a fresh index and trailer to ``output``.
 
     ``source`` is never modified. An existing ``output`` is refused unless ``force`` (and then
@@ -549,6 +554,12 @@ def repair(source: Path, output: Path, *, force: bool = False) -> RepairResult:
     ``IB-REC-001`` for the refusals and a failed write.
     """
     _refuse_same_file(source, output)
+    if force and is_managed_name(output.name):
+        raise IronbirdError(
+            Code.REC_CREATE,
+            f"{output.name} is named like a ledger or recording file of ironbird's own; "
+            "--force never replaces one, choose another output name",
+        )
     if os.path.lexists(output) and not force:
         raise IronbirdError(Code.REC_CREATE, f"{output} already exists; pass --force to replace it")
     reader = RecordingReader(source)
@@ -570,11 +581,22 @@ def repair(source: Path, output: Path, *, force: bool = False) -> RepairResult:
         beyond = _frames_after(source, last_seq) if damage is not None and not damage.torn else 0
         suffix = _closing_records(reader, prefix_end, chunk_offsets, frames, last_seq, tail)
         total = prefix_end + len(suffix)
+        sync_warning: str | None = None
         try:
-            with TempOutput(output, force=force) as out:
+            with TempOutput(output, force=force, fs=fs) as out:
                 _copy(reader, out, prefix_end)
                 out.write(suffix)
-                out.commit()
+                try:
+                    out.commit()
+                except SyncAfterCommit as sync:
+                    sync_warning = sync.strerror or "directory sync failed"  # renamed all the same
+        except Locked as exc:
+            raise IronbirdError(
+                Code.REC_CREATE,
+                f"{output} is in use by another process (it holds a lock on it); it was not "
+                "replaced, choose another output",
+                cause=exc,
+            ) from exc
         except Collision as exc:
             raise IronbirdError(
                 Code.REC_CREATE,
@@ -590,7 +612,9 @@ def repair(source: Path, output: Path, *, force: bool = False) -> RepairResult:
                 cause=exc,
             ) from exc
         dropped = size - prefix_end if damage is not None else 0  # a clean file's index is rebuilt
-        return RepairResult(output, frames, prefix_end, total, dropped, damage, beyond)
+        return RepairResult(
+            output, frames, prefix_end, total, dropped, damage, beyond, sync_warning
+        )
     finally:
         reader.close()
 

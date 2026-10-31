@@ -53,8 +53,25 @@ class Code(StrEnum):
     # Responder
     RSP_RULE = "IB-RSP-001"  # response rule failed
     # Ledger
-    LED_WRITE = "IB-LED-001"  # ledger cannot be written
+    LED_WRITE = "IB-LED-001"  # ledger stalled: an essential record cannot be written (retrying)
     LED_DIR = "IB-LED-002"  # no usable ledger/state directory (HOME unset, path unusable)
+    LED_TIER = "IB-LED-003"  # event or evidence tier over its allowance: counted, not written
+    LED_UNLOGGED = (
+        "IB-LED-004"  # a transmission whose ledger record was not (or may not be) written
+    )
+    LED_DISK = "IB-LED-005"  # disk or quota full: essential records go to the preallocated reserve
+    LED_RESERVE = "IB-LED-006"  # the essential reserve is not available or not guaranteed
+    LED_RESUMED = "IB-LED-007"  # the ledger writes again after a stall
+    LED_UNBOUNDED = "IB-LED-008"  # evidence_bytes_per_hour = "unlimited"
+    LED_NOLOCK = "IB-LED-009"  # file locks unavailable: liveness rests on freshness
+    LED_ROTATE = "IB-LED-010"  # rotation blocked: part names taken or numbers exhausted
+    # Retention
+    RET_AGE = "IB-RET-001"  # sessions older than retention.max_age (review with prune)
+    RET_TOTAL = "IB-RET-002"  # ledger + recordings past, or projected past, max_total_bytes
+    RET_PRUNE = "IB-RET-003"  # a listed session was not deleted
+    RET_SCAN = "IB-RET-004"  # retention scan partial, or a reserve that could not be recovered
+    RET_TARGET = "IB-RET-005"  # --until-under cannot be reached: the rest is protected
+    RET_UNSAFE = "IB-RET-006"  # directory writable by others without the sticky bit
     # Output
     OUT_DROPPED = "IB-OUT-001"  # output lines dropped because stdout/stderr is not draining
     OUT_LOST = "IB-OUT-002"  # final tally: output lines dropped, abandoned or never deliverable

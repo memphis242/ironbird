@@ -242,8 +242,9 @@ SLOW_CLOSE = """
     def _slow_close(self):
         print("IN_CLOSE", file=sys.__stderr__, flush=True)
         time.sleep(1.5)
-        _orig_close(self)
+        report = _orig_close(self)
         print("CLOSE_DONE", file=sys.__stderr__, flush=True)
+        return report
     _l.Ledger.close = _slow_close
 """
 

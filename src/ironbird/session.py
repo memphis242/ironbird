@@ -44,9 +44,10 @@ from ironbird.engine import (
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
 from ironbird.filter import Filter, FilterError, Matcher, compile_filter
-from ironbird.frame import Decoded, Stream
+from ironbird.frame import Decoded, Frame, Stream
 from ironbird.header import load_profile
 from ironbird.ledger import Ledger
+from ironbird.ledgertiers import Tier
 from ironbird.notice import Level, Notice
 from ironbird.transport import LinkEnd
 
@@ -134,6 +135,7 @@ class Session:
         self._ledger: Ledger = ledger
         ledger.set_max_raw_bytes(config.max_packet_bytes)
         self._coalescer: Coalescer = Coalescer(notify)
+        ledger.set_notifier(notify)
         self._codecs: dict[str, Codec] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._last_tx: TxAttempt | None = None
@@ -209,6 +211,7 @@ class Session:
             try:
                 self.flush_notices()
             finally:
+                self.ledger.settle()
                 self.ledger.flush()
 
     def _background_done(self, task: asyncio.Task[None]) -> None:
@@ -231,6 +234,7 @@ class Session:
         while True:
             await asyncio.sleep(TICK_S)
             self._coalescer.tick()
+            self.ledger.tick()
             await self._engine.tick()
 
     # -- error reporting ---------------------------------------------------------------
@@ -238,6 +242,7 @@ class Session:
     def flush_notices(self) -> None:
         """Emit every pending coalesced summary now (shutdown, or before reading the output)."""
         self._coalescer.flush()
+        self.ledger.flush_notices()
 
     def withdraw_notices(self, code: Code, context: str) -> None:
         """Drop the pending coalesced summary of ``code`` reported with ``context``, because a
@@ -255,11 +260,13 @@ class Session:
         context: str = "",
         level: Level = Level.ERROR,
         evidence: bool = False,
+        sample: str | None = None,
     ) -> None:
         """Ledger in full, notify the user coalesced (one notice per key per window).
 
         ``evidence`` marks an error that untrusted wire input can produce at will; its ledger
-        record then shares the capped evidence tier instead of the essential one.
+        record then belongs to the evidence tier instead of the essential one, and ``sample``
+        names its evidence-sampling key.
         """
         if isinstance(error, DecodeError):
             raw_mid = error.mid
@@ -270,10 +277,24 @@ class Session:
             err = error
             offset = None
         ledger_n = self.ledger.record_error(
-            err, evidence=evidence, role=self.node.name, mid=raw_mid, offset=offset
+            err,
+            tier=Tier.EVIDENCE if evidence else None,
+            sample=sample,
+            role=self.node.name,
+            mid=raw_mid,
+            offset=offset,
         )
         key = _notice_key(err.code, raw_mid, context)
-        self._coalescer.report(err.code, level, key, err.summary, ledger_n=ledger_n, group=err.code)
+        self._coalescer.report(
+            err.code,
+            level,
+            key,
+            err.summary,
+            ledger_n=ledger_n,
+            group=err.code,
+            ledger_part=self.ledger.part_number,
+            ledger_file=self.ledger.part_file,
+        )
 
     # -- loading -------------------------------------------------------------------
 
@@ -422,6 +443,7 @@ class Session:
             link=route.link.name,
         )
         encoded = codec.encode_command(command, args, tamper=tamper)
+        self.ledger.check_transmit(encoded.message.name, route.server.name)
         attempt = TxAttempt(encoded.message.name)
         self._last_tx = attempt
         result = "not_sent"
@@ -446,9 +468,10 @@ class Session:
             result = type(exc).__name__
             raise
         finally:
-            self.ledger.record(
-                "command",
+            self.ledger.record_tx(
                 "tx.command",
+                encoded.message.name,
+                route.server.name,
                 node=route.server.name,
                 command=encoded.message.name,
                 mid=encoded.mid,
@@ -610,11 +633,25 @@ class Session:
     ) -> Listener:
         """Open a listener for ``peer``. ``where`` is a filter expression (S4) that frames must
         match to be yielded; it is compiled first, so a bad one fails before any socket opens."""
+        route, flt = self.plan_listen(peer, mids=mids, link=link, where=where)
+        return await self._open_listener(route, mids, flt)
+
+    def plan_listen(
+        self,
+        peer: str,
+        *,
+        mids: frozenset[int] | None = None,
+        link: str | None = None,
+        where: str | None = None,
+    ) -> tuple[Route, Filter | None]:
+        """Everything :meth:`listen` decides before it opens a socket: the route and the compiled
+        filter. Raises the usage errors (``IB-CFG-*``, ``IB-FLT-*``) without opening anything or
+        writing a ledger record, so a front end can refuse a bad invocation up front."""
         route = self.route(peer, link_name=link)
         flt = self.compile_filter(where, [route.server.name]) if where is not None else None
         if flt is not None:
             self._require_overlap(flt, mids, "--mid allows")
-        return await self._open_listener(route, mids, flt)
+        return route, flt
 
     def _listen_endpoint(self, route: Route) -> str:
         link = route.link
@@ -703,20 +740,12 @@ class Session:
             if self.codec_for(route.server.name).model.event_messages()
         ]
 
-    async def events(
-        self,
-        nodes: Sequence[str] | None = None,
-        *,
-        min_severity: EventSeverity | None = None,
-        where: str | None = None,
-    ) -> EventStream:
-        """Listen on every telemetry link of ``nodes`` (default: all) for event packets.
-
-        Every received event is ledgered in full; ``min_severity`` and ``where`` (a filter
-        expression, S4, tested on the event's frame) only limit what the stream yields. Nodes
-        whose CCDD defines no event messages are skipped with a notice; if none is left, that
-        is an error.
-        """
+    def plan_events(
+        self, nodes: Sequence[str] | None = None, *, where: str | None = None
+    ) -> tuple[list[Route], dict[str, frozenset[int]], Filter | None]:
+        """Everything :meth:`events` decides before it opens a socket: the routes that carry
+        event telemetry, their event MIDs and the compiled filter. Raises the usage errors
+        without opening anything (see :meth:`plan_listen`)."""
         routes: list[Route] = []
         event_mids: dict[str, frozenset[int]] = {}
         for route in self._event_routes(nodes):
@@ -746,6 +775,23 @@ class Session:
         )
         if flt is not None:
             self._require_overlap(flt, frozenset().union(*event_mids.values()), "events carry")
+        return routes, event_mids, flt
+
+    async def events(
+        self,
+        nodes: Sequence[str] | None = None,
+        *,
+        min_severity: EventSeverity | None = None,
+        where: str | None = None,
+    ) -> EventStream:
+        """Listen on every telemetry link of ``nodes`` (default: all) for event packets.
+
+        Every received event is ledgered in full; ``min_severity`` and ``where`` (a filter
+        expression, S4, tested on the event's frame) only limit what the stream yields. Nodes
+        whose CCDD defines no event messages are skipped with a notice; if none is left, that
+        is an error.
+        """
+        routes, event_mids, flt = self.plan_events(nodes, where=where)
         capture = await self.capture(routes)
         for route in routes:
             self._record_listen_start(route, event_mids[route.server.name], flt)
@@ -956,22 +1002,7 @@ class EventStream:
                 event = extract_event(node, frame.time_ns, decoded.packet)
                 if event is None:  # the filter above keeps event MIDs; stay defensive
                     continue
-                ledger.record(
-                    "event",
-                    "rx.event",
-                    node=event.node,
-                    app=event.app,
-                    event_id=event.event_id,
-                    type=event.type_label,
-                    type_value=event.type_value,
-                    severity=event.severity.name if event.severity else None,
-                    text=event.text,
-                    message=event.name,
-                    mid=event.mid,
-                    sequence=event.sequence,
-                    source=frame.source,
-                    raw=frame.data,
-                )
+                ledger.record("event", "rx.event", **event_record_fields(event, frame))
                 floor = self._min_severity
                 if floor is not None and not meets_floor(event.severity, floor):
                     continue
@@ -992,6 +1023,25 @@ class EventStream:
             for route in self._routes:
                 self._session.ledger.record("action", "listen.stop", peer=route.peer.name)
             self._session.ledger.record("action", "events.stop")
+
+
+def event_record_fields(event: Event, frame: Frame) -> dict[str, Any]:
+    """The fields of the ``rx.event`` ledger record: the event in full, raw packet included
+    (its size is what the event allowance is sized by)."""
+    return {
+        "node": event.node,
+        "app": event.app,
+        "event_id": event.event_id,
+        "type": event.type_label,
+        "type_value": event.type_value,
+        "severity": event.severity.name if event.severity else None,
+        "text": event.text,
+        "message": event.name,
+        "mid": event.mid,
+        "sequence": event.sequence,
+        "source": frame.source,
+        "raw": frame.data,
+    }
 
 
 def _validate_rules(node: Node, codec: Codec, config: SystemConfig) -> Mapping[str, ResponseRule]:
@@ -1090,6 +1140,8 @@ class Responder:
             session.ledger.record(
                 "command",
                 "rx.command",
+                sample=f"rx.command:{command.message.name}",
+                seq=frame.seq,
                 command=command.message.name,
                 mid=command.message.mid,
                 function_code=command.message.function_code,
@@ -1128,19 +1180,19 @@ class Responder:
                 assert field is not None and field.type.type_class is TypeClass.INT
                 lo, hi = field.type.bit_range
                 values[counter] = lo + (count - lo) % (hi - lo + 1)  # flight counters wrap
+        if session.ledger.withhold_reply():
+            return None  # on_full = "refuse_commands" and the ledger is stalled: counted, not sent
         try:
             encoded = self._codec.encode_telemetry(rule.reply, values)
             await session._engine.send(self._route.link, link_end(self._route.side), encoded.data)
         except IronbirdError as exc:
             session.report(exc)
             return None
-        session.ledger.record(
-            "command",
-            "tx.telemetry",
-            message=encoded.message.name,
-            mid=encoded.mid,
-            sequence=encoded.sequence,
+        session.ledger.record_reply(
+            encoded.message.name,
             size=len(encoded.data),
+            seq=encoded.sequence,
+            mid=encoded.mid,
             raw=encoded.data,
         )
         return encoded

@@ -63,7 +63,7 @@ READ_BATCH_FRAMES: Final = 512  # most frames one ``next_batch`` hands a consume
 _MAX_STREAMS: Final = MAX_STREAM_ID + 1
 OPEN_TIMEOUT_S: Final = 5.0  # longest a transport may take to open (name resolution, bind)
 
-Reporter = Callable[..., None]  # Session.report: (error, *, context, level, evidence)
+Reporter = Callable[..., None]  # Session.report: (error, *, context, level, evidence, sample)
 
 
 class FrameSink(Protocol):
@@ -682,7 +682,6 @@ class Engine:
         self._ledger.record(
             "state",
             "rx.failed",
-            evidence=False,
             label=io.description,
             code=error.code.value,
             summary=error.summary,
@@ -946,10 +945,20 @@ class Engine:
     def reject(self, frame: Frame, error: DecodeError) -> None:
         """Count, ledger (raw bytes) and report (coalesced) one frame that failed the boundary."""
         self._malformed_total += 1
+        label = self._labels[frame.stream.id]
+        # One evidence-sampling key per (code, MID, stream): the first eight of a window are kept
+        # in full, then one a second; the window summary stands for the rest.
+        key = f"{error.code.value}:{error.mid if error.mid is not None else '-'}:{label}"
         self._ledger.record(
-            "packet", "rx.malformed", raw=frame.data, wire_len=frame.orig_len, source=frame.source
+            "packet",
+            "rx.malformed",
+            sample=key,
+            raw=frame.data,
+            wire_len=frame.orig_len,
+            source=frame.source,
+            seq=frame.seq,
         )
-        self._report(error, context=f"from {self._labels[frame.stream.id]}", evidence=True)
+        self._report(error, context=f"from {label}", evidence=True, sample=f"{key}|error")
 
     def _ingest(
         self,

@@ -8,7 +8,6 @@ import asyncio
 import contextlib
 import copy
 import dataclasses
-import json
 import socket
 from collections.abc import Generator
 from pathlib import Path
@@ -26,21 +25,34 @@ from ironbird.ledger import Ledger
 from ironbird.notice import Level, Notice
 from ironbird.session import Session, TxAttempt
 from ironbird.transport.udp import UdpTransport
+from ledgerutil import all_records
 
 # -- C1: record numbers --
 
 
 def _written(ledger: Ledger) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in ledger.path.read_text().splitlines()]
+    """Part 1 without the ledger's own ``ledger.open`` header."""
+    return [r for r in all_records(ledger) if r["event"] != "ledger.open"]
 
 
-def test_record_error_returns_none_when_its_own_write_fails(tmp_path: Path) -> None:
+def test_a_ledger_in_an_unusable_location_stops_taking_records_after_one_report(
+    tmp_path: Path,
+) -> None:
     blocker = tmp_path / "blk"
     blocker.write_text("a file, not a directory")
     failures: list[IronbirdError] = []
     ledger = Ledger(blocker / "sub", session_id="f", on_failure=failures.append)
+    # The ledger opens on the writer thread, so the first record is queued before anyone knows
+    # the location is wrong: it gets a number, the writer's open then fails and says so once
+    # (IB-LED-002), and the record is discarded with the rest. From then on there is no number
+    # to point at.
+    first = ledger.record_error(IronbirdError(Code.DEC_CHECKSUM, "bad"))
+    assert first is not None
+    ledger.flush()
+    assert [f.code for f in failures] == [Code.LED_DIR]
+    assert not ledger.enabled and ledger.pending == 0
     assert ledger.record_error(IronbirdError(Code.DEC_CHECKSUM, "bad")) is None
-    assert [f.code for f in failures] == [Code.LED_WRITE]
+    assert [f.code for f in failures] == [Code.LED_DIR]  # reported once, not per record
     assert not ledger.path.exists()  # nothing was written, so there is nothing to point at
 
 

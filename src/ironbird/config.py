@@ -17,6 +17,16 @@ from typing import Any, Final
 
 from ironbird.errors import Code, IronbirdError
 from ironbird.header import DEFAULT_MAX_PACKET_BYTES
+from ironbird.units import (
+    DURATION_FORMS,
+    GIB,
+    KIB,
+    MIB,
+    SIZE_FORMS,
+    TIB,
+    parse_duration,
+    parse_size,
+)
 
 MAX_CONFIG_BYTES: Final = 1024 * 1024
 _NAME_RE: Final = re.compile(r"[A-Za-z][A-Za-z0-9_\-]{0,31}")
@@ -140,6 +150,36 @@ class RecordingConfig:
     embed_definitions: bool = True  # decision D1
 
 
+UNLIMITED: Final = "unlimited"
+ON_FULL_POLICIES: Final = ("continue", "refuse_commands")
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerConfig:
+    """The ``[ledger]`` table: tier allowances, the essential reserve, rotation, the full-disk
+    policy. ``None`` for an allowance means ``"unlimited"``."""
+
+    event_bytes_per_hour: int | None = 160 * MIB
+    evidence_bytes_per_hour: int | None = 32 * MIB
+    evidence_raw_bytes_per_second: int = 256 * KIB
+    essential_reserve_bytes: int = 32 * MIB
+    max_file_bytes: int = 32 * MIB
+    on_full: str = "continue"
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionConfig:
+    """The ``[retention]`` table. ``None`` for ``max_age_s`` or ``max_total_bytes`` means
+    ``"unlimited"`` (that warning is off). Retention only warns; ``ib ledger prune`` and
+    ``ib rec prune`` are the only deletion."""
+
+    max_age_s: int | None = 7 * 86400
+    max_total_bytes: int | None = 8 * GIB
+    keep_recent: int = 10
+    warn_interval_s: int = 86400
+    scan_interval_s: int = 600
+
+
 @dataclass(frozen=True, slots=True)
 class SystemConfig:
     path: Path
@@ -148,6 +188,8 @@ class SystemConfig:
     nodes: Mapping[str, Node]
     links: tuple[Link, ...]
     recording: RecordingConfig = RecordingConfig()
+    ledger: LedgerConfig = LedgerConfig()
+    retention: RetentionConfig = RetentionConfig()
 
     def resolve(self, name_or_alias: str) -> Node:
         """Look a node up by name or alias."""
@@ -368,10 +410,167 @@ def _parse_recording(ctx: _Ctx, raw: object) -> RecordingConfig:
     )
 
 
+def _config_size(
+    ctx: _Ctx,
+    table: Mapping[str, Any],
+    key: str,
+    path: str,
+    low: int,
+    high: int,
+    default: int | None,
+    *,
+    unlimited: bool = False,
+) -> int | None:
+    """A size: TOML integer (bytes) or a string in the size grammar; ``"unlimited"`` (exactly
+    that spelling) only where ``unlimited`` allows it."""
+    if key not in table:
+        return default
+    value = table[key]
+    forms = SIZE_FORMS + (" or exactly 'unlimited'" if unlimited else "")
+    if isinstance(value, bool):
+        raise ctx.fail(f"{path}.{key}", f"must be {forms}")
+    if isinstance(value, str) and unlimited and value == UNLIMITED:
+        return None
+    size = (
+        value if isinstance(value, int) else parse_size(value) if isinstance(value, str) else None
+    )
+    if size is None:
+        raise ctx.fail(f"{path}.{key}", f"must be {forms}")
+    if not low <= size <= high:
+        raise ctx.fail(f"{path}.{key}", f"must be from {low} to {high} bytes")
+    return size
+
+
+def _config_duration(
+    ctx: _Ctx,
+    table: Mapping[str, Any],
+    key: str,
+    path: str,
+    low: int,
+    high: int,
+    default: int | None,
+    *,
+    unlimited: bool = False,
+) -> int | None:
+    if key not in table:
+        return default
+    value = table[key]
+    forms = DURATION_FORMS + (" or exactly 'unlimited'" if unlimited else "")
+    if isinstance(value, str) and unlimited and value == UNLIMITED:
+        return None
+    seconds = parse_duration(value) if isinstance(value, str) else None
+    if seconds is None:
+        raise ctx.fail(f"{path}.{key}", f"must be {forms}")
+    if not low <= seconds <= high:
+        raise ctx.fail(f"{path}.{key}", f"must be from {low} to {high} seconds")
+    return seconds
+
+
+def _parse_ledger(ctx: _Ctx, raw: object) -> LedgerConfig:
+    if not isinstance(raw, dict):
+        raise ctx.fail("ledger", "must be a table")
+    ctx.keys(
+        raw,
+        "ledger",
+        {
+            "event_bytes_per_hour",
+            "evidence_bytes_per_hour",
+            "evidence_raw_bytes_per_second",
+            "essential_reserve_bytes",
+            "max_file_bytes",
+            "on_full",
+        },
+        set(),
+    )
+    d = LedgerConfig()
+    on_full = ctx.string(raw, "on_full", "ledger", d.on_full)
+    if on_full not in ON_FULL_POLICIES:
+        raise ctx.fail("ledger.on_full", f"must be one of {', '.join(ON_FULL_POLICIES)}")
+    reserve = _config_size(
+        ctx, raw, "essential_reserve_bytes", "ledger", MIB, GIB, d.essential_reserve_bytes
+    )
+    part = _config_size(ctx, raw, "max_file_bytes", "ledger", MIB, GIB, d.max_file_bytes)
+    rate = _config_size(
+        ctx,
+        raw,
+        "evidence_raw_bytes_per_second",
+        "ledger",
+        KIB,
+        64 * MIB,
+        d.evidence_raw_bytes_per_second,
+    )
+    assert reserve is not None and part is not None and rate is not None
+    return LedgerConfig(
+        event_bytes_per_hour=_config_size(
+            ctx,
+            raw,
+            "event_bytes_per_hour",
+            "ledger",
+            MIB,
+            TIB,
+            d.event_bytes_per_hour,
+            unlimited=True,
+        ),
+        evidence_bytes_per_hour=_config_size(
+            ctx,
+            raw,
+            "evidence_bytes_per_hour",
+            "ledger",
+            MIB,
+            TIB,
+            d.evidence_bytes_per_hour,
+            unlimited=True,
+        ),
+        evidence_raw_bytes_per_second=rate,
+        essential_reserve_bytes=reserve,
+        max_file_bytes=part,
+        on_full=on_full,
+    )
+
+
+def _parse_retention(ctx: _Ctx, raw: object) -> RetentionConfig:
+    if not isinstance(raw, dict):
+        raise ctx.fail("retention", "must be a table")
+    ctx.keys(
+        raw,
+        "retention",
+        {"max_age", "max_total_bytes", "keep_recent", "warn_interval", "scan_interval"},
+        set(),
+    )
+    d = RetentionConfig()
+    warn = _config_duration(
+        ctx, raw, "warn_interval", "retention", 60, 30 * 86400, d.warn_interval_s
+    )
+    scan = _config_duration(ctx, raw, "scan_interval", "retention", 60, 86400, d.scan_interval_s)
+    assert warn is not None and scan is not None
+    return RetentionConfig(
+        max_age_s=_config_duration(
+            ctx, raw, "max_age", "retention", 60, 100_000 * 86400, d.max_age_s, unlimited=True
+        ),
+        max_total_bytes=_config_size(
+            ctx,
+            raw,
+            "max_total_bytes",
+            "retention",
+            MIB,
+            1024 * TIB,
+            d.max_total_bytes,
+            unlimited=True,
+        ),
+        keep_recent=_config_int(ctx, raw, "keep_recent", "retention", 0, 1000)
+        if "keep_recent" in raw
+        else d.keep_recent,
+        warn_interval_s=warn,
+        scan_interval_s=scan,
+    )
+
+
 def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
     """Validate a parsed TOML mapping (paths resolve against ``path.parent``)."""
     ctx = _Ctx(path)
-    ctx.keys(data, "", {"ironbird", "nodes", "links", "recording"}, {"nodes"})
+    ctx.keys(
+        data, "", {"ironbird", "nodes", "links", "recording", "ledger", "retention"}, {"nodes"}
+    )
 
     settings = data.get("ironbird", {})
     if not isinstance(settings, dict):
@@ -484,6 +683,10 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
         recording=_parse_recording(ctx, data["recording"])
         if "recording" in data
         else RecordingConfig(),
+        ledger=_parse_ledger(ctx, data["ledger"]) if "ledger" in data else LedgerConfig(),
+        retention=_parse_retention(ctx, data["retention"])
+        if "retention" in data
+        else RetentionConfig(),
     )
 
 

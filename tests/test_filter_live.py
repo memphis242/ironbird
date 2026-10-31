@@ -15,13 +15,14 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from conftest import EXAMPLES
+from conftest import EXAMPLES, without_host_warnings
 from ironbird.ccdd.model import EventSeverity
 from ironbird.cli.main import app
 from ironbird.config import SystemConfig, load_config
 from ironbird.errors import Code
 from ironbird.filter import FilterError
 from ironbird.frame import Decoded
+from ironbird.fsops import FileSystem
 from ironbird.ledger import Ledger
 from ironbird.session import Responder, Session
 
@@ -332,7 +333,12 @@ def test_the_ledger_records_a_filter_only_when_there_is_one_and_bounds_its_mids(
 # -- the CLI ---------------------------------------------------------------------------------
 
 
-def test_cli_filter_errors_are_one_coded_line_with_details_on_verbose(config_path: Path) -> None:
+@pytest.mark.parametrize("reserve_fs", [None, 0x794C7630], ids=["host-fs", "overlayfs"])
+def test_cli_filter_errors_are_one_coded_line_with_details_on_verbose(
+    config_path: Path, reserve_fs: int | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if reserve_fs is not None:  # the state directory as a container's overlayfs shows it
+        monkeypatch.setattr(FileSystem, "fstatfs_type", lambda _self, _fd: reserve_fs)
     runner = CliRunner()
     base = ["-c", str(config_path)]
     for command, text, code in [
@@ -346,8 +352,7 @@ def test_cli_filter_errors_are_one_coded_line_with_details_on_verbose(config_pat
         done = runner.invoke(app, [*argv, "--timeout", "1"])
         assert done.exit_code == 2, (text, done.output)
         assert f"error {code}:" in done.output and "listening" not in done.output, done.output
-        lines = [ln for ln in done.output.splitlines() if ln.strip()]
-        assert len(lines) == 1, done.output
+        assert len(without_host_warnings(done.output)) == 1, done.output
     verbose = runner.invoke(
         app, [*base, "listen", "fc", "--where", "cmd_countr > 1", "--verbose", "--timeout", "1"]
     )

@@ -43,6 +43,7 @@ from ironbird.notice import Notice
 from ironbird.session import Session
 from ironbird.transport import LinkEnd, UdpTransport, udp
 from ironbird.transport.udp import RECV_FAIL_WINDOW_S
+from ledgerutil import records
 
 T = TypeVar("T")
 TRUNCATED_BIT = int(FrameFlag.TRUNCATED)
@@ -864,8 +865,7 @@ def test_raw_bytes_are_cut_when_the_record_is_created_not_when_it_is_written(
     ledger.record("packet", "rx.malformed", raw=memoryview(bytes(60000)))
     assert ledger.pending_bytes == 3 * (ENTRY_OVERHEAD_BYTES + 100) + 3 * 0  # no 60000 B queued
     ledger.flush()
-    for line in ledger.path.read_text().splitlines():
-        record = json.loads(line)
+    for record in records(ledger):
         assert record["raw_len"] == 60000 and record["raw"].endswith("...(+59900B)")
         assert len(bytes.fromhex(record["raw"].split(" ...")[0])) == 100
     assert ledger.pending_bytes == 0
@@ -880,7 +880,7 @@ def test_a_buffer_the_producer_reuses_cannot_change_a_queued_record(tmp_path: Pa
     buffer[:] = b"\xff\xff\xff"
     view[:] = b"\xff\xff"
     ledger.flush()
-    first, second = (json.loads(x) for x in ledger.path.read_text().splitlines())
+    first, second = records(ledger)
     assert first["raw"] == "01 02 03" and first["raw_len"] == 3
     assert second["raw"] == "0a 0b" and second["raw_len"] == 2
 
@@ -890,7 +890,7 @@ def test_wide_and_strided_memoryviews_are_measured_in_bytes(tmp_path: Path) -> N
     ledger.record("packet", "rx", raw=memoryview(bytes(range(20))).cast("H"))  # 10 items, 20 bytes
     ledger.record("packet", "rx", raw=memoryview(bytes(range(20)))[::2])  # not contiguous
     ledger.flush()
-    wide, strided = (json.loads(x) for x in ledger.path.read_text().splitlines())
+    wide, strided = records(ledger)
     assert wide["raw_len"] == 20 and wide["raw"].startswith("00 01 02 03 04 05 06 07 ...")
     assert strided["raw_len"] == 10 and strided["raw"].startswith("00 02 04 06 08 0a 0c 0e ...")
 

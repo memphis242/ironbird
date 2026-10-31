@@ -19,6 +19,7 @@ from ironbird.errors import Code, IronbirdError
 from ironbird.ledger import Ledger, default_state_dir, format_ts
 from ironbird.notice import Level, Notice
 from ironbird.sanitize import clean
+from ledgerutil import records
 
 
 class FakeClock:
@@ -110,6 +111,9 @@ def test_notice_line_uses_its_level_and_rejects_inconsistent_values() -> None:
 # -- ledger --
 
 
+written = records
+
+
 def test_ledger_record_is_deferred_and_flush_writes_valid_jsonl(tmp_path: Path) -> None:
     ledger = Ledger(tmp_path / "led", session_id="abc")
     ledger.record("action", "cli.invoke", argv=["send"], raw=b"\x01\x02")
@@ -117,8 +121,7 @@ def test_ledger_record_is_deferred_and_flush_writes_valid_jsonl(tmp_path: Path) 
     assert not (tmp_path / "led").exists()  # nothing touched the disk yet
     assert ledger.pending == 2
     ledger.flush()
-    lines = ledger.path.read_text().splitlines()
-    records = [json.loads(line) for line in lines]
+    records = written(ledger)
     assert [r["event"] for r in records] == ["cli.invoke", "x"]
     assert records[0]["session"] == "abc" and records[0]["raw"] == "01 02"
     assert records[0]["ts"].endswith("Z") and len(records[0]["ts"]) == len(
@@ -134,10 +137,10 @@ def test_ledger_record_returns_the_number_it_is_written_with(tmp_path: Path) -> 
     err = ledger.record_error(IronbirdError(Code.DEC_CHECKSUM, "bad"))
     ledger.flush()
     ledger.close()
-    written = [json.loads(line) for line in ledger.path.read_text().splitlines()]
+    records = written(ledger)
     assert (first, err) == (1, 2)
-    assert [r["n"] for r in written] == [1, 2]
-    assert written[1]["event"] == Code.DEC_CHECKSUM.value
+    assert [r["n"] for r in records] == [1, 2]
+    assert records[1]["event"] == Code.DEC_CHECKSUM.value
 
 
 def test_disabled_ledger_has_no_record_number(tmp_path: Path) -> None:
@@ -150,7 +153,8 @@ def test_ledger_error_record_has_code_summary_and_details(tmp_path: Path) -> Non
     ledger = Ledger(tmp_path, session_id="s")
     err = IronbirdError(Code.TX_SEND, "boom", details="more", cause=OSError("low level"))
     ledger.record_error(err, role="ground")
-    record = json.loads(ledger.path.read_text().splitlines()[0])
+    ledger.flush()
+    (record,) = written(ledger)
     assert record["kind"] == "error" and record["event"] == "IB-TX-002"
     assert "more" in record["details"] and "low level" in record["details"]
 
@@ -183,7 +187,7 @@ def test_ledger_write_failure_is_reported_once(tmp_path: Path) -> None:
     ledger.flush()
     ledger.record("action", "b")
     ledger.flush()
-    assert len(seen) == 1 and seen[0].code is Code.LED_WRITE
+    assert len(seen) == 1 and seen[0].code is Code.LED_DIR  # a configuration failure
 
 
 def test_ledger_idle_drain_task_writes_without_explicit_flush(tmp_path: Path) -> None:
@@ -281,7 +285,7 @@ def test_ledger_survives_unformattable_fields_and_keeps_neighbours(tmp_path: Pat
     ledger.record("state", "nan", values=[float("nan"), float("inf"), -float("inf"), 1.5])
     ledger.record("state", "after")
     ledger.flush()
-    records = [_strict_loads(line) for line in ledger.path.read_text().splitlines()]
+    records = [_strict_loads(line) for line in ledger.path.read_text().splitlines()][1:]
     assert [r["event"] for r in records] == ["before", "tuple-keys", "cycle", "nan", "after"]
     assert records[3]["values"] == ["nan", "inf", "-inf", 1.5]
 
@@ -295,7 +299,7 @@ def test_ledger_unformattable_record_falls_back_to_repr(tmp_path: Path) -> None:
     ledger.record("state", "hostile", thing=Hostile())
     ledger.record("state", "after")
     ledger.flush()
-    records = [_strict_loads(line) for line in ledger.path.read_text().splitlines()]
+    records = [_strict_loads(line) for line in ledger.path.read_text().splitlines()][1:]
     assert [r["event"] for r in records] == ["hostile", "after"]
 
 
@@ -319,7 +323,7 @@ def test_record_error_flushes_in_bounded_slices_and_drain_task_finishes(tmp_path
     asyncio.run(finish())
     assert ledger.pending == 0
     lines = ledger.path.read_text().splitlines()
-    assert len(lines) == 5001 and json.loads(lines[-1])["event"] == "IB-DEC-005"
+    assert len(lines) == 5002 and json.loads(lines[-1])["event"] == "IB-DEC-005"  # + ledger.open
 
 
 def test_ledger_raw_evidence_is_kept_up_to_the_max_packet_size(tmp_path: Path) -> None:
@@ -327,6 +331,6 @@ def test_ledger_raw_evidence_is_kept_up_to_the_max_packet_size(tmp_path: Path) -
     ledger.record("packet", "rx", raw=bytes(range(256)) * 8)
     ledger.record("packet", "rx", raw=bytes(2049))
     ledger.flush()
-    first, second = (json.loads(x) for x in ledger.path.read_text().splitlines())
+    first, second = written(ledger)
     assert len(bytes.fromhex(first["raw"])) == 2048
     assert "...(+1B)" in second["raw"]

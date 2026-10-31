@@ -14,6 +14,7 @@ from types import MappingProxyType
 from typing import Final
 
 from ironbird.errors import Code
+from ironbird.units import format_duration
 
 
 class Level(IntEnum):
@@ -44,6 +45,8 @@ class Notice:
     ledger_n: int | None = (
         None  # record number queued for the latest occurrence (written unless the ledger fails)
     )
+    ledger_part: int = 1  # the ledger part current when it was queued (2d rotation)
+    ledger_file: str = ""  # that part's file name stem, set once the ledger has rotated
 
     def __post_init__(self) -> None:
         assert self.count >= 1
@@ -52,10 +55,12 @@ class Notice:
         assert "\n" not in self.summary and "\r" not in self.summary
 
     def line(self, *, verbose: bool = False) -> str:
-        """``error IB-DEC-005: ... (x37 in 10 s)``; ``verbose`` appends ``[ledger n=1234]``."""
+        """``error IB-DEC-005: ... (x37 in 10 s)``; ``verbose`` appends ``[ledger n=1234]``, and
+        ``file=<name>`` once the ledger has rotated past part 1."""
         text = f"{self.level.label} {self.code.value}: {self.summary}"
         if self.count > 1:
-            text += f" (x{self.count} in {max(1, round(self.window_s))} s)"
+            text += f" (x{self.count} in {format_duration(max(1, round(self.window_s)))})"
         if verbose and self.ledger_n is not None:
-            text += f" [ledger n={self.ledger_n}]"
+            where = f" file={self.ledger_file}" if self.ledger_file and self.ledger_part > 1 else ""
+            text += f" [ledger n={self.ledger_n}{where}]"
         return text

@@ -87,7 +87,7 @@ SIGNAL_IN_CLOSE = """
         _calls[0] += 1
         if _calls[0] == 1:
             os.kill(os.getpid(), signal.SIGTERM)  # arrives while the signals are held
-        _orig_close(self)
+        return _orig_close(self)
     _l.Ledger.close = _close
 """
 

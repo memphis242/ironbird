@@ -67,8 +67,81 @@ ledger says how many. A packet's `raw` bytes are cut to `max_packet_bytes` when 
 created and the full length is kept as `raw_len`. Packet and wire-error records
 have a capped share of the queue so a flood of them is unlikely to crowd out actions and commands,
 but capture is not guaranteed when the queue is full. A `[ledger n=N]` pointer names the record
-queued for the latest occurrence; it is written unless the ledger fails (`IB-LED-001`) or the
-process is killed first.
+queued for the latest occurrence; it is written unless the ledger is still stalled at exit
+(`IB-LED-001`) or the process is killed first. After the ledger rotates into a second part the
+pointer names the part too: `[ledger n=1234 file=<stamp>-<session>.p0003]`.
+
+## The ledger under load, a full disk, and retention
+
+The ledger writes through one writer thread, so a slow or hung disk never blocks capture.
+
+- **Tiers.** Records are *essential* (your actions, commands, state changes: never sampled or
+  capped), *evidence* (what the wire drives: malformed packets, wire-error records, a
+  responder's received commands) or *events* (received cFS events). Evidence is sampled per code,
+  MID and stream in 10 s windows (the first eight kept in full, then one a second, the rest
+  summarised in one `...summary` record; every occurrence is counted) and raw bytes are limited
+  to 256 KiB/s. Events and evidence each have an hourly allowance that grows with the run time
+  (`[ledger] event_bytes_per_hour` 160 MiB, `evidence_bytes_per_hour` 32 MiB, never less than one
+  hour's worth): above it a tier is *counted only* (`IB-LED-003`, one line per 10 minutes,
+  `ledger.tier_gap` marks the gap) and resumes when it is back under. Telemetry belongs in
+  recordings, not the ledger.
+- **Rotation.** At `max_file_bytes` (32 MiB) the ledger continues in `<stamp>-<session>.pNNNN.jsonl`,
+  each part opening with a `ledger.part` record naming the previous one. If the next names are
+  taken it keeps writing the current part (`IB-LED-010`).
+- **Disk full.** Long commands (`listen`, `events`, `respond`, `record`) preallocate a 32 MiB
+  essential reserve (`<stamp>-<session>.r0001.reserve`) on ext4, XFS or tmpfs. When a write fails
+  with ENOSPC or EDQUOT the ledger continues in the reserve (`IB-LED-005`), events and evidence
+  are counted only, and essential records, commands included, are still written. On any other
+  file system no reserve is created (`IB-LED-006`) and a full disk stalls the ledger at once.
+- **Stalled ledger.** When an essential record cannot be written (reserve used up, I/O error, a
+  write that hangs for 5 s) the ledger *stalls*: records stay queued and it retries every 5 s
+  (`IB-LED-001`; resuming is `IB-LED-007`). Commands are still sent by default
+  (`[ledger] on_full = "continue"`): each is reported as `warning IB-LED-004: NOOP sent to fc but
+  not logged (...)`, a short command like `ib send` prints one such line at exit, and the process
+  exits **6** if a transmission's record was never written or may have been lost to a deferred
+  sync error. `on_full = "refuse_commands"` refuses them instead (exit 1, nothing sent).
+- **Locks.** Every session holds `flock` on its first part for its life, which is how other
+  processes tell a live session from a dead one. Where locks are unsupported (some NFS and FUSE
+  mounts) the session runs unlocked and says so (`IB-LED-009`); keep the state and recording
+  directories on a local file system, or prune only from the host that writes them. Without a
+  lock, a session is told apart from a dead one only by how recently its files changed (it
+  touches its file every minute while idle): a clock stepped forward by more than ten minutes,
+  or a host suspended for longer, can make a live unlocked session look idle, and a prune may
+  then propose it. A clock stepped backward leaves future file times, which count as live until
+  the clock catches up. Where this matters, do not prune while such a session runs.
+- **Retention only warns.** ironbird never deletes a ledger part, a reserve or a recording on its
+  own. `IB-RET-001` says that sessions older than `[retention] max_age` (7d) exist, `IB-RET-002`
+  that ledgers plus recordings are past, or projected past, `max_total_bytes` (8GiB), `IB-RET-004`
+  that a scan was partial or a reserve could not be recovered. Warnings are shown at most once per
+  `warn_interval` (24h) per code and directory across processes. A crashed session's leftover
+  reserve is cut at its last complete record and renamed to the next part (or, if damaged,
+  salvaged and the original kept as `*.reserve.damaged`); it is never deleted. Long sessions and
+  `prune` do this recovery; a short command only warns.
+- **Pruning** is explicit: `ib ledger prune` and `ib rec prune [--older-than AGE] [--until-under SIZE]
+  [--keep N] [--dry-run] [--yes] [--format line|json]` list exactly what they would delete and ask
+  `delete 14 sessions (310 MiB)? [y/N]` (only `y` or `yes` confirms; without a terminal pass
+  `--yes`). They never touch a live session, one among the `keep_recent` (10) most recent, a
+  short session that ran inside a protected long one, an incomplete or hard-linked one, or a
+  ledger whose recording is still present. Flags use the config grammars (sizes `64MiB`, ages `7d`).
+  Stage 1 processes still running after an upgrade take no locks and write no heartbeat: end them
+  before the first prune.
+
+```toml
+[ledger]    # all optional; sizes are bytes or "64MiB", durations "10min"
+event_bytes_per_hour = "160MiB"        # or exactly "unlimited"
+evidence_bytes_per_hour = "32MiB"      # "unlimited" lets a garbage flood fill the disk (IB-LED-008)
+evidence_raw_bytes_per_second = "256KiB"
+essential_reserve_bytes = "32MiB"
+max_file_bytes = "32MiB"
+on_full = "continue"                   # or "refuse_commands"
+
+[retention]
+max_age = "7d"                         # or "unlimited": no age warning
+max_total_bytes = "8GiB"               # or "unlimited": no size warning
+keep_recent = 10
+warn_interval = "24h"
+scan_interval = "10min"
+```
 
 ## Recording
 
@@ -199,6 +272,7 @@ ib replay run1.ibrec --follow                                 # a recording stil
 | 2 | Usage, configuration, CCDD or header-profile error |
 | 3 | `listen`, `events` or `respond` had `--count N` and `--timeout` elapsed first |
 | 5 | The output was produced, but the input recording was damaged mid-file: `ib rec repair` left valid frames after the damage out of the copy; `ib replay` stopped at the damage (or, with `--skip-damage`, went past it) or a part of a split recording is missing |
+| 6 | A command or reply went out but its ledger record was never written, or may have been lost to a deferred sync or close error (`IB-LED-004`). Same tier as 4 and wins over 4 and 5; an error (1, 2), 3 or a signal takes precedence. A `respond` that withheld replies under `on_full = "refuse_commands"` exits 1 |
 | 4 | The command otherwise succeeded but stdout lines were lost (`IB-OUT-002`): dropped while stdout was not draining, abandoned when a signal cut the final drain short, or stdout is closed (`>&-`). An error (1, 2), 3, 5 or a signal (128+n) takes precedence. A `send` that exits 4 still went out |
 | 128+n | Ended by signal n: 130 (Ctrl-C), 129 (SIGHUP), 143 (SIGTERM). The ledger is flushed first; an interrupted `send` says whether the command went out |
 
@@ -220,7 +294,11 @@ raise `net.core.rmem_max` (`sysctl -w net.core.rmem_max=...`).
 
 The ledger directory is an absolute `$IRONBIRD_STATE_DIR` (a relative one is refused), else an absolute `$XDG_STATE_HOME/ironbird`,
 else `~/.local/state/ironbird`. `send` and `respond` refuse to run (`IB-LED-002`, nothing sent)
-when it cannot be created.
+when the state directory is unusable: a relative path, no home, no permission, a read-only file
+system, a path through a file. When the directory is usable but the disk or the system fails
+(disk or quota full, I/O error, out of descriptors, a hung file server), they send and warn
+(`IB-LED-004`, exit 6 if the record is never written) under the default `on_full = "continue"`,
+or refuse (exit 1) under `on_full = "refuse_commands"`.
 
 ## Events and telemetry categories
 

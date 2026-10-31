@@ -28,6 +28,7 @@ import typer
 
 from ironbird import render
 from ironbird.ccdd.model import EventSeverity, MessageKind
+from ironbird.cli import prunecmd
 from ironbird.cli.output import (
     CLOSE_WAIT_S,
     HANDLED_SIGNALS,
@@ -36,10 +37,12 @@ from ironbird.cli.output import (
     signals_held,
 )
 from ironbird.codec import Codec
-from ironbird.config import SystemConfig, find_config, load_config
+from ironbird.config import RecordingConfig, RetentionConfig, SystemConfig, find_config, load_config
 from ironbird.errors import Code, IronbirdError
 from ironbird.filter import Filter
-from ironbird.ledger import Ledger, default_state_dir
+from ironbird.fsops import REAL_FS
+from ironbird.ledger import ExitReport, Ledger, default_state_dir
+from ironbird.notice import Notice
 from ironbird.recording import inspect as rec_inspect
 from ironbird.recording.defs import (
     config_codecs,
@@ -56,13 +59,22 @@ from ironbird.recording.replay import (
     check_speed,
     parse_time_spec,
 )
-from ironbird.recording.session import PendingRecording, RecordRequest, parse_split
+from ironbird.recording.session import (
+    PendingRecording,
+    RecordRequest,
+    default_recording_dir,
+    parse_split,
+)
 from ironbird.recording.writer import Recorder
+from ironbird.retention import LONG_COMMANDS
+from ironbird.retnotices import Notices
+from ironbird.retservice import Retention
 from ironbird.session import Route, Session, Side
 
 EXIT_TIMEOUT: Final = 3  # --count was given and not reached before --timeout
 EXIT_OUTPUT_LOST: Final = 4  # the command completed but stdout lines were lost
 EXIT_DAMAGED_INPUT: Final = 5  # output produced, but the input recording was damaged mid-file
+EXIT_UNLOGGED: Final = 6  # a command or reply went out but its ledger record was never written
 STATUS_INTERVAL_S: Final = 5.0  # ``ib record`` status line on stderr
 MAX_TIMEOUT_S: Final = 365 * 24 * 3600.0
 OUTPUT_POLL_S: Final = 0.5
@@ -70,6 +82,9 @@ DRAIN_NOTICE_S: Final = 2.0  # waiting this long for the reader of stdout earns 
 SIGNAL_POLL_S: Final = 0.02
 MIN_FREE_FDS: Final = 8  # event loop (3), UDP sockets, ledger, resolver threads, margin
 _SIGNALS: Final = HANDLED_SIGNALS
+# Keyword arguments for the ledger of this process (``fs``, ``clock``, ``join_timeout_s``, ...).
+# Production leaves it empty; a test wrapper module assigns it before calling ``main()``.
+LEDGER_OPTIONS: Final[dict[str, Any]] = {}
 
 app = typer.Typer(
     name="ironbird",
@@ -86,6 +101,14 @@ rec_app = typer.Typer(
     pretty_exceptions_enable=False,
 )
 app.add_typer(rec_app, name="rec")
+ledger_app = typer.Typer(
+    name="ledger",
+    help="Manage the action ledger files (list and delete old sessions after confirmation).",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(ledger_app, name="ledger")
 
 
 class Format(StrEnum):
@@ -269,6 +292,10 @@ class _Run:
     verbose: bool
     session: Session | None = None
     pipe_closed: asyncio.Event = field(default_factory=asyncio.Event)
+    config: SystemConfig | None = None  # loaded before the ledger opens, so [ledger] applies
+    config_error: IronbirdError | None = None
+    config_missing: bool = False  # no configuration file at all (not an error for offline tools)
+    retention: Retention | None = None
 
 
 Body = Callable[[Session, SystemConfig, "_Run"], Awaitable[int]]
@@ -324,12 +351,12 @@ async def _main(glob: Globals, ledger: Ledger, body: Body, run: _Run) -> int:
 
 async def _main_body(glob: Globals, ledger: Ledger, body: Body, run: _Run) -> int:
     console = run.console
-    try:
-        config = load_config(find_config(glob.config))
-    except IronbirdError as exc:
+    if run.config is None:
+        exc = run.config_error or IronbirdError(Code.INTERNAL, "the configuration was not loaded")
         ledger.record_error(exc)
         _print_error(console, exc, run.verbose)
         return exc.exit_code
+    config = run.config
     try:
         async with Session(
             config,
@@ -366,6 +393,14 @@ def _interrupt_notice(name: str, signum: int, run: _Run) -> str:
     if tx.went_out:
         return f"interrupted ({sig}): {tx.command} was sent; delivery was not confirmed"
     return f"interrupted ({sig}): {tx.command} was not sent"
+
+
+def _recording_dir(config: SystemConfig | None) -> Path | None:
+    """Where recordings are kept, or ``None`` when that cannot be resolved (no warning then)."""
+    try:
+        return default_recording_dir(config.recording if config is not None else RecordingConfig())
+    except IronbirdError:
+        return None
 
 
 def _check_descriptors() -> None:
@@ -419,11 +454,7 @@ def _record_signal(
         console.err(notice)
         return 128 + int(signum)
     ledger.flush()
-    if sys.stderr is not None:  # closed with ``2>&-``: nobody to tell
-        late = BoundedWriter(sys.stderr)
-        late.write(term(notice, 1000, err=True))
-        if not late.close(CLOSE_WAIT_S):
-            ledger.record("state", "output.stderr_lost", lost=late.lost, notice=notice)
+    _late_err(ledger, term(notice, 1000, err=True))
     return 128 + int(signum)
 
 
@@ -435,6 +466,27 @@ def _poll_signal(wait_s: float) -> int:
         return 0
     info = take(_SIGNALS, wait_s)
     return int(info.si_signo) if info is not None else 0
+
+
+def _signal_during_wait() -> bool:
+    """Whether a shutdown signal arrived while the exit was waiting for the ledger (the wait
+    ends at once; the signal is kept for the exit code)."""
+    got = _poll_signal(0)
+    if not got:
+        return False
+    if not _STATE.signum:
+        _STATE.signum = got
+    return True
+
+
+def _late_err(ledger: Ledger, text: str) -> None:
+    """Write a line to the process's stderr after the console's writer is closed (bounded)."""
+    if sys.stderr is None:  # closed with ``2>&-``: nobody to tell
+        return
+    late = BoundedWriter(sys.stderr)
+    late.write(text)
+    if not late.close(CLOSE_WAIT_S):
+        ledger.record("state", "output.stderr_lost", lost=late.lost, notice=text)
 
 
 def _drain(writer: BoundedWriter, on_slow: Callable[[], None] | None = None) -> int:
@@ -484,6 +536,40 @@ def _stdout_loss(console: Console, name: str, run: _Run) -> IronbirdError | None
     return IronbirdError(Code.OUT_LOST, summary)
 
 
+def _apply_ledger_report(code: int, report: ExitReport) -> int:
+    """Fold the ledger's account into the exit code.
+
+    Replies withheld under ``on_full = "refuse_commands"`` are an error (1, above 3, 4, 5 and 6);
+    a transmission whose record was never written or was possibly lost is 6, which wins over 4
+    and 5 and yields to an error (1, 2), to 3 and to a signal.
+    """
+    if report.withheld and code in (0, EXIT_TIMEOUT, EXIT_OUTPUT_LOST, EXIT_DAMAGED_INPUT, 6):
+        return 1
+    if report.unlogged and code in (0, EXIT_OUTPUT_LOST, EXIT_DAMAGED_INPUT):
+        return EXIT_UNLOGGED
+    return code
+
+
+def _closing_news(report: ExitReport, closing: ExitReport) -> tuple[Notice, ...]:
+    """The exit lines of the final close for a code the earlier account did not already print
+    (the close may fail where the last write attempt did not). A code that was shown is not shown
+    again with other figures: two lines that disagree on how many records were not written are
+    worse than one."""
+    seen = {notice.code for notice in report.notices}
+    return tuple(notice for notice in closing.notices if notice.code not in seen)
+
+
+def _report_ledger(report: ExitReport, run: _Run, console: Console, code: int) -> int:
+    """Print the ledger's exit lines (and, with ``--verbose``, the unwritten transmission
+    records as JSON lines, so their trace survives in the terminal or CI log)."""
+    for notice in report.notices:
+        console.err(term(notice.line(verbose=run.verbose), 1000, err=True))
+    if run.verbose:
+        for line in report.unwritten_tx_lines:
+            console.err(term(line, 4000, err=True))
+    return _apply_ledger_report(code, report)
+
+
 def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -> int:
     """Write out everything still queued, close the ledger and return the exit code.
 
@@ -498,7 +584,10 @@ def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -
     """
     out, err = console.stdout, console.stderr
     with signals_held():
-        ledger.flush()
+        ledger.begin_exit(_signal_during_wait)  # one bound for every wait on a slow disk
+        if run.retention is not None:
+            run.retention.finish()  # a scan in flight reports before the account is made
+        report = ledger.finish()  # the last write attempt, and the account of what is unwritten
         signum = _STATE.signum
         fresh = 0 if _STATE.announced else signum  # a signal that still has to be ledgered
 
@@ -534,6 +623,7 @@ def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -
             console.err(loss.user_line())
             if code == 0:
                 code = EXIT_OUTPUT_LOST
+        code = _report_ledger(report, run, console, code)
         if not signum and (got := _drain(err)):
             signum = fresh = _STATE.signum = got
             code = _record_signal(name, got, run, ledger, console)
@@ -548,12 +638,44 @@ def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -
                 unavailable=err.unavailable,
                 reader_gone=err.reader_gone,
             )
-        ledger.close()
+        closing = ledger.close()
+        ledger.set_notifier(None)
+        code = _apply_ledger_report(code, closing)  # a sync error at close; the exit says so
+        for notice in _closing_news(report, closing):  # and never without its line
+            _late_err(ledger, term(notice.line(verbose=run.verbose), 1000, err=True))
         if not signum and (got := _poll_signal(0)):  # arrived while the ledger was closing
             code = _record_signal(name, got, run, ledger, console, direct=True)
             ledger.close()
         _STATE.restore_default()  # a later signal ends the process by that signal, not silently
     return code
+
+
+_EARLY_PREFIXES: Final = ("IB-CLI-", "IB-FLT-", "IB-EVT-")  # errors of the invocation itself
+
+
+def _usage_error(
+    run: _Run, role: str | None, precheck: Callable[[Session], None] | None
+) -> IronbirdError | None:
+    """The usage error that ``precheck`` finds in the invocation, else ``None``.
+
+    Only an error of the command line itself (:data:`_EARLY_PREFIXES`) is answered here. The
+    check runs on a session with no ledger and no sockets, and any other error - a configuration,
+    CCDD or header file that fails to load included - is left to the command, which reports and
+    ledgers it like every other failure."""
+    if precheck is None or run.config is None:
+        return None
+    try:
+        precheck(
+            Session(
+                run.config,
+                role=role,
+                ledger=Ledger(Path("/nonexistent"), enabled=False),
+                notify=lambda _notice: None,
+            )
+        )
+    except IronbirdError as exc:
+        return exc if exc.code.value.startswith(_EARLY_PREFIXES) else None
+    return None
 
 
 def _run(
@@ -565,8 +687,15 @@ def _run(
     *,
     transmits: bool = False,
     offline: OfflineBody | None = None,
+    scan: bool = True,
+    precheck: Callable[[Session], None] | None = None,
 ) -> None:
     """Open the ledger, run ``body`` in an event loop, flush everything, exit with its code.
+
+    ``precheck`` validates the invocation against the configuration before anything is opened: a
+    error of the command line itself that it raises (``IB-CLI-``, ``IB-FLT-``, ``IB-EVT-``) is
+    reported alone, with no ledger, reserve or retention scan opened for it; any other error
+    is left to the command, which ledgers it.
 
     ``transmits`` commands (they put packets on a link) refuse to run without a ledger.
     ``offline`` runs instead of ``body``, synchronously and with no configuration or session: it
@@ -577,15 +706,58 @@ def _run(
     glob = Globals(base.config, as_node or base.role, base.verbose or verbose)
     console = Console(sys.stdout, sys.stderr)
     run = _Run(console, glob.verbose)
+    # The configuration is read before the ledger opens: its [ledger] table sets the allowances,
+    # the reserve and the full-disk policy. A session command reports a bad one from its own
+    # body (and ledgers it); the offline commands do without a configuration.
+    try:
+        config_path = find_config(glob.config)
+    except IronbirdError as exc:
+        run.config_error, run.config_missing = exc, True
+    else:
+        try:
+            run.config = load_config(config_path)
+        except IronbirdError as exc:
+            run.config_error = exc
+    retention_cfg = run.config.retention if run.config is not None else RetentionConfig()
+    fs = LEDGER_OPTIONS.get("fs", REAL_FS)
     ledger = Ledger(Path("/nonexistent"), enabled=False)
     code = 1
     try:
+        usage = _usage_error(run, glob.role, precheck)
+        if usage is not None:  # nothing was opened for this invocation, so nothing else is said
+            _print_error(console, usage, glob.verbose)
+            raise typer.Exit(usage.exit_code)
         try:
+            state_dir = default_state_dir()
+            notices = Notices(state_dir, fs=fs)
             ledger = Ledger(
-                default_state_dir(),
+                state_dir,
                 on_failure=lambda exc: _print_error(console, exc, glob.verbose),
+                config=run.config.ledger if run.config is not None else None,
+                session_class="long" if name in LONG_COMMANDS else "short",
+                command=name,
+                warn_gate=lambda code: notices.allow(
+                    code.value, state_dir, retention_cfg.warn_interval_s
+                ),
+                **LEDGER_OPTIONS,
+            )
+            ledger.set_notifier(
+                lambda notice: console.err(term(notice.line(verbose=glob.verbose), 1000, err=True))
             )
             ledger.open()
+            if scan and ledger.enabled:
+                recordings = _recording_dir(run.config)
+                run.retention = Retention(
+                    ledger,
+                    retention_cfg,
+                    state_dir,
+                    recordings,
+                    long_session=name in LONG_COMMANDS,
+                    notices=notices,
+                    fs=fs,
+                )
+                ledger.add_ticker(run.retention.poll)
+                run.retention.start()
             if glob.verbose:  # the `[ledger n=N]` pointers on notices refer to this file
                 console.err(f"ledger: {term(str(ledger.path), 1000, err=True)}")
         except IronbirdError as exc:
@@ -659,6 +831,8 @@ async def _run_until(
     """
     assert run.session is not None
     session = run.session
+    if timeout is not None and run.retention is not None:
+        run.retention.set_deadline(timeout)  # the projection's horizon is what is left to run
     task = asyncio.ensure_future(consumer)
     pipe = asyncio.ensure_future(run.pipe_closed.wait())
     reason = "signal"
@@ -730,6 +904,8 @@ class _RecordingScope:
         if self._pending is None:
             return
         self.recorder = self._pending.commit()
+        if self._run.retention is not None:
+            self._run.retention.add_rate_source(self.recorder.rate_bytes_per_s)
         self._run.console.err(f"recording to {term(str(self.recorder.path), 1000, err=True)}")
 
     async def __aexit__(self, exc_type: object, exc: BaseException | None, tb: object) -> None:
@@ -987,7 +1163,11 @@ def listen(
             await listener.close()
         return _exit_for(reason, count, shown)
 
-    _run(ctx, as_node, verbose, body, "listen")
+    def check(session: Session) -> None:
+        mids = _parse_mids(session, node, mid, link)
+        session.plan_listen(node, mids=mids, link=link, where=where)
+
+    _run(ctx, as_node, verbose, body, "listen", precheck=check)
 
 
 @app.command()
@@ -1056,7 +1236,10 @@ def events(
             await stream.close()
         return _exit_for(reason, count, shown)
 
-    _run(ctx, as_node, verbose, body, "events")
+    def check(session: Session) -> None:
+        session.plan_events(node, where=where)
+
+    _run(ctx, as_node, verbose, body, "events", precheck=check)
 
 
 @app.command()
@@ -1379,6 +1562,14 @@ def rec_repair(
             f"repaired {term(str(source), 400)} -> {term(str(result.output), 400)}: "
             f"{result.frames} frame(s), {size_text(result.size)}; the original is unchanged"
         )
+        if result.sync_warning is not None:
+            warning = (
+                f"the directory of {term(str(result.output), 400, err=True)} could not be synced "
+                f"({term(result.sync_warning, 200, err=True)}); the repaired file exists, but its "
+                "name may not survive a power loss"
+            )
+            ledger.record("warning", Code.REC_DIRSYNC.value, summary=warning, output=result.output)
+            console.err(f"warning {Code.REC_DIRSYNC.value}: {warning}")
         damage = result.damage
         if damage is None:
             return 0
@@ -1395,6 +1586,95 @@ def rec_repair(
         return 0 if damage.torn else EXIT_DAMAGED_INPUT
 
     _run(ctx, None, verbose, None, "rec.repair", offline=work)
+
+
+# -- retention: prune ---------------------------------------------------------------------------
+
+OlderThanOption = Annotated[
+    str | None,
+    typer.Option(
+        "--older-than", help="Delete sessions older than this (default: retention.max_age)."
+    ),
+]
+UntilUnderOption = Annotated[
+    str | None,
+    typer.Option(
+        "--until-under",
+        help="Also delete the oldest sessions until this directory is at or under this size.",
+    ),
+]
+KeepOption = Annotated[
+    str | None,
+    typer.Option("--keep", help="Keep this many recent sessions (default: retention.keep_recent)."),
+]
+DryRunOption = Annotated[bool, typer.Option("--dry-run", help="List what would be deleted.")]
+YesOption = Annotated[
+    bool, typer.Option("--yes", help="Confirm the deletion without asking (needed in scripts).")
+]
+
+
+def _prune_command(
+    ctx: typer.Context,
+    kind: str,
+    older_than: str | None,
+    until_under: str | None,
+    keep: str | None,
+    dry_run: bool,
+    yes: bool,
+    fmt: Format,
+    verbose: bool,
+) -> None:
+    def work(ledger: Ledger, console: Console, run: _Run) -> int:
+        try:
+            flags = prunecmd.parse_flags(
+                older_than, until_under, keep, dry_run=dry_run, yes=yes, fmt_json=fmt is Format.JSON
+            )
+        except IronbirdError as exc:
+            ledger.record_error(exc)
+            _print_error(console, exc, run.verbose)
+            return exc.exit_code
+        return prunecmd.work(
+            kind,
+            flags,
+            run.config,
+            None if run.config_missing else run.config_error,
+            ledger,
+            console,
+            verbose=run.verbose,
+            fs=LEDGER_OPTIONS.get("fs", REAL_FS),
+        )
+
+    _run(ctx, None, verbose, None, f"{kind}.prune", offline=work, scan=False)
+
+
+@ledger_app.command("prune")
+def ledger_prune(
+    ctx: typer.Context,
+    older_than: OlderThanOption = None,
+    until_under: UntilUnderOption = None,
+    keep: KeepOption = None,
+    dry_run: DryRunOption = False,
+    yes: YesOption = False,
+    fmt: Annotated[Format, typer.Option("--format", help="Output format.")] = Format.LINE,
+    verbose: VerboseOption = False,
+) -> None:
+    """List old ledger sessions and delete them after confirmation (never one still in use)."""
+    _prune_command(ctx, "ledger", older_than, until_under, keep, dry_run, yes, fmt, verbose)
+
+
+@rec_app.command("prune")
+def rec_prune(
+    ctx: typer.Context,
+    older_than: OlderThanOption = None,
+    until_under: UntilUnderOption = None,
+    keep: KeepOption = None,
+    dry_run: DryRunOption = False,
+    yes: YesOption = False,
+    fmt: Annotated[Format, typer.Option("--format", help="Output format.")] = Format.LINE,
+    verbose: VerboseOption = False,
+) -> None:
+    """List old recordings and delete them after confirmation (never one being written)."""
+    _prune_command(ctx, "recording", older_than, until_under, keep, dry_run, yes, fmt, verbose)
 
 
 # -- replay -------------------------------------------------------------------------------------
