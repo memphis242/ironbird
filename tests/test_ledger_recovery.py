@@ -122,6 +122,73 @@ def test_an_interrupted_rename_is_completed_leaving_one_name(state: Path) -> Non
     assert result.recovered == 1
 
 
+def scan_later(state: Path) -> DirScan:
+    """A scan an hour on, when the files the last recovery wrote no longer make it live."""
+    return full_scan(
+        REAL_FS, state, "ledger", now=time.time() + 3600, own_session=None, keep_recent=0
+    )
+
+
+def _no_renameat2_and_unlink_fails(suffix: str) -> FaultFs:
+    """A file system with no non-replacing rename (NFS), where unlinking a name ending in
+    ``suffix`` fails: a hard-link commit then leaves its old name behind."""
+    fs = FaultFs()
+    fs.override("renameat2_noreplace", lambda _dir_fd, _old, _new: None)
+    fs.fail("unlink_at", errno.EIO, when=lambda _dir_fd, name: name.endswith(suffix))
+    return fs
+
+
+def test_a_recovery_that_leaves_the_reserve_name_records_it_and_the_next_scan_removes_it(
+    state: Path,
+) -> None:
+    body = (reserve_header(sid(1)) + rec(10)).encode()
+    reserve = make_reserve_at(state, 1, 1, body, pad_to=len(body))
+    result = scan(state, _no_renameat2_and_unlink_fails(".reserve"))
+    recovered = part(state, 2)
+    assert reserve.exists() and os.path.samefile(reserve, recovered)
+    (recovery,) = result.recoveries
+    assert recovery["new"] == recovered.name and recovery["leftover"] == reserve.name
+    assert recovery["leftover_error"] and result.recovered == 1 and result.messages == []
+    again = scan_later(state)
+    assert not reserve.exists() and recovered.read_bytes() == body
+    assert [r["new"] for r in again.recoveries] == [recovered.name]
+
+
+def test_a_salvage_that_leaves_the_reserve_name_records_it_and_the_next_scan_removes_it(
+    state: Path,
+) -> None:
+    """The set-aside to ``.damaged`` committed by hard link but the reserve name stayed: the next
+    scan completes that rename, and does not salvage the file a second time."""
+    original = (reserve_header(sid(1)) + rec(10)).encode() + b'{"partial\x00\x00junk\n'
+    reserve = make_reserve_at(state, 1, 1, original, pad_to=len(original) + 100)
+    damaged = state / f"{reserve.name}.damaged"
+    result = scan(state, _no_renameat2_and_unlink_fails(".reserve"))
+    assert reserve.exists() and os.path.samefile(reserve, damaged)
+    assert [r["n"] for r in lines_of(part(state, 2))] == [9, 10]
+    (recovery,) = result.recoveries
+    assert recovery["damaged"] == damaged.name and recovery["leftover"] == reserve.name
+    again = scan_later(state)
+    assert not reserve.exists() and damaged.exists()
+    assert not [p for p in state.iterdir() if p.name.endswith(".p0003.jsonl")]
+    assert UNRECOVERABLE not in again.sessions[sid(1)].protected, again.messages
+    (completed,) = again.recoveries
+    assert completed["old"] == reserve.name and completed["damaged"] == damaged.name
+    assert completed["new"] is None and again.recovered == 0
+
+
+def test_a_salvage_whose_copy_leaves_its_temporary_name_says_so(state: Path) -> None:
+    original = (reserve_header(sid(1)) + rec(10)).encode() + b'{"partial\x00\x00junk\n'
+    make_reserve_at(state, 1, 1, original, pad_to=len(original) + 100)
+    result = scan(state, _no_renameat2_and_unlink_fails(".tmp"))
+    saved = part(state, 2)
+    (temp,) = [p for p in state.iterdir() if p.name.endswith(".tmp")]
+    assert os.path.samefile(temp, saved)
+    (recovery,) = result.recoveries
+    assert recovery["new"] == saved.name and recovery["copy"]["leftover"] == temp.name
+    (message,) = result.messages  # one line for the file, not a second one from the accounting
+    assert temp.name in message and "could not be removed" in message
+
+
 # -- salvaged ----
 
 

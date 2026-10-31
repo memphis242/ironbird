@@ -63,7 +63,7 @@ from ironbird.recording.player import Ending
 from ironbird.recording.replay import Replay
 from ironbird.retention import is_managed_name
 from ironbird.sanitize import clean
-from ironbird.sigmask import signals_held
+from ironbird.sigmask import Hold, signals_held
 
 #: A text cell is never cut: the longest field is a ``char[]`` of up to 65535 characters, each
 #: of which may escape to ten.
@@ -946,16 +946,19 @@ def write_to_file(
     force: bool,
     run: Callable[[Destination], ExportResult],
     fs: FileSystem = REAL_FS,
-    before_commit: Callable[[], None] | None = None,
+    before_publish: Callable[[], None] | None = None,
+    hold: Hold | None = None,
     progress: WriteProgress | None = None,
 ) -> tuple[ExportResult, str | None]:
     """Run ``run`` against a temporary file beside ``output`` and give it the name ``output``
     when ``run`` returns: refused (``IB-EXP-002``) if the name is taken by then, unless ``force``
-    allows replacing a regular file of ours that no one else holds locked. ``before_commit``, if
-    given, runs just before the rename and may refuse. Any error leaves no file behind
-    (``IB-EXP-001`` for a failed write). The second value is a warning for a file that exists
-    all the same: its directory could not be synced after the commit, or the temporary name of
-    a hard-link commit could not be removed. ``progress`` is filled as the write goes."""
+    allows replacing a regular file of ours that no one else holds locked. ``before_publish``,
+    if given, runs once the data is synced, just before the rename, and may refuse; ``hold`` is
+    begun right before the rename (see :meth:`~ironbird.atomicfile.TempOutput.publish`). Any
+    error leaves no file behind (``IB-EXP-001`` for a failed write). The second value is a
+    warning for a file that exists all the same: its directory could not be synced after the
+    commit, or the temporary name of a hard-link commit could not be removed. ``progress`` is
+    filled as the write goes."""
     name = render.term(str(output), 300)
     sync: str | None = None
     with contextlib.ExitStack() as stack:
@@ -973,10 +976,11 @@ def write_to_file(
             raise _write_error(output, exc.cause) from exc
         if progress is not None:
             progress.result = result
-        if before_commit is not None:
-            before_commit()
         try:
-            temp.commit()
+            temp.prepare()
+            if before_publish is not None:
+                before_publish()
+            temp.publish(hold=hold)
         except SyncAfterCommit as exc:
             sync = _after_commit_note(output, exc, "file")  # committed all the same
         except Locked as exc:
@@ -1005,7 +1009,8 @@ def write_to_directory(
     run: Callable[[Destination], ExportResult],
     fs: FileSystem = REAL_FS,
     max_open: int | None = None,
-    before_commit: Callable[[], None] | None = None,
+    before_publish: Callable[[], None] | None = None,
+    hold: Hold | None = None,
     progress: WriteProgress | None = None,
 ) -> tuple[ExportResult, str | None]:
     """:func:`write_to_file` for a directory of tables: the directory is built beside ``output``
@@ -1031,10 +1036,11 @@ def write_to_directory(
                 raise _write_error(output, exc.cause) from exc
             if progress is not None:
                 progress.result = result
-            if before_commit is not None:
-                before_commit()
             try:
-                temp.commit()
+                temp.prepare()
+                if before_publish is not None:
+                    before_publish()
+                temp.publish(hold=hold)
             except SyncAfterCommit as exc:
                 sync = _after_commit_note(output, exc, "directory")
             except Collision as exc:

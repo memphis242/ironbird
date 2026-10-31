@@ -49,7 +49,7 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
         "TempDirOutput.create",
         "TempDirOutput._discard",
     },
-    ("atomicfile.py", "rename"): {"_link", "_placeholder_rename", "TempOutput.commit"},
+    ("atomicfile.py", "rename"): {"_link", "_placeholder_rename", "TempOutput.publish"},
     # recovery: completing an interrupted rename, cutting a reserve at its last record
     ("retention.py", "removal"): {"_complete_interrupted_rename"},
     ("retention.py", "truncation"): {"_commit_recovered"},

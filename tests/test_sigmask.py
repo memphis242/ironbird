@@ -1,5 +1,6 @@
 """``signals_held``: a signal that arrives inside the scope runs its handler as the scope ends,
-and the mask is what it was before, whatever the handler raises and wherever."""
+and the mask is what it was before, whatever the handler raises and wherever; the exception it
+raises names the one it replaced. ``Hold``: held from ``begin`` to the end of the block."""
 
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ from collections.abc import Iterable, Iterator
 
 import pytest
 
-from ironbird.sigmask import HANDLED_SIGNALS, signals_held
+from ironbird.sigmask import HANDLED_SIGNALS, Hold, Interrupted, signals_held
 
 pytestmark = pytest.mark.skipif(
     threading.current_thread() is not threading.main_thread(),
@@ -17,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-class _Raised(BaseException):
+class _Raised(Interrupted):
     pass
 
 
@@ -32,7 +33,7 @@ def raising_hup() -> Iterator[list[int]]:
 
     def handler(signum: int, _frame: object) -> None:
         seen.append(signum)
-        raise _Raised
+        raise _Raised(signum)
 
     previous = signal.signal(signal.SIGHUP, handler)
     try:
@@ -66,7 +67,7 @@ def test_a_handler_that_raises_while_the_block_is_made_leaves_the_mask_unchanged
         wanted = set(mask)
         previous = real(how, wanted)
         if how == signal.SIG_BLOCK and wanted:
-            raise _Raised
+            raise _Raised(signal.SIGHUP)
         return previous
 
     before = _mask()
@@ -76,3 +77,74 @@ def test_a_handler_that_raises_while_the_block_is_made_leaves_the_mask_unchanged
         ran = True
     monkeypatch.undo()
     assert not ran and _mask() == before
+
+
+def _hup() -> None:
+    signal.pthread_kill(threading.get_ident(), signal.SIGHUP)
+
+
+def test_the_signal_names_the_failure_leaving_the_scope_and_nothing_else(
+    raising_hup: list[int],
+) -> None:
+    failure = ValueError("the step failed")
+    with pytest.raises(_Raised) as caught, signals_held():
+        _hup()
+        raise failure
+    assert caught.value.replaced is failure
+
+    with pytest.raises(_Raised) as caught, signals_held():
+        _hup()
+    assert caught.value.replaced is None
+
+    with pytest.raises(_Raised) as caught:  # handled on purpose when the signal arrives
+        try:
+            raise failure
+        except ValueError:
+            _hup()
+    assert caught.value.replaced is None
+
+
+def test_a_cleanup_names_the_exception_it_runs_for(raising_hup: list[int]) -> None:
+    failure = OSError("the commit failed")
+    with pytest.raises(_Raised) as caught, signals_held(unwinding=failure):
+        _hup()
+    assert caught.value.replaced is failure
+
+
+def test_a_hold_holds_from_begin_to_the_end_of_its_block(raising_hup: list[int]) -> None:
+    before = _mask()
+    with pytest.raises(_Raised), Hold() as hold:
+        _hup()  # not begun: the handler runs at once
+    assert raising_hup == [signal.SIGHUP] and _mask() == before
+    raising_hup.clear()
+
+    steps: list[str] = []
+    with pytest.raises(_Raised) as caught, Hold() as hold:
+        hold.begin()
+        _hup()
+        with signals_held():  # an inner scope that ends inside the hold does not lift it
+            pass
+        hold.begin()  # a no-op once begun
+        steps.append("after")
+        assert raising_hup == [] and hold.begun
+    assert steps == ["after"] and raising_hup == [signal.SIGHUP] and _mask() == before
+    assert caught.value.replaced is None
+
+    with Hold():  # never begun: nothing held, nothing raised
+        assert _mask() == before
+
+
+def test_a_hold_names_the_failure_that_ends_its_block(raising_hup: list[int]) -> None:
+    failure = RuntimeError("after the publish")
+    with pytest.raises(_Raised) as caught, Hold() as hold:
+        hold.begin()
+        _hup()
+        raise failure
+    assert caught.value.replaced is failure
+
+
+def test_a_hold_is_never_begun_inside_an_inner_held_scope() -> None:
+    before = _mask()
+    with Hold() as hold, signals_held(), pytest.raises(AssertionError):
+        hold.begin()  # the inner scope would end first and lift the hold
+    assert not hold.begun and _mask() == before

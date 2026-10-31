@@ -33,7 +33,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, NamedTuple
 
-from ironbird.atomicfile import Collision, SyncAfterCommit, rename_noreplace
+from ironbird.atomicfile import (
+    Collision,
+    LeftoverAfterCommit,
+    SyncAfterCommit,
+    rename_noreplace,
+)
 from ironbird.fsops import (
     REAL_FS,
     RESERVE_FS_ALLOWLIST,
@@ -999,6 +1004,17 @@ class LedgerStore:
                 self._name_taken(name)
                 number = self._claim_part_number() or 0
                 continue
+            except LeftoverAfterCommit as exc:
+                # renamed; the reserve name is a second name of the part until a recovery scan
+                # after this session completes the rename
+                self._emit(
+                    "retire_leftover",
+                    name=name,
+                    leftover=exc.leftover,
+                    text=exc.strerror or str(exc),
+                    sync_error=exc.sync_error,
+                )
+                result = name
             except SyncAfterCommit as exc:
                 self._emit("retire_sync_failed", name=name, text=exc.strerror or str(exc))
                 result = name

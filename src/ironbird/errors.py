@@ -91,6 +91,7 @@ class Code(StrEnum):
     REC_DEFS = "IB-REC-009"  # embedded definitions differ from the config, or cannot be loaded
     REC_SPACE = "IB-REC-010"  # low disk space for the recording
     REC_DIRSYNC = "IB-REC-011"  # the recording's directory cannot be synced (name not durable)
+    REC_LEFTOVER = "IB-REC-012"  # a repaired copy is complete, but its temporary name is left over
     # Export
     EXP_WRITE = "IB-EXP-001"  # the export output could not be written
     EXP_EXISTS = "IB-EXP-002"  # the export output exists, is the input, or is a managed file
@@ -119,7 +120,9 @@ class Code(StrEnum):
 #: ``Ledger.record_error(level=...)``) sets the ledger kind and the displayed label, so a code
 #: outside this set can be reported as a warning and a member can be reported as an error. A
 #: warning code is never raised, so it never decides an exit code.
-WARNING_CODES: Final[frozenset[Code]] = frozenset({Code.TX_RCVBUF, Code.REC_DIRSYNC})
+WARNING_CODES: Final[frozenset[Code]] = frozenset(
+    {Code.TX_RCVBUF, Code.REC_DIRSYNC, Code.REC_LEFTOVER}
+)
 
 
 MAX_SUMMARY_LEN = 600

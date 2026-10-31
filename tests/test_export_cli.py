@@ -935,6 +935,43 @@ def test_a_signal_between_placeholder_and_rename_leaves_no_empty_output(
         assert out.is_file() and out.stat().st_size > 0, err
 
 
+# Child-side hook: every data sync of a temporary (the file, or each table of a directory) counts
+# itself and stops for a while, the first one with the mark that has the parent send the signal.
+_SYNC_HOOKS = """
+import os, time
+from pathlib import Path
+from ironbird import fsops
+MARK = Path(os.environ["IB_TEST_MARK"])
+FS = fsops.FileSystem
+
+def hook_fdatasync(real):
+    def fdatasync(self, fd):
+        if ".tmp" in os.readlink(f"/proc/self/fd/{fd}"):
+            with open(str(MARK) + ".syncs", "a") as count:
+                count.write("x")
+            MARK.touch()
+            time.sleep(2.0)
+        real(self, fd)
+    return fdatasync
+
+FS.fdatasync = hook_fdatasync(FS.fdatasync)
+"""
+
+
+@pytest.mark.parametrize("fmt", ["text", "csv"])
+def test_a_signal_during_the_data_sync_aborts_the_export_and_leaves_nothing(
+    tmp_path: Path, env: dict[str, str], fmt: str
+) -> None:
+    """Syncing the data changes no name, so a signal there ends the export at once: no further
+    sync, no commit, the temporary removed, and the interruption does not claim an output."""
+    out, err = _signal_at_window(tmp_path, env, _SYNC_HOOKS, "sync", fmt)
+    assert not out.exists() and temporaries(tmp_path) == [], err
+    assert (tmp_path / "window-reached.syncs").read_text() == "x", "it waited for every sync"
+    assert "written" not in err
+    (stop,) = _stops(tmp_path)
+    assert stop["committed"] is False and stop["reason"] == "interrupted"
+
+
 def _stops(tmp_path: Path) -> list[dict[str, Any]]:
     return [e for e in ledger_events(tmp_path) if e["event"] == "export.stop"]
 
@@ -1110,16 +1147,20 @@ def test_a_link_commit_that_cannot_remove_the_temporary_name_is_committed_and_na
     assert note.count(".other.txt.") == 1 and len(temporaries(tmp_path)) == 1
 
 
-@pytest.mark.parametrize("hidden", ["ironbird", "other"])
-def test_a_signal_that_replaces_a_failure_still_ledgers_the_failure(
-    tmp_path: Path, rec: Path, monkeypatch: pytest.MonkeyPatch, hidden: str
+@_MAIN_THREAD_ONLY
+@pytest.mark.parametrize("case", ["ironbird", "other", "handled"])
+def test_only_a_failure_that_a_signal_replaced_is_reported_with_the_interruption(
+    tmp_path: Path, rec: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
-    """A signal raised while a failure unwinds (its cleanup is where it landed) leaves the
-    failure on the exception's context: the ledger has it, and the user is shown it once an
-    ``IronbirdError``, besides the interruption."""
+    """A signal acted on as a held scope ends while a failure leaves it takes the failure's
+    place: the ledger has the failure and the user is shown it, besides the interruption (an
+    unexpected exception as IB-INT-001, as without the signal). A failure that was being handled
+    on purpose when the signal arrived (``handled``: a retry waiting in its ``except`` block) is
+    not reported: it is on the signal's context, but nothing replaced it."""
     from typer.testing import CliRunner
 
     from ironbird.cli import main as cli_main
+    from ironbird.sigmask import signals_held
 
     for name in ("state", "recordings"):
         (tmp_path / name).mkdir(mode=0o700)
@@ -1128,29 +1169,38 @@ def test_a_signal_that_replaces_a_failure_still_ledgers_the_failure(
     monkeypatch.delenv("IRONBIRD_CONFIG", raising=False)
     for attr in ("signum", "announced", "_raises"):  # restored after the test
         monkeypatch.setattr(cli_main._STATE, attr, getattr(cli_main._STATE, attr))
+    monkeypatch.setattr(cli_main._STATE, "signum", 0)
+    previous = signal.signal(signal.SIGTERM, cli_main._STATE._handle)
 
-    def unwinding(*args: Any, **kwargs: Any) -> None:
-        try:
-            if hidden == "ironbird":
+    def sigterm() -> None:
+        signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+
+    def failing(*args: Any, **kwargs: Any) -> None:
+        if case == "handled":
+            try:
+                raise IronbirdError(Code.EXP_WRITE, "cannot write the export: retried")
+            except IronbirdError:
+                sigterm()  # the handler raises here, inside the except block
+            raise AssertionError("not reached")
+        with signals_held():  # held: the handler runs as the failure leaves the scope
+            sigterm()
+            if case == "ironbird":
                 raise IronbirdError(Code.EXP_WRITE, "cannot write the export: disk trouble")
             raise ValueError("not an ironbird error")
-        except (IronbirdError, ValueError):
-            cli_main._STATE.signum = signal.SIGTERM
-            # the handler's exception, raised while the failure is being handled
-            raise cli_main._Terminated(signal.SIGTERM)  # noqa: B904
 
-    monkeypatch.setattr(cli_main, "write_to_file", unwinding)
-    out = tmp_path / "out.txt"
-    result = CliRunner().invoke(
-        cli_main.app, ["export", str(rec), "--format", "text", "-o", str(out)]
-    )
+    monkeypatch.setattr(cli_main, "write_to_file", failing)
+    try:
+        result = CliRunner().invoke(
+            cli_main.app, ["export", str(rec), "--format", "text", "-o", str(tmp_path / "o.txt")]
+        )
+    finally:
+        signal.signal(signal.SIGTERM, previous)
     assert result.exit_code == 143, result.output
-    events = ledger_events(tmp_path)
-    code = Code.EXP_WRITE if hidden == "ironbird" else Code.INTERNAL
-    assert _errors(tmp_path, code), events
     assert "interrupted" in result.output
-    assert (Code.EXP_WRITE.value in result.output) is (hidden == "ironbird")
-    assert Code.INTERNAL.value not in result.output
+    reported = {"ironbird": Code.EXP_WRITE, "other": Code.INTERNAL, "handled": None}[case]
+    for code in (Code.EXP_WRITE, Code.INTERNAL):
+        assert bool(_errors(tmp_path, code)) is (code is reported), ledger_events(tmp_path)
+        assert (code.value in result.output) is (code is reported)
 
 
 def test_a_reader_that_goes_away_ends_a_stdout_export_quietly(
@@ -1377,7 +1427,7 @@ def test_an_output_that_became_the_input_while_exporting_is_refused_at_the_commi
         return result
 
     with pytest.raises(IronbirdError) as caught, contextlib.closing(replaying):
-        write_to_file(out, force=True, run=run, before_commit=input_guard(out, replaying))
+        write_to_file(out, force=True, run=run, before_publish=input_guard(out, replaying))
     assert (
         caught.value.code is Code.EXP_EXISTS and "recording being exported" in caught.value.summary
     )
@@ -1397,7 +1447,7 @@ def test_a_directory_output_that_became_the_input_is_refused_at_the_commit(
         return result
 
     with pytest.raises(IronbirdError) as caught, contextlib.closing(replaying):
-        write_to_directory(out, run=run, before_commit=input_guard(out, replaying))
+        write_to_directory(out, run=run, before_publish=input_guard(out, replaying))
     assert caught.value.code is Code.EXP_EXISTS and temporaries(tmp_path) == []
     assert out.is_symlink() and out.samefile(rec)
 
@@ -1406,7 +1456,7 @@ def test_the_guard_lets_an_ordinary_output_through(tmp_path: Path, rec: Path) ->
     out = tmp_path / "out.txt"
     replaying, inner = export_text_of(rec)
     with contextlib.closing(replaying):
-        write_to_file(out, force=False, run=inner, before_commit=input_guard(out, replaying))
+        write_to_file(out, force=False, run=inner, before_publish=input_guard(out, replaying))
     assert len(out.read_text().splitlines()) == 10
 
 

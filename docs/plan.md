@@ -3062,51 +3062,63 @@ As built (where the build differs from, or settles, the text above)
   marking the injected fault, no `IB-DEC-*` report from the listener) pass with the 28 earlier cFS
   cases on the dev host.
 - Signals around temporaries (a 2h/2e fix made in this stage). Outside an event loop the CLI's signal
-  handler raises, so its exception can land between any two lines. Every step in `atomicfile.py` that
-  changes the file system and records the change runs inside `sigmask.signals_held()` (SIGINT, SIGTERM,
-  SIGHUP blocked; a signal that arrives waits and its handler runs as the step ends): creating a
-  temporary file, directory or member together with recording it for removal; the removal of what was
-  created (`_discard`); and the whole commit from the rename through the directory sync and the
-  `committed` flag (`TempOutput.commit`, `TempDirOutput.commit`, `rename_noreplace`: renameat2, link
-  and unlink, or placeholder and rename). `committed` is a read-only property of both. On NFS, which has
-  no `RENAME_NOREPLACE`, a regular file takes the hard-link path (link, then unlink of the temporary
-  name); the placeholder path (an empty file or directory at the final name, then a rename over it)
-  applies to directory exports and to file systems without hard links, and a held signal never leaves
-  the empty placeholder at the final name. `export.write_to_file` and `write_to_directory` hold the
-  signals across `ExitStack.enter_context` until the stack holds the cleanup, and take an optional
-  `WriteProgress` (the temporary output and the result, readable after any exit).
-  A signal that lands in a commit therefore ends the command (exit 128+n) with the export complete
-  under its final name, and the command says so:
-  1. `ib export` holds the signals from just before the commit (`before_commit`) through the
-     `export.stop` record and the summary, and releases them last, so the handler runs after the
-     export is recorded (`export.stop` with `committed`, `output` and the rows). Should a signal
-     still arrive after the commit by any other route, the `finally` writes `export.stop` with
-     `committed=true`, the output and the rows from `WriteProgress`, and the interruption line is
-     `interrupted (SIGTERM) after the export was written to X` (also in the `cli.signal` record);
-     the exit code stays 128+n.
-  2. A signal that raises over a failure that is unwinding (the cleanup after a failed commit is
-     where it landed) no longer replaces that failure: `_run` walks the `__cause__` and `__context__`
-     chain of the signal's exception (bounded; the first `Exception` on each branch), ledgers each
-     as an error (an `IronbirdError` as it is, any other exception as `IB-INT-001` with its
-     traceback) and shows one line for each `IronbirdError`, besides `interrupted`. This holds for
-     every command that runs through `_run`, not only `export`.
-  3. A hard-link commit whose link succeeded counts as committed even if removing the temporary name
-     fails: `ENOENT` (the retransmitted unlink after a lost reply, NFSv3) is success; any other error
-     is `LeftoverAfterCommit` (a `SyncAfterCommit`, so every caller already treats the rename as
-     done), which names the leftover temporary file and carries the directory-sync failure if that
-     failed too. The directory is still synced. An export prints
-     `warning IB-EXP-001: the file X was written, but the temporary file T beside it could not be
-     removed (reason); remove it by hand` (exit 0), never "the partial output was removed"; `rec
-     repair` reports the same as `IB-REC-011`.
-  `signals_held` reads the mask before blocking, because
-  `pthread_sigmask` runs a pending handler before it returns: a handler that raises there leaves the
-  mask as it was. Helper threads (ledger, retention, gate, output, recorder) start inside it and
-  inherit the block. A member that `fstat` cannot identify right after its creation is removed by name
-  at once (`TempDirOutput.create`, on the deletion allowlist). Tests: the signal at each window, sent
-  to a real `ib export` from a hook that stops there (`test_export_cli.py`: temporary made, rename,
-  link, placeholder, cleanup of a failed commit, a signal after the commit), the in-process rename
-  with a signal and the directory sync after it, the lost and the failed unlink of a link commit, the
-  failure under a signal in `_run`, and `test_sigmask.py`.
+  handler raises `sigmask.Interrupted` (`_Terminated`), so it can land between any two lines. The
+  design has three parts, all in `sigmask.py` and `atomicfile.py`:
+  1. Held scopes. `signals_held()` blocks SIGINT, SIGTERM and SIGHUP; a signal that arrives waits,
+     and its handler runs as the scope ends. Every step that changes the file system and records the
+     change runs in one: creating a temporary file, directory or member together with recording it
+     for removal, the removal of what was created (`_discard`), and the publish below. Scopes end in
+     the reverse order they began (asserted per thread). The mask is read before blocking, because
+     `pthread_sigmask` runs a pending handler before it returns. Helper threads (ledger, retention,
+     gate, output, recorder) start inside one and inherit the block.
+  2. Two-phase commit. `prepare()` syncs the data (a file; every member and the temporary
+     directory) and renames nothing, so it is interruptible: a signal there aborts, the cleanup
+     removes the temporary, and the interruption claims no output. `publish(hold=)` is held from the
+     rename (renameat2, link and unlink, or placeholder and rename, or the `--force` replacement)
+     through the directory sync and the `committed` flag, so a signal is acted on only once the
+     output is durable and known committed. `commit()` is both. A `sigmask.Hold` is the one helper
+     for a caller that must also finish its own record first: `with Hold() as hold:` around the
+     command's work, passed down to `publish`, which calls `hold.begin()` right before the rename;
+     the signal then acts as the block ends. `ib export` (through `write_to_file`/`write_to_directory`,
+     whose `before_publish` input guard runs after the syncs) and `ib rec repair` use it identically:
+     after the rename the done record (`export.stop` with `committed`, the output and the rows;
+     `rec.repair.done`), the result line and any warning are written, then the signal acts, exit
+     128+n, with `interrupted (SIGTERM) after the export was written to X` (or `after the repaired
+     recording was written to X`), also in the `cli.signal` record. `Hold.begin` asserts that no held
+     scope opened since the block began is still open, so an inner scope can never lift it.
+  3. What a signal replaced. When a held scope ends while an exception leaves it (its body raised,
+     or a cleanup passes `unwinding=` the exception its `__exit__` runs for), the `Interrupted` that
+     the handler raises records that exception in `replaced`. `_run` ledgers and shows that one
+     failure besides the interruption (an `IronbirdError` as it is, anything else as `IB-INT-001`
+     with its traceback) and nothing from the `__context__` chain, so an error handled on purpose
+     when the signal arrived (the `replay --follow` head-wait retry) is not reported, and nothing is
+     reported twice. `ib export` records `export.stop` with reason `error` when the replaced failure
+     is an `IronbirdError`.
+  On NFS, which has no `RENAME_NOREPLACE`, a regular file takes the hard-link path (link, then unlink
+  of the old name); the placeholder path applies to directory exports and to file systems without
+  hard links, and a held signal never leaves the empty placeholder at the final name. `ENOENT` from
+  the unlink (a retransmit after a lost reply, NFSv3) is success; any other unlink error is
+  `LeftoverAfterCommit` (a `SyncAfterCommit`: the name is committed and the directory still synced),
+  naming the old name and carrying the sync failure if any. Every caller handles it explicitly: an
+  export warns `IB-EXP-001` (the file was written, the temporary T beside it could not be removed;
+  remove it by hand; exit 0); `rec repair` warns `IB-REC-012`; the ledger's reserve retirement
+  records `ledger.note` `retire_leftover` (the part, the reserve name left, the reason); recovery
+  records `leftover` and `leftover_error` in `ledger.recovered`, and the next scan completes the
+  rename (the reserve name is unlinked once it and the part, or its own `.damaged` set-aside, are
+  checked to be the same inode with two links; a completed set-aside is recorded with `new` null
+  and is not counted as recovered); a salvage copy whose temporary name stays records it under
+  `copy` and its one `IB-RET-004` line says to delete it. `export.write_to_file` and
+  `write_to_directory` hold the signals across `ExitStack.enter_context` until the stack holds the
+  cleanup, and fill an optional `WriteProgress` (the temporary output and the result). A member that
+  `fstat` cannot identify right after its creation is removed by name at once
+  (`TempDirOutput.create`, on the deletion allowlist). Tests: the signal at each window, sent to a
+  real `ib export` from a hook that stops there (`test_export_cli.py`: temporary made, data sync,
+  rename, link, placeholder, cleanup of a failed commit, after the commit), the same for `rec repair`
+  (rename, leftover; `test_recording_tools.py`), Ctrl-C in the `replay --follow` head wait
+  (`test_replay_cli.py`), the replaced, unexpected and handled failure under a signal in `_run`, the
+  in-process rename with a signal and the directory sync after it, the lost and the failed unlink of
+  a link commit, the leftover paths of retirement, recovery and salvage (`test_ledger_store.py`,
+  `test_ledger_recovery.py`), and `test_sigmask.py` (`replaced`, `unwinding`, `Hold`).
 - Deferred: arrays of structs (D11); a filter operator over number arrays (`contains`, indexing); TOML
   arrays in response rules; `--allow-count-mismatch` has no counterpart in `respond` (a reply rule with a wrong count is refused); a real-cFS case
   against MD's dwell packet; the `ib_test` gcc 8 (EL8) build is covered by CI only. Signals: the
@@ -3256,6 +3268,7 @@ Verification
 | `IB-REC-009` | `REC_DEFS` | embedded definitions differ from config, or cannot be loaded | 2g |
 | `IB-REC-010` | `REC_SPACE` | low disk space for the recording | 2e |
 | `IB-REC-011` | `REC_DIRSYNC` | the recording's directory cannot be synced; its name may not survive a power loss (warning) | 2e |
+| `IB-REC-012` | `REC_LEFTOVER` | `rec repair`: the repaired copy is complete under its name, but its temporary name beside it could not be removed (a hard-link commit, as on NFS); remove it by hand (warning) | 2j |
 | `IB-FLT-001` | `FLT_SYNTAX` | filter syntax error (column, excerpt) | 2f |
 | `IB-FLT-002` | `FLT_NAME` | unknown name in a filter, or a reserved name misused | 2f |
 | `IB-FLT-003` | `FLT_TYPE` | literal does not fit the name's type, or the filter can never match | 2f |

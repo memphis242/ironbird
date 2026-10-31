@@ -9,14 +9,21 @@ replacement is an explicit ``force`` over an existing regular file owned by the 
 removes the temporary file, and only that: by directory descriptor and name, after checking that
 the name still denotes the descriptor this process holds open.
 
-A signal handler that raises (the CLI's, outside an event loop) cannot split a step that changes
-the file system from the record of that change, because each such step runs with the termination
-signals held (:func:`~ironbird.sigmask.signals_held`) and the handler only runs as the step ends:
-creating a temporary (file, directory or member) and recording it for removal, removing what was
-created, and a commit from the rename (renameat2, link and unlink, or placeholder and rename)
-through the sync of the directory and the note that it happened (``committed``). A caller that
-registers the cleanup apart from a ``with`` statement (an :class:`contextlib.ExitStack`) holds
-them across the registration too.
+A commit has two phases. :meth:`TempOutput.prepare` (and :meth:`TempDirOutput.prepare`) syncs
+the data, the members and the temporary directory; it changes no name, so a signal there simply
+aborts and the cleanup removes the temporary. :meth:`~TempOutput.publish` gives the final name:
+the rename (renameat2, link and unlink, or placeholder and rename), the directory sync and the
+note that it happened (``committed``), with the termination signals held
+(:func:`~ironbird.sigmask.signals_held`), so a signal is acted on only once the output is
+durable and known to be committed. A caller that must also finish its own record of the output
+before a signal acts passes a :class:`~ironbird.sigmask.Hold`, which ``publish`` begins right
+before the rename and the caller ends.
+
+A signal handler that raises (the CLI's, outside an event loop) cannot split any other step that
+changes the file system from the record of that change either, because each runs held too:
+creating a temporary (file, directory or member) and recording it for removal, and removing what
+was created. A caller that registers the cleanup apart from a ``with`` statement (an
+:class:`contextlib.ExitStack`) holds them across the registration too.
 
 Nothing here deletes a file this process did not create in the same call. Every system call goes
 through a :class:`~ironbird.fsops.FileSystem`, so tests can fail any step.
@@ -34,6 +41,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from types import TracebackType
 from typing import Final, TypeVar
 
 from ironbird.fsops import (
@@ -45,7 +53,7 @@ from ironbird.fsops import (
     same_file,
     try_stat_at,
 )
-from ironbird.sigmask import signals_held
+from ironbird.sigmask import Hold, signals_held
 
 _NO_HARD_LINKS: Final = frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV})
 _NAME_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -226,6 +234,7 @@ class TempOutput:
         self._fs = fs
         self._dir_fd = -1
         self._committed = False
+        self._prepared = False
         self._reuse = tuple(reuse)
         self._accept = accept
         self._reused = False
@@ -251,10 +260,10 @@ class TempOutput:
                     self.fd, self.name = fd, name
                 return self
             raise OSError(errno.EEXIST, "no free temporary name", str(directory))
-        except BaseException:
+        except BaseException as exc:
             try:
                 with contextlib.suppress(OSError):  # the reason it failed is what is raised
-                    self._discard()
+                    self._discard(exc)
             finally:
                 close_quietly(fs, self.fd)
                 close_quietly(fs, self._dir_fd)
@@ -292,6 +301,7 @@ class TempOutput:
         return self.final.parent / self.name
 
     def write(self, data: bytes | bytearray | memoryview) -> None:
+        assert not self._prepared, "nothing is written after prepare"
         view = memoryview(data)
         while view:
             written = self._fs.write(self.fd, view)
@@ -305,17 +315,32 @@ class TempOutput:
         after the rename counts: the rename is not undone)."""
         return self._committed
 
-    def commit(self) -> None:
-        """Sync the file and give it its final name. An existing name is refused
+    def commit(self, *, hold: Hold | None = None) -> None:
+        """:meth:`prepare`, then :meth:`publish`."""
+        self.prepare()
+        self.publish(hold=hold)
+
+    def prepare(self) -> None:
+        """Sync the file's data. Nothing is renamed, so this is interruptible: a signal here
+        ends the work and leaving the block removes the temporary."""
+        assert self.fd >= 0 and not self._committed
+        self._fs.fdatasync(self.fd)
+        self._prepared = True
+
+    def publish(self, *, hold: Hold | None = None) -> None:
+        """Give the prepared file its final name. An existing name is refused
         (:class:`Collision`) unless ``force`` and it is an existing regular file owned by this
         user, which is replaced.
 
-        From the rename on, the termination signals are held until :attr:`committed` is set and
-        the directory is synced, so a handler that raises cannot report a finished commit as
-        interrupted; it runs as this method ends.
+        ``hold`` (begun first) keeps the termination signals held past this call, until the
+        caller's ``with`` block ends. In any case they are held until the directory is synced
+        and :attr:`committed` set, so a handler that raises cannot report a finished commit as
+        interrupted; it runs as this method ends (or the hold does).
         """
+        assert self._prepared and not self._committed, "publish once, after prepare"
+        if hold is not None:
+            hold.begin()
         fs = self._fs
-        fs.fdatasync(self.fd)
         final = self.final.name
         with signals_held():
             if self.force:
@@ -365,23 +390,30 @@ class TempOutput:
         finally:
             close_quietly(fs, probe)
 
-    def _discard(self) -> None:
+    def _discard(self, unwinding: BaseException | None) -> None:
         """Remove the temporary file this process created, unless it was committed, reused, or
-        its name no longer denotes the file held open."""
+        its name no longer denotes the file held open. ``unwinding``: the exception this
+        cleanup runs for, which a signal acted on here replaces."""
         if self._committed or not self.name or self._reused:
             return
         assert self.fd >= 0 and self._dir_fd >= 0, "a named temporary is held open"
         fs = self._fs
-        with signals_held():  # a signal that lands in the removal does not cut it short
+        # a signal that lands in the removal does not cut it short
+        with signals_held(unwinding=unwinding):
             held, named = fs.fstat(self.fd), try_stat_at(fs, self._dir_fd, self.name)
             if named is not None and same_file(held, named):
                 with contextlib.suppress(OSError):
                     fs.unlink_at(self._dir_fd, self.name)  # our own uncommitted temporary
 
-    def __exit__(self, *exc_info: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         fs = self._fs
         try:
-            self._discard()
+            self._discard(exc)
         finally:
             close_quietly(fs, self.fd)
             close_quietly(fs, self._dir_fd)
@@ -430,6 +462,7 @@ class TempDirOutput:
         self._by_name: set[str] = set()
         self._open: OrderedDict[int, None] = OrderedDict()  # members with a descriptor, LRU first
         self._committed = False
+        self._prepared = False
 
     def __enter__(self) -> TempDirOutput:
         fs = self._fs
@@ -452,10 +485,10 @@ class TempDirOutput:
             named = try_stat_at(fs, self._parent_fd, name)
             if named is None or not same_file(fs.fstat(self._dir_fd), named):
                 raise OSError(errno.EIO, "the temporary directory was replaced", name)
-        except BaseException:
+        except BaseException as exc:
             try:
                 with contextlib.suppress(OSError):  # the reason it failed is what is raised
-                    self._discard()
+                    self._discard(exc)
             finally:
                 close_quietly(fs, self._dir_fd)
                 close_quietly(fs, self._parent_fd)
@@ -471,6 +504,7 @@ class TempDirOutput:
         """Create the member ``name`` (a bare file name) exclusively and return its handle."""
         assert name and "/" not in name and name not in (".", "..")
         assert name not in self._by_name, "a member is created once"
+        assert not self._prepared, "nothing is created after prepare"
         fs = self._fs
         # created and recorded as a member in one step no signal handler can split, so leaving
         # the block removes it (see TempOutput)
@@ -494,6 +528,7 @@ class TempDirOutput:
         return handle
 
     def write(self, handle: int, data: bytes | bytearray | memoryview) -> None:
+        assert not self._prepared, "nothing is written after prepare"
         member = self._members[handle]
         if member.fd < 0:
             self._reopen(handle)
@@ -551,11 +586,15 @@ class TempDirOutput:
         """Whether the directory has its final name (see :attr:`TempOutput.committed`)."""
         return self._committed
 
-    def commit(self) -> None:
-        """Sync every member and the directory, then give the directory its final name. An
-        existing name is refused (:class:`Collision`), whatever it is. From the rename on, the
-        termination signals are held until :attr:`committed` is set (see
-        :meth:`TempOutput.commit`)."""
+    def commit(self, *, hold: Hold | None = None) -> None:
+        """:meth:`prepare`, then :meth:`publish`."""
+        self.prepare()
+        self.publish(hold=hold)
+
+    def prepare(self) -> None:
+        """Sync every member and the directory, and close the members. Nothing is renamed, so
+        this is interruptible (see :meth:`TempOutput.prepare`)."""
+        assert self.name and not self._committed
         fs = self._fs
         for member in self._members:
             if member.fd >= 0:
@@ -574,20 +613,33 @@ class TempDirOutput:
             close_quietly(fs, fd)
         self._open.clear()
         fs.fsync(self._dir_fd)
+        self._prepared = True
+
+    def publish(self, *, hold: Hold | None = None) -> None:
+        """Give the prepared directory its final name. An existing name is refused
+        (:class:`Collision`), whatever it is. ``hold`` and the signals as in
+        :meth:`TempOutput.publish`."""
+        assert self._prepared and not self._committed, "publish once, after prepare"
+        if hold is not None:
+            hold.begin()
         with signals_held():
             try:
-                rename_noreplace(self._parent_fd, self.name, self.final.name, self._dir_fd, fs=fs)
+                rename_noreplace(
+                    self._parent_fd, self.name, self.final.name, self._dir_fd, fs=self._fs
+                )
             except SyncAfterCommit:
                 self._committed = True  # renamed; only a step after it failed
                 raise
             self._committed = True
 
-    def _discard(self) -> None:
-        """Remove what this process created: its members, then the (then empty) directory."""
+    def _discard(self, unwinding: BaseException | None) -> None:
+        """Remove what this process created: its members, then the (then empty) directory.
+        ``unwinding`` as in :meth:`TempOutput._discard`."""
         fs = self._fs
         if not self.name:
             return
-        with signals_held():  # a signal that lands in the removal does not cut it short
+        # a signal that lands in the removal does not cut it short
+        with signals_held(unwinding=unwinding):
             if self._dir_fd >= 0:
                 named = try_stat_at(fs, self._parent_fd, self.name)
                 if named is None or not same_file(fs.fstat(self._dir_fd), named):
@@ -604,11 +656,16 @@ class TempDirOutput:
             except OSError:
                 self.leftover = self.name
 
-    def __exit__(self, *exc_info: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         fs = self._fs
         try:
             if not self._committed:
-                self._discard()
+                self._discard(exc)
         finally:
             for member in self._members:
                 close_quietly(fs, member.fd)

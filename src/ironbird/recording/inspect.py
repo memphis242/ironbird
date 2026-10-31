@@ -26,6 +26,7 @@ from ironbird.recording.format import RecordType
 from ironbird.recording.reader import Damage, Item, RecordingReader
 from ironbird.retention import is_managed_name
 from ironbird.sanitize import clean
+from ironbird.sigmask import Hold
 
 MAX_FINDINGS: Final = 100
 MAX_HOLES: Final = 1000  # holes kept for display; the count covers them all
@@ -546,13 +547,19 @@ class RepairResult:
 
 
 def repair(
-    source: Path, output: Path, *, force: bool = False, fs: FileSystem = REAL_FS
+    source: Path,
+    output: Path,
+    *,
+    force: bool = False,
+    fs: FileSystem = REAL_FS,
+    hold: Hold | None = None,
 ) -> RepairResult:
     """Write the valid prefix of ``source`` plus a fresh index and trailer to ``output``.
 
     ``source`` is never modified. An existing ``output`` is refused unless ``force`` (and then
     only a regular file is replaced); ``output`` being ``source`` is always refused. Raises
-    ``IB-REC-001`` for the refusals and a failed write.
+    ``IB-REC-001`` for the refusals and a failed write. ``hold`` is begun right before the
+    rename (see :meth:`~ironbird.atomicfile.TempOutput.publish`).
     """
     _refuse_same_file(source, output)
     if force and is_managed_name(output.name):
@@ -589,7 +596,7 @@ def repair(
                 _copy(reader, out, prefix_end)
                 out.write(suffix)
                 try:
-                    out.commit()
+                    out.commit(hold=hold)
                 except LeftoverAfterCommit as left:  # renamed all the same
                     leftover = f"{left.leftover} ({left.strerror})"
                     sync_warning = left.sync_error
