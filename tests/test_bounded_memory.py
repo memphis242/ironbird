@@ -697,12 +697,7 @@ def test_the_cli_exits_with_the_coded_error_when_the_receive_socket_dies(
         env={**os.environ, "IRONBIRD_STATE_DIR": str(tmp_path / "state")},
     )
     assert done.returncode == 1, done.stderr
-    # IB-TX-005 (a host with a small net.core.rmem_max) is the only other line that may appear.
-    errors = [
-        line
-        for line in done.stderr.splitlines()
-        if line.startswith("error ") and Code.TX_RCVBUF.value not in line
-    ]
+    errors = [line for line in done.stderr.splitlines() if line.startswith("error ")]
     assert len(errors) == 1 and "IB-TX-003" in errors[0] and "EBADF" in errors[0], done.stderr
 
 

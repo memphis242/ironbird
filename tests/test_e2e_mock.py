@@ -185,11 +185,7 @@ def test_responder_survives_a_flood_of_malformed_commands_and_coalesces(
         assert any(f"x{flood}" in n for n in shown)
 
     _, fc_ledger = _run(config, tmp_path, scenario)
-    # IB-TX-005 (a host with a small net.core.rmem_max) is the only error that may also appear;
-    # any other error fails this test.
-    errors = [
-        e for e in _events(fc_ledger) if e["kind"] == "error" and e["event"] != Code.TX_RCVBUF.value
-    ]
+    errors = [e for e in _events(fc_ledger) if e["kind"] == "error"]
     assert {e["event"] for e in errors} == {Code.DEC_CHECKSUM.value}, errors[:5]
     # Evidence sampling: the first eight in full (then one a second), the window summary stands
     # for the rest, so every occurrence is accounted for.

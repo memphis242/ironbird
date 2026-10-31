@@ -320,6 +320,7 @@ OfflineBody = Callable[[Ledger, Console, "_Run"], int]
 
 
 def _print_error(console: Console, exc: IronbirdError, verbose: bool) -> None:
+    assert not exc.code.is_warning, "a warning code is reported, never raised"
     console.err(term(exc.user_line(), 1000, err=True))
     if verbose:
         for line in exc.detail_text().splitlines():
@@ -1632,8 +1633,9 @@ def rec_repair(
                 f"({term(result.sync_warning, 200, err=True)}); the repaired file exists, but its "
                 "name may not survive a power loss"
             )
-            ledger.record("warning", Code.REC_DIRSYNC.value, summary=warning, output=result.output)
-            console.err(f"warning {Code.REC_DIRSYNC.value}: {warning}")
+            sync_warning = IronbirdError(Code.REC_DIRSYNC, warning)
+            ledger.record_error(sync_warning, output=result.output)
+            console.err(sync_warning.user_line())
         damage = result.damage
         if damage is None:
             return 0
