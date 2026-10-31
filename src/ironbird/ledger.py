@@ -78,6 +78,7 @@ from ironbird.ledgertiers import (
     TokenBucket,
 )
 from ironbird.notice import Level, Notice, level_of
+from ironbird.sigmask import wait_event
 from ironbird.units import format_duration, format_size
 
 FORCE_AGE_S: Final = 1.0
@@ -196,6 +197,7 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "prune.delete": Tier.ESSENTIAL,
         "prune.gone": Tier.ESSENTIAL,
         "prune.skip": Tier.ESSENTIAL,
+        "prune.interrupted": Tier.ESSENTIAL,
     }
 )
 #: Patterns of the record names built from a variable (``f"{name}.ending"``), for the same test.
@@ -653,7 +655,9 @@ class Ledger:
         aborted the budget."""
         if self._budget is not None:
             return self._budget.wait(event, cap, floor=floor)
-        return event.wait(self._join_timeout_s if cap is None else min(cap, self._join_timeout_s))
+        return wait_event(
+            event, self._join_timeout_s if cap is None else min(cap, self._join_timeout_s)
+        )
 
     def set_warn_gate(self, gate: Callable[[Code], bool]) -> None:
         """Cross-process rate limit of the start-of-session warnings (``IB-LED-006/008/009``):
@@ -1357,8 +1361,8 @@ class Ledger:
         done = threading.Event()
         box: list[Any] = []
         self._writer.submit("open", (done, box))
-        if not done.wait(self._open_timeout_s):
-            return  # an open step is blocked: transient, the stall watchdog takes over
+        if not wait_event(done, self._open_timeout_s):
+            return  # an open step is blocked, or a signal is owed: transient, the watchdog resumes
         failure = box[0] if box else None
         if isinstance(failure, ConfigFailure):
             self.disable()  # and the records queued meanwhile go with it

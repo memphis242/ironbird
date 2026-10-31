@@ -23,6 +23,7 @@ from ironbird.errors import Code, IronbirdError
 from ironbird.fsops import REAL_FS, FileSystem
 from ironbird.ledger import Ledger, default_state_dir
 from ironbird.prune import (
+    Outcome,
     Plan,
     confirmed,
     execute_plan,
@@ -34,7 +35,7 @@ from ironbird.prune import (
 from ironbird.recording.session import default_recording_dir
 from ironbird.render import term
 from ironbird.retention import DirScan, full_scan, recording_blocks
-from ironbird.sigmask import wait_readable
+from ironbird.sigmask import Interrupted, wait_readable
 from ironbird.units import format_size, parse_count, parse_duration, parse_size
 
 MAX_SKIPS_SHOWN: Final = 5
@@ -244,7 +245,22 @@ def _confirm_and_delete(
     def record(event: str, **fields: Any) -> None:
         ledger.record("action", event, **fields)
 
-    outcome = execute_plan(fs, plan, record)
+    outcome = Outcome()
+    try:
+        execute_plan(fs, plan, record, outcome)
+    except Interrupted:
+        ledger.record(
+            "action",
+            "prune.interrupted",
+            deleted_sessions=outcome.deleted_sessions,
+            of=len(plan.candidates),
+            deleted_bytes=outcome.deleted_bytes,
+        )
+        console.err(
+            f"deleted {outcome.deleted_sessions} of {len(plan.candidates)} {what} "
+            f"({format_size(outcome.deleted_bytes)}) before the interruption"
+        )
+        raise
     summary = (
         f"deleted {outcome.deleted_sessions} {what} ({format_size(outcome.deleted_bytes)}, "
         f"{outcome.deleted_files} files)"

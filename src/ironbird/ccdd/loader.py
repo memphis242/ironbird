@@ -17,6 +17,8 @@ class Adapter(Protocol):
 
     name: str
 
+    def read(self, path: Path) -> bytes: ...
+
     def load(self, path: Path) -> CcddModel: ...
 
     def load_bytes(self, raw: bytes, source: str) -> CcddModel: ...
@@ -36,6 +38,12 @@ def _adapter(source: str, adapter: str) -> Adapter:
             f"{', '.join(sorted(ADAPTERS))}",
         )
     return impl
+
+
+def read_ccdd(path: Path, adapter: str = "json") -> bytes:
+    """The content of a CCDD file, read once, for :func:`load_ccdd_bytes` and for whoever must
+    hold exactly the bytes that were parsed."""
+    return _adapter(str(path), adapter).read(path)
 
 
 def load_ccdd(path: Path, adapter: str = "json") -> CcddModel:

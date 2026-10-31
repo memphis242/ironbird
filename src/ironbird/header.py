@@ -777,15 +777,25 @@ def parse_profile(data: Mapping[str, Any], source: str = "<memory>") -> HeaderPr
     )
 
 
-def load_profile(path: Path) -> HeaderProfile:
-    """Read, parse and validate a header profile TOML file."""
+def read_profile(path: Path) -> bytes:
+    """The content of a header profile file, at most one byte past the size limit."""
     try:
-        raw = read_capped(path, MAX_PROFILE_FILE_BYTES)
+        return read_capped(path, MAX_PROFILE_FILE_BYTES)
     except OSError as exc:
         raise IronbirdError(
             Code.HDR_FILE, f"{path}: cannot read header profile ({exc.strerror or exc})", cause=exc
         ) from exc
+
+
+def parse_profile_file(raw: bytes, path: Path) -> HeaderProfile:
+    """Parse and validate the content of the local profile file ``path`` (as :func:`read_profile`
+    gave it): trusted configuration, so the ``python:`` escape hatch is allowed."""
     return _profile_from_bytes(raw, str(path), trusted=True)
+
+
+def load_profile(path: Path) -> HeaderProfile:
+    """Read, parse and validate a header profile TOML file."""
+    return parse_profile_file(read_profile(path), path)
 
 
 def load_profile_bytes(raw: bytes, source: str) -> HeaderProfile:

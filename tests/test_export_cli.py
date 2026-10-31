@@ -973,7 +973,10 @@ def test_a_signal_whose_handler_runs_inside_a_weakref_callback_ends_the_export_u
     out, err = _signal_at_window(tmp_path, env, _SWALLOWING_HOOKS, where, "text", send=False)
     assert not out.exists() and temporaries(tmp_path) == [], err
     assert "Exception ignored" not in err and "Traceback" not in err, err
-    assert [e["reason"] for e in _stops(tmp_path)] == ["interrupted"], err
+    # a signal owed before the export began ends the command at the checkpoint that precedes it,
+    # so no export was started to be stopped
+    expected = [] if where == "start" else ["interrupted"]
+    assert [e["reason"] for e in _stops(tmp_path)] == expected, err
     signals = [e["signal"] for e in ledger_events(tmp_path) if e["event"] == "cli.signal"]
     assert signals == ["SIGTERM"], err
 

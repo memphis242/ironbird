@@ -7,10 +7,10 @@ raises the owed :class:`Interrupted` itself, at defined points only:
 - :func:`checkpoint`, called by every loop that can run long (each record a reader reads, each
   block a copy writes, each member a directory export syncs, each session a prune deletes);
 - every wait, in slices of :data:`WAIT_SLICE_S` with a checkpoint between two (:func:`sleep`,
-  :func:`wait_readable`, the wait for room on stdout, the drain at exit), so no wait of the
-  main thread outlasts a signal by more than a slice, whenever the signal arrives: one that
-  lands just before a wait begins, too late for the system call to be interrupted, is seen as
-  the slice ends;
+  :func:`wait_readable`, :func:`wait_event` for the ledger's, the wait for room on stdout, the
+  drain at exit), so no wait of the main thread outlasts a signal by more than a slice, whenever
+  the signal arrives: one that lands just before a wait begins, too late for the system call to
+  be interrupted, is seen as the slice ends;
 - the end of a :func:`signals_held` scope, and :meth:`Hold.begin` (the commit point of an
   output: a signal that came before it ends the work there, so nothing is published).
 
@@ -110,12 +110,34 @@ def _raise_owed(replaced: BaseException | None) -> NoReturn:
     raise stop
 
 
+def _actionable() -> bool:
+    """Whether :func:`checkpoint` would raise here."""
+    return bool(_OWED.signum) and not _DEPTH.open and threading.get_ident() == _MAIN_IDENT
+
+
 def checkpoint() -> None:
     """Act on the owed signal here: raise its :class:`Interrupted`, unless a held scope is open
     (then it is acted on as the outermost one ends) or this is not the main thread (which acts
     on every signal). Cheap enough for a loop that runs once per record."""
-    if _OWED.signum and not _DEPTH.open and threading.get_ident() == _MAIN_IDENT:
+    if _actionable():
         _raise_owed(None)
+
+
+def wait_event(event: threading.Event, timeout: float) -> bool:
+    """Wait up to ``timeout`` seconds for ``event``, in slices of :data:`WAIT_SLICE_S`; ``True``
+    when it is set. For a wait whose caller treats a timeout as a transient condition: it ends
+    early, as a timeout would, when a signal is owed that :func:`checkpoint` would act on here
+    (the caller's next checkpoint raises it), so the wait never outlasts a signal by more than
+    a slice. Raises nothing."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if _actionable():
+            return event.is_set()
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return event.is_set()
+        if event.wait(min(left, WAIT_SLICE_S)):
+            return True
 
 
 def sleep(seconds: float) -> None:

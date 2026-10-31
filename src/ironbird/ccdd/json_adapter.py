@@ -593,14 +593,17 @@ class JsonAdapter:
 
     name: str = "json"
 
-    def load(self, path: Path) -> CcddModel:
+    def read(self, path: Path) -> bytes:
+        """The content of the CCDD file ``path``, at most one byte past the size limit."""
         try:
-            raw = read_capped(path, MAX_FILE_BYTES)
+            return read_capped(path, MAX_FILE_BYTES)
         except OSError as exc:
             raise IronbirdError(
                 Code.CCD_FILE, f"{path}: cannot read CCDD file ({exc.strerror or exc})", cause=exc
             ) from exc
-        return self.load_bytes(raw, str(path))
+
+    def load(self, path: Path) -> CcddModel:
+        return self.load_bytes(self.read(path), str(path))
 
     def load_bytes(self, raw: bytes, source: str) -> CcddModel:
         """The model of a file already read (``source`` labels errors). The size, JSON and schema

@@ -47,7 +47,7 @@ from ironbird.fsops import (
     try_stat_at,
 )
 from ironbird.ledgerstore import NAME_TRIES, part_name
-from ironbird.sigmask import naming_replaced
+from ironbird.sigmask import checkpoint, naming_replaced
 from ironbird.units import MIB, format_size
 
 MAX_ENTRIES: Final = 100_000
@@ -711,6 +711,7 @@ def _read_facts(fs: FileSystem, fd: int, size: int, limit: int | None = None) ->
     offset = 0
     read = 0
     while offset < size:
+        checkpoint()  # a shutdown signal ends the read between two blocks
         want = min(READ_BLOCK, size - offset)
         if limit is not None:
             want = min(want, limit - read)
@@ -1256,6 +1257,7 @@ def _same_prefix(fs: FileSystem, a: int, b: int, length: int) -> bool:
     """Whether the first ``length`` bytes of ``a`` and ``b`` are equal (``OSError`` propagates)."""
     offset = 0
     while offset < length:
+        checkpoint()
         want = min(READ_BLOCK, length - offset)
         left, right = fs.pread(a, want, offset), fs.pread(b, want, offset)
         if not left or left != right:
@@ -1386,6 +1388,7 @@ def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, s
         ) as out:
             offset = resume_at[0]
             while offset < cut:
+                checkpoint()  # the cleanup removes a temporary this attempt created
                 block = fs.pread(fd, min(READ_BLOCK, cut - offset), offset)
                 if not block:
                     raise OSError(errno.EIO, "the reserve ended early")

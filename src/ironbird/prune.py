@@ -155,13 +155,16 @@ def execute_plan(
     fs: FileSystem,
     plan: Plan,
     record: Callable[..., Any],
+    outcome: Outcome | None = None,
 ) -> Outcome:
     """Delete exactly the listed sessions, or skip (and report) the ones that changed.
 
     ``record(event, **fields)`` writes the ledger trail: one ``prune.delete`` per file,
-    ``prune.gone`` for a name already absent, ``prune.skip`` with the reason.
+    ``prune.gone`` for a name already absent, ``prune.skip`` with the reason. ``outcome`` (a
+    fresh one by default) is filled as the sessions are done, so a caller whose prune a signal
+    ends can still say how far it got.
     """
-    outcome = Outcome()
+    outcome = Outcome() if outcome is None else outcome
     try:
         dir_fd = fs.open_dir(plan.scan.path)
     except OSError as exc:

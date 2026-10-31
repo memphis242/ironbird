@@ -662,10 +662,13 @@ def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -
     code = _apply_ledger_report(code, closing)  # a sync error at close; the exit says so
     for notice in _closing_news(report, closing):  # and never without its line
         _late_err(ledger, term(notice.line(verbose=run.verbose), 1000, err=True))
-    if not signum and (got := _STATE.signum):  # arrived while the ledger was closing
-        code = _record_signal(name, got, run, ledger, console, direct=True)
-        ledger.close()
-    _STATE.restore_default()  # a later signal ends the process by that signal, not silently
+    # With the signals blocked, a signal is either seen by this last check and announced, or
+    # waits until the default actions are back and then ends the process by that signal.
+    with masked():
+        if not signum and (got := _STATE.signum):  # arrived while the ledger was closing
+            code = _record_signal(name, got, run, ledger, console, direct=True)
+            ledger.close()
+        _STATE.restore_default()
     return code
 
 
@@ -823,6 +826,7 @@ def _run(
         main_coro: Coroutine[Any, Any, int] | None = None
         try:
             _check_descriptors()
+            checkpoint()  # a signal that came while the ledger opened ends the command here
             if offline is not None:
                 code = offline(ledger, console, run)
             else:
@@ -864,6 +868,8 @@ def _run(
         finally:
             if main_coro is not None:
                 main_coro.close()  # no "never awaited" warning when the loop never started
+    except typer.Exit as leaving:  # a usage or ledger error: _finish may replace its code
+        code = leaving.exit_code
     finally:
         _STATE.detach()  # from here a signal is only recorded; _finish announces it
         code = _finish(name, run, ledger, console, code)
@@ -2644,7 +2650,10 @@ def main() -> int:
             with contextlib.suppress(AttributeError, OSError, ValueError):
                 stream.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
         result: Any = app(standalone_mode=False)
-    except Interrupted as stop:
+    except Interrupted as stop:  # before any command could announce it (a configuration read)
+        if not _STATE.announced:
+            _STATE.announced = True
+            _stderr_line(f"interrupted ({signal.Signals(stop.signum).name})")
         return 128 + stop.signum
     except KeyboardInterrupt:  # SIGINT's default handler, before ours was in place
         return 128 + int(signal.SIGINT)

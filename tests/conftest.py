@@ -169,6 +169,7 @@ def _fresh_cli_signal_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     sigmask = sys.modules.get("ironbird.sigmask")
     if sigmask is not None:
         sigmask.discard()
+        assert sigmask._DEPTH.open == 0, "a test left a signals_held scope open"
 
 
 @pytest.fixture

@@ -291,6 +291,9 @@ class TempOutput:
             )
         except OSError:
             usable = False
+        except BaseException:  # a signal acted on while the caller judged the content
+            close_quietly(fs, fd)
+            raise
         if not usable:
             close_quietly(fs, fd)
             return False

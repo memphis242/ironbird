@@ -3081,7 +3081,14 @@ As built (where the build differs from, or settles, the text above)
      `fsops.read_capped`, which opens it `O_NONBLOCK`, so a FIFO without a writer waits for one
      and a terminal for a line; the prune prompt, which reads its answer from the descriptor once
      it has data), and the wait for room on stdout (`write_wait`: replay and export to stdout
-     behind a reader that does not read). So no wait outlasts a signal by more than a slice,
+     behind a reader that does not read), and the ledger's own waits while no exit is under way
+     (`sigmask.wait_event`: the open of the ledger directory and a `flush` end at a slice, as a
+     timeout would, once a signal is owed; the ledger then starts stalled and retries, and the
+     command acts on the signal at its next checkpoint, the first being right before the command
+     starts). The loops of the retention recovery that the prune command runs in the main thread
+     (the layout read, the prefix comparison and the copy of a reserve) take a checkpoint per
+     block; an interrupted copy leaves no temporary of its own behind, and a reused temporary of
+     an earlier attempt is kept. So no wait outlasts a signal by more than a slice,
      whenever it arrives: a signal whose handler runs just before a wait's system call begins
      (too late to interrupt it with `EINTR`, which Python would retry anyway) is seen as that
      slice ends. Only the first signal acts; repeats are ignored. Every thread the tool starts
@@ -3135,8 +3142,23 @@ As built (where the build differs from, or settles, the text above)
   cut in two, every signal (repeats counted) ends the waits on a slow disk at once, and the first
   ends an unbounded drain of stdout within 20 ms. Repeats change nothing else: the handlers stay
   until the very end of `_finish`, when the default actions come back, so only a signal after that
-  ends the process by the signal. `main()` returns 128+n for a signal recorded where no command
-  acted on it (argument parsing, `--help`).
+  ends the process by the signal. The last check, the direct record of a signal that arrived while
+  the ledger closed, and the return of the default actions happen together with the signals
+  blocked, so a late signal is either announced and ledgered or waits and takes the default
+  action as the block ends (the process ends by that signal). A `typer.Exit` raised inside `_run`
+  (a usage error, the ledger being required) gives its code to `_finish`, so the exit code of a
+  signal recorded meanwhile (128+n) wins. `main()` returns 128+n for a signal recorded where no
+  command acted on it (argument parsing, `--help`), and prints the one-line `interrupted
+  (SIGxxx)` notice for an `Interrupted` that left `_run` before any ledger existed (a signal
+  during the read of a configuration that is a FIFO). A prune interrupted between two sessions
+  says how many of the N it had deleted (`deleted K of N ... before the interruption`, and a
+  `prune.interrupted` record) before the interruption notice.
+  The session facts a recording keeps are read once: `load_config` digests the bytes it parsed
+  (`SystemConfig.sha256`, read-only) and `Session.codec_for` keeps the bytes of the CCDD and the
+  two header profiles it built the codec from (`Session.definitions_of`); META and the embedded
+  definitions use those, so nothing reopens a configuration, CCDD or header file inside the
+  loop, a FIFO or `<(...)` file is digested as parsed, and the digest cannot disagree with the
+  parsed content.
   On NFS, which has no `RENAME_NOREPLACE`, a regular file takes the hard-link path (link, then unlink
   of the old name); the placeholder path applies to directory exports and to file systems without
   hard links, and a held signal never leaves the empty placeholder at the final name. `ENOENT` from
@@ -3175,8 +3197,12 @@ As built (where the build differs from, or settles, the text above)
   ended at its slice, a capped read of a FIFO and of a file, a signal handled inside a weakref
   callback and inside a Python unraisable hook, other threads), `test_signal_replaced.py` (the replaced failure of each step
   named as the error without a signal, for export, repair and recovery) with the CLI cases in
-  `test_export_cli.py`, and `test_harness_isolation.py` (an in-process command, or a signal left
-  owed, in one test never reaches the next).
+  `test_export_cli.py`, `test_signal_windows.py` (a FIFO configuration, the exit code of a usage
+  error under a signal, the ledger's open wait, a prune recovery's copy, the loop's boundaries, the
+  last window of the exit, a signal before any ledger exists, a prune interrupted between
+  sessions, the configuration and definition bytes held from the load) and
+  `test_harness_isolation.py` (an in-process command, or a signal left owed, in one test never
+  reaches the next; no `signals_held` scope is left open).
 - Deferred: arrays of structs (D11); a filter operator over number arrays (`contains`, indexing); TOML
   arrays in response rules; `--allow-count-mismatch` has no counterpart in `respond` (a reply rule with a wrong count is refused); a real-cFS case
   against MD's dwell packet; the `ib_test` gcc 8 (EL8) build is covered by CI only. Signals: the
