@@ -31,12 +31,14 @@ from exportutil import (
     write_wide,
 )
 from ironbird.ccdd.model import FieldDef, TypeClass
-from ironbird.errors import Code, IronbirdError
+from ironbird.codec import Codec
+from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.frame import FrameFlag
 from ironbird.ledger import format_ts
 from ironbird.recording.export import (
     FIXED_COLUMNS,
     FORMULA_LEAD,
+    FORMULA_PREFIX,
     MALFORMED_COLUMNS,
     ExportFormat,
     UtcFormatter,
@@ -79,7 +81,7 @@ def test_tab_cr_and_lf_lead_cells_are_escaped_not_carried() -> None:
 
 
 def test_plain_text_is_untouched_and_a_leading_quote_is_not_doubled() -> None:
-    for text in ("", "SAFE", "a=b", "x-y", "'=x", "50%", " =1", "3.5e3"):
+    for text in ("", "SAFE", "a=b", "x-y", "'=x", "50%", "3.5e3"):
         assert safe_cell(text) == text
     assert safe_cell("'=x") == "'=x"
 
@@ -98,8 +100,110 @@ def test_a_string_cell_is_one_inert_text_that_no_spreadsheet_reads_as_a_formula(
     assert "\n" not in cell and "\r" not in cell and "\x1b" not in cell
     if cell and cell[0] in FORMULA_LEAD:
         raise AssertionError(f"{cell!r} leads like a formula")
+    assert inert(cell), cell
     body = cell.removeprefix("'") if cell.startswith("'") and not text.startswith("'") else cell
     assert body == clean(text, 1 << 20)
+
+
+SPACES = [
+    " ",
+    "  ",
+    "\t",
+    "\xa0",  # NBSP
+    "\u3000",  # ideographic space
+    "\u2003",  # em space
+    "\u2028",  # line separator
+    "\x85",  # next line
+    "\x1f",
+    " \xa0\u3000 ",
+]
+LEADS_UNDER_TEST = ["=", "+", "-", "@", "\uff1d", "\uff0b", "\uff0d", "\uff20"]
+
+
+@pytest.mark.parametrize("lead", LEADS_UNDER_TEST)
+@pytest.mark.parametrize("space", ["", *SPACES])
+def test_a_formula_lead_behind_whitespace_a_spreadsheet_may_trim_is_prefixed(
+    space: str, lead: str
+) -> None:
+    for text in (f"{space}{lead}1+1", f"{space}{lead}cmd|' /C calc'!A0"):
+        cell = safe_cell(text)
+        assert inert(cell), (text, cell)
+        if space in ("", " ", "  "):  # survives escaping, so the lead is what the prefix guards
+            assert cell == FORMULA_PREFIX + text
+
+
+@pytest.mark.parametrize("lead", ["\uff1d", "\uff0b", "\uff0d", "\uff20"])
+def test_fullwidth_formula_leads_are_prefixed(lead: str) -> None:
+    assert safe_cell(f"{lead}1") == f"'{lead}1"
+
+
+def test_whitespace_alone_or_before_ordinary_text_is_left_as_it_is() -> None:
+    for text in (" ", "\u3000", " a=b", "\xa0x", "  50%", " 'x"):
+        assert safe_cell(text) == clean(text, 1 << 20)
+
+
+@given(
+    st.lists(st.sampled_from([*SPACES, "\u00a0", "\u2009", "\u205f"]), max_size=4).map("".join),
+    st.sampled_from([*LEADS_UNDER_TEST, "\t", "\r", "\n"]),
+    st.text(),
+)
+def test_no_leading_whitespace_hides_a_formula_lead(space: str, lead: str, rest: str) -> None:
+    cell = safe_cell(f"{space}{lead}{rest}")
+    assert inert(cell), cell
+
+
+@given(st.text(alphabet="".join(SPACES + LEADS_UNDER_TEST) + "a1", max_size=8))
+def test_a_string_of_spaces_and_leads_is_always_inert(text: str) -> None:
+    assert inert(safe_cell(text))
+
+
+def test_hex_cells_carry_a_0x_prefix_so_a_spreadsheet_keeps_them_as_text(tmp_path: Path) -> None:
+    """``00123456`` would lose its zeros and ``1e300000`` would become a number (infinity)."""
+    codec = wide_codec()
+    msg = codec.model.by_name["WIDE"]
+    blob = msg.field("blob")
+    assert blob is not None
+    payloads = []
+    for digits in ("00123456", "1e300000", "12345678", "deadbeef"):
+        raw = bytearray(msg.payload_size)
+        raw[blob.offset : blob.offset + 4] = bytes.fromhex(digits)
+        payloads.append(bytes(raw))
+    write_wide(tmp_path / "r.ibrec", wide_frames(codec, payloads))
+    export_in_process(tmp_path / "r.ibrec", tmp_path / "out")
+    rows = read_dicts(tmp_path / "out" / "WIDE.csv")
+    assert [r["blob"] for r in rows] == ["0x00123456", "0x1e300000", "0x12345678", "0xdeadbeef"]
+    assert all(not _parses_as_number(r["blob"]) for r in rows)
+    text, _ = export_in_process(tmp_path / "r.ibrec", tmp_path / "t.txt", ExportFormat.TEXT)
+    assert text.rows == 4  # text and jsonl are replay's lines, unchanged by the prefix
+
+
+def _parses_as_number(cell: str) -> bool:
+    try:
+        float(cell)
+    except ValueError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize(
+    "reason", ["=cmd|' /C calc'!A0", " =1+1", "\uff1d1+1", "@SUM(1)", "-2+3", "+1\nx\x1b[31mred"]
+)
+def test_the_reason_of_a_malformed_row_exports_inert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    """The reason is text a decoder produced from packet content, so it is a cell like any other."""
+    monkeypatch.setattr(
+        Codec, "decode", lambda self, kind, data: DecodeError(Code.DEC_PAYLOAD, 3, reason)
+    )
+    hk_and_status(tmp_path / "r.ibrec", 2, 0)
+    export_in_process(tmp_path / "r.ibrec", tmp_path / "out")
+    rows = read_dicts(tmp_path / "out" / "malformed.csv")
+    assert len(rows) == 2
+    for row in rows:
+        assert inert(row["reason"]) and "\n" not in row["reason"] and "\x1b" not in row["reason"]
+        assert row["reason"].lstrip("' ") != "" and all(inert(cell) for cell in row.values())
+        if reason[0] in "=@-+":
+            assert row["reason"].startswith("'" + reason[0]), row["reason"]
 
 
 @given(st.lists(st.text(), min_size=1, max_size=6), st.integers(), st.floats(allow_nan=False))
@@ -162,7 +266,7 @@ def check_cell(field: FieldDef, cell: str, value: object, *, raw_enums: bool = F
             assert cell in (text, "'" + text)
             assert cell == text or text[:1] in "=+-@\t\r\n"
         case TypeClass.BYTES:
-            assert isinstance(value, bytes) and cell == value.hex()
+            assert isinstance(value, bytes) and cell == "0x" + value.hex()
 
 
 WIDE_COLUMNS = [
@@ -445,7 +549,8 @@ def test_csv_holds_the_frames_replay_shows_decoded_and_malformed_ones_separately
     assert [r["status"] for r in bad] == ["unknown", "malformed", "malformed"]
     assert [r["seq"] for r in bad] == ["19", "20", "21"]
     assert bad[0]["code"] == "IB-DEC-006" and bad[0]["mid"] == "0x0FF0" and bad[1]["mid"] == ""
-    assert bytes.fromhex(bad[2]["hex"]) == hk_frames(1)[0].data + b"\x00"
+    assert bad[2]["hex"].startswith("0x")
+    assert bytes.fromhex(bad[2]["hex"].removeprefix("0x")) == hk_frames(1)[0].data + b"\x00"
     assert bad[2]["len"] == bad[2]["orig_len"] == str(len(hk_frames(1)[0].data) + 1)
 
 

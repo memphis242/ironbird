@@ -58,7 +58,10 @@ from ironbird.recording.export import (
     Selection,
     StdoutDestination,
     check_messages,
+    check_single_layout,
+    input_guard,
     refuse_unsafe_output,
+    stale_temporaries,
     write_to_directory,
     write_to_file,
 )
@@ -2114,16 +2117,34 @@ def _export_summary(replay: Replay, result: ExportResult, where: str) -> str:
     return ", ".join(part for part in parts if part)
 
 
-def _managed_directories(run: _Run) -> list[Path]:
-    """The state directory and the recording directory: files in them named like ledger parts or
-    recordings are retention's, and an export must not take such a name."""
-    found: list[Path] = []
+def _warn_stale_temporaries(output: Path, ledger: Ledger, console: Console) -> None:
+    """One warning when an export of ``output`` was killed earlier and left its temporary file or
+    directory beside it. They are never removed here: a live export may own one."""
+    found, truncated = stale_temporaries(output)
+    if not found:
+        return
+    shown = ", ".join(term(name, 120, err=True) for name in found[:3])
+    more = f" and {len(found) - 3} more" if len(found) > 3 else ""
+    warning = (
+        f"{len(found)} temporary file(s) of an earlier export of "
+        f"{term(output.name, 120, err=True)} remain in "
+        f"{term(str(output.parent), 200, err=True)} ({shown}{more}); they are not removed "
+        "(a killed export leaves them); delete them if no export is running"
+        + ("; the directory is large and only part of it was searched" if truncated else "")
+    )
+    ledger.record("warning", Code.EXP_WRITE.value, summary=warning, output=output, stale=found[:20])
+    console.err(f"warning {Code.EXP_WRITE.value}: {warning}")
+
+
+def _managed_directories(run: _Run) -> tuple[list[Path], list[Path]]:
+    """``(state directories, recording directories)``: nothing may be exported into the state
+    directory, and in the recording directory an export must not take a name retention manages
+    (a ledger part, a reserve, a recording)."""
+    states: list[Path] = []
     with contextlib.suppress(IronbirdError):
-        found.append(default_state_dir())
+        states.append(default_state_dir())
     recordings = _recording_dir(run.config)
-    if recordings is not None:
-        found.append(recordings)
-    return found
+    return states, [recordings] if recordings is not None else []
 
 
 @app.command("export")
@@ -2261,10 +2282,15 @@ def export_command(
                 )
             if force and output is None:
                 raise IronbirdError(Code.CLI_USAGE, "--force needs -o")
-            managed = _managed_directories(run)
+            state_dirs, recording_dirs = _managed_directories(run)
             if output is not None:
                 refuse_unsafe_output(
-                    output, files, managed_dirs=managed, force=force, directory=directory
+                    output,
+                    files,
+                    state_dirs=state_dirs,
+                    managed_dirs=recording_dirs,
+                    force=force,
+                    directory=directory,
                 )
             ledger.record(
                 "action",
@@ -2294,9 +2320,16 @@ def export_command(
             )
             if output is not None:  # the parts found by name are inputs too
                 refuse_unsafe_output(
-                    output, replaying.parts, managed_dirs=managed, force=force, directory=directory
+                    output,
+                    replaying.parts,
+                    state_dirs=state_dirs,
+                    managed_dirs=recording_dirs,
+                    force=force,
+                    directory=directory,
                 )
             _report_missing_parts(replaying, ledger, console)
+            if output is not None:
+                _warn_stale_temporaries(output, ledger, console)
             codecs, aliases, _ = _replay_definitions(
                 base,
                 replaying,
@@ -2315,6 +2348,14 @@ def export_command(
             if names:
                 check_messages(names, codecs)
                 selection = Selection(names, codecs)
+            if single:  # before the first row, to stdout or to a file
+                check_single_layout(
+                    names[0],
+                    codecs,
+                    replaying.nodes,
+                    header_fields=header_fields,
+                    selected=flt.nodes if flt is not None else None,
+                )
             candidates = [
                 m
                 for m in (flt.mids if flt else None, selection.mids if selection else None)
@@ -2342,10 +2383,14 @@ def export_command(
                 result = run_it(StdoutDestination(console.stdout.write_wait))
                 target = "stdout"
             elif directory:
-                result, sync = write_to_directory(output, run=run_it)
+                result, sync = write_to_directory(
+                    output, run=run_it, before_commit=input_guard(output, replaying)
+                )
                 target = f"directory {term(str(output), 300, err=True)}"
             else:
-                result, sync = write_to_file(output, force=force, run=run_it)
+                result, sync = write_to_file(
+                    output, force=force, run=run_it, before_commit=input_guard(output, replaying)
+                )
                 target = term(str(output), 300, err=True)
             ending = result.ending.value
             rows = result.rows

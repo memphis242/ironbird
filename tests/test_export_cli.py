@@ -4,6 +4,7 @@ test_export.py."""
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
 import json
@@ -17,18 +18,29 @@ from typing import Any
 
 import pytest
 
-from exportutil import NullDestination, export_in_process, hk_and_status, read_dicts
-from ironbird import fsops
-from ironbird.atomicfile import Collision, TempDirOutput
+from exportutil import (
+    NullDestination,
+    export_in_process,
+    hk_and_status,
+    many_message_recording,
+    read_dicts,
+    two_node_recording,
+)
+from ironbird import atomicfile, fsops
+from ironbird.atomicfile import Collision, TempDirOutput, TempOutput
 from ironbird.errors import Code, IronbirdError
+from ironbird.recording.defs import embedded_codecs
 from ironbird.recording.export import (
     ExportFormat,
     ExportResult,
+    export,
+    input_guard,
     write_to_directory,
     write_to_file,
 )
 from ironbird.recording.format import RecordType
 from ironbird.recording.reader import RecordingReader
+from ironbird.recording.replay import Replay
 from recutil import CLI_MAIN, run_ib
 from replayutil import child_env, hk_frames, write_recording
 from support.faultfs import FaultFs
@@ -37,6 +49,7 @@ from test_replay import split_set
 LEDGER_NAME = "20261031T010203Z-0123456789ab.jsonl"
 RECORDING_NAME = "20261031T010203Z-0123456789ab.ibrec"
 RESERVE_NAME = "20261031T010203Z-0123456789ab.r0001.reserve"
+SALVAGE_TMP = ".20261031T010203Z-0123456789ab.p0002.jsonl.0123456789abcdef.tmp"
 
 
 @pytest.fixture
@@ -200,7 +213,14 @@ def test_the_output_may_not_be_a_part_of_the_split_recording_being_exported(
 
 
 @pytest.mark.parametrize(
-    "name", [LEDGER_NAME, RECORDING_NAME, RESERVE_NAME, "20261031T010203Z-0123456789ab.p0002.ibrec"]
+    "name",
+    [
+        LEDGER_NAME,
+        RECORDING_NAME,
+        RESERVE_NAME,
+        "20261031T010203Z-0123456789ab.p0002.ibrec",
+        SALVAGE_TMP,
+    ],
 )
 @pytest.mark.parametrize("where", ["state", "recordings"])
 @pytest.mark.parametrize("force", [False, True])
@@ -212,7 +232,7 @@ def test_the_output_may_not_be_named_like_a_file_retention_manages(
         tmp_path, env, str(rec), "--format", "text", "-o", str(out), *(["--force"] if force else [])
     )
     assert done.returncode == 1 and "error IB-EXP-002" in done.stderr, done.stderr
-    assert "manages" in done.stderr
+    assert ("state directory" if where == "state" else "manages") in done.stderr
     assert not out.exists() and temporaries(tmp_path / where) == []
 
 
@@ -230,18 +250,36 @@ def test_the_managed_directory_is_found_by_inode_so_a_symlinked_path_does_not_hi
     assert relative.returncode == 1 and "error IB-EXP-002" in relative.stderr
 
 
-def test_managed_looking_names_elsewhere_and_ordinary_names_in_those_directories_are_fine(
+def test_managed_looking_names_elsewhere_and_ordinary_names_in_the_recording_directory_are_fine(
     tmp_path: Path, env: dict[str, str], rec: Path
 ) -> None:
     (tmp_path / "elsewhere").mkdir()
     for out in (
         tmp_path / "elsewhere" / LEDGER_NAME,
-        tmp_path / "state" / "export.txt",
         tmp_path / "recordings" / "export.txt",
     ):
         done = ib(tmp_path, env, str(rec), "--format", "text", "-o", str(out))
         assert done.returncode == 0, done.stderr
         assert len(out.read_text().splitlines()) == 10
+
+
+@pytest.mark.parametrize(
+    "name", ["export.txt", "notes.csv", "out", f".{LEDGER_NAME}.0123456789abcdef.tmp", SALVAGE_TMP]
+)
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("as_directory", [False, True])
+def test_nothing_may_be_exported_into_the_state_directory_under_any_name(
+    tmp_path: Path, env: dict[str, str], rec: Path, name: str, force: bool, as_directory: bool
+) -> None:
+    out = tmp_path / "state" / name
+    args = [str(rec), "-o", str(out)] if as_directory else [str(rec), "--format", "text"]
+    if not as_directory:
+        args += ["-o", str(out)]
+    before = sorted(p.name for p in (tmp_path / "state").iterdir())
+    done = ib(tmp_path, env, *args, *(["--force"] if force else []))
+    assert done.returncode == 1 and "error IB-EXP-002" in done.stderr, done.stderr
+    assert "state directory" in done.stderr and not out.exists()
+    assert temporaries(tmp_path / "state") == [n for n in before if n.endswith(".tmp")]
 
 
 def test_a_directory_export_never_replaces_anything(
@@ -294,6 +332,11 @@ def test_a_missing_directory_is_a_write_error_and_leaves_nothing(
     done = ib(tmp_path, env, str(rec), "--format", "text", "-o", str(tmp_path / "no" / "x.txt"))
     assert done.returncode == 1 and "error IB-EXP-001" in done.stderr, done.stderr
     assert "Traceback" not in done.stderr and not (tmp_path / "no").exists()
+    assert "does not exist" in done.stderr and "nothing was created" in done.stderr
+    assert "mkdir -p" in done.stderr and "partial output" not in done.stderr
+    in_dir = ib(tmp_path, env, str(rec), "-o", str(tmp_path / "no" / "out"))
+    assert in_dir.returncode == 1 and "error IB-EXP-001" in in_dir.stderr, in_dir.stderr
+    assert "does not exist" in in_dir.stderr and not (tmp_path / "no").exists()
 
 
 # -- committing: faults and races, in process ----
@@ -665,3 +708,374 @@ def test_the_malformed_table_is_opened_first_then_one_table_per_message_seen(rec
     result, _ = export_in_process(rec, None, ExportFormat.CSV, destination=dest)
     assert dest.members == ["malformed.csv", "MOCK_HK.csv", "MOCK_STATUS.csv"]
     assert result.rows == 10
+
+
+# -- one message, two layouts ----
+
+
+@pytest.fixture
+def two_nodes(tmp_path: Path) -> Path:
+    return two_node_recording(tmp_path / "two.ibrec")
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        None,
+        "seq > 2",
+        "node in [fc, gc]",
+        "node == fc or node == gc",
+        "not node == fc",
+    ],
+)
+@pytest.mark.parametrize("to_file", [False, True])
+def test_a_single_table_export_of_a_message_with_two_layouts_is_refused_before_any_row(
+    tmp_path: Path, env: dict[str, str], two_nodes: Path, where: str | None, to_file: bool
+) -> None:
+    out = tmp_path / "hk.csv"
+    args = [str(two_nodes), "--message", "HK", *(["--where", where] if where else [])]
+    done = ib(tmp_path, env, *args, *(["-o", str(out)] if to_file else []))
+    assert done.returncode == 2 and "error IB-CLI-001" in done.stderr, done.stderr
+    assert "layout" in done.stderr and "Traceback" not in done.stderr
+    assert done.stdout == "" and not out.exists() and temporaries(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("where", "node", "rows"),
+    [
+        ("node == fc", "fc", 4),
+        ("node == gc", "gc", 4),
+        ("node in [fc]", "fc", 4),
+        ("node != fc", "gc", 4),
+        ("node != gc", "fc", 4),
+        ("node == fc and seq > 2", "fc", 3),
+        ("(node == fc or node == gc) and node == gc", "gc", 4),
+    ],
+)
+def test_a_node_predicate_that_leaves_one_layout_exports_it(
+    tmp_path: Path, env: dict[str, str], two_nodes: Path, where: str, node: str, rows: int
+) -> None:
+    out = tmp_path / "hk.csv"
+    done = ib(tmp_path, env, str(two_nodes), "--message", "HK", "--where", where, "-o", str(out))
+    assert done.returncode == 0, done.stderr
+    table = read_dicts(out)
+    assert len(table) == rows and {r["node"] for r in table} == {node}
+    assert ("b" in table[0]) == (node == "gc")
+    piped = ib(tmp_path, env, str(two_nodes), "--message", "HK", "--where", where)
+    assert piped.returncode == 0 and len(piped.stdout.splitlines()) == rows + 1
+
+
+def test_the_same_message_in_a_directory_keeps_both_layouts(
+    tmp_path: Path, env: dict[str, str], two_nodes: Path
+) -> None:
+    done = ib(tmp_path, env, str(two_nodes), "-o", str(tmp_path / "all"))
+    assert done.returncode == 0, done.stderr
+    assert sorted(p.name for p in (tmp_path / "all").iterdir()) == [
+        "HK.2.csv",
+        "HK.csv",
+        "malformed.csv",
+    ]
+
+
+# -- descriptors ----
+
+
+def run_ib_with_descriptor_limit(
+    tmp_path: Path, env: dict[str, str], limit: int, *args: str
+) -> subprocess.CompletedProcess[str]:
+    import resource
+
+    def lower() -> None:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (limit, limit))
+
+    return subprocess.run(
+        [sys.executable, "-c", CLI_MAIN, "export", *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+        check=False,
+        cwd=tmp_path,
+        preexec_fn=lower,
+    )
+
+
+@pytest.mark.parametrize("limit", [40, 64, 96])
+def test_a_directory_export_of_many_messages_fits_the_descriptor_limit_it_runs_under(
+    tmp_path: Path, env: dict[str, str], limit: int
+) -> None:
+    many = many_message_recording(tmp_path / "many.ibrec", 90, 3)
+    done = run_ib_with_descriptor_limit(tmp_path, env, limit, str(many), "-o", str(tmp_path / "o"))
+    assert done.returncode == 0, done.stderr
+    tables = sorted(p.name for p in (tmp_path / "o").iterdir())
+    assert len(tables) == 91  # 90 messages and malformed.csv
+    assert all(len(read_dicts(tmp_path / "o" / n)) == 3 for n in tables if n != "malformed.csv")
+    assert temporaries(tmp_path) == []
+
+
+def test_the_default_number_of_open_members_follows_the_descriptor_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import resource
+
+    from ironbird.recording import export as export_module
+
+    monkeypatch.setattr(export_module, "_descriptors_in_use", lambda: 10)
+    for soft, expected in (
+        (1024, 64),
+        (200, 64),
+        (100, 100 - 10 - export_module.DESCRIPTOR_MARGIN),
+    ):
+        monkeypatch.setattr(resource, "getrlimit", lambda _which, soft=soft: (soft, soft))
+        assert export_module.default_max_open() == expected
+    for soft in (10, 3, 0):  # nothing to spare: one member at a time, never zero
+        monkeypatch.setattr(resource, "getrlimit", lambda _which, soft=soft: (soft, soft))
+        assert export_module.default_max_open() == 1
+    monkeypatch.setattr(
+        resource, "getrlimit", lambda _which: (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
+    )
+    assert export_module.default_max_open() == 64
+
+
+def test_running_out_of_descriptors_gives_one_up_and_goes_on(tmp_path: Path, rec: Path) -> None:
+    fs = FaultFs()
+    fs.fail("open_at", errno.EMFILE, skip=3, times=1)  # the 3rd member: the limit is reached
+    result, _ = write_to_directory(tmp_path / "out", run=lambda dest: run_dirs(rec, dest), fs=fs)
+    assert result.rows == 10 and sorted(p.name for p in (tmp_path / "out").iterdir())
+    assert temporaries(tmp_path) == []
+
+
+def test_a_member_reopened_at_the_limit_is_retried_after_giving_one_up(tmp_path: Path) -> None:
+    fs = FaultFs()
+    final = tmp_path / "out"
+    with TempDirOutput(final, fs=fs, max_open=3) as out:
+        handles = [out.create(f"m{n}.csv") for n in range(6)]
+        fs.fail("open_at", errno.EMFILE, times=1)
+        out.write(
+            handles[0], b"again"
+        )  # evicted earlier: reopened, and the first try hits the limit
+        out.commit()
+    assert (final / "m0.csv").read_bytes() == b"again"
+
+
+def test_without_a_descriptor_to_give_up_the_error_names_the_remedy(
+    tmp_path: Path, rec: Path
+) -> None:
+    fs = FaultFs()
+    fs.fail("open_at", errno.EMFILE, skip=1)  # nothing is open yet when it hits
+    with pytest.raises(IronbirdError) as caught:
+        write_to_directory(tmp_path / "out", run=lambda dest: run_dirs(rec, dest), fs=fs)
+    assert caught.value.code is Code.EXP_WRITE
+    assert "ulimit -n" in caught.value.summary and "Traceback" not in caught.value.summary
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["in.ibrec"]
+
+
+# -- the input, again at the commit ----
+
+
+def export_text_of(rec: Path, fmt: ExportFormat = ExportFormat.TEXT) -> tuple[Replay, Any]:
+    replaying = Replay([rec])
+    codecs = embedded_codecs(
+        replaying.parts[0],
+        replaying.head,
+        replaying.nodes,
+        replaying.meta.data,
+        replaying.max_packet_bytes,
+    )
+
+    def run(dest: Any) -> ExportResult:
+        return export(replaying, codecs, dest, fmt, directory=fmt is ExportFormat.CSV)
+
+    return replaying, run
+
+
+@pytest.mark.parametrize("how", ["hardlink", "symlink"])
+def test_an_output_that_became_the_input_while_exporting_is_refused_at_the_commit(
+    tmp_path: Path, rec: Path, how: str
+) -> None:
+    out = tmp_path / "out.txt"
+    out.write_text("old export")  # an ordinary file at the start, so --force may replace it
+    replaying, inner = export_text_of(rec)
+    before = rec.read_bytes()
+
+    def run(dest: Any) -> ExportResult:
+        result = inner(dest)
+        out.unlink()
+        if how == "hardlink":
+            os.link(rec, out)  # the name now denotes the recording (same inode)
+        else:
+            out.symlink_to(rec)
+        return result
+
+    with pytest.raises(IronbirdError) as caught, contextlib.closing(replaying):
+        write_to_file(out, force=True, run=run, before_commit=input_guard(out, replaying))
+    assert (
+        caught.value.code is Code.EXP_EXISTS and "recording being exported" in caught.value.summary
+    )
+    assert rec.read_bytes() == before and temporaries(tmp_path) == []
+    assert out.samefile(rec)
+
+
+def test_a_directory_output_that_became_the_input_is_refused_at_the_commit(
+    tmp_path: Path, rec: Path
+) -> None:
+    out = tmp_path / "out"
+    replaying, inner = export_text_of(rec, ExportFormat.CSV)
+
+    def run(dest: Any) -> ExportResult:
+        result = inner(dest)
+        out.symlink_to(rec)
+        return result
+
+    with pytest.raises(IronbirdError) as caught, contextlib.closing(replaying):
+        write_to_directory(out, run=run, before_commit=input_guard(out, replaying))
+    assert caught.value.code is Code.EXP_EXISTS and temporaries(tmp_path) == []
+    assert out.is_symlink() and out.samefile(rec)
+
+
+def test_the_guard_lets_an_ordinary_output_through(tmp_path: Path, rec: Path) -> None:
+    out = tmp_path / "out.txt"
+    replaying, inner = export_text_of(rec)
+    with contextlib.closing(replaying):
+        write_to_file(out, force=False, run=inner, before_commit=input_guard(out, replaying))
+    assert len(out.read_text().splitlines()) == 10
+
+
+# -- leftovers of a killed export ----
+
+
+def test_stale_temporaries_of_a_killed_export_are_warned_about_once_and_kept(
+    tmp_path: Path, env: dict[str, str], rec: Path
+) -> None:
+    out = tmp_path / "hk.txt"
+    stale_file = tmp_path / ".hk.txt.0123456789abcdef.tmp"
+    stale_dir = tmp_path / ".hk.txt.fedcba9876543210.tmp"
+    stale_file.write_text("half an export")
+    stale_dir.mkdir()
+    unrelated = [
+        tmp_path / ".other.txt.0123456789abcdef.tmp",  # another output's
+        tmp_path / ".hk.txt.0123456789abcdeg.tmp",  # not a temporary name
+        tmp_path / "hk.txt.0123456789abcdef.tmp",  # no leading dot
+    ]
+    for item in unrelated:
+        item.write_text("x")
+    done = ib(tmp_path, env, str(rec), "--format", "text", "-o", str(out))
+    assert done.returncode == 0, done.stderr
+    assert done.stderr.count("earlier export") == 1, done.stderr
+    assert "IB-EXP-001" in done.stderr and "2 " in done.stderr and "not removed" in done.stderr
+    assert stale_file.read_text() == "half an export" and stale_dir.is_dir()
+    assert all(item.exists() for item in unrelated)
+    warned = [e for e in ledger_events(tmp_path) if e.get("event") == "IB-EXP-001"]
+    assert len(warned) == 1 and warned[0]["kind"] == "warning"
+
+
+def test_no_warning_without_stale_temporaries(
+    tmp_path: Path, env: dict[str, str], rec: Path
+) -> None:
+    (tmp_path / ".hk.txt.0123456789abcdef.tmp").write_text("not ours to warn about")
+    done = ib(tmp_path, env, str(rec), "--format", "text", "-o", str(tmp_path / "other.txt"))
+    assert done.returncode == 0 and "IB-EXP-001" not in done.stderr, done.stderr
+
+
+# -- the count of rows ----
+
+
+class Closing:
+    """A destination whose output goes away at the ``limit``-th line it is given."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.accepted_rows = 0  # data lines taken (a CSV header line is not a row)
+        self.seen = 0
+        self.members = 0
+
+    def member(self, name: str) -> int:
+        self.members += 1
+        return self.members - 1
+
+    def write(self, handle: int, text: str) -> bool:
+        self.seen += 1
+        if self.seen >= self.limit:
+            return False
+        if not text.startswith("rx_time_utc,"):
+            self.accepted_rows += 1
+        return True
+
+    def flush(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize("fmt", list(ExportFormat))
+@pytest.mark.parametrize("limit", [1, 2, 3, 5, 9])
+def test_the_row_that_the_output_refused_is_not_counted(
+    rec: Path, fmt: ExportFormat, limit: int
+) -> None:
+    dest = Closing(limit)
+    result, _ = export_in_process(rec, None, fmt, destination=dest)
+    assert result.ending.value == "output"
+    assert result.rows == dest.accepted_rows
+    if fmt is ExportFormat.CSV:
+        assert result.rows == sum(result.per_table.values())
+    else:
+        assert result.rows == result.decoded + result.malformed + result.unknown + result.garbage
+
+
+# -- exclusive creation, and the members at the commit ----
+
+
+def test_a_member_swapped_after_it_was_given_up_is_caught_at_the_commit(tmp_path: Path) -> None:
+    final = tmp_path / "out"
+    with (
+        pytest.raises(OSError, match="the member changed"),
+        TempDirOutput(final, max_open=1) as out,
+    ):
+        first = out.create("a.csv")
+        out.write(first, b"mine")
+        second = out.create("b.csv")  # a.csv's descriptor is given up
+        out.write(second, b"b")
+        os.link(out.path / "a.csv", tmp_path / "kept")  # the original inode stays allocated
+        os.unlink(out.path / "a.csv")
+        (out.path / "a.csv").write_text("an imposter")
+        out.commit()
+    assert not final.exists()
+    assert (tmp_path / out.leftover / "a.csv").read_text() == "an imposter"  # type: ignore[operator]
+
+
+def test_a_member_that_still_holds_its_descriptor_commits_and_an_untouched_evicted_one_too(
+    tmp_path: Path,
+) -> None:
+    final = tmp_path / "out"
+    with TempDirOutput(final, max_open=1) as out:
+        out.write(out.create("a.csv"), b"a")
+        out.write(out.create("b.csv"), b"b")
+        out.commit()
+    assert (final / "a.csv").read_bytes() == b"a" and (final / "b.csv").read_bytes() == b"b"
+
+
+def test_a_temporary_file_is_created_exclusively_never_opened_over_an_existing_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(atomicfile.os, "urandom", lambda n: b"\x01" * n)
+    squatter = tmp_path / f".out.txt.{'01' * 8}.tmp"
+    squatter.write_text("someone else's data")
+    with pytest.raises(OSError, match="no free temporary name"), TempOutput(tmp_path / "out.txt"):
+        raise AssertionError("must not get a temporary file")
+    assert squatter.read_text() == "someone else's data"
+    squat_dir = tmp_path / f".out.{'01' * 8}.tmp"
+    squat_dir.mkdir()
+    (squat_dir / "keep").write_text("kept")
+    with pytest.raises(OSError, match="no free temporary name"), TempDirOutput(tmp_path / "out"):
+        raise AssertionError("must not get a temporary directory")
+    assert (squat_dir / "keep").read_text() == "kept"
+
+
+def test_a_member_is_created_exclusively_never_opened_over_an_existing_file(
+    tmp_path: Path,
+) -> None:
+    final = tmp_path / "out"
+    out = TempDirOutput(final)
+    with pytest.raises(FileExistsError), out:
+        (out.path / "a.csv").write_text("already here")
+        out.create("a.csv")
+    assert out.leftover is not None
+    assert (tmp_path / out.leftover / "a.csv").read_text() == "already here"

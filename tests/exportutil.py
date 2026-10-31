@@ -24,6 +24,7 @@ from ironbird.recording.export import (
     ExportResult,
     Selection,
     check_messages,
+    check_single_layout,
     export,
     write_to_directory,
     write_to_file,
@@ -149,6 +150,157 @@ def wide_meta(node: str = "fc") -> dict[str, Any]:
     )
 
 
+def many_message_recording(path: Path, messages: int, rounds: int = 2) -> Path:
+    """A recording of ``messages`` telemetry messages ``M000``..., ``rounds`` frames each,
+    interleaved (so every table is written to again and again)."""
+    import asyncio
+
+    from ironbird.recording.writer import Recorder
+    from recutil import FAST
+
+    names = [f"M{i:03d}" for i in range(messages)]
+    ccdd = json.dumps(
+        {
+            "schema": "ironbird-ccdd/0",
+            "target": "many",
+            "messages": [
+                {
+                    "name": name,
+                    "kind": "telemetry",
+                    "mid": hex(0x0900 + i),
+                    "category": "other",
+                    "description": "x",
+                    "fields": [{"name": "v", "type": "uint16"}],
+                }
+                for i, name in enumerate(names)
+            ],
+        }
+    ).encode()
+    command, telemetry = COMMAND_PROFILE.read_bytes(), TELEMETRY_PROFILE.read_bytes()
+    codec = Codec(
+        load_ccdd_bytes(ccdd, "many.json", "json"),
+        load_profile(COMMAND_PROFILE),
+        load_profile(TELEMETRY_PROFILE),
+        max_packet_bytes=MAX_PACKET,
+        clock=lambda: 1_000_000.25,
+    )
+    meta = meta_data(
+        nodes={
+            "fc": {
+                "adapter": "json",
+                "ccdd_sha256": hashlib.sha256(ccdd).hexdigest(),
+                "command_profile_sha256": hashlib.sha256(command).hexdigest(),
+                "telemetry_profile_sha256": hashlib.sha256(telemetry).hexdigest(),
+            }
+        }
+    )
+    blobs = [
+        BlobSpec(BlobKind.CCDD, "fc", "json", ccdd),
+        BlobSpec(BlobKind.COMMAND_PROFILE, "fc", "toml", command),
+        BlobSpec(BlobKind.TELEMETRY_PROFILE, "fc", "toml", telemetry),
+    ]
+    from recutil import TX
+
+    recorder = Recorder.open(path, meta, blobs=blobs, streams=(RX, TX), options=FAST)
+    seq = 1
+    for round_ in range(rounds):
+        for i, name in enumerate(names):
+            codec.reset_sequences()
+            data = codec.encode_telemetry(name, {"v": round_}).data
+            recorder.append(
+                frame(seq, stream=RX, data=data, mid=0x0900 + i, time_ns=T0 + seq * STEP_NS)
+            )
+            seq += 1
+    asyncio.run(recorder.close())
+    return path
+
+
+def two_node_recording(path: Path, per_node: int = 4) -> Path:
+    """A recording whose nodes ``fc`` and ``gc`` both define telemetry ``HK`` (MID 0x890), with
+    one field on ``fc`` and two on ``gc``: the same message in two table layouts. Frames
+    alternate between the nodes."""
+    import asyncio
+
+    from ironbird.frame import Direction, Stream
+    from ironbird.recording.writer import Recorder
+    from recutil import FAST
+
+    def ccdd(fields: list[dict[str, str]]) -> bytes:
+        return json.dumps(
+            {
+                "schema": "ironbird-ccdd/0",
+                "target": "t",
+                "messages": [
+                    {
+                        "name": "HK",
+                        "kind": "telemetry",
+                        "mid": "0x0890",
+                        "category": "other",
+                        "description": "x",
+                        "fields": fields,
+                    }
+                ],
+            }
+        ).encode()
+
+    one = [{"name": "a", "type": "uint16"}]
+    defs = {"fc": ccdd(one), "gc": ccdd([*one, {"name": "b", "type": "uint8"}])}
+    command, telemetry = COMMAND_PROFILE.read_bytes(), TELEMETRY_PROFILE.read_bytes()
+    nodes: dict[str, Any] = {}
+    blobs: list[BlobSpec] = []
+    codecs: dict[str, Codec] = {}
+    streams: list[Stream] = []
+    for index, (node, definition) in enumerate(defs.items()):
+        nodes[node] = {
+            "adapter": "json",
+            "ccdd_sha256": hashlib.sha256(definition).hexdigest(),
+            "command_profile_sha256": hashlib.sha256(command).hexdigest(),
+            "telemetry_profile_sha256": hashlib.sha256(telemetry).hexdigest(),
+        }
+        blobs += [
+            BlobSpec(BlobKind.CCDD, node, "json", definition),
+            BlobSpec(BlobKind.COMMAND_PROFILE, node, "toml", command),
+            BlobSpec(BlobKind.TELEMETRY_PROFILE, node, "toml", telemetry),
+        ]
+        codecs[node] = Codec(
+            load_ccdd_bytes(definition, f"{node}.json", "json"),
+            load_profile(COMMAND_PROFILE),
+            load_profile(TELEMETRY_PROFILE),
+            max_packet_bytes=MAX_PACKET,
+            clock=lambda: 1_000_000.25,
+        )
+        streams.append(
+            Stream(
+                index,
+                f"ground-{node}",
+                node,
+                MessageKind.TELEMETRY,
+                Direction.RX,
+                "udp",
+                "udp 127.0.0.1:1",
+            )
+        )
+    recorder = Recorder.open(
+        path, meta_data(nodes=nodes), blobs=blobs, streams=streams, options=FAST
+    )
+    seq = 1
+    for round_ in range(per_node):
+        for index, node in enumerate(defs):
+            data = codecs[node].encode_telemetry("HK", {"a": round_}).data
+            recorder.append(
+                frame(
+                    seq,
+                    stream=streams[index],
+                    data=data,
+                    mid=0x890,
+                    time_ns=T0 + seq * STEP_NS,
+                )
+            )
+            seq += 1
+    asyncio.run(recorder.close())
+    return path
+
+
 def write_wide(path: Path, frames: Iterable[Frame]) -> None:
     """Record ``frames`` with the wide CCDD embedded as the definitions of node ``fc``."""
     import asyncio
@@ -221,6 +373,14 @@ def export_in_process(
         as_csv = fmt is ExportFormat.CSV
         single = as_csv and len(set(messages)) == 1
         directory = as_csv and not single
+        if single:
+            check_single_layout(
+                messages[0],
+                codecs,
+                replaying.nodes,
+                header_fields=header_fields,
+                selected=flt.nodes if flt else None,
+            )
 
         def run(dest: Destination) -> ExportResult:
             return export(
@@ -246,10 +406,15 @@ def export_in_process(
         replaying.close()
 
 
+LEADS = frozenset("=+-@\t\r\n\uff1d\uff0b\uff0d\uff20")  # ASCII and fullwidth = + - @, tab, CR, LF
+
+
 def inert(cell: str) -> bool:
-    """Whether ``cell`` is safe to open in a spreadsheet: it does not lead like a formula, unless
-    it is a plain finite number (numbers are typed cells and may be negative)."""
-    if not cell or cell[0] not in "=+-@\t\r\n":
+    """Whether ``cell`` is safe to open in a spreadsheet: after any leading whitespace (which an
+    importer may trim) it does not lead like a formula, unless it is a plain finite number
+    (numbers are typed cells and may be negative)."""
+    lead = cell.lstrip()[:1]
+    if not lead or lead not in LEADS:
         return True
     try:
         return math.isfinite(float(cell)) and cell[0] == "-"
@@ -282,10 +447,12 @@ __all__ = [
     "export_in_process",
     "hk_and_status",
     "inert",
+    "many_message_recording",
     "packet",
     "payload_size",
     "read_dicts",
     "read_table",
+    "two_node_recording",
     "wide_codec",
     "wide_frames",
     "write_recording",

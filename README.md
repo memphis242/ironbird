@@ -285,8 +285,16 @@ ib export run1.ibrec --format text --from +90s --to +2m -o minute.txt
   payload fields in CCDD order (a payload field called like a fixed column is `<MESSAGE>.<field>`).
   Numbers are numbers (floats in the shortest form that round-trips, `inf`/`nan` as text);
   enum fields are their label (`--raw-enums`: the number; a value the enum lacks is its number);
-  `char` fields are text; `bytes` fields are hex. Lines end in LF and cells are quoted as RFC 4180
-  says.
+  `char` fields are text; `bytes` fields are hex with a `0x` prefix (`0x00123456`; so is the `hex`
+  of `malformed.csv`), which keeps a spreadsheet from reading `00123456` as the number 123456 or
+  `1e300000` as a number at all. `text` and `jsonl` keep exactly what `ib replay` prints. Lines end
+  in LF and cells are quoted as RFC 4180 says.
+- **Spreadsheets reinterpret numbers.** A CSV carries no types, and Excel or LibreOffice guess: a
+  number with more than 15 significant digits (a `uint64`, a nanosecond time such as `rx_time_ns`)
+  is rounded to 15 and shown as `1.7E+18`, a text of digits keeps no leading zeros, and `1e30` is a
+  number. The file is exact; the application's guess is not. When the values matter, import the
+  columns as text (Excel: Data > From Text/CSV, set the column type to Text; LibreOffice: the
+  import dialog's column type "Text"), or read the CSV with a tool that keeps types.
 - **Which files.** One `--message` is a single table, written to `-o FILE` or to stdout. Several
   `--message`s, or none, make a directory (`-o DIR`, required) with `<MESSAGE>.csv` for each message
   that occurs and `malformed.csv` for every frame that did not decode (`seq`, time, `node`, `link`,
@@ -294,22 +302,34 @@ ib export run1.ibrec --format text --from +90s --to +2m -o minute.txt
   frame's bytes as `hex`), so the evidence is exported with the data. A single-file CSV has no place
   for frames that did not decode: they are counted in a warning, never dropped silently. A message
   that two nodes define with different layouts gets `<MESSAGE>.2.csv` for the second; a message
-  called `malformed` is `malformed.1.csv`. `--format text` and `jsonl` are one file or stdout, with
+  called `malformed` is `malformed.1.csv`. A single table (one `--message`, to a file or stdout)
+  cannot hold two layouts: when the recording's nodes define that message differently the export is
+  refused (`IB-CLI-001`) before any row is written, unless a `--where` that pins the node (`node ==
+  fc`, `node in [...]`, `node != gc`) leaves one layout. `--format text` and `jsonl` are one file or stdout, with
   the lines and records `ib replay` prints (frames that did not decode flagged, as replay shows them).
 - **Strings are untrusted.** Every string cell (names, enum labels, `char` text, hex, the reason of a
   malformed frame) has its control characters and escape sequences escaped, so a newline or an
   escape sequence from a packet cannot add a line or drive a terminal, and a cell that starts with
-  `=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`, so a spreadsheet does not read it
-  as a formula. Numbers are never touched.
+  `=`, `+`, `-`, `@` (or their fullwidth forms), a tab or a carriage return gets a leading `'`, so a
+  spreadsheet does not read it as a formula; leading spaces do not hide the lead (importers trim
+  them), so ` =1+1` is prefixed too. Numbers are never touched.
 - **The output is written whole or not at all.** The data goes to `.<name>.<16 hex>.tmp` beside OUT
   (a directory of the same form for a CSV directory), is synced, and is renamed to OUT without
   replacing anything; a failure, a signal or a full disk removes the temporary file and leaves
   nothing. An existing OUT is refused (`IB-EXP-002`) unless `--force` replaces a regular file of
   yours (not one another process holds locked, not a directory or a symbolic link); a CSV directory
-  is never replaced, `--force` or not. Two refusals no `--force` overrides: OUT is the recording
-  being exported (same file, however the path is spelled), and OUT is named like a file `ib
-  ledger prune` or `ib rec prune` manages (a ledger part, a reserve or a recording) in the state or
-  the recording directory, since a prune would later delete it. A write that fails is `IB-EXP-001`.
+  is never replaced, `--force` or not. "Holds locked" means an advisory `flock` (what `ib record`
+  and the other ironbird tools take): a program that writes the file without locking it, or locks it
+  with POSIX `fcntl` locks, is not detected, so `--force` over a file something else is writing
+  can still replace it. Two refusals no `--force` overrides: OUT is the recording
+  being exported (same file, however the path is spelled, checked again just before the rename),
+  and OUT is inside the state directory (which holds the ledger only) or named like a file `ib
+  ledger prune` or `ib rec prune` manages (a ledger part, a reserve, a salvage temporary or a
+  recording) in the recording directory, since a prune would later delete it. A write that fails is
+  `IB-EXP-001`; a missing directory for OUT says so and that nothing was created. A killed export
+  can leave `.<name>.<16 hex>.tmp` beside OUT: the next export of that name warns once and does not
+  delete it. A directory export keeps at most as many tables open as the descriptor limit allows
+  (`ulimit -n`; if the limit is still reached the error says to raise it).
 - **Exit codes.** As for `replay`: 0 normal (a torn tail or a recording never closed is a warning),
   5 when the recording was damaged mid-file (the export ends there, or with `--skip-damage` goes
   past it) or a part of a split recording is missing; the output exists and holds everything read.

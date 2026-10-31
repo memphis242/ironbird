@@ -318,6 +318,7 @@ class ReplayStats:
     """What a replay found, filled in as it reads."""
 
     parts: int = 0
+    opened: set[tuple[int, int]] = field(default_factory=set)  # (device, inode) of every part read
     frames_read: int = 0  # frames read from the files (chunks skipped by the index are not)
     frames_in_range: int = 0  # ... of them inside the time range
     gaps: int = 0  # GAP records met whose lost frames overlap the range (skipped chunks included)
@@ -573,6 +574,7 @@ class Replay:
         ended at its trailer, else ``None``."""
         stats = self.stats
         reader = RecordingReader(path, skip_damage=self._skip_damage)
+        stats.opened.add(reader.identity)
         try:
             skip = None if self._select_nothing else self._chunk_skipper(reader, start, end)
             wait = (

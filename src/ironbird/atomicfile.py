@@ -23,8 +23,9 @@ import stat
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Final
+from typing import Final, TypeVar
 
 from ironbird.fsops import (
     INSPECT_FLAGS,
@@ -38,6 +39,8 @@ from ironbird.fsops import (
 
 _NO_HARD_LINKS: Final = frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV})
 _NAME_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+_OUT_OF_DESCRIPTORS: Final = frozenset({errno.EMFILE, errno.ENFILE})
+_T = TypeVar("_T")
 
 
 class Collision(OSError):
@@ -323,9 +326,12 @@ class TempDirOutput:
 
     Only ``max_open`` members hold a descriptor at a time; a member whose descriptor was given up
     is appended to again through a descriptor that is checked to denote the file this process
-    created. Leaving the block without a commit removes the members this process created (by
-    name, after checking that the name still denotes the file created) and then the directory
-    with ``rmdir``; anything else inside is left alone, and the directory with it
+    created. When the process runs out of descriptors anyway (``EMFILE``, ``ENFILE``) the least
+    recently written member gives its descriptor up, ``max_open`` drops to the number still held,
+    and the open is tried again; with none left to give up the error is raised as it is.
+    Leaving the block without a commit removes the members this process created (by name, after
+    checking that the name still denotes the file created) and then the directory with
+    ``rmdir``; anything else inside is left alone, and the directory with it
     (:attr:`leftover` names it).
     """
 
@@ -377,8 +383,7 @@ class TempDirOutput:
         assert name and "/" not in name and name not in (".", "..")
         assert name not in self._by_name, "a member is created once"
         fs = self._fs
-        self._make_room()
-        fd = fs.open_at(self._dir_fd, name, _NAME_FLAGS, 0o600)
+        fd = self._with_room(lambda: fs.open_at(self._dir_fd, name, _NAME_FLAGS, 0o600))
         try:
             made = fs.fstat(fd)
         except OSError:
@@ -404,20 +409,34 @@ class TempDirOutput:
                 raise OSError(errno.EIO, "write made no progress", member.name)
             view = view[written:]
 
-    def _make_room(self) -> None:
-        while len(self._open) >= self._max_open:
-            oldest, _ = self._open.popitem(last=False)
-            member = self._members[oldest]
-            close_quietly(self._fs, member.fd)
-            member.fd = -1
+    def _give_up_oldest(self) -> None:
+        oldest, _ = self._open.popitem(last=False)
+        member = self._members[oldest]
+        close_quietly(self._fs, member.fd)
+        member.fd = -1
+
+    def _with_room(self, opener: Callable[[], _T]) -> _T:
+        """``opener()`` with fewer than ``max_open`` descriptors held; if the process is out of
+        descriptors all the same, one more is given up and ``max_open`` follows, until it
+        works or no member has a descriptor left to give up."""
+        while True:
+            while len(self._open) >= self._max_open:
+                self._give_up_oldest()
+            try:
+                return opener()
+            except OSError as exc:
+                if exc.errno not in _OUT_OF_DESCRIPTORS or not self._open:
+                    raise
+                self._give_up_oldest()
+                self._max_open = max(1, len(self._open))
 
     def _reopen(self, handle: int) -> None:
         fs, member = self._fs, self._members[handle]
-        self._make_room()
         flags = (
             os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
         )
-        fd = fs.open_at(self._dir_fd, member.name, flags)  # append to a file this process made
+        # append to a file this process made
+        fd = self._with_room(lambda: fs.open_at(self._dir_fd, member.name, flags))
         try:
             now = fs.fstat(fd)
             if (now.st_dev, now.st_ino) != member.ident or not stat.S_ISREG(now.st_mode):
@@ -438,7 +457,7 @@ class TempDirOutput:
             if member.fd >= 0:
                 fs.fdatasync(member.fd)
                 continue
-            fd = fs.open_at(self._dir_fd, member.name, INSPECT_FLAGS)
+            fd = self._with_room(partial(fs.open_at, self._dir_fd, member.name, INSPECT_FLAGS))
             try:
                 now = fs.fstat(fd)
                 if (now.st_dev, now.st_ino) != member.ident:
