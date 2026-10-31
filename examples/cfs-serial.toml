@@ -1,0 +1,42 @@
+# ironbird system description: ground station plus a real cFS flight computer, over a serial link.
+#
+# cFS has no serial lab app here, so tools/cfs/serial_bridge.py stands in for the UART: it joins
+# a pseudo-terminal to CI_LAB (commands) and TO_LAB (telemetry). With cFS running (tools/cfs/run.sh):
+#
+#   tools/cfs/serial_bridge.py --link /tmp/ib-cfs-uart &
+#   ib -c examples/cfs-serial.toml send fc TO_LAB_ENABLE_OUTPUT dest_IP=127.0.0.1
+#   ib -c examples/cfs-serial.toml listen fc          # one process owns the device at a time
+#
+# On real hardware `device` is the adapter, e.g. /dev/serial/by-id/usb-FTDI_..., and the user needs
+# access to it (usually the `dialout` group); ironbird never needs root.
+#
+# Telemetry is read with the cFE mission time epoch, like examples/ironbird.toml.
+
+[ironbird]
+acts_as = "ground"
+max_packet_bytes = 2048
+
+[nodes.ground]
+alias = "gnd"
+description = "Ground station (this host)"
+
+[nodes.fc]
+alias = "flight"
+description = "cFS flight computer (CI_LAB / TO_LAB behind serial_bridge.py)"
+ccdd = "ccdd/cfs.json"
+command_header = "headers/ccsds_v1_cfs_cmd.toml"
+telemetry_header = "headers/ccsds_v1_cfs_tlm_cfe_time.toml"
+
+[[links]]
+name = "ground-fc"
+from = "ground"
+to = "fc"
+transport = "serial"
+serial = { device = "/tmp/ib-cfs-uart", baud = 115200, data_bits = 8, parity = "none", stop_bits = 1, flow = "none" }
+# The header profile's length field cuts the stream into packets. These telemetry headers have no
+# checksum, so a packet is also confirmed by a sane header right behind it, or by max_idle_ms of
+# silence. A header profile with a trailer checksum (examples/headers/ccsds_pec_tlm.toml) needs
+# neither. `sync` is a marker before every packet, e.g. sync = "1ACFFC1D"; none here.
+# require_known_mid bounds a header's claimed length by 1.25 times the largest packet the CCDD
+# defines (a packet with an unknown MID or a grown payload is still framed; the decode reports it).
+framing = { kind = "header_length", sync = "", max_idle_ms = 50, require_known_mid = true }

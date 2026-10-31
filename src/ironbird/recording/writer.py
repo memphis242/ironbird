@@ -859,6 +859,13 @@ class Recorder:
         except Exception as exc:
             self._internal_failure(exc)
 
+    def link_event(self, stream: Stream, up: bool, time_ns: int, text: str) -> None:
+        """The link of ``stream`` went down or came back: a MARK (``link_down``/``link_up``) at
+        that time, unless this recorder was not given the stream. Never raises."""
+        if self._accept is not None and stream.id not in self._accept:
+            return
+        self.mark(MarkKind.LINK_UP if up else MarkKind.LINK_DOWN, text, time_ns)
+
     # -- chunks and flushing --
 
     def _close_chunk(self, *, final: bool = False) -> None:

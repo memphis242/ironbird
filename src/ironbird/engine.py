@@ -33,11 +33,12 @@ from typing import Any, Final, Protocol
 
 from ironbird.ccdd.model import MessageKind
 from ironbird.codec import Codec, Resolved
-from ironbird.config import Link, SystemConfig
+from ironbird.config import SERIAL_TRANSPORT, Link, SystemConfig
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.frame import (
     FLAG_GARBAGE,
     FLAG_HAS_MID,
+    FLAG_STALE,
     FLAG_TRUNCATED,
     FLAGS_BY_BITS,
     KNOWN_FLAG_BITS,
@@ -50,6 +51,7 @@ from ironbird.frame import (
     garbage_error,
 )
 from ironbird.ledger import Ledger
+from ironbird.notice import Level
 from ironbird.transport import LinkEnd, Receiver, Transport, TransportClosed, open_transport
 
 MAX_TRACKED_MIDS: Final = 1024
@@ -92,6 +94,16 @@ class GapSink(Protocol):
         """``lost`` frames of ``stream`` went missing between wall times ``first_ns`` and
         ``last_ns``, while the engine's sequence ran from ``first_seq`` to ``last_seq`` (the
         loss lies somewhere in that range of the capture)."""
+        ...
+
+
+class LinkSink(Protocol):
+    """A sink that also wants to know when a link end goes down or comes back. Optional: the
+    engine calls ``link_event`` on a sink that has it, and detaches a sink whose method raises."""
+
+    def link_event(self, stream: Stream, up: bool, time_ns: int, text: str) -> None:
+        """The receive ``stream``'s link went down (``up`` false) or came back at ``time_ns``;
+        ``text`` is a one-line description."""
         ...
 
 
@@ -335,6 +347,8 @@ class _LinkIO:
         self.opening: asyncio.Future[None] | None = None  # the transport open in progress
         self.lossy = False  # a consumer queue of this end has refused a frame
         self.failure: IronbirdError | None = None  # the receiving transport failed for good
+        # When the link went down: (wall time, engine sequence number); None while it is up.
+        self.down: tuple[int, int] | None = None
 
     def on_data(self, data: bytes, time_ns: int, source: str, orig_len: int, flags: int) -> None:
         """The transport's receiver. A bug in ingest is reported, never raised into the loop."""
@@ -522,6 +536,7 @@ class Engine:
         self._stats: dict[int, _MidStat] = {}
         self._stats_overflow = 0
         self._malformed_total = 0  # unknown-MID and malformed frames, filtered by a consumer or not
+        self._resync_frames = 0  # garbage and stale frames a stream framer produced
         self._rcvbuf_warned = False
 
     # -- read-only state ---------------------------------------------------------------
@@ -539,6 +554,12 @@ class Engine:
     @property
     def malformed_total(self) -> int:
         return self._malformed_total
+
+    @property
+    def resync_frames(self) -> int:
+        """Frames of skipped bytes (``GARBAGE``) and flushed partial packets (``STALE``) that
+        serial framing produced; the transport reports them as ``IB-TX-007``, not per frame."""
+        return self._resync_frames
 
     def stats_snapshot(self) -> dict[int, MidStatSnapshot]:
         return {mid: MidStatSnapshot(s.count, s.last_ns) for mid, s in self._stats.items()}
@@ -631,6 +652,11 @@ class Engine:
                 else:
                     rx_where, tx_where = spec.command_endpoint, spec.telemetry_endpoint
                 rx_text, tx_text, tx_peer = f"udp {rx_where}", f"udp {tx_where}", str(tx_where)
+            case "serial":
+                serial = link.serial
+                assert serial is not None
+                rx_text = tx_text = f"serial {serial.device}"  # one device carries both ways
+                tx_peer = ""
             case _:  # pragma: no cover - the config accepts only transports with a branch here
                 raise AssertionError(f"no stream description for transport {link.transport}")
         if end is LinkEnd.SOURCE:
@@ -655,6 +681,9 @@ class Engine:
             if self._rcvbuf_warned:
                 return
             self._rcvbuf_warned = True
+        if err.code is Code.TX_RESYNC:  # the line's bytes cause it at will: evidence, sampled
+            self._report(err, context=label, evidence=True, sample=f"{err.code.value}:{label}")
+            return
         self._report(err, context=label)
 
     def _new_transport(self, io: _LinkIO) -> Transport:
@@ -664,7 +693,83 @@ class Engine:
             lambda err: self._transport_report(err, io.label),
             failed=lambda err: self._receive_failed(io, err),
             max_packet_bytes=self._max_packet_bytes,
+            codec=io.codec,
+            link_state=lambda up, time_ns, err: self._link_state(io, up, time_ns, err),
         )
+
+    def _link_state(self, io: _LinkIO, up: bool, time_ns: int, error: IronbirdError | None) -> None:
+        """A link end that was up lost its device, or got it back (serial reconnect).
+
+        Going down is ledgered, shown once (coalesced) as ``IB-TX-008`` and recorded as a MARK
+        by sinks that take them. Coming back is ledgered, shown as an info notice, marked, and
+        the time in between becomes one ``link_down`` GAP on the receive stream (UDP has no link
+        to lose, so it never gets one).
+        """
+        label = io.description
+        if not up:
+            if io.down is not None:
+                return
+            assert error is not None, "a link goes down with a reason"
+            io.down = (time_ns, self._seq)
+            self._ledger.record(
+                "state",
+                "link.down",
+                label=label,
+                code=error.code.value,
+                summary=error.summary,
+                seq=self._seq,
+            )
+            self._notify_link(io, False, time_ns, f"{label}: link lost")
+            self._report(error, context=f"link down {label}")
+            return
+        started = io.down
+        if started is None:
+            return
+        io.down = None
+        seconds = max(0, time_ns - started[0]) / 1e9
+        self._ledger.record(
+            "state", "link.up", label=label, down_s=round(seconds, 3), seq=self._seq
+        )
+        self._notify_link(io, True, time_ns, f"{label}: link restored after {seconds:.1f} s")
+        self._link_down_gap(io, started, time_ns)
+        self._report(
+            IronbirdError(
+                Code.TX_DOWN, f"{label}: link restored after {seconds:.1f} s; a gap is recorded"
+            ),
+            context=f"link up {label}",
+            level=Level.INFO,
+        )
+
+    def _link_down_gap(self, io: _LinkIO, started: tuple[int, int], end_ns: int) -> None:
+        """Tell the gap sinks the receive stream of ``io`` was down from ``started`` until
+        ``end_ns``. How many frames that cost is unknown, so the GAP counts the interruption (1)."""
+        if not io.receiving:
+            return
+        down_ns, down_seq = started
+        self._notify_gap(
+            io.rx_stream, GapReason.LINK_DOWN, 1, down_ns, max(down_ns, end_ns), down_seq, self._seq
+        )
+
+    def _close_down_link(self, io: _LinkIO) -> None:
+        """The transport of ``io`` is closing: a link still down ends its gap now."""
+        started, io.down = io.down, None
+        if started is None:
+            return
+        now_ns = time.time_ns()
+        self._ledger.record(
+            "state", "link.down_at_close", label=io.description, since_ns=started[0], seq=self._seq
+        )
+        self._link_down_gap(io, started, now_ns)
+
+    def _notify_link(self, io: _LinkIO, up: bool, time_ns: int, text: str) -> None:
+        for sink in self._sinks:
+            event = getattr(sink, "link_event", None)
+            if event is None:
+                continue
+            try:
+                event(io.rx_stream, up, time_ns, text)
+            except Exception as exc:
+                self._sink_failed(sink, self._seq, exc)
 
     def _receive_failed(self, io: _LinkIO, error: IronbirdError) -> None:
         """The receiving transport of ``io`` cannot receive any more (``IB-TX-003``).
@@ -735,6 +840,11 @@ class Engine:
                 raise io.failure
             if not io.receiving:
                 transport = self._new_transport(io)
+                if io.transport is not None and io.link.transport == SERIAL_TRANSPORT:
+                    # A serial device is locked by its opener, so the send-only transport lets go
+                    # of it before the receiving one opens (a UDP socket can share its port).
+                    stale, io.transport = io.transport, None
+                    await stale.close()
                 try:
                     await self._open_transport(io, transport, io.on_data)
                 except _Closing:
@@ -766,6 +876,7 @@ class Engine:
             finally:  # drops counted while closing are part of the final report
                 self._poll_kernel(io, transport)
                 self._note_unread(io, transport)
+                self._close_down_link(io)
                 io.transport, io.receiving, io.failure = None, False, None
 
     async def open_capture(
@@ -912,6 +1023,7 @@ class Engine:
                         if io.receiving:
                             self._poll_kernel(io, transport)
                         self._note_unread(io, transport)
+                        self._close_down_link(io)
                         io.transport, io.receiving = None, False
             except BaseException as exc:  # the other link ends are still closed
                 failure = failure or exc
@@ -982,8 +1094,13 @@ class Engine:
         stream, codec = io.rx_stream, io.codec
         kind = stream.kind
         checked: Resolved | None = None
-        error: DecodeError | None
-        if bits & FLAG_TRUNCATED:
+        error: DecodeError | None = None
+        skipped = bits & (FLAG_GARBAGE | FLAG_STALE)
+        if skipped:
+            # Bytes a stream framer skipped or flushed are not a packet to check; the transport
+            # reports them as one resynchronisation notice (IB-TX-007), not one error each.
+            mid = None if bits & FLAG_GARBAGE else codec.peek_mid(kind, data)
+        elif bits & FLAG_TRUNCATED:
             error = codec.oversize_error(kind, data, orig_len)
             mid = codec.peek_mid(kind, data)
         else:
@@ -1015,6 +1132,8 @@ class Engine:
                 self._sink_failed(sink, frame.seq, exc)
         if checked is not None:
             self._count(checked.message.mid, time_ns)
+        elif skipped:
+            self._resync_frames += 1
         else:
             assert error is not None
             self.reject(frame, error)
@@ -1093,13 +1212,19 @@ class Engine:
         )
 
     def _note_unread(self, io: _LinkIO, transport: Transport) -> None:
-        """Account for datagrams still in the socket buffer when ``transport`` closed (they are
+        """Ledger the packets a framing transport emitted although the CCDD disagrees with them,
+        and account for datagrams still in the socket buffer when ``transport`` closed (they are
         discarded unread). Always ledgered; reported only on a link end that was already losing
         frames, where the count completes the picture rather than adding noise."""
-        left = transport.stats().unread_at_close
+        stats = transport.stats()
+        label = io.description
+        if stats.ccdd_mismatched:  # the decode reports each one; this is the total for the ledger
+            self._ledger.record(
+                "state", "rx.ccdd_mismatch", label=label, packets=stats.ccdd_mismatched
+            )
+        left = stats.unread_at_close
         if not left:
             return
-        label = io.description
         self._ledger.record("state", "rx.unread_at_close", label=label, datagrams=left)
         # Datagrams the OS discards unread are lost before the transport read them, like a kernel
         # drop: sinks that record gaps get one, bracketing the loss by the last poll and now.
@@ -1113,7 +1238,7 @@ class Engine:
             watch.last_seq,
             self._seq,
         )
-        if io.lossy or transport.stats().kernel_dropped:
+        if io.lossy or stats.kernel_dropped:
             self._report(
                 IronbirdError(
                     Code.TX_OVERRUN,
@@ -1178,5 +1303,6 @@ __all__ = [
     "FrameDecoder",
     "FrameSink",
     "GapSink",
+    "LinkSink",
     "MidStatSnapshot",
 ]

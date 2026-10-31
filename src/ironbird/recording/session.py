@@ -255,10 +255,16 @@ class _Staging:
         if len(self.events) < self._limit:
             self.events.append(("gap", args))
 
+    def link_event(self, *args: Any) -> None:
+        if len(self.events) < self._limit:
+            self.events.append(("link", args))
+
     def replay(self, recorder: Recorder) -> None:
         for kind, payload in self.events:
             if kind == "frame":
                 recorder.append(payload)
+            elif kind == "link":
+                recorder.link_event(*payload)
             else:
                 recorder.gap(*payload)
         for stream, count, first, last in self._lost.values():

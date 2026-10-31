@@ -45,7 +45,7 @@ from ironbird.engine import (
 from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
 from ironbird.filter import Filter, FilterError, Matcher, compile_filter
-from ironbird.frame import Decoded, Frame, Stream
+from ironbird.frame import SERIAL_TRANSPORT, Decoded, Frame, Stream
 from ironbird.header import load_profile
 from ironbird.ledger import Ledger
 from ironbird.ledgertiers import Tier
@@ -86,6 +86,7 @@ class SentCommand:
     size: int
     data: bytes
     endpoint: str
+    transport: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,15 +283,24 @@ class Session:
             offset = None
         if level is None:
             level = level_of(err.code)
-        ledger_n = self.ledger.record_error(
-            err,
-            level=level,
-            tier=Tier.EVIDENCE if evidence else None,
-            sample=sample,
-            role=self.node.name,
-            mid=raw_mid,
-            offset=offset,
-        )
+        if level is Level.INFO:  # an error record is a warning or an error; info is a state
+            ledger_n = self.ledger.record(
+                "state",
+                "notice.info",
+                code=err.code.value,
+                summary=err.summary,
+                details=err.detail_text(),
+            )
+        else:
+            ledger_n = self.ledger.record_error(
+                err,
+                level=level,
+                tier=Tier.EVIDENCE if evidence else None,
+                sample=sample,
+                role=self.node.name,
+                mid=raw_mid,
+                offset=offset,
+            )
         key = _notice_key(err.code, raw_mid, context)
         self._coalescer.report(
             err.code,
@@ -441,7 +451,7 @@ class Session:
     ) -> SentCommand:
         route = self.route(peer, require=Side.COMMANDER, link_name=link)
         codec = self.codec_for(route.server.name)
-        endpoint = route.link.command_endpoint
+        endpoint = route.link.command_target
         extra: dict[str, Any] = {"header": dict(header)} if header else {}
         if allow_count_mismatch:
             extra["allow_count_mismatch"] = True  # asked for; ``send.fault`` records what it did
@@ -510,7 +520,7 @@ class Session:
                 function_code=encoded.function_code,
                 sequence=encoded.sequence,
                 size=len(encoded.data),
-                endpoint=str(endpoint),
+                endpoint=endpoint,
                 result=result,
                 sent=attempt.went_out,
                 raw=encoded.data,
@@ -524,7 +534,8 @@ class Session:
             sequence=encoded.sequence,
             size=len(encoded.data),
             data=encoded.data,
-            endpoint=str(endpoint),
+            endpoint=endpoint,
+            transport=route.link.transport,
         )
 
     # -- capture (raw frames) and decoding ---------------------------------------------
@@ -588,12 +599,8 @@ class Session:
         seen: dict[str, Route] = {}
         for route in routes:
             end = link_end(route.side)
-            rx = (
-                route.link.telemetry_endpoint
-                if end is LinkEnd.SOURCE
-                else route.link.command_endpoint
-            )
-            clash = seen.setdefault(str(rx), route)
+            rx = route.link.telemetry_target if end is LinkEnd.SOURCE else route.link.command_target
+            clash = seen.setdefault(rx, route)
             if clash is not route:
                 raise IronbirdError(
                     Code.CFG_LINK,
@@ -688,8 +695,8 @@ class Session:
     def _listen_endpoint(self, route: Route) -> str:
         link = route.link
         if route.side is Side.COMMANDER:
-            return str(link.telemetry_endpoint)
-        return str(link.command_endpoint)
+            return link.telemetry_target
+        return link.command_target
 
     async def _open_listener(
         self, route: Route, mids: frozenset[int] | None, flt: Filter | None
@@ -754,12 +761,12 @@ class Session:
             )
         seen: dict[str, Route] = {}
         for route in routes:
-            clash = seen.setdefault(str(route.link.telemetry_endpoint), route)
+            clash = seen.setdefault(route.link.telemetry_target, route)
             if clash is not route:
                 raise IronbirdError(
                     Code.CFG_LINK,
                     f"links {clash.link.name!r} and {route.link.name!r} both receive telemetry "
-                    f"on {route.link.telemetry_endpoint}; select one node with --node",
+                    f"on {route.link.telemetry_target}; select one node with --node",
                 )
         return routes
 
@@ -875,8 +882,8 @@ class Session:
             "action",
             "respond.start",
             link=chosen.name,
-            listen=str(chosen.command_endpoint),
-            reply_to=str(chosen.telemetry_endpoint),
+            listen=chosen.command_target,
+            reply_to=chosen.telemetry_target,
             rules=len(rules),
         )
         return Responder(self, route, codec, capture, rules)
@@ -922,6 +929,12 @@ class Listener:
     @property
     def local_address(self) -> tuple[str, int] | None:
         return self._capture.addresses[0][1]
+
+    @property
+    def device(self) -> str | None:
+        """Display text of the serial device this end reads (``None`` for a network end)."""
+        stream = self._capture.streams[0]
+        return stream.endpoint if stream.transport == SERIAL_TRANSPORT else None
 
     def __aiter__(self) -> AsyncIterator[Decoded]:
         return self._iterate()
@@ -1155,6 +1168,12 @@ class Responder:
     @property
     def local_address(self) -> tuple[str, int] | None:
         return self._capture.addresses[0][1]
+
+    @property
+    def device(self) -> str | None:
+        """Display text of the serial device this end reads (``None`` for a network end)."""
+        stream = self._capture.streams[0]
+        return stream.endpoint if stream.transport == SERIAL_TRANSPORT else None
 
     def __aiter__(self) -> AsyncIterator[Handled]:
         return self._iterate()
