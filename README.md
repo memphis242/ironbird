@@ -263,6 +263,81 @@ ib replay run1.ibrec --follow                                 # a recording stil
   at once may not have been handed the last of them. The ledger records the start (files, options) and the end (counts, how it
   ended); malformed frames are not ledgered one by one, the recording is their evidence.
 
+## Export
+
+`ib export FILE... [-o OUT] [--format csv|text|jsonl] [--message NAME ...] [--where EXPR]
+[--from T] [--to T] [--header-fields] [--raw-enums] [--defs recording|config] [--skip-damage]
+[--force]` writes a recording to files other tools read. It decodes exactly as `ib replay` does
+(same definitions, same `--where`, `--from`/`--to` and `--skip-damage`), needs no configuration
+and sends nothing.
+
+```bash
+ib export run1.ibrec -o run1-csv                               # a directory: one CSV per message
+ib export run1.ibrec --message SAMPLE_APP_HK -o hk.csv         # one message: one file
+ib export run1.ibrec --message SAMPLE_APP_HK > hk.csv          # ... or to stdout
+ib export run1.ibrec --where 'event.type >= error' --format jsonl -o errors.jsonl
+ib export run1.ibrec --format text --from +90s --to +2m -o minute.txt
+```
+
+- **CSV tables.** The columns differ by message, so each message has its own table:
+  `rx_time_utc` (ISO 8601, microseconds), `rx_time_ns`, `seq` (the recording's frame number),
+  `node`, `link`, `mid` (hex), the header fields as `hdr.<name>` with `--header-fields`, then the
+  payload fields in CCDD order (a payload field called like a fixed column is `<MESSAGE>.<field>`).
+  Numbers are numbers (floats in the shortest form that round-trips, `inf`/`nan` as text);
+  enum fields are their label (`--raw-enums`: the number; a value the enum lacks is its number);
+  `char` fields are text; `bytes` fields are hex with a `0x` prefix (`0x00123456`; so is the `hex`
+  of `malformed.csv`), which keeps a spreadsheet from reading `00123456` as the number 123456 or
+  `1e300000` as a number at all. `text` and `jsonl` keep exactly what `ib replay` prints. Lines end
+  in LF and cells are quoted as RFC 4180 says.
+- **Spreadsheets reinterpret numbers.** A CSV carries no types, and Excel or LibreOffice guess: a
+  number with more than 15 significant digits (a `uint64`, a nanosecond time such as `rx_time_ns`)
+  is rounded to 15 and shown as `1.7E+18`, a text of digits keeps no leading zeros, and `1e30` is a
+  number. The file is exact; the application's guess is not. When the values matter, import the
+  columns as text (Excel: Data > From Text/CSV, set the column type to Text; LibreOffice: the
+  import dialog's column type "Text"), or read the CSV with a tool that keeps types.
+- **Which files.** One `--message` is a single table, written to `-o FILE` or to stdout. Several
+  `--message`s, or none, make a directory (`-o DIR`, required) with `<MESSAGE>.csv` for each message
+  that occurs and `malformed.csv` for every frame that did not decode (`seq`, time, `node`, `link`,
+  `dir`, `mid`, `status`, `code`, `offset`, `reason`, `len`, `orig_len`, `flags`, and all of the
+  frame's bytes as `hex`), so the evidence is exported with the data. A single-file CSV has no place
+  for frames that did not decode: they are counted in a warning, never dropped silently. A message
+  that two nodes define with different layouts gets `<MESSAGE>.2.csv` for the second; a message
+  called `malformed` is `malformed.1.csv`. A single table (one `--message`, to a file or stdout)
+  cannot hold two layouts: when the recording's nodes define that message differently the export is
+  refused (`IB-CLI-001`) before any row is written, unless a `--where` that pins the node (`node ==
+  fc`, `node in [...]`, `node != gc`) leaves one layout. `--format text` and `jsonl` are one file or stdout, with
+  the lines and records `ib replay` prints (frames that did not decode flagged, as replay shows them).
+- **Strings are untrusted.** Every string cell (names, enum labels, `char` text, hex, the reason of a
+  malformed frame) has its control characters and escape sequences escaped, so a newline or an
+  escape sequence from a packet cannot add a line or drive a terminal, and a cell that starts with
+  `=`, `+`, `-`, `@` (or their fullwidth forms), a tab or a carriage return gets a leading `'`, so a
+  spreadsheet does not read it as a formula; leading spaces do not hide the lead (importers trim
+  them), so ` =1+1` is prefixed too. Numbers are never touched.
+- **The output is written whole or not at all.** The data goes to `.<name>.<16 hex>.tmp` beside OUT
+  (a directory of the same form for a CSV directory), is synced, and is renamed to OUT without
+  replacing anything; a failure, a signal or a full disk removes the temporary file and leaves
+  nothing. An existing OUT is refused (`IB-EXP-002`) unless `--force` replaces a regular file of
+  yours (not one another process holds locked, not a directory or a symbolic link); a CSV directory
+  is never replaced, `--force` or not. "Holds locked" means an advisory `flock` (what `ib record`
+  and the other ironbird tools take): a program that writes the file without locking it, or locks it
+  with POSIX `fcntl` locks, is not detected, so `--force` over a file something else is writing
+  can still replace it. Two refusals no `--force` overrides: OUT is the recording
+  being exported (same file, however the path is spelled, checked again just before the rename),
+  and OUT is inside the state directory (which holds the ledger only) or named like a file `ib
+  ledger prune` or `ib rec prune` manages (a ledger part, a reserve, a salvage temporary or a
+  recording) in the recording directory, since a prune would later delete it. A write that fails is
+  `IB-EXP-001`; a missing directory for OUT says so and that nothing was created. A killed export
+  can leave `.<name>.<16 hex>.tmp` beside OUT: the next export of that name warns once and does not
+  delete it. A directory export keeps at most as many tables open as the descriptor limit allows
+  (`ulimit -n`; if the limit is still reached the error says to raise it).
+- **Exit codes.** As for `replay`: 0 normal (a torn tail or a recording never closed is a warning),
+  5 when the recording was damaged mid-file (the export ends there, or with `--skip-damage` goes
+  past it) or a part of a split recording is missing; the output exists and holds everything read.
+  1 for `IB-REC-004..009`, `IB-EXP-*`; 2 for usage and `IB-FLT-*`.
+- **Cost.** One pass over the file in one process, with a few MiB of buffer whatever the size of the
+  recording; about 40,000 rows per second as CSV on the development host. The ledger records the
+  start (options) and the end (counts per table, how it ended).
+
 ## Exit codes
 
 | Code | Meaning |
@@ -271,7 +346,7 @@ ib replay run1.ibrec --follow                                 # a recording stil
 | 1 | Runtime error (`error IB-...`), `find` with no match; `ib rec check` found damage; a recording failed to write (`IB-REC-002`) |
 | 2 | Usage, configuration, CCDD or header-profile error |
 | 3 | `listen`, `events` or `respond` had `--count N` and `--timeout` elapsed first |
-| 5 | The output was produced, but the input recording was damaged mid-file: `ib rec repair` left valid frames after the damage out of the copy; `ib replay` stopped at the damage (or, with `--skip-damage`, went past it) or a part of a split recording is missing |
+| 5 | The output was produced, but the input recording was damaged mid-file: `ib rec repair` left valid frames after the damage out of the copy; `ib replay` or `ib export` stopped at the damage (or, with `--skip-damage`, went past it) or a part of a split recording is missing |
 | 6 | A command or reply went out but its ledger record was never written, or may have been lost to a deferred sync or close error (`IB-LED-004`). Same tier as 4 and wins over 4 and 5; an error (1, 2), 3 or a signal takes precedence. A `respond` that withheld replies under `on_full = "refuse_commands"` exits 1 |
 | 4 | The command otherwise succeeded but stdout lines were lost (`IB-OUT-002`): dropped while stdout was not draining, abandoned when a signal cut the final drain short, or stdout is closed (`>&-`). An error (1, 2), 3, 5 or a signal (128+n) takes precedence. A `send` that exits 4 still went out |
 | 128+n | Ended by signal n: 130 (Ctrl-C), 129 (SIGHUP), 143 (SIGTERM). The ledger is flushed first; an interrupted `send` says whether the command went out |

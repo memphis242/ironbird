@@ -113,6 +113,7 @@ class _Node(NamedTuple):
     cost: Cost
     mids: frozenset[int] | None
     fn: MatchFn
+    nodes: frozenset[str] | None = None  # candidate nodes, like ``mids`` (``None``: any node)
 
 
 def _found(lit: Literal) -> str:
@@ -566,15 +567,30 @@ class _Compiler:
                         "these conditions can never match together: no message ID satisfies "
                         "all of them",
                     )
-                return _Node(parts[-1].cost, mids, _all_of([p.fn for p in parts]))
+                nodes: frozenset[str] | None = None
+                for part in parts:
+                    if part.nodes is not None:
+                        nodes = part.nodes if nodes is None else nodes & part.nodes
+                return _Node(parts[-1].cost, mids, _all_of([p.fn for p in parts]), nodes)
             case Or(children=children):
                 parts = sorted((self.compile(c) for c in children), key=lambda n: n.cost)
+                every_node: set[str] | None = set()
+                for part in parts:
+                    if part.nodes is None:
+                        every_node = None
+                        break
+                    every_node |= part.nodes
+                nodes_of_or = None if every_node is None else frozenset(every_node)
                 united: set[int] = set()
                 for part in parts:
                     if part.mids is None:
-                        return _Node(parts[-1].cost, None, _any_of([p.fn for p in parts]))
+                        return _Node(
+                            parts[-1].cost, None, _any_of([p.fn for p in parts]), nodes_of_or
+                        )
                     united |= part.mids
-                return _Node(parts[-1].cost, frozenset(united), _any_of([p.fn for p in parts]))
+                return _Node(
+                    parts[-1].cost, frozenset(united), _any_of([p.fn for p in parts]), nodes_of_or
+                )
         raise AssertionError(f"unhandled node {tree!r}")  # pragma: no cover
 
     # -- errors ----------------------------------------------------------------------
@@ -869,7 +885,7 @@ class _Compiler:
 
     def _node(self, p: Predicate) -> _Node:
         table = self.env.node_names
-        return self._scalar(
+        node, values = self._scalar(
             p,
             "node",
             _WORD_OPS,
@@ -877,7 +893,16 @@ class _Compiler:
                 _text_literal(lit) if op == "contains" else _word_literal(lit, table, fold=False)
             ),
             operator.attrgetter("stream.node"),
-        )[0]
+        )
+        nodes: frozenset[str] | None = None
+        match p.op:
+            case "==" | "in":
+                nodes = frozenset(values)
+            case "!=":
+                nodes = frozenset(self.env.codecs) - frozenset(values)
+            case _:
+                pass  # contains: any node may match
+        return _Node(node.cost, None, node.fn, nodes)
 
     def _link(self, p: Predicate) -> _Node:
         links = self.env.links
@@ -1184,7 +1209,7 @@ def compile_filter(
         raise FilterError(
             Code.FLT_LIMIT, text, 0, f"nesting deeper than {MAX_DEPTH} levels"
         ) from None
-    return Filter(text, root.mids, root.cost is Cost.DECODE, _root(root), root.cost)
+    return Filter(text, root.mids, root.cost is Cost.DECODE, _root(root), root.cost, root.nodes)
 
 
 def _root(root: _Node) -> MatchFn:

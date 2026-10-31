@@ -162,6 +162,7 @@ class RecordingReader:
         self._seed = 0
         self._start = 0
         self.meta: fmt.Meta
+        self.identity: tuple[int, int] = (0, 0)  # (st_dev, st_ino) of the open file
         self.writer_active = False  # a writer holds the file's lock: it is being recorded now
         self.locked = False
         self._state = _State()
@@ -195,6 +196,7 @@ class RecordingReader:
             ) from exc
         if not stat.S_ISREG(info.st_mode):
             raise IronbirdError(Code.REC_FORMAT, f"{shown} is not a regular file")
+        self.identity = (info.st_dev, info.st_ino)
         # A reader takes a shared lock where it can, so retention sees the session as in use; a
         # writer's exclusive lock refuses it, which says the recording is still being written.
         try:

@@ -110,26 +110,35 @@ def _meta_digest(meta: Mapping[str, Any], node: str, kind: BlobKind) -> str | No
     return value.lower() if isinstance(value, str) else None
 
 
-def _unusable(label: str, why: str) -> IronbirdError:
-    return IronbirdError(
-        Code.REC_DEFS,
-        f"{label}: {why}; replay with --defs config to use the current configuration, or "
-        "--format hex to see the frames undecoded",
-    )
+REPLAY_HINT: Final = (
+    "replay with --defs config to use the current configuration, or --format hex to see the "
+    "frames undecoded"
+)
+EXPORT_HINT: Final = "export with --defs config to use the current configuration"
+
+
+def _unusable(label: str, why: str, hint: str) -> IronbirdError:
+    return IronbirdError(Code.REC_DEFS, f"{label}: {why}; {hint}")
 
 
 def embedded_codecs(
-    path: Path, head: Head, nodes: Sequence[str], meta: Mapping[str, Any], max_packet_bytes: int
+    path: Path,
+    head: Head,
+    nodes: Sequence[str],
+    meta: Mapping[str, Any],
+    max_packet_bytes: int,
+    hint: str = REPLAY_HINT,
 ) -> dict[str, Codec]:
     """A codec for each of ``nodes`` from the definitions the recording embeds.
 
     Raises ``IB-REC-009`` for a node with a definition missing (recorded with
     ``embed_definitions = false``), a digest that disagrees with META, an unknown adapter, or
     anything the strict loaders refuse (malformed JSON or TOML, duplicate keys, oversize,
-    a profile of the wrong kind, a message that does not fit its header or the cap)."""
+    a profile of the wrong kind, a message that does not fit its header or the cap). ``hint``
+    is what the error tells the user to do instead."""
     label = label_of(path)
     if head.problem:
-        raise _unusable(label, head.problem)
+        raise _unusable(label, head.problem, hint)
     codecs: dict[str, Codec] = {}
     for node in dict.fromkeys(nodes):
         found = {kind: head.blobs.get((node, kind)) for kind in _ALL_KINDS}
@@ -139,6 +148,7 @@ def embedded_codecs(
                 label,
                 f"it embeds no {', '.join(missing)} for node {clean(node, 64)} "
                 "(recorded with embed_definitions = false, or by a node without them)",
+                hint,
             )
         for kind, blob in found.items():
             assert blob is not None
@@ -148,6 +158,7 @@ def embedded_codecs(
                     label,
                     f"the embedded {_KIND_NAMES[kind]} of node {clean(node, 64)} does not match "
                     "the digest the recording's META names for it",
+                    hint,
                 )
         ccdd, command, telemetry = (found[kind] for kind in _ALL_KINDS)
         assert ccdd is not None and command is not None and telemetry is not None
@@ -169,9 +180,7 @@ def embedded_codecs(
         except IronbirdError as exc:
             raise IronbirdError(
                 Code.REC_DEFS,
-                f"an embedded definition cannot be used: {exc.summary}; replay with --defs "
-                "config to use the current configuration, or --format hex to see the frames "
-                "undecoded",
+                f"an embedded definition cannot be used: {exc.summary}; {hint}",
                 details=exc.detail_text(),
                 cause=exc,
             ) from exc
@@ -179,10 +188,11 @@ def embedded_codecs(
 
 
 def config_codecs(
-    config: SystemConfig, nodes: Sequence[str], max_packet_bytes: int
+    config: SystemConfig, nodes: Sequence[str], max_packet_bytes: int, command: str = "replay"
 ) -> dict[str, Codec]:
     """A codec for each of ``nodes`` from the current configuration's definition files, with the
-    recording's packet cap (the frames were cut at it, not at the configuration's)."""
+    recording's packet cap (the frames were cut at it, not at the configuration's). ``command``
+    names the command whose ``--defs`` the error advice is about."""
     codecs: dict[str, Codec] = {}
     for name in dict.fromkeys(nodes):
         node = config.nodes.get(name)
@@ -190,13 +200,13 @@ def config_codecs(
             raise IronbirdError(
                 Code.REC_DEFS,
                 f"the recording has frames of node {clean(name, 64)}, which {config.path} does "
-                "not define; replay without --defs config to use the recording's own",
+                f"not define; {command} without --defs config to use the recording's own",
             )
         if node.ccdd is None or node.command_header is None or node.telemetry_header is None:
             raise IronbirdError(
                 Code.REC_DEFS,
                 f"node {clean(name, 64)} has no ccdd/command_header/telemetry_header in "
-                f"{config.path}; replay without --defs config to use the recording's own",
+                f"{config.path}; {command} without --defs config to use the recording's own",
             )
         try:
             codecs[name] = Codec(
@@ -211,7 +221,7 @@ def config_codecs(
             raise IronbirdError(
                 exc.code,
                 f"{exc.summary}; the {max_packet_bytes}-byte cap is the recording's, not the "
-                f"configuration's; replay without --defs config to use the recording's own "
+                f"configuration's; {command} without --defs config to use the recording's own "
                 "definitions",
                 details=exc.detail_text(),
                 cause=exc,
