@@ -11,14 +11,13 @@
 from __future__ import annotations
 
 import queue
-import signal
 import threading
 import time
 from collections import deque
 from collections.abc import Callable
 from typing import Final
 
-from ironbird.ledgerstore import SHUTDOWN_SIGNALS
+from ironbird.sigmask import signals_held
 
 SLICE_S: Final = 0.05
 FINAL_WRITE_FLOOR_S: Final = 0.2  # what the ledger's last write may still wait after a signal
@@ -27,11 +26,8 @@ FINAL_WRITE_FLOOR_S: Final = 0.2  # what the ledger's last write may still wait 
 def start_thread(thread: threading.Thread) -> None:
     """Start a helper thread with the shutdown signals blocked, so it never receives one: they are
     handled by the main thread, which must see them all."""
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, SHUTDOWN_SIGNALS)
-    try:
+    with signals_held():
         thread.start()
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 class WaitBudget:

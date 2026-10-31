@@ -7,10 +7,14 @@ the final name's directory, created ``O_EXCL``, then synced and committed by
 :func:`rename_noreplace`, so a final name that appeared meanwhile is never overwritten. The only
 replacement is an explicit ``force`` over an existing regular file owned by the caller. A failure
 removes the temporary file, and only that: by directory descriptor and name, after checking that
-the name still denotes the descriptor this process holds open. Each temporary is created and
-recorded for that removal with the termination signals held
-(:func:`~ironbird.sigmask.signals_held`), so a signal handler that raises cannot leave one
-behind; a caller that registers the cleanup apart from a ``with`` statement (an
+the name still denotes the descriptor this process holds open.
+
+A signal handler that raises (the CLI's, outside an event loop) cannot split a step that changes
+the file system from the record of that change, because each such step runs with the termination
+signals held (:func:`~ironbird.sigmask.signals_held`) and the handler only runs as the step ends:
+creating a temporary (file, directory or member) and recording it for removal, removing what was
+created, and the rename of a commit (renameat2, link and unlink, or placeholder and rename). A
+caller that registers the cleanup apart from a ``with`` statement (an
 :class:`contextlib.ExitStack`) holds them across the registration too.
 
 Nothing here deletes a file this process did not create in the same call. Every system call goes
@@ -80,13 +84,18 @@ def rename_noreplace(dir_fd: int, old: str, new: str, fd: int, *, fs: FileSystem
     held, named = fs.fstat(fd), try_stat_at(fs, dir_fd, old)
     if named is None or not same_file(held, named):
         raise OSError(errno.ENOENT, "the name no longer denotes the file", old)
-    try:
-        renamed = fs.renameat2_noreplace(dir_fd, old, new)
-    except FileExistsError:
-        raise Collision(new) from None
-    # renameat2 unavailable here: a hard link for a regular file, else the placeholder rename
-    if renamed is None and not (stat.S_ISREG(held.st_mode) and _link(fs, dir_fd, old, new, held)):
-        _placeholder_rename(fs, dir_fd, old, new, held)
+    # One step a signal handler cannot split: the link without its unlink, or the placeholder
+    # without the rename over it, would be left behind. A handler that raises runs as it ends.
+    with signals_held():
+        try:
+            renamed = fs.renameat2_noreplace(dir_fd, old, new)
+        except FileExistsError:
+            raise Collision(new) from None
+        # renameat2 unavailable here: a hard link for a regular file, else the placeholder rename
+        if renamed is None and not (
+            stat.S_ISREG(held.st_mode) and _link(fs, dir_fd, old, new, held)
+        ):
+            _placeholder_rename(fs, dir_fd, old, new, held)
     try:
         fs.fsync(dir_fd)
     except OSError as exc:
@@ -316,10 +325,11 @@ class TempOutput:
             return
         assert self.fd >= 0 and self._dir_fd >= 0, "a named temporary is held open"
         fs = self._fs
-        held, named = fs.fstat(self.fd), try_stat_at(fs, self._dir_fd, self.name)
-        if named is not None and same_file(held, named):
-            with contextlib.suppress(OSError):
-                fs.unlink_at(self._dir_fd, self.name)  # our own uncommitted temporary
+        with signals_held():  # a signal that lands in the removal does not cut it short
+            held, named = fs.fstat(self.fd), try_stat_at(fs, self._dir_fd, self.name)
+            if named is not None and same_file(held, named):
+                with contextlib.suppress(OSError):
+                    fs.unlink_at(self._dir_fd, self.name)  # our own uncommitted temporary
 
     def __exit__(self, *exc_info: object) -> None:
         fs = self._fs
@@ -355,7 +365,9 @@ class TempDirOutput:
     Leaving the block without a commit removes the members this process created (by name, after
     checking that the name still denotes the file created) and then the directory with
     ``rmdir``; anything else inside is left alone, and the directory with it
-    (:attr:`leftover` names it).
+    (:attr:`leftover` names it). A member that cannot be identified (``fstat`` failed on the
+    descriptor just opened) is removed by name at once, before :meth:`create` raises: the call
+    created that name exclusively, inside the directory this process made and holds open.
     """
 
     def __init__(self, final: Path, *, fs: FileSystem = REAL_FS, max_open: int = 64) -> None:
@@ -394,9 +406,13 @@ class TempDirOutput:
             if named is None or not same_file(fs.fstat(self._dir_fd), named):
                 raise OSError(errno.EIO, "the temporary directory was replaced", name)
         except BaseException:
-            self._discard()
-            close_quietly(fs, self._dir_fd)
-            close_quietly(fs, self._parent_fd)
+            try:
+                with contextlib.suppress(OSError):  # the reason it failed is what is raised
+                    self._discard()
+            finally:
+                close_quietly(fs, self._dir_fd)
+                close_quietly(fs, self._parent_fd)
+                self._dir_fd = self._parent_fd = -1
             raise
         return self
 
@@ -417,6 +433,11 @@ class TempDirOutput:
                 made = fs.fstat(fd)
             except OSError:
                 close_quietly(fs, fd)
+                # Not identified, so _discard could not tell it is ours later; but this call
+                # created the name exclusively a moment ago, in the private directory this
+                # process made and holds open. Left in place, it keeps the directory (leftover).
+                with contextlib.suppress(OSError):
+                    fs.unlink_at(self._dir_fd, name)
                 raise
             member = _Member(name, (made.st_dev, made.st_ino), fd)
             self._members.append(member)
@@ -441,8 +462,8 @@ class TempDirOutput:
     def _give_up_oldest(self) -> None:
         oldest, _ = self._open.popitem(last=False)
         member = self._members[oldest]
-        close_quietly(self._fs, member.fd)
-        member.fd = -1
+        fd, member.fd = member.fd, -1  # forgotten first: never closed twice, whatever lands here
+        close_quietly(self._fs, fd)
 
     def _with_room(self, opener: Callable[[], _T]) -> _T:
         """``opener()`` with fewer than ``max_open`` descriptors held; if the process is out of
@@ -495,8 +516,8 @@ class TempDirOutput:
             finally:
                 close_quietly(fs, fd)
         for member in self._members:
-            close_quietly(fs, member.fd)
-            member.fd = -1
+            fd, member.fd = member.fd, -1  # forgotten first, as in _give_up_oldest
+            close_quietly(fs, fd)
         self._open.clear()
         fs.fsync(self._dir_fd)
         try:
@@ -511,21 +532,22 @@ class TempDirOutput:
         fs = self._fs
         if not self.name:
             return
-        if self._dir_fd >= 0:
-            named = try_stat_at(fs, self._parent_fd, self.name)
-            if named is None or not same_file(fs.fstat(self._dir_fd), named):
-                return  # the name no longer denotes the directory made; not ours to remove
-            for member in self._members:
-                found = try_stat_at(fs, self._dir_fd, member.name)
-                if found is not None and (found.st_dev, found.st_ino) == member.ident:
-                    with contextlib.suppress(OSError):
-                        fs.unlink_at(self._dir_fd, member.name)  # a file this process created
-        try:
-            fs.rmdir_at(self._parent_fd, self.name)  # fails, harmlessly, if anything is left
-        except FileNotFoundError:
-            pass
-        except OSError:
-            self.leftover = self.name
+        with signals_held():  # a signal that lands in the removal does not cut it short
+            if self._dir_fd >= 0:
+                named = try_stat_at(fs, self._parent_fd, self.name)
+                if named is None or not same_file(fs.fstat(self._dir_fd), named):
+                    return  # the name no longer denotes the directory made; not ours to remove
+                for member in self._members:
+                    found = try_stat_at(fs, self._dir_fd, member.name)
+                    if found is not None and (found.st_dev, found.st_ino) == member.ident:
+                        with contextlib.suppress(OSError):
+                            fs.unlink_at(self._dir_fd, member.name)  # a file this process made
+            try:
+                fs.rmdir_at(self._parent_fd, self.name)  # fails, harmlessly, if anything is left
+            except FileNotFoundError:
+                pass
+            except OSError:
+                self.leftover = self.name
 
     def __exit__(self, *exc_info: object) -> None:
         fs = self._fs

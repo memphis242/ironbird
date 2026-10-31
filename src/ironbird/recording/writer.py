@@ -37,7 +37,6 @@ import fcntl
 import hashlib
 import os
 import queue
-import signal
 import threading
 import time
 import zlib
@@ -54,6 +53,7 @@ from ironbird.ledger import Ledger
 from ironbird.notice import Level
 from ironbird.recording import format as fmt
 from ironbird.recording.format import BlobKind, MarkKind, RecordType
+from ironbird.sigmask import signals_held
 
 DEFAULT_MAX_BUFFER_BYTES: Final = 256 * 1024 * 1024
 DEFAULT_MIN_FREE_BYTES: Final = 1024 * 1024 * 1024
@@ -78,7 +78,6 @@ MAX_PARTS: Final = 9999
 _PADS: Final = tuple(bytes(n) for n in range(fmt.ALIGN))
 _FRAME_TYPE: Final = int(RecordType.FRAME)
 _HAS_MID: Final = 0x01
-_HANDLED_SIGNALS: Final = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 assert FLUSH_BYTES < CHUNK_BYTES
 
 Report = Callable[..., None]  # Session.report: (error, *, context, level, evidence)
@@ -159,17 +158,6 @@ class _Loss:
             self.first_ns, self.first_seq = frame.time_ns, frame.seq
         self.count += 1
         self.last_ns, self.last_seq = frame.time_ns, frame.seq
-
-
-@contextlib.contextmanager
-def _signals_blocked() -> Any:
-    """Threads started inside inherit a mask that blocks the shutdown signals, so one never lands
-    in a thread that cannot act on it."""
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, _HANDLED_SIGNALS)
-    try:
-        yield
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 class _WriterThread(threading.Thread):
@@ -467,7 +455,7 @@ class Recorder:
             ) from exc
         recorder._check_start_space(path.parent)
         recorder._begin_part(first=True)
-        with _signals_blocked():
+        with signals_held():  # the thread inherits the mask: no shutdown signal lands in it
             recorder._writer.start()
         recorder._writer.jobs.put(("active", recorder._fd))
         now = recorder._mono()

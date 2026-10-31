@@ -23,7 +23,6 @@ import fcntl
 import itertools
 import os
 import queue
-import signal
 import stat
 import threading
 import time
@@ -45,8 +44,8 @@ from ironbird.fsops import (
     write_all,
 )
 from ironbird.ledgertiers import TIER_COUNT, Tier
+from ironbird.sigmask import signals_held
 
-SHUTDOWN_SIGNALS: Final = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 MAX_PART_NUMBER: Final = 999_999_999
 NAME_TRIES: Final = 16  # part or reserve names tried per attempt
 OPEN_TRIES: Final = 3  # session ids tried when part 1 already exists
@@ -1180,11 +1179,8 @@ class LedgerWriter:
             self._started = True
             # A thread started with the shutdown signals blocked never receives one: they are
             # handled by the main thread, which must see them all.
-            previous = signal.pthread_sigmask(signal.SIG_BLOCK, SHUTDOWN_SIGNALS)
-            try:
+            with signals_held():
                 self._thread.start()
-            finally:
-                signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
     @property
     def pending_jobs(self) -> int:

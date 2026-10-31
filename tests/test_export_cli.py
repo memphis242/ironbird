@@ -43,7 +43,7 @@ from ironbird.recording.reader import RecordingReader
 from ironbird.recording.replay import Replay
 from recutil import CLI_MAIN, run_ib
 from replayutil import child_env, hk_frames, write_recording
-from support.faultfs import FaultFs
+from support.faultfs import FaultFs, Rule
 from test_replay import split_set
 
 LEDGER_NAME = "20261031T010203Z-0123456789ab.jsonl"
@@ -510,6 +510,18 @@ def test_a_member_swapped_for_another_file_is_not_written_to(tmp_path: Path) -> 
     assert [p.name for p in (tmp_path / out.leftover).iterdir()] == ["a.csv"]
 
 
+def test_a_member_that_cannot_be_identified_is_removed_at_once(tmp_path: Path) -> None:
+    fs = FaultFs()
+    final = tmp_path / "out"
+    with TempDirOutput(final, fs=fs) as out:
+        out.create("a.csv")
+        fs.rules.append(Rule("fstat", err=errno.EIO, times=1))
+        with pytest.raises(OSError):
+            out.create("b.csv")
+        assert [p.name for p in out.path.iterdir()] == ["a.csv"]
+    assert out.leftover is None and not final.exists() and temporaries(tmp_path) == []
+
+
 def test_a_foreign_file_in_the_temporary_directory_is_left_alone_and_named(tmp_path: Path) -> None:
     final = tmp_path / "out"
     out = TempDirOutput(final)
@@ -729,28 +741,19 @@ atomicfile.TempDirOutput.__enter__ = hook_enter(atomicfile.TempDirOutput.__enter
 """
 
 
-@pytest.mark.parametrize(
-    ("where", "fmt"),
-    [
-        ("file", "text"),
-        ("entered", "text"),
-        ("dir", "csv"),
-        ("member", "csv"),
-        ("dir_entered", "csv"),
-    ],
-)
-def test_a_signal_just_as_a_temporary_is_made_leaves_nothing_behind(
-    tmp_path: Path, env: dict[str, str], where: str, fmt: str
-) -> None:
-    """The signal lands right after the temporary file, directory or table is created, before
-    the code that made it has recorded it for removal: it is removed all the same."""
+def _signal_at_window(
+    tmp_path: Path, env: dict[str, str], hooks: str, where: str, fmt: str
+) -> tuple[Path, str]:
+    """Run an export of a small recording to ``tmp_path/out`` with ``hooks`` installed, send
+    SIGTERM once the hooks report the window ``where`` reached, and check it ended by the
+    signal. Returns the output path and stderr."""
     hk_and_status(tmp_path / "in.ibrec", 6, 4)
     out, mark = tmp_path / "out", tmp_path / "window-reached"
     proc = subprocess.Popen(
         [
             sys.executable,
             "-c",
-            _WINDOW_HOOKS + CLI_MAIN,
+            hooks + CLI_MAIN,
             "export",
             str(tmp_path / "in.ibrec"),
             "--format",
@@ -758,7 +761,12 @@ def test_a_signal_just_as_a_temporary_is_made_leaves_nothing_behind(
             "-o",
             str(out),
         ],
-        env={**env, "IB_TEST_WINDOW": where, "IB_TEST_MARK": str(mark)},
+        env={
+            **env,
+            "IB_TEST_WINDOW": where,
+            "IB_TEST_MARK": str(mark),
+            "IB_TEST_FINAL": out.name,
+        },
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
@@ -775,7 +783,113 @@ def test_a_signal_just_as_a_temporary_is_made_leaves_nothing_behind(
         if proc.poll() is None:
             proc.kill()
     assert proc.returncode == 143, err
+    return out, err
+
+
+@pytest.mark.parametrize(
+    ("where", "fmt"),
+    [
+        ("file", "text"),
+        ("entered", "text"),
+        ("dir", "csv"),
+        ("member", "csv"),
+        ("dir_entered", "csv"),
+    ],
+)
+def test_a_signal_just_as_a_temporary_is_made_leaves_nothing_behind(
+    tmp_path: Path, env: dict[str, str], where: str, fmt: str
+) -> None:
+    """The signal lands right after the temporary file, directory or table is created, before
+    the code that made it has recorded it for removal: it is removed all the same."""
+    out, err = _signal_at_window(tmp_path, env, _WINDOW_HOOKS, where, fmt)
     assert not out.exists() and temporaries(tmp_path) == [], err
+
+
+# Child-side hooks for the steps after the tables are written. ``discard_*``: the commit fails
+# (the data sync of a temporary gives EIO) and the signal lands while the cleanup is between
+# checking a temporary and removing it. ``placeholder_*``: the file system has neither a
+# non-replacing rename nor hard links (NFS has no RENAME_NOREPLACE), so the commit makes an empty
+# placeholder at the final name and renames over it; the signal lands between the two.
+_LATE_HOOKS = """
+import errno, os, time
+from pathlib import Path
+from ironbird import fsops
+WHERE, MARK = os.environ["IB_TEST_WINDOW"], Path(os.environ["IB_TEST_MARK"])
+FINAL = os.environ["IB_TEST_FINAL"]
+FS = fsops.FileSystem
+
+def window():
+    MARK.touch()
+    time.sleep(0.5)
+
+def hook_fdatasync(real):
+    def fdatasync(self, fd):
+        if WHERE.startswith("discard") and ".tmp" in os.readlink(f"/proc/self/fd/{fd}"):
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        real(self, fd)
+    return fdatasync
+
+def hook_unlink(real):
+    def unlink_at(self, dir_fd, name):
+        if name.endswith({"discard_file": ".tmp", "discard_member": ".csv"}.get(WHERE, "/")):
+            window()
+        real(self, dir_fd, name)
+    return unlink_at
+
+def hook_mkdir(real):
+    def mkdir_at(self, dir_fd, name, mode=0o700):
+        real(self, dir_fd, name, mode)
+        if WHERE == "placeholder_dir" and name == FINAL:
+            window()
+    return mkdir_at
+
+def hook_open(real):
+    def open_at(self, dir_fd, name, flags, mode=0o600):
+        fd = real(self, dir_fd, name, flags, mode)
+        if WHERE == "placeholder_file" and name == FINAL and flags & os.O_CREAT:
+            window()
+        return fd
+    return open_at
+
+def no_renameat2(self, dir_fd, old, new):
+    return None
+
+def no_link(self, dir_fd, old, new):
+    raise OSError(errno.EPERM, os.strerror(errno.EPERM))
+
+FS.fdatasync = hook_fdatasync(FS.fdatasync)
+FS.unlink_at = hook_unlink(FS.unlink_at)
+FS.mkdir_at = hook_mkdir(FS.mkdir_at)
+FS.open_at = hook_open(FS.open_at)
+if WHERE.startswith("placeholder"):
+    FS.renameat2_noreplace, FS.link_at = no_renameat2, no_link
+"""
+
+
+@pytest.mark.parametrize(("where", "fmt"), [("discard_file", "text"), ("discard_member", "csv")])
+def test_a_signal_during_the_cleanup_of_a_failed_commit_leaves_nothing_behind(
+    tmp_path: Path, env: dict[str, str], where: str, fmt: str
+) -> None:
+    """The cleanup after a failed commit is not cut short by a signal that lands in it."""
+    out, err = _signal_at_window(tmp_path, env, _LATE_HOOKS, where, fmt)
+    assert not out.exists() and temporaries(tmp_path) == [], err
+
+
+@pytest.mark.parametrize(
+    ("where", "fmt"), [("placeholder_file", "text"), ("placeholder_dir", "csv")]
+)
+def test_a_signal_between_placeholder_and_rename_leaves_no_empty_output(
+    tmp_path: Path, env: dict[str, str], where: str, fmt: str
+) -> None:
+    """A commit by placeholder is not split by a signal: the final name ends up with the whole
+    export, never the empty placeholder, and no temporary is left."""
+    out, err = _signal_at_window(tmp_path, env, _LATE_HOOKS, where, fmt)
+    assert temporaries(tmp_path) == [], err
+    if fmt == "csv":
+        assert out.is_dir() and all(p.stat().st_size > 0 for p in out.iterdir()), err
+        assert any(out.iterdir()), err
+    else:
+        assert out.is_file() and out.stat().st_size > 0, err
 
 
 def test_a_reader_that_goes_away_ends_a_stdout_export_quietly(

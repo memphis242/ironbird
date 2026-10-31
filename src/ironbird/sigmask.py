@@ -25,12 +25,18 @@ def signals_held() -> Generator[None]:
     A blocked signal waits as pending (see ``signal.sigtimedwait``) instead of running a handler
     at an arbitrary line; its handler runs as the scope ends, so whatever the handler raises
     comes out of the ``with`` statement. The previous mask is restored on exit, so uses nest.
+
+    ``pthread_sigmask`` runs the handlers of signals already caught before it returns, so the
+    call that blocks can raise after it changed the mask: the mask is read first and the block
+    made inside the ``try``, so the mask is restored whatever is raised, and the body does not
+    run when the block raised.
     """
     if not hasattr(signal, "pthread_sigmask"):  # pragma: no cover - not POSIX
         yield
         return
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, ())  # reads the mask, changes nothing
     try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
         yield
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)

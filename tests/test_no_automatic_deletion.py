@@ -40,11 +40,13 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
     # the confirmed prune
     ("prune.py", "removal"): {"_delete_session"},
     # a process's own temporary file on its failure path; the second step of rename_noreplace
-    # (a directory export's own members and temporary directory, by name after an inode check)
+    # (a directory export's own members and temporary directory, by name after an inode check;
+    # a member just created that fstat cannot identify, by name before create raises)
     ("atomicfile.py", "removal"): {
         "_link",
         "_placeholder_rename",
         "TempOutput._discard",
+        "TempDirOutput.create",
         "TempDirOutput._discard",
     },
     ("atomicfile.py", "rename"): {"_link", "_placeholder_rename", "TempOutput.commit"},

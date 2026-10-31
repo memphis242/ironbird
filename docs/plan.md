@@ -3061,9 +3061,30 @@ As built (where the build differs from, or settles, the text above)
   error counter, nothing stored) for a count beyond the packet and one above the maximum, the ledger
   marking the injected fault, no `IB-DEC-*` report from the listener) pass with the 28 earlier cFS
   cases on the dev host.
+- Signals around temporaries (a 2h/2e fix made in this stage). Outside an event loop the CLI's signal
+  handler raises, so its exception can land between any two lines. Every step in `atomicfile.py` that
+  changes the file system and records the change runs inside `sigmask.signals_held()` (SIGINT, SIGTERM,
+  SIGHUP blocked; a signal that arrives waits and its handler runs as the step ends): creating a
+  temporary file, directory or member together with recording it for removal; the removal of what was
+  created (`_discard`); and the commit's rename in `rename_noreplace` (renameat2, link and unlink, or
+  placeholder and rename, so NFS, which has no `RENAME_NOREPLACE`, never keeps an empty placeholder at
+  the final name; the directory sync after it is not held). `export.write_to_file` and
+  `write_to_directory` hold them across `ExitStack.enter_context` until the stack holds the cleanup.
+  A signal that lands in a commit's rename therefore ends the command (exit 128+n) with the export
+  complete under its final name. `signals_held` reads the mask before blocking, because
+  `pthread_sigmask` runs a pending handler before it returns: a handler that raises there leaves the
+  mask as it was. Helper threads (ledger, retention, gate, output, recorder) start inside it and
+  inherit the block. A member that `fstat` cannot identify right after its creation is removed by name
+  at once (`TempDirOutput.create`, on the deletion allowlist). Tests: the signal at each window, sent
+  to a real `ib export` from a hook that stops there (`test_export_cli.py`), and `test_sigmask.py`.
 - Deferred: arrays of structs (D11); a filter operator over number arrays (`contains`, indexing); TOML
   arrays in response rules; `--allow-count-mismatch` has no counterpart in `respond` (a reply rule with a wrong count is refused); a real-cFS case
-  against MD's dwell packet; the `ib_test` gcc 8 (EL8) build is covered by CI only.
+  against MD's dwell packet; the `ib_test` gcc 8 (EL8) build is covered by CI only. Signals: the
+  default executor threads of `asyncio.to_thread` (UDP drop scan) start without the signal block;
+  harmless while the loop runs (the handler cancels, it does not raise) and gone after `asyncio.run`,
+  but a held scope inside a running loop does not stop the handler from running in it. An `fstat`
+  failure on a held temporary inside `TempOutput._discard` at `__exit__` raises a bare `OSError` and
+  keeps the file unreported (`TempOutput` has no `leftover` like `TempDirOutput`).
 
 ### 2k - Serial transport
 
