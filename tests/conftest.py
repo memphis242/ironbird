@@ -11,6 +11,7 @@ import pytest
 
 from ironbird.ccdd.loader import load_ccdd
 from ironbird.codec import Codec
+from ironbird.errors import Code
 from ironbird.header import load_profile
 
 REPO = Path(__file__).resolve().parent.parent
@@ -26,6 +27,24 @@ CFS_EXE = (
     / "cpu1"
     / "core-cpu1"
 )
+
+
+# Warnings that report a property of the host, not of the code under test: a receive buffer
+# capped by a small net.core.rmem_max (IB-TX-005), a state directory on a file system outside
+# the essential-reserve allowlist such as a container's overlayfs (IB-LED-006), and a file
+# system without file locks (IB-LED-009). A test that counts the lines a command prints drops
+# these first, so it holds on any host.
+HOST_WARNINGS: frozenset[Code] = frozenset({Code.TX_RCVBUF, Code.LED_RESERVE, Code.LED_NOLOCK})
+_HOST_WARNING_PREFIXES: tuple[str, ...] = tuple(f"warning {c.value}:" for c in HOST_WARNINGS)
+
+
+def without_host_warnings(text: str) -> list[str]:
+    """The non-blank lines of ``text`` other than the host warnings above."""
+    return [
+        line
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith(_HOST_WARNING_PREFIXES)
+    ]
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:

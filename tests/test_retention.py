@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+import retutil
 from ironbird.fsops import REAL_FS
 from ironbird.prune import execute_plan, list_lines, make_plan, unreachable_summary
 from ironbird.retention import (
@@ -32,10 +33,18 @@ from ironbird.retention import (
     scan_directory,
 )
 from ironbird.units import GIB, MIB
-from retutil import DAY, head, make_session, sid, stamp
+from retutil import DAY, head, sid, stamp
 from support.faultfs import FaultFs
 
 NOW = time.time()
+
+
+def make_session(*args: Any, **kwargs: Any) -> list[Path]:
+    """``retutil.make_session`` anchored to ``NOW``, the clock every scan here runs at. ``NOW``
+    is taken when the module is collected, which can be minutes before a test runs (xdist on a
+    slow runner); a file aged from the wall clock at run time would then lie in the future of
+    the scan and be read as a clock step instead of as fresh."""
+    return retutil.make_session(*args, now=NOW, **kwargs)
 
 
 def scan(
