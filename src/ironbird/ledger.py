@@ -77,7 +77,7 @@ from ironbird.ledgertiers import (
     TierBudget,
     TokenBucket,
 )
-from ironbird.notice import Level, Notice
+from ironbird.notice import Level, Notice, level_of
 from ironbird.units import format_duration, format_size
 
 FORCE_AGE_S: Final = 1.0
@@ -879,15 +879,21 @@ class Ledger:
         *,
         tier: Tier | None = None,
         sample: str | None = None,
+        level: Level | None = None,
         **fields: Any,
     ) -> int | None:
         """Record an error in full and hand it to the writer promptly (rate-limited under
         floods). Returns the record number as :meth:`record` does. ``tier`` defaults from the
-        code: errors that received bytes can cause at will are evidence."""
+        code: errors that received bytes can cause at will are evidence. ``level`` is the record
+        kind, ``warning`` or ``error``; it defaults from the code (``WARNING_CODES``), and an
+        explicit ``level`` overrides that default in either direction."""
         if tier is None:
             tier = Tier.EVIDENCE if error.code in EVIDENCE_ERRORS else Tier.ESSENTIAL
+        if level is None:
+            level = level_of(error.code)
+        assert level in (Level.WARNING, Level.ERROR), "an error record is a warning or an error"
         number = self.record(
-            "error",
+            level.label,
             error.code.value,
             tier=tier,
             sample=sample,

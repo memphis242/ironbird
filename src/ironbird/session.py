@@ -48,7 +48,7 @@ from ironbird.frame import Decoded, Frame, Stream
 from ironbird.header import load_profile
 from ironbird.ledger import Ledger
 from ironbird.ledgertiers import Tier
-from ironbird.notice import Level, Notice
+from ironbird.notice import Level, Notice, level_of
 from ironbird.transport import LinkEnd
 
 TICK_S: Final = 1.0
@@ -258,11 +258,14 @@ class Session:
         error: IronbirdError | DecodeError,
         *,
         context: str = "",
-        level: Level = Level.ERROR,
+        level: Level | None = None,
         evidence: bool = False,
         sample: str | None = None,
     ) -> None:
         """Ledger in full, notify the user coalesced (one notice per key per window).
+
+        ``level`` defaults from the code (:func:`ironbird.notice.level_of`): a warning code is
+        displayed and ledgered as a warning, any other as an error.
 
         ``evidence`` marks an error that untrusted wire input can produce at will; its ledger
         record then belongs to the evidence tier instead of the essential one, and ``sample``
@@ -276,8 +279,11 @@ class Session:
             raw_mid = None
             err = error
             offset = None
+        if level is None:
+            level = level_of(err.code)
         ledger_n = self.ledger.record_error(
             err,
+            level=level,
             tier=Tier.EVIDENCE if evidence else None,
             sample=sample,
             role=self.node.name,

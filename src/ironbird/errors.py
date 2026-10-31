@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Final
 
 from ironbird.sanitize import clean
 
@@ -47,7 +48,7 @@ class Code(StrEnum):
     TX_SEND = "IB-TX-002"  # send failed or refused
     TX_RECV = "IB-TX-003"  # receive failed: a socket read errored (may end the capture)
     TX_OVERRUN = "IB-TX-004"  # datagrams dropped by the kernel socket buffer (or left unread)
-    TX_RCVBUF = "IB-TX-005"  # kernel granted a smaller receive buffer than requested
+    TX_RCVBUF = "IB-TX-005"  # kernel granted a smaller receive buffer than requested (warning)
     # Events
     EVT_NONE = "IB-EVT-001"  # no event telemetry is defined for the selected node(s)
     # Responder
@@ -104,6 +105,20 @@ class Code(StrEnum):
     CLI_USAGE = "IB-CLI-001"  # command line usage error
     INTERNAL = "IB-INT-001"  # unexpected internal error (bug)
 
+    @property
+    def is_warning(self) -> bool:
+        """True for a condition that does not stop the work: shown and ledgered as a warning."""
+        return self in WARNING_CODES
+
+
+#: Codes whose default report level is warning (``warning IB-XXX-NNN: ...``, ledger kind
+#: ``warning``) because the operation continues. Every other code defaults to error. The default
+#: is only a default: a reporter that passes an explicit level (``Session.report(level=...)``,
+#: ``Ledger.record_error(level=...)``) sets the ledger kind and the displayed label, so a code
+#: outside this set can be reported as a warning and a member can be reported as an error. A
+#: warning code is never raised, so it never decides an exit code.
+WARNING_CODES: Final[frozenset[Code]] = frozenset({Code.TX_RCVBUF, Code.REC_DIRSYNC})
+
 
 MAX_SUMMARY_LEN = 600
 _USAGE_PREFIXES = ("IB-CFG-", "IB-HDR-", "IB-CCD-", "IB-CLI-", "IB-EVT-", "IB-FLT-")
@@ -142,7 +157,8 @@ class IronbirdError(Exception):
 
     def user_line(self) -> str:
         """The single line shown to the user (the summary is sanitized at construction)."""
-        return f"error {self.code.value}: {self.summary}"
+        label = "warning" if self.code.is_warning else "error"
+        return f"{label} {self.code.value}: {self.summary}"
 
     def detail_text(self) -> str:
         """Full detail for ``--verbose`` and the ledger: details plus the cause chain."""

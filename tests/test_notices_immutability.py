@@ -20,7 +20,7 @@ from ironbird.ccdd import ADAPTERS
 from ironbird.ccdd.model import MessageKind
 from ironbird.codec import Codec
 from ironbird.config import load_config
-from ironbird.errors import Code, DecodeError, IronbirdError
+from ironbird.errors import WARNING_CODES, Code, DecodeError, IronbirdError
 from ironbird.ledger import Ledger
 from ironbird.notice import Level, Notice
 from ironbird.session import MidStatSnapshot, Session
@@ -55,6 +55,34 @@ def test_session_notices_point_at_their_ledger_records(
         assert records[notice.ledger_n]["event"] == notice.code.value
     assert warning.line() == "warning IB-TX-005: small buffer"
     assert records[summary.ledger_n]["mid"] == 0x0881
+
+
+def test_warning_codes_report_as_warnings_by_default(
+    mock_config_path: Path, tmp_path: Path
+) -> None:
+    config = load_config(mock_config_path)
+    ledger = Ledger(tmp_path / "ledgers", session_id="w")
+    notices: list[Notice] = []
+
+    async def main() -> None:
+        async with Session(config, role="ground", ledger=ledger, notify=notices.append) as ground:
+            ground.report(IronbirdError(Code.TX_RCVBUF, "small buffer"))
+            ground.report(IronbirdError(Code.TX_SEND, "refused"))
+            ground.flush_notices()
+
+    asyncio.run(main())
+    ledger.flush()
+    records = {r["event"]: r for r in map(json.loads, ledger.path.read_text().splitlines())}
+    assert {n.code: n.level for n in notices} == {
+        Code.TX_RCVBUF: Level.WARNING,
+        Code.TX_SEND: Level.ERROR,
+    }
+    assert records[Code.TX_RCVBUF.value]["kind"] == "warning"
+    assert records[Code.TX_SEND.value]["kind"] == "error"
+    assert IronbirdError(Code.TX_RCVBUF, "x").user_line().startswith("warning ")
+    assert IronbirdError(Code.TX_SEND, "x").user_line().startswith("error ")
+    # A warning is never raised, so it never picks an exit code; a code is one or the other.
+    assert Code.TX_RCVBUF in WARNING_CODES and Code.TX_SEND not in WARNING_CODES
 
 
 def test_notices_without_a_ledger_have_no_pointer(mock_config_path: Path, tmp_path: Path) -> None:

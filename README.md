@@ -364,7 +364,8 @@ summed up in one `IB-OUT-002` line, in the ledger, and in exit code 4. Datagrams
 the kernel's own copy (`IB-DEC-002` reports its size on the wire), and a front-end that cannot keep
 up holds at most 32 MiB of received frames; those it was not shown are reported as `IB-ENG-001`
 (a recorder sees them regardless). A socket read that fails is reported as `IB-TX-003`; one that
-cannot recover ends the command with that error. If the kernel grants a smaller receive buffer than requested, `IB-TX-005` says to
+cannot recover ends the command with that error. If the kernel grants a smaller receive buffer than requested, `IB-TX-005` is shown as a
+warning (once per session; capture continues and exit codes are unchanged): ask an admin to
 raise `net.core.rmem_max` (`sysctl -w net.core.rmem_max=...`).
 
 The ledger directory is an absolute `$IRONBIRD_STATE_DIR` (a relative one is refused), else an absolute `$XDG_STATE_HOME/ironbird`,

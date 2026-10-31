@@ -24,6 +24,12 @@ Stage 1 is CLI send + receive.
 - **Layers** (`src/ironbird/`):
   - `errors.py` - `IronbirdError(code, summary, details, cause)`; stable codes like
     `IB-CFG-001`, `IB-TX-003`. One-line summary for the user, details for the ledger.
+    A code in `WARNING_CODES` (`Code.is_warning`) is a non-fatal condition: the work
+    continues, it is never raised (so it never decides an exit code), the user line starts
+    `warning` instead of `error`, and its ledger record has kind `warning` instead of `error`.
+    `Session.report` and `Ledger.record_error` take the level from the code unless the caller
+    passes one; an explicit level wins and sets the ledger kind (so a code outside
+    `WARNING_CODES` reported at `Level.WARNING` is ledgered as `warning`, and the reverse).
   - `ledger.py` - action ledger: JSON Lines, one record per action/state change/error,
     UTC ISO 8601 with microseconds, session id. Default `$XDG_STATE_HOME/ironbird/`.
   - `config.py` - `ironbird.toml` describing the **system as a set of nodes** (ground,
@@ -2165,6 +2171,8 @@ As built (where the build differs from, or settles, the text above)
   `recorder_overrun` and `not_recorded` (seq ranges of the frames not written, per stream).
   `queue_drop` and `link_down` are defined for 2k; a consumer queue overflow is not a recording gap
   because the sinks already have the frame.
+- Decision: `link_down` is emitted in 2k with serial reconnect (unplug/EIO to reopen), not for UDP,
+  which has no link to lose.
 - Writer: `Recorder.open` writes preamble, META, BLOBs and the declared streams synchronously and
   syncs file and directory before returning; the 250 ms flush, the 1 s chunk close, the end of an
   overrun (hysteresis at half the cap), the 10 s free-space projection (`IB-REC-010` warning under
@@ -3039,6 +3047,7 @@ Verification
 |------|------|---------|------|
 | `IB-ENG-001` | `ENG_LAG` | a consumer fell behind; frames not shown (still captured and recorded) | 2c |
 | `IB-TX-003` | `TX_RECV` | receive failed (existing code, now raised) | 2c |
+| `IB-TX-005` | `TX_RCVBUF` | **warning**, not an error: the kernel granted a smaller UDP receive buffer than requested, so bursts may be lost; capture continues and exit codes are unchanged. Shown once per session, with the granted and requested sizes and the remedy (ask an admin to raise `net.core.rmem_max`); ledger kind `warning` | 2c |
 | `IB-TX-006` | `TX_BUSY` | serial device locked by another process | 2k |
 | `IB-TX-007` | `TX_RESYNC` | serial stream resynchronised, N bytes skipped | 2k |
 | `IB-TX-008` | `TX_DOWN` | link lost, reconnecting | 2k |
