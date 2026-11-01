@@ -14,7 +14,6 @@ import json
 import math
 import os
 import resource
-import select
 import signal
 import sys
 import time
@@ -30,7 +29,16 @@ import typer
 from ironbird import render
 from ironbird.ccdd.model import EventSeverity, MessageKind
 from ironbird.cli import prunecmd
-from ironbird.cli.output import CLOSE_WAIT_S, WRITE_SLICE, BoundedWriter, Console
+from ironbird.cli.output import (
+    CLOSE_WAIT_S,
+    WRITE_SLICE,
+    BoundedWriter,
+    Console,
+    encode_line,
+    fit_line,
+    line_codec,
+    write_within,
+)
 from ironbird.codec import Codec
 from ironbird.config import RecordingConfig, RetentionConfig, SystemConfig, find_config, load_config
 from ironbird.errors import Code, IronbirdError
@@ -505,7 +513,7 @@ def _late_err(ledger: Ledger, text: str) -> None:
     """Write a line to the process's stderr after the console's writer is closed (bounded)."""
     if sys.stderr is None:  # closed with ``2>&-``: nobody to tell
         return
-    late = BoundedWriter(sys.stderr)
+    late = BoundedWriter(sys.stderr, flush_first=False)  # a flush has no bound on a full pipe
     late.write(text)
     if not late.close(CLOSE_WAIT_S):
         ledger.record("state", "output.stderr_lost", lost=late.lost, notice=text)
@@ -2605,34 +2613,37 @@ def export_command(
 
 
 def _stderr_line(text: str) -> None:
-    """Line on stderr for errors raised outside a command run, with no thread: the handlers stay
-    installed here and never kill the process, so a stderr nobody reads must not be able to
-    block it for good, and a process that cannot start a thread still says what failed.
+    """Line on stderr for errors raised outside a command run. The handlers stay installed here
+    and never kill the process, so a stderr nobody reads (a stalled terminal, a pipe that is
+    never drained) must not be able to block it: the wait is bounded by :data:`CLOSE_WAIT_S`,
+    and a line that finds no room in that time is dropped.
 
-    The descriptor is polled for room for up to :data:`CLOSE_WAIT_S`, then the line (cut to
-    :data:`WRITE_SLICE` bytes, which a pipe takes whole or not at all) goes out in one ``write``.
-    A line that finds no room in that time is dropped. Stderr is line-buffered, so no earlier
-    text waits in the stream."""
+    The line is cut to :data:`WRITE_SLICE` bytes (a pipe takes that much whole or not at all),
+    ending in a marker when cut, at a character boundary. A :class:`BoundedWriter` writes it
+    from a thread, so the process never waits on the descriptor; a process that cannot start a
+    thread still says what failed, through :func:`~ironbird.cli.output.write_within`, which waits
+    on a separate non-blocking file description instead. Stderr is line-buffered, so no earlier
+    text waits in the stream, and the writer does not flush it (a flush into a full pipe has no
+    bound)."""
     stream = sys.stderr
     if stream is None:  # closed with ``2>&-``; there is nobody to tell
         return
-    encoding = getattr(stream, "encoding", None) or "utf-8"
-    body = term(text, 1000, err=True).encode(encoding, "backslashreplace")
-    if len(body) >= WRITE_SLICE:  # leave room for the newline, and never end inside a character
-        body = body[: WRITE_SLICE - 1].decode(encoding, "ignore").encode(encoding)
-    line = body + b"\n"
+    codec = line_codec(getattr(stream, "encoding", None))
+    fitted = fit_line(term(text, 1000, err=True), codec, WRITE_SLICE)
     try:
         fd = stream.fileno()
     except (AttributeError, OSError, ValueError):  # not a descriptor (an in-process capture)
         with contextlib.suppress(OSError, ValueError):
-            stream.write(line.decode(encoding, "replace"))
+            stream.write(encode_line(fitted, codec).decode(codec, "replace"))
             stream.flush()
         return
-    poller = select.poll()
-    poller.register(fd, select.POLLOUT)
-    with contextlib.suppress(OSError):  # a reader that went away has nobody to tell either
-        if poller.poll(int(CLOSE_WAIT_S * 1000)):
-            os.write(fd, line)
+    try:
+        writer = BoundedWriter(stream, flush_first=False)
+    except (RuntimeError, OSError):  # no thread could be started
+        write_within(fd, encode_line(fitted, codec), CLOSE_WAIT_S)
+        return
+    writer.write(fitted)
+    writer.close(CLOSE_WAIT_S)
 
 
 def _fill_standard_descriptors() -> None:

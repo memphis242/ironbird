@@ -34,7 +34,7 @@ from ironbird.prune import (
 )
 from ironbird.recording.session import default_recording_dir
 from ironbird.render import term
-from ironbird.retention import DirScan, full_scan, recording_blocks
+from ironbird.retention import FUTURE, LIVE, DirScan, full_scan, recording_blocks
 from ironbird.sigmask import Interrupted, wait_readable
 from ironbird.units import format_size, parse_count, parse_duration, parse_size
 
@@ -114,6 +114,15 @@ def _json_plan(plan: Plan, now: float) -> dict[str, Any]:
     }
 
 
+def _unrecovered_reserves(scan: DirScan) -> int:
+    """Leftover reserves of the sessions a recovery would have handled (all but the live ones)."""
+    return sum(
+        len(session.reserves)
+        for session in scan.sessions.values()
+        if LIVE not in session.protected and FUTURE not in session.protected
+    )
+
+
 def work(
     kind: str,
     flags: PruneFlags,
@@ -158,14 +167,8 @@ def work(
         ledger.record("state", event, **fields)
 
     # A recovery renames files, so it needs the trace the ledger keeps; a dry run without a
-    # ledger lists what is there and recovers nothing.
+    # ledger renames nothing, but still runs the checks that protect a session from a prune.
     recover = ledger.enabled
-    if kind == "ledger" and not recover:
-        console.err(
-            f"warning {Code.LED_DIR.value}: the action ledger cannot be used, so leftover "
-            "reserves were not recovered (a recovery must leave a trace); fix the ledger "
-            "and run again"
-        )
 
     # Each recovery step is ledgered as it ends, so a signal that ends the scan leaves a record
     # of every file it changed.
@@ -180,6 +183,14 @@ def work(
         recover=recover,
         on_record=record_recovery,
     )
+    if kind == "ledger" and not recover:
+        left = _unrecovered_reserves(scan)
+        if left:
+            console.err(
+                f"warning {Code.LED_DIR.value}: the action ledger cannot be used, so {left} "
+                "leftover reserve(s) were not recovered (a recovery must leave a trace); fix "
+                "the ledger and run again"
+            )
     for message in (*scan.messages, *([scan.partial] if scan.partial else [])):
         console.err(f"warning {Code.RET_SCAN.value}: {term(message, 1000, err=True)}")
         ledger.warn(  # shown above; the ledger gets it in full
@@ -187,6 +198,7 @@ def work(
             message,
             event="retention.warning",
             display=False,
+            shown=True,
             directory=str(directory),
         )
     plan = make_plan(scan, older_than_s=older, until_under=flags.until_under, now=now)

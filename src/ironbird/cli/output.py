@@ -6,7 +6,8 @@ socket reads and the ledger. :class:`BoundedWriter` therefore hands lines to a d
 through a byte-bounded queue; when the queue is full, new lines are dropped and counted, and the
 owner reports the count as one coalesced coded notice. The thread writes to the raw file
 descriptor, so an abandoned blocked write cannot hold a buffer lock that interpreter shutdown
-would wait for.
+would wait for. Constructing a writer never waits on the stream: text already buffered in it is
+flushed by the thread (or not at all, for a caller that cannot afford that wait).
 
 A reader that went away (``| head -1``) is a normal end of output, not an error: the writer
 records it, discards the rest and calls ``on_closed`` so the command can stop.
@@ -21,13 +22,16 @@ signals blocked, so a signal never lands in a thread that cannot act on it.
 from __future__ import annotations
 
 import bisect
+import codecs
 import contextlib
 import errno
 import os
 import select
 import signal
+import socket
 import stat
 import threading
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import Final, TextIO
@@ -46,6 +50,161 @@ CLOSE_WAIT_S: Final = 1.0
 # a whole chunk per write.
 WRITE_SLICE: Final = getattr(select, "PIPE_BUF", 512)
 _GONE: Final = frozenset({errno.EPIPE, errno.ECONNRESET, errno.EBADF})
+
+
+# Byte order marks a codec may put at the start of what it encodes (the longer UTF-32 little
+# endian mark begins with the UTF-16 one, so it is tried first).
+_BOMS: Final = (
+    codecs.BOM_UTF32_LE,
+    codecs.BOM_UTF32_BE,
+    codecs.BOM_UTF8,
+    codecs.BOM_UTF16_LE,
+    codecs.BOM_UTF16_BE,
+)
+LINE_MARKER: Final = "..."  # ends a line that :func:`fit_line` cut short
+_RETRY_S: Final = 0.005  # pause between two refused writes of a non-blocking descriptor
+
+
+def _without_bom(data: bytes) -> bytes:
+    for bom in _BOMS:
+        if data.startswith(bom):
+            return data[len(bom) :]
+    return data
+
+
+def line_codec(encoding: str | None) -> str:
+    """The codec a line is written with for a stream of ``encoding``: that one when a newline is
+    a single ``\\n`` byte in it (a byte order mark aside), else UTF-8. A wide codec such as
+    UTF-16 would put a mark and two-byte newlines into every line of a stream that is appended
+    to line by line."""
+    name = encoding or "utf-8"
+    try:
+        newline = _without_bom("\n".encode(name))
+    except (LookupError, ValueError):
+        return "utf-8"
+    return name if newline == b"\n" else "utf-8"
+
+
+def encode_line(text: str, codec: str) -> bytes:
+    """``text`` and its newline as bytes of ``codec`` (from :func:`line_codec`), encoded in one
+    call so a stateful codec stays consistent, without a leading byte order mark; what the
+    codec cannot represent becomes a backslash escape."""
+    return _without_bom((text + "\n").encode(codec, "backslashreplace"))
+
+
+def fit_line(text: str, codec: str, limit: int) -> str:
+    """``text``, cut at a character and ended with :data:`LINE_MARKER` when its line (see
+    :func:`encode_line`) would be longer than ``limit`` bytes; else ``text`` itself. A character
+    is never split, and neither is the escape that stands for one it cannot be encoded as."""
+    assert limit >= len(encode_line(LINE_MARKER, codec))
+    if len(encode_line(text, codec)) <= limit:
+        return text
+    low, high = 0, len(text)  # the longest prefix that fits with the marker is in [low, high]
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(encode_line(text[:middle] + LINE_MARKER, codec)) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + LINE_MARKER
+
+
+def _never_blocks(mode: int, rdev: int) -> bool:
+    """Whether a write to a descriptor of this kind completes without a reader: a regular file or
+    the null device."""
+    if stat.S_ISREG(mode):
+        return True
+    try:
+        null = os.stat(os.devnull)
+    except OSError:
+        return False
+    return stat.S_ISCHR(mode) and rdev == null.st_rdev
+
+
+def write_within(fd: int, data: bytes, timeout: float) -> bool:
+    """Write all of ``data`` to ``fd`` in at most about ``timeout`` seconds without a thread and
+    without changing ``fd`` (it may be shared with other processes); True if it all went out.
+
+    A pipe or a terminal whose reader stopped takes no bytes, and polling for room says little
+    (a terminal reports room while its queue cannot take a whole line), so the bytes go through
+    a second, non-blocking open file description of the same file (``/proc/self/fd``), written
+    and polled until they are all out or the time is up. A socket cannot be reopened and is
+    sent to with ``MSG_DONTWAIT``. A regular file and the null device never block and are
+    written directly. A pipe that cannot be reopened takes one atomic write (at most
+    :data:`WRITE_SLICE` bytes) once it reports room; any other descriptor that cannot be reopened
+    is not written. A reader that went away ends the write quietly; the result is then False.
+    """
+    deadline = time.monotonic() + timeout
+    try:
+        info = os.fstat(fd)
+        if _never_blocks(info.st_mode, info.st_rdev):
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view) :]
+            return True
+        if stat.S_ISSOCK(info.st_mode):
+            return _send_within(fd, data, deadline)
+        try:
+            second = os.open(f"/proc/self/fd/{fd}", os.O_WRONLY | os.O_NONBLOCK | os.O_NOCTTY)
+        except OSError:
+            if not stat.S_ISFIFO(info.st_mode) or len(data) > WRITE_SLICE:
+                return False
+            poller = select.poll()
+            poller.register(fd, select.POLLOUT)
+            if not poller.poll(max(0, int((deadline - time.monotonic()) * 1000))):
+                return False
+            os.write(fd, data)
+            return True
+        try:
+            return _push_within(second, data, deadline)
+        finally:
+            os.close(second)
+    except (OSError, ValueError):
+        return False
+
+
+def _wait_room(fd: int, deadline: float, event: int) -> bool:
+    """Wait until ``fd`` reports ``event`` (``POLLOUT``) or the deadline; False on the deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return False
+    poller = select.poll()
+    poller.register(fd, event)
+    # round up: a poll of 0 ms would spin until the deadline
+    return bool(poller.poll(max(1, int(remaining * 1000) + 1)))
+
+
+def _push_within(fd: int, data: bytes, deadline: float) -> bool:
+    """Write ``data`` to the non-blocking ``fd`` until done or the deadline."""
+    view = memoryview(data)
+    while view:
+        try:
+            view = view[os.write(fd, view) :]
+        except (BlockingIOError, InterruptedError):
+            if not _wait_room(fd, deadline, select.POLLOUT):
+                return False
+            time.sleep(_RETRY_S)  # room is reported before a whole write fits; do not spin
+    return True
+
+
+def _send_within(fd: int, data: bytes, deadline: float) -> bool:
+    """Send ``data`` to the socket ``fd`` without blocking until done or the deadline."""
+    duplicate = os.dup(fd)
+    try:
+        sock = socket.socket(fileno=duplicate)
+    except OSError:
+        os.close(duplicate)
+        raise
+    with sock:
+        view = memoryview(data)
+        while view:
+            try:
+                view = view[sock.send(view, socket.MSG_DONTWAIT) :]
+            except (BlockingIOError, InterruptedError):
+                if not _wait_room(sock.fileno(), deadline, select.POLLOUT):
+                    return False
+                time.sleep(_RETRY_S)
+    return True
 
 
 def write_slice_for(fd: int) -> int:
@@ -84,12 +243,14 @@ class BoundedWriter:
         *,
         max_bytes: int = MAX_QUEUED_BYTES,
         on_closed: Callable[[], None] | None = None,
+        flush_first: bool = True,
     ) -> None:
         assert max_bytes > 0
         self._stream = stream
         self._max_bytes = max_bytes
         self._on_closed = on_closed
-        self._encoding = getattr(stream, "encoding", None) or "utf-8"
+        self._codec = line_codec(getattr(stream, "encoding", None))
+        self._flush_first = flush_first
         self._cond = threading.Condition()
         self._queue: deque[bytes] = deque()
         self._queued = 0
@@ -117,8 +278,6 @@ class BoundedWriter:
             except (AttributeError, OSError, ValueError):
                 fd = None
         if fd is not None and stream is not None:
-            with contextlib.suppress(OSError, ValueError):
-                stream.flush()  # earlier buffered text goes out first
             self._fd = fd
             self._slice = write_slice_for(fd)
             self._thread = threading.Thread(target=self._pump, name="ib-output", daemon=True)
@@ -143,7 +302,7 @@ class BoundedWriter:
             elif self.error is not None:  # a failing descriptor, not a reader that left
                 self.undelivered_total += 1
             return
-        data = (text + "\n").encode(self._encoding, "backslashreplace")
+        data = encode_line(text, self._codec)
         with self._cond:
             if self.unavailable:
                 self.undelivered_total += 1
@@ -172,7 +331,7 @@ class BoundedWriter:
         if self._fd is None and not self.unavailable:
             self.write(text)
             return not self.reader_gone
-        data = (text + "\n").encode(self._encoding, "backslashreplace")
+        data = encode_line(text, self._codec)
         with self._cond:
             while True:
                 if self.unavailable:
@@ -268,8 +427,7 @@ class BoundedWriter:
             try:
                 stream.write(text + "\n")
             except UnicodeEncodeError:
-                safe = (text + "\n").encode(self._encoding, "backslashreplace")
-                stream.write(safe.decode(self._encoding, "replace"))
+                stream.write(encode_line(text, self._codec).decode(self._codec, "replace"))
             stream.flush()
         except (BrokenPipeError, ValueError):
             self._mark_gone()
@@ -334,6 +492,12 @@ class BoundedWriter:
         assert fd is not None
         if hasattr(signal, "pthread_sigmask"):  # also when started some other way
             signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
+        stream = self._stream
+        if self._flush_first and stream is not None:
+            # Earlier buffered text goes out first. A full pipe can hold this flush for good,
+            # which is why it is the thread's and not the constructor's.
+            with contextlib.suppress(OSError, ValueError):
+                stream.flush()
         while (chunk := self._next_chunk()) is not None:
             view = memoryview(chunk)
             offset = 0

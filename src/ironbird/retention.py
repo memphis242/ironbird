@@ -754,6 +754,7 @@ class RecoveryContext:
     control: ScanControl | None = None
     on_record: Callable[[str, dict[str, Any]], None] | None = None
     dirty: bool = False  # a file was renamed: the listing is stale
+    check_only: bool = False  # run the checks that can protect a session; change nothing
     committed_part: str = ""  # the part a salvage copy committed as a signal ended it
     committed_copy: dict[str, Any] = field(default_factory=dict)  # leftover fields of that commit
 
@@ -800,6 +801,8 @@ def recover_directory(
     own_session: str | None,
     control: ScanControl | None = None,
     on_record: Callable[[str, dict[str, Any]], None] | None = None,
+    *,
+    check_only: bool = False,
 ) -> bool:
     """Recover the leftover reserves of every non-live session of a ledger directory (cut at the
     last complete record and renamed to the next part, never deleted) and finish the salvages
@@ -807,7 +810,14 @@ def recover_directory(
     writable by others without the sticky bit is not touched. Returns whether any file changed.
 
     ``control.stop`` ends the pass between sessions: no recovery step begins after it is set.
-    ``on_record(event, fields)`` is called as each step ends, from the calling thread."""
+    ``on_record(event, fields)`` is called as each step ends, from the calling thread.
+
+    ``check_only`` runs every check a recovery makes before it changes a file (the reserve opens,
+    is a regular file of yours, locks, carries its session's header and holds a complete record,
+    and its target names are free) and marks the sessions a recovery would leave protected, but
+    renames, truncates and unlinks nothing, so it returns ``False`` and records nothing. A reserve
+    that a recovery would salvage protects its session as it would after the salvage. What a
+    step can only learn by failing (a full disk, a permission change meanwhile) is not predicted."""
     if scan.kind != "ledger" or scan.unsafe or not scan.exists:
         return False
     try:
@@ -825,7 +835,13 @@ def recover_directory(
                 if not (session.reserves or session.damaged):
                     continue
                 ctx = RecoveryContext(
-                    fs, dir_fd, scan, session, control=control, on_record=on_record
+                    fs,
+                    dir_fd,
+                    scan,
+                    session,
+                    control=control,
+                    on_record=on_record,
+                    check_only=check_only,
                 )
                 changed |= _recover_session(ctx)
     finally:
@@ -910,7 +926,7 @@ def _recover_locked(ctx: RecoveryContext, held: list[int]) -> bool:
         if outcome == "stop":
             break
     for entry in session.damaged:
-        if ctx.stopping:
+        if ctx.stopping or ctx.check_only:  # a session with a .damaged file is protected anyway
             break
         if entry.name in scan.handled:
             continue
@@ -1001,6 +1017,8 @@ def _complete_interrupted_rename(
             or held.st_nlink < 2
         ):
             continue
+        if ctx.check_only:
+            return "unchanged"  # a recovery would unlink the reserve name; nothing protects it
         with signals_held():  # the unlink and its record are one step
             fs.unlink_at(ctx.dir_fd, name)  # completes the rename: one name remains
             if set_aside:
@@ -1044,11 +1062,18 @@ def _commit_recovered(
         "error": "the process ended before the rename did; the next long session or prune "
         "recovers the reserve",
     }
-    with _stepping(ctx, step), signals_held():  # the rename and its record are one step
+    if ctx.check_only:
+        if try_stat_at(fs, ctx.dir_fd, new) is not None:
+            _unrecoverable(scan, session, name, f"a file already has the next part name {new}")
+            return "stop"
+        ctx.next_part += 1
+        return "unchanged"
+    with signals_held():  # the rename and its record are one step
         try:
-            fs.ftruncate(fd, cut)
-            fs.fdatasync(fd)
-            rename_noreplace(ctx.dir_fd, name, new, fd, fs=fs)
+            with _stepping(ctx, step):  # clear before the record is handed out
+                fs.ftruncate(fd, cut)
+                fs.fdatasync(fd)
+                rename_noreplace(ctx.dir_fd, name, new, fd, fs=fs)
         except Collision:
             _unrecoverable(scan, session, name, f"a file already has the next part name {new}")
             return "stop"
@@ -1084,6 +1109,17 @@ def _salvage(
     damaged = f"{name}.damaged"
     if ctx.stopping:
         return "stop"  # nothing is committed to yet: the next scan salvages it
+    if ctx.check_only:
+        if try_stat_at(fs, ctx.dir_fd, damaged) is not None:
+            _unrecoverable(scan, session, name, f"a file named {damaged} already exists")
+            return "stop"
+        scan.damaged_kept.add(session.id)  # the set-aside original protects the session
+        scan.messages.append(
+            f"reserve {name} is damaged: a recovery would save {format_size(cut)} as part "
+            f"p{ctx.next_part:04d} and keep the rest as {damaged}"
+        )
+        ctx.next_part += 1
+        return "unchanged"
     set_aside: dict[str, Any] = {}
     renamed = False
     try:
@@ -1549,12 +1585,15 @@ def full_scan(
     on_record: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> DirScan:
     """Scan, probe liveness, recover leftover reserves (a ledger directory; ``recover=False``
-    leaves them for a scan that may), account for the salvaged originals, then decide the
-    protections - the one pass a warning check and a prune both start from."""
+    leaves them for a scan that may, but still checks them so that the sessions a recovery would
+    protect are protected), account for the salvaged originals, then decide the protections -
+    the one pass a warning check and a prune both start from."""
     scan = scan_directory(fs, path, kind)
     live = liveness(fs, path, scan, now, own_session)
     if kind == "ledger":
-        if recover and recover_directory(fs, scan, live, own_session, control, on_record):
+        if recover_directory(
+            fs, scan, live, own_session, control, on_record, check_only=not recover
+        ):
             again = scan_directory(fs, path, kind)
             scan.carry_to(again)
             scan = again

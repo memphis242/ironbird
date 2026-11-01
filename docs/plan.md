@@ -845,7 +845,12 @@ As built (where the build differs from, or settles, the text above)
   of an iteration and iterating again loses nothing. `Capture.next_batch()` (at most 512 frames)
   transfers what it returns to the caller.
   `BoundedWriter` writes whole chunks to a regular file or a terminal and `PIPE_BUF` slices only
-  to pipes and sockets, where atomicity matters.
+  to pipes and sockets, where atomicity matters. Constructing one never waits on the stream: the
+  flush of text already buffered in it (so that it goes out first) is the writer thread's, and
+  a caller that cannot afford even that (the last-resort stderr lines) asks for none. A line is
+  encoded in one call with the stream's codec, without a leading byte order mark, and with UTF-8
+  when that codec does not write a newline as the single byte `\n` (UTF-16 and UTF-32 would put a
+  mark and two-byte newlines into every line).
 - Sinks are attached once however many holders ask (reference counted by identity), so one sink
   on two captures sees each frame once. A sink that raises is detached on its first failure and
   reported and ledgered once (`sink.detached`), never once per frame; its holders stay counted,
@@ -1632,8 +1637,15 @@ Deliverables
   - *Needs a ledger*: a deletion must leave a trace, so with `IB-LED-002` (configuration)
     prune refuses to delete (exit 1, nothing deleted), as transmitting commands do;
     `--dry-run` still lists, but recovers no leftover reserve (a recovery renames files and must
-    leave a trace): a warning with `IB-LED-002` says so. Every `IB-RET-004` line the scan
-    shows is also a `retention.warning` record in the ledger, in full. A stalled ledger (transient, such as the full disk prune is
+    leave a trace): a warning with `IB-LED-002` says how many leftover reserves of non-live
+    sessions were not recovered (none, no warning). The scan still runs every check a recovery
+    makes before it changes a file (`recover_directory(check_only=True)`: the reserve opens, is a
+    regular file of the user, locks, carries its session's header and a complete record, and its
+    target name is free), so the sessions a real prune protects as `unrecoverable reserve` or
+    as holding a `.damaged` original are protected in the listing too, and nothing is renamed,
+    truncated or unlinked. Every `IB-RET-004` line the scan
+    shows is also a `retention.warning` record in the ledger, in full, with `shown` true
+    (`Ledger.warn(shown=)` sets it for a warning the caller displayed itself). A stalled ledger (transient, such as the full disk prune is
     run to fix) does not refuse: the `prune.*` records are queued, the deletions usually
     free the space to write them, and the short-command exit line reports any left
     unwritten.
@@ -2072,6 +2084,19 @@ As built (where the build differs from, or settles, the text above)
   of an adopted temporary file sit in `TempOutput._adopt`, which the guard's allowlist names;
   an abandoned salvage record has the same `kept` + `cut` = size as the others, and the close
   never prints a second stall or unlogged line with other figures than the first.
+- **PR #10 review, round 4 (fixed).** The last-resort stderr line is bounded on a stalled
+  terminal (a `BoundedWriter` thread, or `write_within` when no thread starts); its encoding is
+  one call, without a byte order mark, UTF-8 for a codec with a wide newline, and a cut line
+  ends in a marker at a character boundary. A `BoundedWriter` no longer flushes the stream in
+  its constructor (the flush runs on its thread). A dry run without a usable ledger runs the
+  checks of a recovery without changing a file (`check_only`), so it protects the sessions a
+  real prune protects; its `IB-LED-002` warning counts the non-live leftover reserves and is
+  silent when there are none. The `retention.warning` records of the scan warnings a prune
+  displays say `shown` true (`Ledger.warn(shown=)`). A clean reserve's truncate, sync and
+  rename are the `stepping` window of the exit's wait and nothing more (the signals-held scope
+  encloses it), so the window has closed before the `ledger.recovered` record is handed out and
+  an exit that gives up on the wait cannot also write `ledger.recovery_incomplete` for a rename
+  that was done and recorded.
 - **Deferred.** The stderr line for exit 6 found only at the final close is written through a
   bounded late writer. A `.damaged` file keeps its session protected until the user deletes it:
   there is no command that does that for them. The 1000-run `ib send` loops against a no-lock file system are covered by the
@@ -3168,10 +3193,18 @@ As built (where the build differs from, or settles, the text above)
   says how many of the N it had deleted (`deleted K of N ... before the interruption`, and a
   `prune.interrupted` record) and shows the `IB-RET-` warnings of the sessions it skipped, before
   the interruption notice. Every line `main()` writes to stderr outside a command run (`_stderr_line`)
-  starts no thread, so it is written even when none can be started: the descriptor is polled for
-  room for up to `CLOSE_WAIT_S`, then the line, cut to `PIPE_BUF` bytes, goes out in one `write`
-  (dropped when there was no room), since the handlers stay installed there and a full stderr pipe
-  must not leave the process killable only by `SIGKILL`.
+  is bounded by `CLOSE_WAIT_S` whatever stderr is (a stalled terminal, an undrained pipe, a full
+  socket), since the handlers stay installed there and the process must not become killable only
+  by `SIGKILL`; a line that finds no room in that time is dropped. The line is cut to `PIPE_BUF`
+  bytes at a character boundary and ends in `...` when cut (an escape that stands for a
+  character the codec cannot encode is never split), and is written by a `BoundedWriter` thread
+  that does not flush the stream. A process that cannot start a thread still says what failed:
+  `write_within` writes through a separate non-blocking file description of the same file
+  (`/proc/self/fd/N` opened `O_NONBLOCK | O_NOCTTY`, so descriptor 2 itself is never made
+  non-blocking and other processes sharing it are not affected), looping poll and write over
+  partial writes and `EAGAIN` until the deadline; a socket, which cannot be reopened, takes
+  `send(MSG_DONTWAIT)`, and a regular file or `/dev/null` a plain `write`. Polling for room alone
+  is not enough: a terminal reports `POLLOUT` while its queue cannot take a whole line.
   The session facts a recording keeps are read once: `load_config` digests the bytes it parsed
   (`SystemConfig.sha256`, read-only) and `Session.codec_for` keeps the bytes of the CCDD and the
   two header profiles it built the codec from (`Session.definitions_of`); META and the embedded
