@@ -6,7 +6,20 @@ The file lives in the state directory and is *untrusted* on read: opened ``O_NOF
 O_NONBLOCK`` and checked with ``fstat`` (regular, ours, one link), at most 4 KiB, strict schema,
 timestamps not in the future; anything else is ignored and rewritten. It is rewritten in place
 (``pwrite`` at 0, then ``ftruncate``) under ``flock``, so no temporary file exists; a rewrite
-torn by a crash reads as invalid and is rewritten, at worst repeating one warning.
+torn by a crash reads as invalid and is rewritten, at worst repeating one warning. Every record
+is exactly :data:`MAX_BYTES` long (the JSON, space padding, a newline), so a rewrite is one
+``pwrite`` of the whole file and its ``ftruncate`` cuts nothing: a reader without a lock, between
+the two calls of another caller's rewrite, reads one whole record.
+
+That narrows the race without closing it: a ``pread`` that overlaps the ``pwrite`` itself can
+still return a mix of the old and the new image (a write of 4 KiB is not atomic against a
+concurrent read). So where there is no lock, a read that does not parse is
+repeated up to :data:`TORN_RETRIES` times. A read that still does not parse, with the reads
+differing from one another, means a rewrite is in progress: the answer is given from an empty
+state and the file is left alone, so a torn read never erases the timestamps other processes
+wrote. Reads that all agree on an unparseable image mean a file that is really invalid: it is
+treated as empty and rewritten. (A tear that happens to repeat four times is indistinguishable
+from that and is repaired the same way, at worst repeating one warning.)
 
 A lock never causes silence: when it is held for more than 200 ms the warning is displayed and
 the file is left unwritten. Where a lock cannot be taken for any other reason (``ENOLCK``,
@@ -39,6 +52,7 @@ MAX_ENTRIES: Final = 32
 MAX_KEY_LEN: Final = 200
 LOCK_TRIES: Final = 20  # x 10 ms: the 200 ms bound
 LOCK_STEP_S: Final = 0.01
+TORN_RETRIES: Final = 3  # extra reads of an unparseable image where there is no lock
 SCHEMA: Final = 1
 _OPEN_FLAGS: Final = INSPECT_RW_FLAGS | os.O_CREAT
 
@@ -57,26 +71,32 @@ def _number(value: object, now: float) -> float | None:
 def parse_notices(raw: bytes, now: float) -> tuple[dict[str, float], float | None]:
     """The state a file holds, or an empty one for anything that is not exactly the schema:
     ``{"v": 1, "last_scan": ts | null, "shown": {"<code>@<dir>": ts, ...}}``."""
+    state = _parse_strict(raw, now)
+    return ({}, None) if state is None else state
+
+
+def _parse_strict(raw: bytes, now: float) -> tuple[dict[str, float], float | None] | None:
+    """The state a file holds, or ``None`` for anything that is not exactly the schema."""
     if not raw or len(raw) > MAX_BYTES:
-        return {}, None
+        return None
     try:
         data = json.loads(raw.decode("utf-8"), parse_constant=_refuse)
     except (ValueError, RecursionError):
-        return {}, None
+        return None
     if not isinstance(data, dict) or set(data) != {"v", "last_scan", "shown"}:
-        return {}, None
+        return None
     shown_raw = data["shown"]
     if data["v"] != SCHEMA or not isinstance(shown_raw, dict) or len(shown_raw) > MAX_ENTRIES:
-        return {}, None
+        return None
     shown: dict[str, float] = {}
     for key, value in shown_raw.items():
         stamp = _number(value, now)
         if not isinstance(key, str) or len(key) > MAX_KEY_LEN or stamp is None:
-            return {}, None
+            return None
         shown[key] = stamp
     last = data["last_scan"]
     if last is not None and _number(last, now) is None:
-        return {}, None
+        return None
     return shown, None if last is None else float(last)
 
 
@@ -85,7 +105,8 @@ def _refuse(token: str) -> object:
 
 
 def render_notices(shown: Mapping[str, float], last_scan: float | None) -> bytes:
-    """The file's content; the oldest entries go first when there are too many."""
+    """The file's content, exactly :data:`MAX_BYTES` long (see the module); the oldest entries
+    go first when there are too many."""
     kept = dict(sorted(shown.items(), key=lambda item: item[1])[-MAX_ENTRIES:])
     text = json.dumps({"v": SCHEMA, "last_scan": last_scan, "shown": kept}, separators=(",", ":"))
     while len(text) + 1 > MAX_BYTES and kept:
@@ -93,7 +114,9 @@ def render_notices(shown: Mapping[str, float], last_scan: float | None) -> bytes
         text = json.dumps(
             {"v": SCHEMA, "last_scan": last_scan, "shown": kept}, separators=(",", ":")
         )
-    return (text + "\n").encode("ascii")
+    image = text.encode("ascii")
+    assert len(image) + 1 <= MAX_BYTES
+    return image + b" " * (MAX_BYTES - 1 - len(image)) + b"\n"
 
 
 class Notices:
@@ -139,9 +162,10 @@ class Notices:
                 return change({}, None)[2], False
             if not self._lock(fd):
                 return change({}, None)[2], False  # held: display, do not write
-            raw = fs.pread(fd, MAX_BYTES + 1, 0)
-            shown, last = parse_notices(raw, now)
-            shown, last, result = change(shown, last)
+            raw, state = self._read(fd, now)
+            if state is None:  # a rewrite is in progress: answer, leave the file to its writer
+                return change({}, None)[2], False
+            shown, last, result = change(*state)
             data = render_notices(shown, last)
             if data != raw:  # an answer that changed nothing leaves the file alone
                 fs.pwrite(fd, data, 0)
@@ -152,6 +176,27 @@ class Notices:
         finally:
             close_quietly(fs, fd)
             close_quietly(fs, dir_fd)
+
+    def _read(
+        self, fd: int, now: float
+    ) -> tuple[bytes, tuple[dict[str, float], float | None] | None]:
+        """The file's bytes and the state they hold (empty when the file is invalid). The state
+        is ``None`` when, without a lock, every read failed to parse and the reads differed: a
+        concurrent rewrite is torn across them, and the file must not be rewritten from here."""
+        raw = self._fs.pread(fd, MAX_BYTES + 1, 0)
+        state = _parse_strict(raw, now)
+        if state is not None:
+            return raw, state
+        if not self.unlocked or not raw:  # a lock excludes writers; an empty file is not torn
+            return raw, ({}, None)
+        agree = True
+        for _ in range(TORN_RETRIES):
+            again = self._fs.pread(fd, MAX_BYTES + 1, 0)
+            state = _parse_strict(again, now)
+            if state is not None:
+                return again, state
+            agree = agree and again == raw
+        return (raw, ({}, None)) if agree else (raw, None)
 
     def _lock(self, fd: int) -> bool:
         self.unlocked = False
