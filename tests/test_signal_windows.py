@@ -217,21 +217,23 @@ import os, time
 from pathlib import Path
 import ironbird.fsops as fsops
 MARK = Path(os.environ["IB_MARK"])
-_orig = fsops.FileSystem.pread
-def pread(self, fd, n, offset):
-    if n >= 1 << 20:              # the reserve's 1 MiB blocks: a slow file server
+_orig = fsops.FileSystem.write
+def write(self, fd, data):
+    r = _orig(self, fd, data)
+    if len(data) >= 1 << 20:      # a block of the salvage copy: a slow file server
         MARK.touch()
         time.sleep(0.25)
-    return _orig(self, fd, n, offset)
-fsops.FileSystem.pread = pread
+    return r
+fsops.FileSystem.write = write
 """
     state = tmp_path / "st"
     state.mkdir(mode=0o700)
     now = time.time()
     make_session(state, 1, age_days=3, now=now)
     line = json.dumps({"session": sid(1), "n": 10, "kind": "action", "event": "x" * 200}) + "\n"
-    body = (reserve_header(sid(1)) + line * 60000).encode()  # about 13 MiB of records
-    make_reserve(state, 1, 1, body, now=now, pad_to=len(body) + (8 << 20))
+    # about 13 MiB of records, then damage: the prune sets the reserve aside and copies the records
+    body = (reserve_header(sid(1)) + line * 60000).encode() + b"\x00" * 16 + b"junk after NUL\n"
+    reserve = make_reserve(state, 1, 1, body, now=now, pad_to=len(body) + (8 << 20))
     mark = tmp_path / "mark"
     env = {"PATH": "/usr/bin:/bin", "IRONBIRD_STATE_DIR": str(state), "IB_MARK": str(mark)}
     proc = subprocess.Popen(
@@ -255,6 +257,7 @@ fsops.FileSystem.pread = pread
         p.name for p in state.iterdir() if p.name.endswith(".tmp") or p.name.startswith(".")
     ]
     assert not leftovers, leftovers  # the interrupted copy left no temporary behind
+    assert (state / (reserve.name + ".damaged")).exists()  # the copy was reached
 
 
 def test_a_signal_mid_prune_says_how_many_sessions_were_deleted(tmp_path: Path) -> None:

@@ -2604,11 +2604,14 @@ def export_command(
 
 
 def _stderr_line(text: str) -> None:
-    """Direct (unbuffered-queue) line on stderr for errors raised outside a command run."""
-    if sys.stderr is None:  # closed with ``2>&-``; print(file=None) would use stdout
+    """Line on stderr for errors raised outside a command run, through a :class:`BoundedWriter`
+    closed after :data:`CLOSE_WAIT_S`: the handlers stay installed here and never kill the
+    process, so a stderr nobody reads must not be able to block it for good."""
+    if sys.stderr is None:  # closed with ``2>&-``; there is nobody to tell
         return
-    with contextlib.suppress(OSError, ValueError):
-        print(term(text, 1000, err=True), file=sys.stderr, flush=True)
+    line = BoundedWriter(sys.stderr)
+    line.write(term(text, 1000, err=True))
+    line.close(CLOSE_WAIT_S)
 
 
 def _fill_standard_descriptors() -> None:

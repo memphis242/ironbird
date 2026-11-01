@@ -13,7 +13,12 @@ from ironbird.errors import Code, IronbirdError
 
 
 class Adapter(Protocol):
-    """Reads one CCDD export format. Must raise ``IronbirdError`` (IB-CCD-*), never crash."""
+    """Reads one CCDD export format. Must raise ``IronbirdError`` (IB-CCD-*), never crash.
+
+    ``read``, ``load`` and ``load_bytes`` refuse content larger than
+    ``recording.format.MAX_BLOB_CONTENT``: a recording embeds the bytes that were parsed in one
+    BLOB, which cannot hold more. ``recording.session`` asserts the cap of each adapter that
+    exists."""
 
     name: str
 

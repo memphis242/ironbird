@@ -47,7 +47,7 @@ from ironbird.fsops import (
     try_stat_at,
 )
 from ironbird.ledgerstore import NAME_TRIES, part_name
-from ironbird.sigmask import checkpoint, naming_replaced
+from ironbird.sigmask import Interrupted, checkpoint, naming_replaced, signals_held
 from ironbird.units import MIB, format_size
 
 MAX_ENTRIES: Final = 100_000
@@ -752,6 +752,7 @@ class RecoveryContext:
     control: ScanControl | None = None
     on_record: Callable[[str, dict[str, Any]], None] | None = None
     dirty: bool = False  # a file was renamed: the listing is stale
+    committed_part: str = ""  # the part a salvage copy committed as a signal ended it
 
     @property
     def stopping(self) -> bool:
@@ -979,15 +980,22 @@ def _complete_interrupted_rename(
             or held.st_nlink < 2
         ):
             continue
-        fs.unlink_at(ctx.dir_fd, name)  # completes the rename: one name remains
-        if set_aside:
-            ctx.dirty = True
-            scan.recoveries.append(
-                {"old": name, "new": None, "kept": 0, "cut": st.st_size, "damaged": other.name}
-            )
-            return "changed"
-        scan.recovered += 1
-        scan.recoveries.append({"old": name, "new": other.name, "kept": st.st_size, "cut": 0})
+        with signals_held():  # the unlink and its record are one step
+            fs.unlink_at(ctx.dir_fd, name)  # completes the rename: one name remains
+            if set_aside:
+                ctx.dirty = True
+                record: dict[str, Any] = {
+                    "old": name,
+                    "new": None,
+                    "kept": 0,
+                    "cut": st.st_size,
+                    "damaged": other.name,
+                }
+            else:
+                scan.recovered += 1
+                record = {"old": name, "new": other.name, "kept": st.st_size, "cut": 0}
+            scan.recoveries.append(record)
+            ctx.report("ledger.recovered", record)
         return "changed"
     return None
 
@@ -998,25 +1006,27 @@ def _commit_recovered(
     fs, scan, session, name = ctx.fs, ctx.scan, ctx.session, reserve.name
     new = part_name(_stamp_of(session), session.id, ctx.next_part)
     record: dict[str, Any] = {"old": name, "new": new, "kept": cut, "cut": st.st_size - cut}
-    try:
-        fs.ftruncate(fd, cut)
-        fs.fdatasync(fd)
-        rename_noreplace(ctx.dir_fd, name, new, fd, fs=fs)
-    except Collision:
-        _unrecoverable(scan, session, name, f"a file already has the next part name {new}")
-        return "stop"
-    except LeftoverAfterCommit as exc:
-        # renamed; the reserve name stays a second name of the part until the next scan
-        # completes the rename (_complete_interrupted_rename)
-        record.update(_leftover_fields(exc))
-    except SyncAfterCommit as exc:
-        record["sync_error"] = exc.strerror  # renamed; the rename is not undone
-    except OSError as exc:
-        _unrecoverable(scan, session, name, f"it could not be renamed: {exc.strerror}")
-        return "stop"
-    scan.recovered += 1
-    scan.recoveries.append(record)
-    ctx.next_part += 1
+    with signals_held():  # the rename and its record are one step
+        try:
+            fs.ftruncate(fd, cut)
+            fs.fdatasync(fd)
+            rename_noreplace(ctx.dir_fd, name, new, fd, fs=fs)
+        except Collision:
+            _unrecoverable(scan, session, name, f"a file already has the next part name {new}")
+            return "stop"
+        except LeftoverAfterCommit as exc:
+            # renamed; the reserve name stays a second name of the part until the next scan
+            # completes the rename (_complete_interrupted_rename)
+            record.update(_leftover_fields(exc))
+        except SyncAfterCommit as exc:
+            record["sync_error"] = exc.strerror  # renamed; the rename is not undone
+        except OSError as exc:
+            _unrecoverable(scan, session, name, f"it could not be renamed: {exc.strerror}")
+            return "stop"
+        scan.recovered += 1
+        scan.recoveries.append(record)
+        ctx.report("ledger.recovered", record)
+        ctx.next_part += 1
     return "changed"
 
 
@@ -1037,24 +1047,62 @@ def _salvage(
     if ctx.stopping:
         return "stop"  # nothing is committed to yet: the next scan salvages it
     set_aside: dict[str, Any] = {}
+    renamed = False
     try:
-        rename_noreplace(ctx.dir_fd, name, damaged, fd, fs=fs)
-    except LeftoverAfterCommit as exc:
-        # set aside; the reserve name stays a second name of the .damaged file until the next
-        # scan completes the rename (_complete_interrupted_rename)
-        set_aside = _leftover_fields(exc)
-    except SyncAfterCommit as exc:
-        set_aside = {"sync_error": exc.strerror}
-    except Collision:
-        _unrecoverable(scan, session, name, f"a file named {damaged} already exists")
-        return "stop"
-    except OSError as exc:
-        _unrecoverable(
-            scan, session, name, f"it could not be set aside as .damaged: {exc.strerror}"
-        )
-        return "stop"
-    ctx.dirty = True
+        with signals_held():  # the set-aside and the fact that it happened are one step
+            try:
+                rename_noreplace(ctx.dir_fd, name, damaged, fd, fs=fs)
+            except LeftoverAfterCommit as exc:
+                # set aside; the reserve name stays a second name of the .damaged file until the
+                # next scan completes the rename (_complete_interrupted_rename)
+                set_aside = _leftover_fields(exc)
+            except SyncAfterCommit as exc:
+                set_aside = {"sync_error": exc.strerror}
+            except Collision:
+                _unrecoverable(scan, session, name, f"a file named {damaged} already exists")
+                return "stop"
+            except OSError as exc:
+                _unrecoverable(
+                    scan, session, name, f"it could not be set aside as .damaged: {exc.strerror}"
+                )
+                return "stop"
+            renamed = True
+            ctx.dirty = True
+    except Interrupted:
+        if renamed:  # set aside, and the signal came before the copy began
+            _report_interrupted_salvage(ctx, name, damaged, st.st_size, 0, set_aside)
+        raise
     return _finish_salvage(ctx, fd, name, damaged, st.st_size, cut, set_aside)
+
+
+def _report_interrupted_salvage(
+    ctx: RecoveryContext,
+    name: str,
+    damaged: str,
+    size: int,
+    cut: int,
+    set_aside: dict[str, Any],
+) -> None:
+    """Hand out the record of a salvage a signal ended: ``ledger.recovered`` when the copy had
+    been committed as a part by then (``ctx.committed_part``), else
+    ``ledger.recovery_incomplete``, where the original is kept whole as ``damaged`` and the next
+    long session or prune finishes the copy. ``cut``: the bytes the copy was to save."""
+    record: dict[str, Any] = {
+        "old": name,
+        "new": ctx.committed_part or None,
+        "kept": cut if ctx.committed_part else 0,
+        "cut": size - (cut if ctx.committed_part else 0),
+        "damaged": damaged,
+        **set_aside,
+        "interrupted": True,
+    }
+    if ctx.committed_part:
+        ctx.report("ledger.recovered", record)
+        return
+    record["error"] = (
+        "a signal ended the copy; the next long session or prune finishes it from the .damaged file"
+    )
+    ctx.report("ledger.recovery_incomplete", record)
 
 
 def _leftover_fields(exc: LeftoverAfterCommit) -> dict[str, Any]:
@@ -1093,6 +1141,9 @@ def _finish_salvage(
         control.stepping.set()  # from here the copy runs to its end
     try:
         new, error, copied = _copy_prefix(ctx, fd, cut)
+    except Interrupted:
+        _report_interrupted_salvage(ctx, name, damaged, size, cut, set_aside or {})
+        raise
     finally:
         if control is not None:
             control.stepping.clear()
@@ -1400,6 +1451,10 @@ def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, s
                 commit = _leftover_fields(exc)
             except SyncAfterCommit as exc:  # renamed; the rename is not undone
                 commit = {"sync_error": exc.strerror}
+            except Interrupted:
+                if out.committed:  # the signal was acted on once the part was durable
+                    ctx.committed_part = new
+                raise
     except Collision:
         return None, f"a file appeared at {new}", {}
     except OSError as exc:

@@ -23,9 +23,11 @@ from pathlib import Path
 from typing import Any, Final
 
 import ironbird
+from ironbird.ccdd.json_adapter import MAX_FILE_BYTES as CCDD_MAX_FILE_BYTES
 from ironbird.config import RecordingConfig
 from ironbird.errors import Code, IronbirdError
 from ironbird.frame import Frame, GapReason, Stream
+from ironbird.header import MAX_PROFILE_FILE_BYTES
 from ironbird.recording import format as fmt
 from ironbird.recording.format import BlobKind, MarkKind
 from ironbird.recording.writer import (
@@ -44,6 +46,10 @@ MAX_STAGED_EVENTS: Final = 1 << 16  # frames kept between the capture opening an
 _SPLIT_RE: Final = re.compile(r"([0-9]{1,12}(?:\.[0-9]{1,6})?)([a-z]{1,3})")
 _SIZE_UNITS: Final = {"b": 1, "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4}
 _TIME_UNITS: Final = {"s": 1.0, "m": 60.0, "h": 3600.0}
+
+# A definition file the loaders accept always fits an embedded BLOB (see collect_definitions).
+assert CCDD_MAX_FILE_BYTES <= fmt.MAX_BLOB_CONTENT
+assert MAX_PROFILE_FILE_BYTES <= fmt.MAX_BLOB_CONTENT
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,8 +150,11 @@ def collect_definitions(
         node = session.config.nodes[name]
         entry: dict[str, Any] = {"adapter": node.ccdd_adapter}
         table[name] = entry
-        if node.ccdd is None or node.command_header is None or node.telemetry_header is None:
-            continue
+        assert (
+            node.ccdd is not None
+            and node.command_header is not None
+            and node.telemetry_header is not None
+        ), "parse_config requires all three definition files of a node"
         held = session.definitions_of(name)  # the bytes the codec was built from, never re-read
         files = (
             (BlobKind.CCDD, held.ccdd, node.ccdd_adapter),

@@ -153,6 +153,12 @@ def work(
         recordings = full_scan(
             fs, recordings_dir, "recording", now=now, own_session=None, keep_recent=keep
         )
+
+    def record_recovery(event: str, fields: dict[str, Any]) -> None:
+        ledger.record("state", event, **fields)
+
+    # Each recovery step is ledgered as it ends, so a signal that ends the scan leaves a record
+    # of every file it changed.
     scan = full_scan(
         fs,
         directory,
@@ -161,11 +167,8 @@ def work(
         own_session=ledger.session_id if kind == "ledger" else None,
         keep_recent=keep,
         has_recording=recording_blocks(recordings, now, older),
+        on_record=record_recovery,
     )
-    for recovery in scan.recoveries:
-        ledger.record("state", "ledger.recovered", **recovery)
-    for incomplete in scan.incompletes:
-        ledger.record("state", "ledger.recovery_incomplete", **incomplete)
     for message in scan.messages:
         console.err(f"warning {Code.RET_SCAN.value}: {term(message, 1000, err=True)}")
     if scan.partial:
@@ -260,6 +263,7 @@ def _confirm_and_delete(
             f"deleted {outcome.deleted_sessions} of {len(plan.candidates)} {what} "
             f"({format_size(outcome.deleted_bytes)}) before the interruption"
         )
+        _show_skips(outcome, console)
         raise
     summary = (
         f"deleted {outcome.deleted_sessions} {what} ({format_size(outcome.deleted_bytes)}, "
@@ -268,6 +272,13 @@ def _confirm_and_delete(
     if outcome.gone_files:
         summary += f"; {outcome.gone_files} files were already gone"
     console.out(summary)
+    _show_skips(outcome, console)
+    return 1 if outcome.skipped or unreachable else 0
+
+
+def _show_skips(outcome: Outcome, console: Console) -> None:
+    """One ``RET_PRUNE`` warning for each of the first :data:`MAX_SKIPS_SHOWN` sessions the
+    prune left in place, then the count of the rest."""
     for session, reason in outcome.skipped[:MAX_SKIPS_SHOWN]:
         console.err(
             f"warning {Code.RET_PRUNE.value}: session {term(session, 40, err=True)} not deleted: "
@@ -278,7 +289,6 @@ def _confirm_and_delete(
             f"warning {Code.RET_PRUNE.value}: {len(outcome.skipped) - MAX_SKIPS_SHOWN} more "
             "sessions not deleted (see the ledger)"
         )
-    return 1 if outcome.skipped or unreachable else 0
 
 
 def _ask(question: str) -> str:
