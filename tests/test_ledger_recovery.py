@@ -152,6 +152,9 @@ def test_a_recovery_that_leaves_the_reserve_name_records_it_and_the_next_scan_re
     again = scan_later(state)
     assert not reserve.exists() and recovered.read_bytes() == body
     assert [r["new"] for r in again.recoveries] == [recovered.name]
+    # the record of the completion is marked, so what the first record counted is not added twice
+    (completed,) = again.recoveries
+    assert completed["completed"] is True and "completed" not in result.recoveries[0]
 
 
 def test_a_salvage_that_leaves_the_reserve_name_records_it_and_the_next_scan_removes_it(

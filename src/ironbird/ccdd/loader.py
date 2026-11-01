@@ -13,9 +13,16 @@ from ironbird.errors import Code, IronbirdError
 
 
 class Adapter(Protocol):
-    """Reads one CCDD export format. Must raise ``IronbirdError`` (IB-CCD-*), never crash."""
+    """Reads one CCDD export format. Must raise ``IronbirdError`` (IB-CCD-*), never crash.
+
+    ``read``, ``load`` and ``load_bytes`` refuse content larger than
+    ``recording.format.MAX_BLOB_CONTENT``: a recording embeds the bytes that were parsed in one
+    BLOB, which cannot hold more. ``recording.session`` asserts the cap of each adapter that
+    exists."""
 
     name: str
+
+    def read(self, path: Path) -> bytes: ...
 
     def load(self, path: Path) -> CcddModel: ...
 
@@ -36,6 +43,12 @@ def _adapter(source: str, adapter: str) -> Adapter:
             f"{', '.join(sorted(ADAPTERS))}",
         )
     return impl
+
+
+def read_ccdd(path: Path, adapter: str = "json") -> bytes:
+    """The content of a CCDD file, read once, for :func:`load_ccdd_bytes` and for whoever must
+    hold exactly the bytes that were parsed."""
+    return _adapter(str(path), adapter).read(path)
 
 
 def load_ccdd(path: Path, adapter: str = "json") -> CcddModel:

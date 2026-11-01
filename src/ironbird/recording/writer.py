@@ -53,7 +53,7 @@ from ironbird.ledger import Ledger
 from ironbird.notice import Level
 from ironbird.recording import format as fmt
 from ironbird.recording.format import BlobKind, MarkKind, RecordType
-from ironbird.sigmask import signals_held
+from ironbird.sigmask import start_thread
 
 DEFAULT_MAX_BUFFER_BYTES: Final = 256 * 1024 * 1024
 DEFAULT_MIN_FREE_BYTES: Final = 1024 * 1024 * 1024
@@ -455,8 +455,7 @@ class Recorder:
             ) from exc
         recorder._check_start_space(path.parent)
         recorder._begin_part(first=True)
-        with signals_held():  # the thread inherits the mask: no shutdown signal lands in it
-            recorder._writer.start()
+        start_thread(recorder._writer)  # no shutdown signal lands in it
         recorder._writer.jobs.put(("active", recorder._fd))
         now = recorder._mono()
         recorder._last_redefine = recorder._last_space = recorder._buf_since = now

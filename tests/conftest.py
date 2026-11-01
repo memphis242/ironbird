@@ -4,6 +4,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -145,6 +146,30 @@ def _isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("IRONBIRD_RECORD_DIR", str(tmp_path / "recordings"))  # never the user's
     monkeypatch.delenv("IRONBIRD_CONFIG", raising=False)
     return state
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cli_signal_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Every test sees the signal state as a fresh process has it, and leaves none behind.
+
+    The states are module globals: a command run in-process (``CliRunner``) ends with
+    ``_STATE.detach()``, after which the CLI's handler only records a signal instead of
+    delivering it, and a test can leave a signal owed in :mod:`ironbird.sigmask`. Without a
+    fresh state per test, a test that runs that handler, or that reaches a checkpoint, would
+    behave according to whichever test ran before it in the same worker, which xdist decides.
+    Not imported yet means not used yet, so its state is fresh already.
+    """
+    cli_main = sys.modules.get("ironbird.cli.main")
+    if cli_main is not None:
+        monkeypatch.setattr(cli_main, "_STATE", cli_main._SignalState())
+    sigmask = sys.modules.get("ironbird.sigmask")
+    if sigmask is not None:
+        sigmask.discard()
+    yield
+    sigmask = sys.modules.get("ironbird.sigmask")
+    if sigmask is not None:
+        sigmask.discard()
+        assert sigmask._DEPTH.open == 0, "a test left a signals_held scope open"
 
 
 @pytest.fixture

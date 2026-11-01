@@ -39,6 +39,7 @@ from ironbird.ccdd.model import (
     parse_type,
 )
 from ironbird.errors import Code, IronbirdError
+from ironbird.fsops import read_capped
 
 SCHEMA_ID: Final = "ironbird-ccdd/1"  # the schema new files are written in
 SCHEMA_IDS: Final = ("ironbird-ccdd/0", SCHEMA_ID)  # every schema that loads
@@ -592,15 +593,17 @@ class JsonAdapter:
 
     name: str = "json"
 
-    def load(self, path: Path) -> CcddModel:
+    def read(self, path: Path) -> bytes:
+        """The content of the CCDD file ``path``, at most one byte past the size limit."""
         try:
-            with path.open("rb") as handle:
-                raw = handle.read(MAX_FILE_BYTES + 1)
+            return read_capped(path, MAX_FILE_BYTES)
         except OSError as exc:
             raise IronbirdError(
                 Code.CCD_FILE, f"{path}: cannot read CCDD file ({exc.strerror or exc})", cause=exc
             ) from exc
-        return self.load_bytes(raw, str(path))
+
+    def load(self, path: Path) -> CcddModel:
+        return self.load_bytes(self.read(path), str(path))
 
     def load_bytes(self, raw: bytes, source: str) -> CcddModel:
         """The model of a file already read (``source`` labels errors). The size, JSON and schema

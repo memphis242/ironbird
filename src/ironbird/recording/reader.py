@@ -53,6 +53,7 @@ from ironbird.frame import (
 from ironbird.recording import format as fmt
 from ironbird.recording.format import RecordType
 from ironbird.sanitize import clean
+from ironbird.sigmask import checkpoint
 
 READ_BLOCK: Final = 1 << 20
 SMALL_BLOCK: Final = 16 * 1024  # random access (index, chunk heads) reads this much, not a MiB
@@ -534,6 +535,7 @@ class RecordingReader:
         position = (damaged_at + fmt.ALIGN) & ~(fmt.ALIGN - 1)
         step = SMALL_BLOCK  # doubles up to a block: a record close by is cheap, a long scan fast
         while True:
+            checkpoint()  # a shutdown signal ends a long scan here
             try:
                 block = os.pread(self._fd, step + 16, position)
             except OSError as exc:
@@ -607,6 +609,7 @@ class RecordingReader:
         state = self._state
         offset = self._start
         while True:
+            checkpoint()  # a shutdown signal ends every reading loop here, once per record
             if skip is not None and (jump := skip(offset)) is not None:
                 assert jump > offset, "a skip moves forward"
                 offset = jump

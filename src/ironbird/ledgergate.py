@@ -17,17 +17,10 @@ from collections import deque
 from collections.abc import Callable
 from typing import Final
 
-from ironbird.sigmask import signals_held
+from ironbird.sigmask import start_thread
 
 SLICE_S: Final = 0.05
 FINAL_WRITE_FLOOR_S: Final = 0.2  # what the ledger's last write may still wait after a signal
-
-
-def start_thread(thread: threading.Thread) -> None:
-    """Start a helper thread with the shutdown signals blocked, so it never receives one: they are
-    handled by the main thread, which must see them all."""
-    with signals_held():
-        thread.start()
 
 
 class WaitBudget:
