@@ -6,7 +6,10 @@ The file lives in the state directory and is *untrusted* on read: opened ``O_NOF
 O_NONBLOCK`` and checked with ``fstat`` (regular, ours, one link), at most 4 KiB, strict schema,
 timestamps not in the future; anything else is ignored and rewritten. It is rewritten in place
 (``pwrite`` at 0, then ``ftruncate``) under ``flock``, so no temporary file exists; a rewrite
-torn by a crash reads as invalid and is rewritten, at worst repeating one warning.
+torn by a crash reads as invalid and is rewritten, at worst repeating one warning. Every record
+is exactly :data:`MAX_BYTES` long (the JSON, space padding, a newline), so a rewrite is one
+``pwrite`` of the whole file and its ``ftruncate`` cuts nothing: a reader without a lock, between
+the two calls of another caller's rewrite, still reads one whole record.
 
 A lock never causes silence: when it is held for more than 200 ms the warning is displayed and
 the file is left unwritten. Where a lock cannot be taken for any other reason (``ENOLCK``,
@@ -85,7 +88,8 @@ def _refuse(token: str) -> object:
 
 
 def render_notices(shown: Mapping[str, float], last_scan: float | None) -> bytes:
-    """The file's content; the oldest entries go first when there are too many."""
+    """The file's content, exactly :data:`MAX_BYTES` long (see the module); the oldest entries
+    go first when there are too many."""
     kept = dict(sorted(shown.items(), key=lambda item: item[1])[-MAX_ENTRIES:])
     text = json.dumps({"v": SCHEMA, "last_scan": last_scan, "shown": kept}, separators=(",", ":"))
     while len(text) + 1 > MAX_BYTES and kept:
@@ -93,7 +97,9 @@ def render_notices(shown: Mapping[str, float], last_scan: float | None) -> bytes
         text = json.dumps(
             {"v": SCHEMA, "last_scan": last_scan, "shown": kept}, separators=(",", ":")
         )
-    return (text + "\n").encode("ascii")
+    image = text.encode("ascii")
+    assert len(image) + 1 <= MAX_BYTES
+    return image + b" " * (MAX_BYTES - 1 - len(image)) + b"\n"
 
 
 class Notices:

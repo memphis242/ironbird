@@ -282,6 +282,38 @@ def test_eight_parallel_callers_without_locks_repeat_at_most_a_few_lines(tmp_pat
     assert 1 <= sum(results) <= 8  # a race may repeat one line, never one per call
 
 
+def test_an_unlocked_rewrite_is_never_read_half_done(tmp_path: Path) -> None:
+    """Without a lock, a reader can run between a rewrite's ``pwrite`` and its ``ftruncate``
+    (another process, or another thread while the writer's system call releases the GIL). What
+    it reads there is a whole record of the rewrite, never the new text over the tail of the old
+    one, which would read as invalid and repeat the warning."""
+    state = tmp_path / "st"
+    state.mkdir(mode=0o700)
+
+    def unlocked() -> FaultFs:
+        fs = FaultFs()
+        fs.fail("flock", errno.ENOLCK)
+        return fs
+
+    # the first record's timestamp is longer than the rewrite's: the rewrite is the shorter text
+    first = Notices(state, fs=unlocked(), wall=lambda: 1_700_000_000.123456)
+    assert first.allow("IB-LED-006", state, 60)
+    reader = Notices(state, fs=unlocked(), wall=lambda: 1_700_000_100.5)
+    seen: list[bool] = []
+    writer_fs = unlocked()
+
+    def pwrite(fd: int, data: bytes | memoryview, offset: int) -> int:
+        done = REAL_FS.pwrite(fd, data, offset)
+        if not seen:  # the reader runs before this rewrite's ftruncate
+            seen.append(reader.allow("IB-LED-006", state, 60))
+        return done
+
+    writer_fs.override("pwrite", pwrite)
+    writer = Notices(state, fs=writer_fs, wall=lambda: 1_700_000_100.0)
+    assert writer.allow("IB-LED-006", state, 60)  # the interval is over: shown and rewritten
+    assert seen == [False]  # shown 0.5 s ago by the writer: not again
+
+
 def test_a_symlink_or_foreign_file_as_the_notices_file_is_not_written(tmp_path: Path) -> None:
     state = tmp_path / "st"
     state.mkdir(mode=0o700)
