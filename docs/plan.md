@@ -262,8 +262,11 @@ Practices (enforced in review and by tests):
 - **Preserve the evidence.** Malformed packets are recorded raw and shown as hex with
   the failing offset highlighted; they are never silently dropped or "repaired".
 - **No code from data.** No `pickle`, `eval`, `exec`, or YAML object loading on
-  anything read from files, the wire, or shared memory. The ring and worker pool move
-  raw bytes and offsets only. The header-profile `python:` escape hatch is trusted
+  anything read from files, the wire, or shared memory. The ring moves raw bytes and
+  offsets only. The export worker pool (2m) pickles jobs and results between the parent and
+  its own spawned workers over a private socketpair; the types are fixed by ironbird's code,
+  recording bytes only ever become string or number contents inside them, and nothing read
+  from a file is unpickled. The header-profile `python:` escape hatch is trusted
   local configuration and is documented as such.
 - **Bounded resources.** Caps on per-MID caches, scroll-back, unknown-MID tables, and
   ledger queue; a flood of unique garbage MIDs cannot exhaust memory.
@@ -3938,9 +3941,9 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   configuration is read before the ledger opens, since its `[ledger]` table sets the ledger's allowances;
   an offline command (`export`, `replay`, `rec info|check|repair|prune`, `ledger prune`) kept the error and
   ran on defaults, so an `[export]` or `[retention]` table that did not load was ignored without a word.
-  Now no configuration file at all (nothing found by `-c`, `$IRONBIRD_CONFIG`, `./ironbird.toml`, the
-  XDG directory) is still not an error for these tools, but a file that is found (or named with `-c`) and
-  cannot be loaded ends the command before it does anything: the one-line coded `IB-CFG-001|002|003`
+  Now finding no configuration file in the search (`./ironbird.toml`, the XDG directory) is still not
+  an error for these tools; a file named by `-c` or `$IRONBIRD_CONFIG` that does not exist is
+  `IB-CFG-001`, and a file that is found and cannot be loaded ends the command before it does anything: the one-line coded `IB-CFG-001|002|003`
   error (`--verbose` adds the cause), exit 2, the error in full in the ledger. `tests/test_offline_config_error.py`:
   a TOML syntax error, a value of the wrong kind, an unknown `[export]` key and an unknown `[ledger]` key,
   for each of those commands.
@@ -4024,7 +4027,12 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   single process included); a faster scan would help a crash-extended file. (11) A directory export (several CSV tables, one shared
   write buffer) whose write fails in a range that holds no damage or gaps fails at the end of a
   table's block, not at the row where one process would; the damage noted may then differ by what lies
-  between. A range with damage or gaps is exact.
+  between. A range with damage or gaps is exact. (12) Signals while a pool message is mid-transfer
+  (third review): `connection.wait` returns on the first bytes, then `recv_bytes` (or a `send_bytes`
+  of a job larger than the socket buffer to a worker still starting) blocks for the whole message
+  with no checkpoint. A worker stopped mid-send (`kill -STOP`, a debugger) therefore holds the parent
+  past SIGINT and SIGTERM until it resumes. Ctrl-Z of the whole process group is unaffected. Fix: own
+  message framing read and written in polled slices with a checkpoint between.
 
 ### Error codes added in Stage 2
 
