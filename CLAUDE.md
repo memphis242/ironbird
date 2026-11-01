@@ -53,6 +53,11 @@ replays telemetry across multiple aliased hardware targets.
   costs: development here is done by an agentic system of humans and AI agents.
   Prioritize quality, simplicity, robustness, scalability, and long-term maintainability.
 
+- Priority order for ironbird, when goals conflict: (1) correctness, (2) performance,
+  (3) error handling and code quality. Performance is a first-class requirement, not a
+  later optimization: measure it, gate it with benchmarks, and choose designs that keep
+  the hot paths (capture, recording, decode, export, UI redraw) fast.
+
 - GUI and TUI work of any kind, from a new view to a styling tweak, follows the
   `gui-principles` skill; load it before starting. For the TUI, apply its
   principles translated to the terminal (panes, tables, modals, keyboard paths,

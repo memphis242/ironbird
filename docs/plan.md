@@ -363,6 +363,7 @@ interface, later sub-steps build on it unchanged.
 | 2j | Variable-length payloads | 2i (codec overlap), 2h | counted and tail arrays in CCDD, encode and decode |
 | 2k | Serial transport | 2b, 2c, 2i | `transport = "serial"` links with resync and reconnect |
 | 2l | Stage 2 acceptance, throughput gate, docs | all | end-to-end cFS scenario, 10k pkt/s gate |
+| 2m | Parallel export decode | export | worker pool by file offset; one-hour export re-measured with 200-byte frames |
 
 Parallel lanes once 2b is merged: {2c -> 2d}, {2e}, {2f}, {2i}; then 2g, 2h, 2j, 2k.
 
@@ -3781,9 +3782,9 @@ Built (all items below are done; the differences from the first design are state
   split cannot bring the target hour under 60 s, and the floor hour is within 2x of it. Caveat: the benchmark
   exports `hk_frames` (the small housekeeping message, about 75-byte frames), while the 10k target's packets are
   200 bytes with more fields per row, so the per-row rate measured here is probably optimistic for the target
-  and the 987 s figure is a lower bound; re-measure with 200-byte frames before relying on it. OPEN for the
-  user's decision: build the pool (and what a one-hour export is to cost), or accept the single pass and state
-  the cost in the README (done: the README gives the measured figures).
+  and the 987 s figure is a lower bound; re-measure with 200-byte frames before relying on it. Decided by
+  the user: build the pool, in step 2m (below), before Stage 3 feature work; performance ranks right after
+  correctness (CLAUDE.md).
 - `[recording] max_buffer_bytes` and `min_free_bytes` take the size grammar of `[ledger]` and `[retention]` (an
   integer of bytes or a string such as `"64MiB"`), with the same range checks and `IB-CFG-003` errors (found
   in review: the README showed strings the loader refused). `min_free_bytes = 0` is the integer 0 (the string
