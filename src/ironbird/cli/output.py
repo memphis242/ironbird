@@ -6,8 +6,13 @@ socket reads and the ledger. :class:`BoundedWriter` therefore hands lines to a d
 through a byte-bounded queue; when the queue is full, new lines are dropped and counted, and the
 owner reports the count as one coalesced coded notice. The thread writes to the raw file
 descriptor, so an abandoned blocked write cannot hold a buffer lock that interpreter shutdown
-would wait for. Constructing a writer never waits on the stream: text already buffered in it is
-flushed by the thread (or not at all, for a caller that cannot afford that wait).
+would wait for. Constructing a writer never waits on the stream, and neither does its thread:
+nothing here flushes the stream's own buffer, because a flush into a full pipe has no bound and
+would hold the buffer's lock. That works because the writer is the only writer of the stream
+once the command has begun: :class:`Console` owns standard output and standard error, nothing
+else writes to them while it exists (but the one confirmation question of ``prune``, written
+and flushed at once on its own), and the entry point flushes both before it creates one, so no
+text waits in their buffers.
 
 A reader that went away (``| head -1``) is a normal end of output, not an error: the writer
 records it, discards the rest and calls ``on_closed`` so the command can stop.
@@ -22,9 +27,8 @@ signals blocked, so a signal never lands in a thread that cannot act on it.
 from __future__ import annotations
 
 import bisect
-import codecs
-import contextlib
 import errno
+import functools
 import os
 import select
 import signal
@@ -52,44 +56,43 @@ WRITE_SLICE: Final = getattr(select, "PIPE_BUF", 512)
 _GONE: Final = frozenset({errno.EPIPE, errno.ECONNRESET, errno.EBADF})
 
 
-# Byte order marks a codec may put at the start of what it encodes (the longer UTF-32 little
-# endian mark begins with the UTF-16 one, so it is tried first).
-_BOMS: Final = (
-    codecs.BOM_UTF32_LE,
-    codecs.BOM_UTF32_BE,
-    codecs.BOM_UTF8,
-    codecs.BOM_UTF16_LE,
-    codecs.BOM_UTF16_BE,
-)
 LINE_MARKER: Final = "..."  # ends a line that :func:`fit_line` cut short
+# Characters that stress a codec: ASCII, a Latin letter, a CJK character, and one outside the
+# basic plane.
+_CODEC_SAMPLE: Final = "a\u00e9\u65e5\U0001f600"
 _RETRY_S: Final = 0.005  # pause between two refused writes of a non-blocking descriptor
 
 
-def _without_bom(data: bytes) -> bytes:
-    for bom in _BOMS:
-        if data.startswith(bom):
-            return data[len(bom) :]
-    return data
+@functools.lru_cache(maxsize=16)
+def _own_mark(codec: str) -> bytes:
+    """The bytes ``codec`` puts at the start of what it encodes, even of nothing (a byte order
+    mark; empty for most codecs)."""
+    return "".encode(codec)
 
 
 def line_codec(encoding: str | None) -> str:
-    """The codec a line is written with for a stream of ``encoding``: that one when a newline is
-    a single ``\\n`` byte in it (a byte order mark aside), else UTF-8. A wide codec such as
-    UTF-16 would put a mark and two-byte newlines into every line of a stream that is appended
-    to line by line."""
+    """The codec a line is written with for a stream of ``encoding``: that one when it encodes a
+    line (with characters it must escape) and a newline is a single ``\\n`` byte in it, else
+    UTF-8. A wide codec such as UTF-16 would put a mark and two-byte newlines into every line of
+    a stream that is appended to line by line; a codec that is not a text codec (``idna``) cannot
+    escape what it does not represent."""
     name = encoding or "utf-8"
     try:
-        newline = _without_bom("\n".encode(name))
-    except (LookupError, ValueError):
+        newline = encode_line("", name)
+        encode_line(_CODEC_SAMPLE, name)
+    except (LookupError, ValueError, TypeError):
         return "utf-8"
     return name if newline == b"\n" else "utf-8"
 
 
 def encode_line(text: str, codec: str) -> bytes:
     """``text`` and its newline as bytes of ``codec`` (from :func:`line_codec`), encoded in one
-    call so a stateful codec stays consistent, without a leading byte order mark; what the
-    codec cannot represent becomes a backslash escape."""
-    return _without_bom((text + "\n").encode(codec, "backslashreplace"))
+    call so a stateful codec stays consistent, without the mark the codec puts at the start of
+    what it encodes (its own, and nothing that merely looks like one: a line may begin with
+    U+FEFF); what the codec cannot represent becomes a backslash escape."""
+    data = (text + "\n").encode(codec, "backslashreplace")
+    mark = _own_mark(codec)
+    return data[len(mark) :] if mark and data.startswith(mark) else data
 
 
 def fit_line(text: str, codec: str, limit: int) -> str:
@@ -235,7 +238,11 @@ def slice_end(chunk: bytes, offset: int, limit: int = WRITE_SLICE) -> int:
 
 
 class BoundedWriter:
-    """Line writer for one stream; ``write`` never blocks."""
+    """Line writer for one stream; ``write`` never blocks.
+
+    The writer is the only one that writes to the stream's descriptor while it lives, and it
+    never touches the stream's own buffer: whatever the stream still buffers is not flushed here
+    (see the module notes)."""
 
     def __init__(
         self,
@@ -243,14 +250,12 @@ class BoundedWriter:
         *,
         max_bytes: int = MAX_QUEUED_BYTES,
         on_closed: Callable[[], None] | None = None,
-        flush_first: bool = True,
     ) -> None:
         assert max_bytes > 0
         self._stream = stream
         self._max_bytes = max_bytes
         self._on_closed = on_closed
         self._codec = line_codec(getattr(stream, "encoding", None))
-        self._flush_first = flush_first
         self._cond = threading.Condition()
         self._queue: deque[bytes] = deque()
         self._queued = 0
@@ -492,12 +497,6 @@ class BoundedWriter:
         assert fd is not None
         if hasattr(signal, "pthread_sigmask"):  # also when started some other way
             signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
-        stream = self._stream
-        if self._flush_first and stream is not None:
-            # Earlier buffered text goes out first. A full pipe can hold this flush for good,
-            # which is why it is the thread's and not the constructor's.
-            with contextlib.suppress(OSError, ValueError):
-                stream.flush()
         while (chunk := self._next_chunk()) is not None:
             view = memoryview(chunk)
             offset = 0

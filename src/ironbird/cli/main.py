@@ -513,7 +513,7 @@ def _late_err(ledger: Ledger, text: str) -> None:
     """Write a line to the process's stderr after the console's writer is closed (bounded)."""
     if sys.stderr is None:  # closed with ``2>&-``: nobody to tell
         return
-    late = BoundedWriter(sys.stderr, flush_first=False)  # a flush has no bound on a full pipe
+    late = BoundedWriter(sys.stderr)
     late.write(text)
     if not late.close(CLOSE_WAIT_S):
         ledger.record("state", "output.stderr_lost", lost=late.lost, notice=text)
@@ -2623,8 +2623,8 @@ def _stderr_line(text: str) -> None:
     from a thread, so the process never waits on the descriptor; a process that cannot start a
     thread still says what failed, through :func:`~ironbird.cli.output.write_within`, which waits
     on a separate non-blocking file description instead. Stderr is line-buffered, so no earlier
-    text waits in the stream, and the writer does not flush it (a flush into a full pipe has no
-    bound)."""
+    text waits in the stream (``main`` flushed both standard streams before any command ran),
+    and the writer does not flush it (a flush into a full pipe has no bound)."""
     stream = sys.stderr
     if stream is None:  # closed with ``2>&-``; there is nobody to tell
         return
@@ -2638,7 +2638,7 @@ def _stderr_line(text: str) -> None:
             stream.flush()
         return
     try:
-        writer = BoundedWriter(stream, flush_first=False)
+        writer = BoundedWriter(stream)
     except (RuntimeError, OSError):  # no thread could be started
         write_within(fd, encode_line(fitted, codec), CLOSE_WAIT_S)
         return
@@ -2684,6 +2684,11 @@ def main() -> int:
         for stream in (sys.stdout, sys.stderr):
             with contextlib.suppress(AttributeError, OSError, ValueError):
                 stream.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
+            # Nothing is buffered in a standard stream once the command begins, and the console
+            # is their only writer from then on (see ironbird.cli.output): text from before
+            # this point goes out here, where nothing else is waiting on the stream.
+            with contextlib.suppress(AttributeError, OSError, ValueError):
+                stream.flush()
         result: Any = app(standalone_mode=False)
     except Interrupted as stop:  # before any command could announce it (a configuration read)
         if not _STATE.announced:

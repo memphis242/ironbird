@@ -146,9 +146,9 @@ def test_a_full_socket_does_not_hold_the_line_past_the_bound(mode: str) -> None:
 
 
 def test_a_pending_partial_line_does_not_hold_a_full_pipe() -> None:
-    """Text waiting in a stream's buffer is flushed by the writer's thread: constructing the
-    writer must not wait for room in a full pipe. (The child itself cannot exit: that text can
-    never be written.)"""
+    """Constructing a writer must not wait for room in a full pipe while text waits in the
+    stream's buffer, and the writer's thread does not flush that text either. (The child itself
+    cannot exit: that text can never be written.)"""
     code = textwrap.dedent(
         f"""
         import sys, time

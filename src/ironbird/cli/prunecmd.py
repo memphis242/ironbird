@@ -115,12 +115,15 @@ def _json_plan(plan: Plan, now: float) -> dict[str, Any]:
 
 
 def _unrecovered_reserves(scan: DirScan) -> int:
-    """Leftover reserves of the sessions a recovery would have handled (all but the live ones)."""
-    return sum(
-        len(session.reserves)
-        for session in scan.sessions.values()
-        if LIVE not in session.protected and FUTURE not in session.protected
-    )
+    """Files a recovery would have handled, as distinct files: the leftover reserves of every
+    session but the live ones, and the ``.damaged`` originals whose records are in no part."""
+    files: set[tuple[int, int]] = set()
+    for session in scan.sessions.values():
+        if LIVE in session.protected or FUTURE in session.protected:
+            continue
+        files.update((f.dev, f.ino) for f in session.reserves)
+        files.update((f.dev, f.ino) for f in session.damaged if f.name in scan.pending_damaged)
+    return len(files)
 
 
 def work(
@@ -181,6 +184,7 @@ def work(
         keep_recent=keep,
         has_recording=recording_blocks(recordings, now, older),
         recover=recover,
+        check_only=not recover,
         on_record=record_recovery,
     )
     if kind == "ledger" and not recover:

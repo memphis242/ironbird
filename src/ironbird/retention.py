@@ -81,6 +81,7 @@ FUTURE: Final = "future mtime"
 INCOMPLETE: Final = "incomplete"
 HARDLINKED: Final = "hard-linked"
 UNRECOVERABLE: Final = "unrecoverable reserve"
+BUSY: Final = "locked by another process"
 DAMAGED_KEPT: Final = "damaged reserve kept"
 UNREADABLE: Final = "unreadable file"
 KEEP_RECENT: Final = "keep_recent"
@@ -218,10 +219,14 @@ class DirScan:
     unlocked: bool = False  # a lock probe was unsupported here
     recovered: int = 0
     unrecoverable: set[str] = field(default_factory=set)
+    busy: set[str] = field(default_factory=set)  # a lock held elsewhere kept a recovery out
     damaged_kept: set[str] = field(default_factory=set)  # saved, original kept as .damaged
     unreadable: set[str] = field(default_factory=set)  # a file that could not be examined
     # .damaged files this scan produced or ended, and salvage temporaries it already reported
     handled: set[str] = field(default_factory=set)
+    # .damaged files whose records are in no part, which a recovery would copy (set by
+    # classify_damaged)
+    pending_damaged: set[str] = field(default_factory=set)
     check_budget: int = field(default_factory=lambda: MAX_DAMAGED_CHECK_BYTES)
     messages: list[str] = field(default_factory=list)  # IB-RET-004 lines, ready to show
     recoveries: list[dict[str, Any]] = field(default_factory=list)  # ledger.recovered
@@ -244,6 +249,7 @@ class DirScan:
             self.handled,
             self.check_budget,
         )
+        other.busy = self.busy
 
     def total_bytes(self) -> int:
         """Bytes of all pattern files, hard links counted once."""
@@ -587,10 +593,11 @@ def apply_protection(
     """Fill ``Session.protected`` for every session of the directory (see the module notes).
 
     A session is protected when it is live, incomplete, hard-linked, holds an unrecoverable
-    reserve, a salvaged reserve's original (``.damaged``) or a file that could not be examined,
-    has its recording, is among the ``keep_recent`` most recent (of any class, and of
-    the long ones), or is a short session that started inside the span (start to newest file
-    time) of any protected long session.
+    reserve, is locked by a process that is not live (a recovery under way elsewhere, or a writer
+    that took its lock after the liveness probe), holds a salvaged reserve's original
+    (``.damaged``) or a file that could not be examined, has its recording, is among the
+    ``keep_recent`` most recent (of any class, and of the long ones), or is a short session that
+    started inside the span (start to newest file time) of any protected long session.
     """
     try:
         dir_fd = fs.open_dir(scan.path)
@@ -609,6 +616,8 @@ def apply_protection(
                 session.protected.append(HARDLINKED)
             if session.id in scan.unrecoverable:
                 session.protected.append(UNRECOVERABLE)
+            if session.id in scan.busy:
+                session.protected.append(BUSY)
             if session.id in scan.damaged_kept:
                 session.protected.append(DAMAGED_KEPT)
             if session.id in scan.unreadable:
@@ -817,7 +826,10 @@ def recover_directory(
     and its target names are free) and marks the sessions a recovery would leave protected, but
     renames, truncates and unlinks nothing, so it returns ``False`` and records nothing. A reserve
     that a recovery would salvage protects its session as it would after the salvage. What a
-    step can only learn by failing (a full disk, a permission change meanwhile) is not predicted."""
+    step can only learn by failing (a full disk, a permission change meanwhile) is not predicted.
+    A session whose lock is held elsewhere is protected (:data:`BUSY`) for the pass in both modes.
+    A recovery keeps the times of the file it cuts or copies, so a session just recovered is
+    judged by its true age, as the check-only pass judges it."""
     if scan.kind != "ledger" or scan.unsafe or not scan.exists:
         return False
     try:
@@ -878,7 +890,10 @@ def _recover_session(ctx: RecoveryContext) -> bool:
             fs.flock(fd1, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-                return False  # a writer, or another scan recovering the session: try next scan
+                # A writer, or another scan recovering the session: what it holds is unknown
+                # to this pass, so the session is protected from a deletion in it.
+                scan.busy.add(session.id)
+                return False
             scan.unlocked = True
             _unrecoverable(scan, session, named, "file locks are unavailable here")
             return False
@@ -920,7 +935,8 @@ def _recover_locked(ctx: RecoveryContext, held: list[int]) -> bool:
                 scan, session, reserve.name, f"the file system failed: {exc.strerror or exc}"
             )
             return changed
-        if outcome == "skip":
+        if outcome == "skip":  # a lock held elsewhere: the session is protected for this pass
+            scan.busy.add(session.id)
             return changed
         changed |= outcome == "changed"
         if outcome == "stop":
@@ -944,8 +960,8 @@ def _recover_locked(ctx: RecoveryContext, held: list[int]) -> bool:
 
 
 def _recover_reserve(ctx: RecoveryContext, reserve: FileEntry, held: list[int]) -> str:
-    """One reserve: ``"changed"``, ``"unchanged"``, ``"skip"`` (leave the session for the next
-    scan) or ``"stop"`` (left untouched and reported)."""
+    """One reserve: ``"changed"``, ``"unchanged"``, ``"skip"`` (its lock is held elsewhere: leave
+    the session for the next scan) or ``"stop"`` (left untouched and reported)."""
     fs, scan, session, name = ctx.fs, ctx.scan, ctx.session, reserve.name
     try:
         fd = fs.open_at(ctx.dir_fd, name, INSPECT_RW_FLAGS)
@@ -1072,6 +1088,10 @@ def _commit_recovered(
         try:
             with _stepping(ctx, step):  # clear before the record is handed out
                 fs.ftruncate(fd, cut)
+                # The cut moved the file's times to now; the part keeps the reserve's own, so
+                # the session is judged by when it was last active and not by when it was
+                # recovered.
+                fs.utime_ns(fd, st.st_atime_ns, st.st_mtime_ns)
                 fs.fdatasync(fd)
                 rename_noreplace(ctx.dir_fd, name, new, fd, fs=fs)
         except Collision:
@@ -1476,6 +1496,8 @@ def classify_damaged(fs: FileSystem, scan: DirScan) -> None:
                     scan.damaged_kept.add(session.id)
                     continue
                 unfinished = True
+                if check.state == "pending":
+                    scan.pending_damaged.add(entry.name)
                 scan.unrecoverable.add(session.id)
                 scan.messages.append(_unfinished_message(entry, check))
             temps = [t for t in session.temps if t.name not in scan.handled]
@@ -1549,6 +1571,8 @@ def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, s
                     raise OSError(errno.EIO, "the reserve ended early")
                 out.write(block)
                 offset += len(block)
+            source = fs.fstat(fd)  # the part keeps the original's times (see _commit_recovered)
+            fs.utime_ns(out.fd, source.st_atime_ns, source.st_mtime_ns)
             try:
                 out.commit()
             except LeftoverAfterCommit as exc:  # renamed all the same
@@ -1581,18 +1605,24 @@ def full_scan(
     keep_recent: int,
     has_recording: Callable[[str], bool] | None = None,
     recover: bool = True,
+    check_only: bool = False,
     control: ScanControl | None = None,
     on_record: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> DirScan:
     """Scan, probe liveness, recover leftover reserves (a ledger directory; ``recover=False``
-    leaves them for a scan that may, but still checks them so that the sessions a recovery would
-    protect are protected), account for the salvaged originals, then decide the protections -
-    the one pass a warning check and a prune both start from."""
+    only looks: no lock is taken and no reserve is read, so a short command pays for the listing
+    alone), account for the salvaged originals, then decide the protections - the one pass a
+    warning check and a prune both start from.
+
+    ``check_only`` (without ``recover``) is the prune that may not recover, a dry run with no
+    usable ledger: it makes the checks of a recovery, locks and reads included, so the sessions
+    a recovery would protect are protected, and changes no file (see :func:`recover_directory`)."""
+    assert not (recover and check_only), "a scan recovers or only checks, not both"
     scan = scan_directory(fs, path, kind)
     live = liveness(fs, path, scan, now, own_session)
     if kind == "ledger":
-        if recover_directory(
-            fs, scan, live, own_session, control, on_record, check_only=not recover
+        if (recover or check_only) and recover_directory(
+            fs, scan, live, own_session, control, on_record, check_only=check_only
         ):
             again = scan_directory(fs, path, kind)
             scan.carry_to(again)

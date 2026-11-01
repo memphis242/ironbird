@@ -141,6 +141,10 @@ class FileSystem:
     def utime(self, fd: int) -> None:
         os.utime(fd, None)
 
+    def utime_ns(self, fd: int, atime_ns: int, mtime_ns: int) -> None:
+        """Set the access and modification times of ``fd`` to the given nanosecond values."""
+        os.utime(fd, ns=(atime_ns, mtime_ns))
+
     # -- locks and metadata -------------------------------------------------------------
 
     def flock(self, fd: int, operation: int) -> None:

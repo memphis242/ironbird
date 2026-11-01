@@ -93,6 +93,7 @@ def test_check_only_marks_the_sessions_a_recovery_would_protect_and_changes_noth
         own_session=None,
         keep_recent=0,
         recover=False,
+        check_only=True,
     )
     assert {p.name: p.read_bytes() for p in state.iterdir()} == before
     assert foreign.exists() and clean.exists() and damaged.exists()

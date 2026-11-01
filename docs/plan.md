@@ -845,12 +845,17 @@ As built (where the build differs from, or settles, the text above)
   of an iteration and iterating again loses nothing. `Capture.next_batch()` (at most 512 frames)
   transfers what it returns to the caller.
   `BoundedWriter` writes whole chunks to a regular file or a terminal and `PIPE_BUF` slices only
-  to pipes and sockets, where atomicity matters. Constructing one never waits on the stream: the
-  flush of text already buffered in it (so that it goes out first) is the writer thread's, and
-  a caller that cannot afford even that (the last-resort stderr lines) asks for none. A line is
-  encoded in one call with the stream's codec, without a leading byte order mark, and with UTF-8
-  when that codec does not write a newline as the single byte `\n` (UTF-16 and UTF-32 would put a
-  mark and two-byte newlines into every line).
+  to pipes and sockets, where atomicity matters. Neither constructing one nor its thread ever
+  waits on the stream: nothing flushes the stream's own buffer (a flush into a full pipe has no
+  bound and holds the buffer's lock). That rests on one invariant: `Console` is the only writer
+  of standard output and standard error once a command has begun (the confirmation question of
+  `prune` aside, which is written and flushed on its own), and `main()` flushes both streams
+  once, synchronously, before any console exists, so no text waits in their buffers. A line is
+  encoded in one call with the stream's codec, without the mark that codec itself puts at the
+  start (`"".encode(codec)`, cached per codec; a line that begins with U+FEFF keeps it), and with
+  UTF-8 when that codec does not write a newline as the single byte `\n` (UTF-16 and UTF-32 would
+  put a mark and two-byte newlines into every line) or cannot encode a sample line with the
+  backslash escape (`idna`).
 - Sinks are attached once however many holders ask (reference counted by identity), so one sink
   on two captures sees each frame once. A sink that raises is detached on its first failure and
   reported and ledgered once (`sink.detached`), never once per frame; its holders stay counted,
@@ -1580,8 +1585,9 @@ Deliverables
     runs (the projection needs other sessions' growth); a short command only when the last
     scan by any process is older than `scan_interval` (its time is kept in the notices
     file, below), so a script of a thousand `ib send` runs scans about once per 10 min.
-    *Who recovers*: long sessions and prune. A short command only looks (it warns), since it
-    is about to exit and a recovery rewrites files; a long session's exit gives a step under
+    *Who recovers*: long sessions and prune. A short command only looks (it warns): it takes
+    no lock on a reserve and reads none, since it is about to exit and a recovery rewrites
+    files; the liveness probe and the listing are all it pays for. A long session's exit gives a step under
     way (a salvage copy) the exit's waiting budget instead of cutting it off, and starts no
     further step. The scan and the notices file are used on worker threads only: neither
     the main thread nor the event loop ever waits for the state directory, so a hung one
@@ -1591,7 +1597,9 @@ Deliverables
     the ledger, and the next scan runs).
   - *Cost*: in a worker thread, at most 100 000 directory entries per directory; head reads
     newest first and only as far as the protection rules and the candidates need, at most
-    one 4 KiB read per session. Beyond the bound, or with a
+    one 4 KiB read per session. A short command's scan reads no reserve (it only looks); the
+    whole-reserve read of a recovery, and the check-only pass that makes the same reads, belong
+    to a long session and to prune. Beyond the bound, or with a
     directory unreadable, the figures are partial: `IB-RET-004`, displayed at most once per
     `warn_interval` per directory.
 - *Age warning* `IB-RET-001`: non-protected sessions whose newest file's mtime is older
@@ -1637,13 +1645,23 @@ Deliverables
   - *Needs a ledger*: a deletion must leave a trace, so with `IB-LED-002` (configuration)
     prune refuses to delete (exit 1, nothing deleted), as transmitting commands do;
     `--dry-run` still lists, but recovers no leftover reserve (a recovery renames files and must
-    leave a trace): a warning with `IB-LED-002` says how many leftover reserves of non-live
-    sessions were not recovered (none, no warning). The scan still runs every check a recovery
-    makes before it changes a file (`recover_directory(check_only=True)`: the reserve opens, is a
-    regular file of the user, locks, carries its session's header and a complete record, and its
-    target name is free), so the sessions a real prune protects as `unrecoverable reserve` or
+    leave a trace): a warning with `IB-LED-002` says how many files a recovery would have
+    handled (the leftover reserves of non-live sessions, and the `.damaged` originals whose
+    records are in no part, a file with two names counted once; none, no warning). The scan
+    still runs every check a recovery makes before it changes a file (`full_scan(check_only=True)`,
+    which only this dry run asks for, and `recover_directory(check_only=True)`: the reserve opens,
+    is a regular file of the user, locks, carries its session's header and a complete record, and
+    its target name is free), so the sessions a real prune protects as `unrecoverable reserve` or
     as holding a `.damaged` original are protected in the listing too, and nothing is renamed,
-    truncated or unlinked. Every `IB-RET-004` line the scan
+    truncated or unlinked. A recovery keeps the times of what it cuts or copies (`utime` with
+    the reserve's original nanosecond times after the `ftruncate`, before the sync and rename;
+    a salvaged part gets the original's), so a session just recovered is judged by its true age
+    and the check-only listing and a real prune's agree. The one divergence is accepted: an
+    interrupted rename (a reserve name that is a second name of a part) is protected as
+    hard-linked by the check-only pass, while a real recovery unlinks the name and may list the
+    session; it errs on the safe side (never lists what a real prune keeps). In both modes a
+    session whose part 1 or reserve lock is held by another process is protected for the pass
+    (`locked by another process`), so a prune that cannot recover it never lists it. Every `IB-RET-004` line the scan
     shows is also a `retention.warning` record in the ledger, in full, with `shown` true
     (`Ledger.warn(shown=)` sets it for a warning the caller displayed itself). A stalled ledger (transient, such as the full disk prune is
     run to fix) does not refuse: the `prune.*` records are queued, the deletions usually
@@ -2084,21 +2102,32 @@ As built (where the build differs from, or settles, the text above)
   of an adopted temporary file sit in `TempOutput._adopt`, which the guard's allowlist names;
   an abandoned salvage record has the same `kept` + `cut` = size as the others, and the close
   never prints a second stall or unlogged line with other figures than the first.
-- **PR #10 review, round 4 (fixed).** The last-resort stderr line is bounded on a stalled
+- **PR #16 review (fixed).** (The code came from Stage 2d; this entry was labelled "PR #10
+  review, round 4".) The last-resort stderr line is bounded on a stalled
   terminal (a `BoundedWriter` thread, or `write_within` when no thread starts); its encoding is
-  one call, without a byte order mark, UTF-8 for a codec with a wide newline, and a cut line
-  ends in a marker at a character boundary. A `BoundedWriter` no longer flushes the stream in
-  its constructor (the flush runs on its thread). A dry run without a usable ledger runs the
-  checks of a recovery without changing a file (`check_only`), so it protects the sessions a
-  real prune protects; its `IB-LED-002` warning counts the non-live leftover reserves and is
-  silent when there are none. The `retention.warning` records of the scan warnings a prune
+  one call, without the codec's own byte order mark, UTF-8 for a codec with a wide newline or
+  one that cannot escape (`idna`), and a cut line ends in a marker at a character boundary. A
+  `BoundedWriter` never flushes the stream (not in its constructor, and not on its thread: a
+  flush into a full pipe holds the buffer's lock for good); `Console` is the only writer of the
+  standard streams and `main()` flushes both once before any console exists. A dry run without
+  a usable ledger runs the checks of a recovery without changing a file (`check_only`, asked
+  for by that dry run alone; a short command's scan only looks), so it protects the sessions a
+  real prune protects; its `IB-LED-002` warning counts the non-live leftover reserves and the
+  pending `.damaged` originals, and is silent when there are none. A recovery keeps the
+  original's modification time on the part it commits (and on a salvaged part), and a lock
+  held elsewhere protects its session for the pass. The `retention.warning` records of the scan warnings a prune
   displays say `shown` true (`Ledger.warn(shown=)`). A clean reserve's truncate, sync and
   rename are the `stepping` window of the exit's wait and nothing more (the signals-held scope
   encloses it), so the window has closed before the `ledger.recovered` record is handed out and
   an exit that gives up on the wait cannot also write `ledger.recovery_incomplete` for a rename
   that was done and recorded.
 - **Deferred.** The stderr line for exit 6 found only at the final close is written through a
-  bounded late writer. A `.damaged` file keeps its session protected until the user deletes it:
+  bounded late writer. `write_within` on a terminal or FIFO whose reopen through
+  `/proc/self/fd` is refused (`EACCES`, `ENOENT`, `EBUSY`; a terminal handed to another user by
+  `su`) has no bounded wait: it is reachable only when no thread can start and the reopen is
+  refused at once, and the line is dropped (the call returns `False`) rather than risking a
+  blocking write; no timer is armed for it. Accepted gap. Check-only over-protects an
+  interrupted rename (see Prune). A `.damaged` file keeps its session protected until the user deletes it:
   there is no command that does that for them. The 1000-run `ib send` loops against a no-lock file system are covered by the
   in-process 1000-caller test of the notices file and the per-process warnings, not by 1000
   subprocesses. The `IB-RET-002` projection is tested with an injected clock and rate source, not

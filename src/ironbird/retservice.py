@@ -162,7 +162,8 @@ class Retention:
         own = self._ledger.session_id
         keep = self._cfg.keep_recent
         # A short command only looks: recovering a reserve rewrites files, and a command about
-        # to exit must not leave that half done. Long sessions and prune recover.
+        # to exit must not leave that half done; it takes no lock and reads no reserve either,
+        # so it costs a listing and nothing more. Long sessions and prune recover.
         recover = self._long
         recordings: DirScan | None = None
         if self._recording_dir is not None:
