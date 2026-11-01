@@ -116,10 +116,12 @@ def _json_plan(plan: Plan, now: float) -> dict[str, Any]:
 
 def _unrecovered_reserves(scan: DirScan) -> int:
     """Files a recovery would have handled, as distinct files: the leftover reserves of every
-    session but the live ones, and the ``.damaged`` originals whose records are in no part."""
+    session but the live ones and those another process holds (:data:`BUSY`: a recovery is
+    skipped there with a ledger too), and the ``.damaged`` originals whose records are in no
+    part."""
     files: set[tuple[int, int]] = set()
     for session in scan.sessions.values():
-        if LIVE in session.protected or FUTURE in session.protected:
+        if LIVE in session.protected or FUTURE in session.protected or session.id in scan.busy:
             continue
         files.update((f.dev, f.ino) for f in session.reserves)
         files.update((f.dev, f.ino) for f in session.damaged if f.name in scan.pending_damaged)
@@ -192,8 +194,8 @@ def work(
         if left:
             console.err(
                 f"warning {Code.LED_DIR.value}: the action ledger cannot be used, so {left} "
-                "leftover reserve(s) were not recovered (a recovery must leave a trace); fix "
-                "the ledger and run again"
+                "leftover reserve(s) or set-aside original(s) were not recovered (a recovery "
+                "must leave a trace); fix the ledger and run again"
             )
     for message in (*scan.messages, *([scan.partial] if scan.partial else [])):
         console.err(f"warning {Code.RET_SCAN.value}: {term(message, 1000, err=True)}")

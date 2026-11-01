@@ -1586,8 +1586,10 @@ Deliverables
     scan by any process is older than `scan_interval` (its time is kept in the notices
     file, below), so a script of a thousand `ib send` runs scans about once per 10 min.
     *Who recovers*: long sessions and prune. A short command only looks (it warns): it takes
-    no lock on a reserve and reads none, since it is about to exit and a recovery rewrites
-    files; the liveness probe and the listing are all it pays for. A long session's exit gives a step under
+    no lock on a reserve and reads none a writer may hold (`.reserve`), since it is about to exit
+    and a recovery rewrites files; it pays for the liveness probe, the listing and the check of
+    the `.damaged` originals of earlier salvages (one 4 KiB head each, and at most
+    `MAX_DAMAGED_CHECK_BYTES`, 256 MiB, of further reads per scan). A long session's exit gives a step under
     way (a salvage copy) the exit's waiting budget instead of cutting it off, and starts no
     further step. The scan and the notices file are used on worker threads only: neither
     the main thread nor the event loop ever waits for the state directory, so a hung one
@@ -1597,9 +1599,10 @@ Deliverables
     the ledger, and the next scan runs).
   - *Cost*: in a worker thread, at most 100 000 directory entries per directory; head reads
     newest first and only as far as the protection rules and the candidates need, at most
-    one 4 KiB read per session. A short command's scan reads no reserve (it only looks); the
-    whole-reserve read of a recovery, and the check-only pass that makes the same reads, belong
-    to a long session and to prune. Beyond the bound, or with a
+    one 4 KiB read per session. A short command's scan reads no `.reserve` (it only looks) but
+    checks each `.damaged` original within the bound above; the whole-reserve read of a
+    recovery, and the check-only pass that makes the same reads, belong to a long session and
+    to prune. Beyond the bound, or with a
     directory unreadable, the figures are partial: `IB-RET-004`, displayed at most once per
     `warn_interval` per directory.
 - *Age warning* `IB-RET-001`: non-protected sessions whose newest file's mtime is older
@@ -1646,8 +1649,9 @@ Deliverables
     prune refuses to delete (exit 1, nothing deleted), as transmitting commands do;
     `--dry-run` still lists, but recovers no leftover reserve (a recovery renames files and must
     leave a trace): a warning with `IB-LED-002` says how many files a recovery would have
-    handled (the leftover reserves of non-live sessions, and the `.damaged` originals whose
-    records are in no part, a file with two names counted once; none, no warning). The scan
+    handled (the leftover reserves of non-live sessions that no other process holds, and the
+    `.damaged` originals whose records are in no part, a file with two names counted once;
+    none, no warning; the message says "leftover reserve(s) or set-aside original(s)"). The scan
     still runs every check a recovery makes before it changes a file (`full_scan(check_only=True)`,
     which only this dry run asks for, and `recover_directory(check_only=True)`: the reserve opens,
     is a regular file of the user, locks, carries its session's header and a complete record, and
@@ -1655,11 +1659,21 @@ Deliverables
     as holding a `.damaged` original are protected in the listing too, and nothing is renamed,
     truncated or unlinked. A recovery keeps the times of what it cuts or copies (`utime` with
     the reserve's original nanosecond times after the `ftruncate`, before the sync and rename;
-    a salvaged part gets the original's), so a session just recovered is judged by its true age
-    and the check-only listing and a real prune's agree. The one divergence is accepted: an
-    interrupted rename (a reserve name that is a second name of a part) is protected as
+    a salvaged part gets the original's, taken before the reserve is read; a `utime` that fails
+    does not stop the recovery: the part then looks fresh, which only protects it, and the
+    `ledger.recovered` record carries `utime_error`), so a session just recovered is judged by
+    its true age. The check-only listing is a projection of what a recovery leaves: a clean
+    reserve at the size of its records (the cut drops the preallocated tail, so
+    `--until-under`, the totals and `IB-RET-005` do not count it), a damaged one with the part
+    saved from it, a pending `.damaged` original with the part its copy would add (the session
+    kept as `damaged reserve kept`, as after the copy). The scan is marked `projected` and
+    `execute_plan` asserts it is not given one. The check-only listing and a real prune's agree
+    on the sessions listed, the totals and the protected-bytes line (tested over 19 states,
+    with a 32 MiB reserve). The one divergence is accepted: an interrupted rename or set-aside
+    (a reserve name that is a second name of a part or of its `.damaged` file) is protected as
     hard-linked by the check-only pass, while a real recovery unlinks the name and may list the
-    session; it errs on the safe side (never lists what a real prune keeps). In both modes a
+    session (or, for a set-aside, keep it as `damaged reserve kept`); it errs on the safe side
+    (never lists what a real prune keeps). In both modes a
     session whose part 1 or reserve lock is held by another process is protected for the pass
     (`locked by another process`), so a prune that cannot recover it never lists it. Every `IB-RET-004` line the scan
     shows is also a `retention.warning` record in the ledger, in full, with `shown` true
@@ -2121,6 +2135,13 @@ As built (where the build differs from, or settles, the text above)
   encloses it), so the window has closed before the `ledger.recovered` record is handed out and
   an exit that gives up on the wait cannot also write `ledger.recovery_incomplete` for a rename
   that was done and recorded.
+- **PR #16 review, round 6 (fixed).** The check-only listing projects what a recovery leaves
+  (sizes, saved parts, `projected`), so `--until-under`, the totals, `IB-RET-005` and the
+  protected-bytes line agree with a real prune; a short command's scan reads no `.reserve` but
+  does check `.damaged` originals within `MAX_DAMAGED_CHECK_BYTES` plus a 4 KiB head each; a
+  failing `utime` is recorded (`utime_error`) and the recovery goes on; a salvaged part takes
+  the original's access time from before the read; the `IB-LED-002` count says "leftover
+  reserve(s) or set-aside original(s)" and leaves out sessions another process holds.
 - **Deferred.** The stderr line for exit 6 found only at the final close is written through a
   bounded late writer. `write_within` on a terminal or FIFO whose reopen through
   `/proc/self/fd` is refused (`EACCES`, `ENOENT`, `EBUSY`; a terminal handed to another user by

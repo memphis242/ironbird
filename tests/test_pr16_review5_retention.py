@@ -16,12 +16,13 @@ from pathlib import Path
 
 import pytest
 
+from ironbird import retention
 from ironbird.cli import prunecmd
 from ironbird.cli.output import Console
 from ironbird.config import RetentionConfig
 from ironbird.fsops import REAL_FS, FileSystem
 from ironbird.ledger import Ledger
-from ironbird.prune import execute_plan, make_plan
+from ironbird.prune import Plan, execute_plan, list_lines, make_plan
 from ironbird.retention import (
     BUSY,
     DirScan,
@@ -34,6 +35,7 @@ from ironbird.retention import (
 )
 from ironbird.retnotices import Notices
 from ironbird.retservice import Retention
+from ironbird.units import MIB
 from retutil import DAY, make_reserve, make_session, reserve_header, sid, stamp
 
 NOW = time.time()
@@ -99,6 +101,13 @@ def _build(d: Path, case: str) -> None:
     elif case == "setaside_exists":
         r = make_reserve(d, 1, 1, _damaged(1), now=NOW)
         (d / (r.name + ".damaged")).mkdir()
+    elif case == "until_under":
+        # a crashed session's 32 MiB preallocated reserve, the oldest, and a clean newer session
+        make_reserve(d, 1, 1, _clean(1), now=NOW, pad_to=32 * MIB)
+        make_session(d, 2, age_days=2, size=1 * MIB, now=NOW)
+    elif case == "until_under_damaged":
+        make_reserve(d, 1, 1, _damaged(1), now=NOW, pad_to=32 * MIB)
+        make_session(d, 2, age_days=2, size=1 * MIB, now=NOW)
     elif case == "short_inside_long":
         make_session(d, 2, age_days=3.5, now=NOW, klass="long")
         make_reserve(d, 2, 1, _clean(2), now=NOW, age_days=3.5)
@@ -126,11 +135,16 @@ CASES = [
     "clean_unpadded",
     "setaside_exists",
     "short_inside_long",
+    "until_under",
+    "until_under_damaged",
 ]
 # Check-only protects an interrupted rename (a reserve name that is a second name of a part) as
 # hard-linked, while a real recovery unlinks the reserve name and the session becomes prunable:
 # the divergence is on the safe side, and accepted (docs/plan.md, PR #16 review).
 ACCEPTED_DIVERGENCE = frozenset({"interrupted_rename"})
+# The same cause where the session is protected either way: the protected-bytes line says
+# "hard-linked" for the check-only pass and "damaged reserve kept" after a real recovery.
+HARD_LINK_LABEL = frozenset({"interrupted_setaside"})
 
 
 def _snapshot(d: Path) -> dict[str, tuple[object, ...]]:
@@ -152,6 +166,11 @@ def _snapshot(d: Path) -> dict[str, tuple[object, ...]]:
 def _candidates(scan: DirScan, now: float) -> list[str]:
     plan = make_plan(scan, older_than_s=86400, until_under=None, now=now)
     return sorted(c.session.id for c in plan.candidates)
+
+
+def _listing(plan: Plan, now: float) -> list[str]:
+    """What ``ib ledger prune`` prints for a plan, without the directory's name."""
+    return [line.replace(str(plan.scan.path), "<dir>") for line in list_lines(plan, now)]
 
 
 def _protected(scan: DirScan) -> dict[str, bool]:
@@ -188,6 +207,23 @@ def test_check_only_and_a_real_recovery_list_the_same_sessions(tmp_path: Path, c
         return
     assert _candidates(checked, now) == _candidates(real, now), report
     assert _protected(checked) == _protected(real), report
+    # the figures agree too: a check-only pass counts a clean reserve at the size a recovery
+    # leaves it, so a size-driven plan, the totals and the protected-bytes line are the same
+    assert checked.total_bytes() == real.total_bytes(), report
+    for until in (1, 2 * MIB, 8 * MIB):
+        a = make_plan(checked, older_than_s=None, until_under=until, now=now)
+        b = make_plan(real, older_than_s=None, until_under=until, now=now)
+        assert [c.session.id for c in a.candidates] == [c.session.id for c in b.candidates], report
+        assert (a.total_bytes, a.selected_bytes, a.unreachable) == (
+            b.total_bytes,
+            b.selected_bytes,
+            b.unreachable,
+        ), report
+        if case in HARD_LINK_LABEL:
+            assert sum(a.protected.values()) == sum(b.protected.values()), report
+            continue
+        assert a.protected == b.protected, report
+        assert _listing(a, now) == _listing(b, now), report
 
 
 def test_a_recovered_reserve_keeps_the_age_of_the_file(tmp_path: Path) -> None:
@@ -223,24 +259,32 @@ def test_a_just_recovered_session_is_judged_by_its_true_age(tmp_path: Path) -> N
 
 
 class _CountingFs(FileSystem):
-    """Counts the locks taken on, and the bytes read from, reserve files (the liveness probe's
-    locks on parts are not a recovery's)."""
+    """Counts the locks taken on, and the bytes read from, reserve files and the ``.damaged``
+    originals of salvaged ones (the liveness probe's locks on parts are not a recovery's)."""
 
     def __init__(self) -> None:
         self.flocks = 0
-        self.reads = 0
+        self.reads = 0  # bytes read from a reserve or a .damaged original
+        self.damaged_reads = 0  # of those, from a .damaged original
 
     @staticmethod
-    def _is_reserve(fd: int) -> bool:
-        return os.readlink(f"/proc/self/fd/{fd}").split(" (deleted)")[0].endswith(".reserve")
+    def _target(fd: int) -> str:
+        return os.readlink(f"/proc/self/fd/{fd}").split(" (deleted)")[0]
+
+    @classmethod
+    def _is_reserve(cls, fd: int) -> bool:
+        return cls._target(fd).endswith((".reserve", ".reserve.damaged"))
 
     def flock(self, fd: int, operation: int) -> None:
         self.flocks += self._is_reserve(fd)
         super().flock(fd, operation)
 
     def pread(self, fd: int, length: int, offset: int) -> bytes:
-        self.reads += self._is_reserve(fd)
-        return super().pread(fd, length, offset)
+        data = super().pread(fd, length, offset)
+        if self._is_reserve(fd):
+            self.reads += len(data)
+            self.damaged_reads += len(data) * self._target(fd).endswith(".damaged")
+        return data
 
 
 def test_a_scan_that_only_looks_takes_no_lock_and_reads_no_reserve(tmp_path: Path) -> None:
@@ -253,6 +297,35 @@ def test_a_scan_that_only_looks_takes_no_lock_and_reads_no_reserve(tmp_path: Pat
     scan = full_scan(fs, d, "ledger", now=now, own_session=None, keep_recent=0, recover=False)
     assert fs.flocks == probe.flocks and fs.reads == 0
     assert scan.recoveries == [] and len(list(d.glob("*.reserve"))) == 1
+
+
+def test_a_scan_that_only_looks_reads_damaged_originals_within_its_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No reserve a writer may hold is read, but each salvaged original is checked: a 4 KiB head
+    and then at most ``MAX_DAMAGED_CHECK_BYTES`` for the whole scan."""
+    budget = 1 * MIB
+    monkeypatch.setattr(retention, "MAX_DAMAGED_CHECK_BYTES", budget)
+    d = tmp_path / "st"
+    d.mkdir(mode=0o700)
+    for s in (1, 2, 3):
+        make_session(d, s, age_days=3, now=NOW)
+        body = (reserve_header(sid(s)) + "".join(rec(s, n) for n in range(5000))).encode()
+        body += b"\0" * 8 + b"junk"  # about 650 KiB of records, then damage
+        r = make_reserve(d, s, 1, body, now=NOW)
+        r.rename(d / (r.name + ".damaged"))
+    make_session(d, 4, age_days=3, now=NOW)
+    make_reserve(d, 4, 1, _clean(4), now=NOW, pad_to=3 * MIB)  # a clean reserve
+    fs = _CountingFs()
+    probe = _CountingFs()
+    now = time.time()
+    liveness(probe, d, scan_directory(probe, d, "ledger"), now, None)
+    scan = full_scan(fs, d, "ledger", now=now, own_session=None, keep_recent=0, recover=False)
+    assert fs.flocks == probe.flocks
+    assert fs.reads == fs.damaged_reads, "a reserve (not a .damaged original) was read"
+    assert 0 < fs.damaged_reads <= budget + 3 * (retention.HEAD_BYTES + 1)
+    assert scan.recoveries == [] and len(list(d.glob("*.reserve"))) == 1
+    assert scan.check_budget <= 0  # the budget really was the limit here
 
 
 def test_a_check_only_scan_is_an_explicit_choice(tmp_path: Path) -> None:
@@ -389,7 +462,7 @@ def test_led002_warning_counts_a_pending_damaged_original(
     _build(state, "damaged_file_pending")
     err = _dry_run_stderr(state, tmp_path, monkeypatch)
     assert "IB-LED-002" in err
-    assert "1 leftover reserve(s)" in err
+    assert "1 leftover reserve(s) or set-aside original(s)" in err
 
 
 def test_led002_warning_counts_a_reserve_that_is_also_a_damaged_original_once(
@@ -398,4 +471,4 @@ def test_led002_warning_counts_a_reserve_that_is_also_a_damaged_original_once(
     state = tmp_path / "state"
     _build(state, "interrupted_setaside")
     err = _dry_run_stderr(state, tmp_path, monkeypatch)
-    assert "1 leftover reserve(s)" in err
+    assert "1 leftover reserve(s) or set-aside original(s)" in err

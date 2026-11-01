@@ -27,7 +27,7 @@ import threading
 import time
 from bisect import bisect_right
 from collections.abc import Callable, Generator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Final
 
@@ -74,6 +74,7 @@ PART: Final = "part"  # a ledger part or a recording (part 1 has no number in it
 RESERVE: Final = "reserve"  # ``.rNNNN.reserve``
 DAMAGED: Final = "damaged"  # ``.rNNNN.reserve.damaged``, the original of a salvaged reserve
 TEMP: Final = "temp"  # a salvage's dot-temporary file; ``number`` is the part it would become
+PROJECTED: Final = "projected"  # check-only: the part a recovery would save from a damaged reserve
 
 # Protection reasons, in the order they are attributed to a session's bytes.
 LIVE: Final = "live"
@@ -150,6 +151,7 @@ class Session:
     files: list[FileEntry] = field(default_factory=list)
     klass: str | None = None  # "long" | "short" (read lazily from part 1's head)
     protected: list[str] = field(default_factory=list)
+    projected_parts: int = 0  # check-only: the parts a recovery would make of the reserves
 
     @property
     def has_part1(self) -> bool:
@@ -172,7 +174,7 @@ class Session:
 
     @property
     def parts(self) -> int:
-        return sum(1 for f in self.files if f.is_part)
+        return sum(1 for f in self.files if f.is_part) + self.projected_parts
 
     @property
     def reserves(self) -> list[FileEntry]:
@@ -228,6 +230,11 @@ class DirScan:
     # classify_damaged)
     pending_damaged: set[str] = field(default_factory=set)
     check_budget: int = field(default_factory=lambda: MAX_DAMAGED_CHECK_BYTES)
+    check_only: bool = False  # the listing is what a recovery would leave (see ``projected``)
+    # Entries a check-only pass projected (a clean reserve at the size a recovery leaves of it, the
+    # part a recovery would save from a damaged one): the listing is a projection, so no deletion
+    # may be made from it.
+    projected: int = 0
     messages: list[str] = field(default_factory=list)  # IB-RET-004 lines, ready to show
     recoveries: list[dict[str, Any]] = field(default_factory=list)  # ledger.recovered
     incompletes: list[dict[str, Any]] = field(default_factory=list)  # ledger.recovery_incomplete
@@ -828,6 +835,9 @@ def recover_directory(
     that a recovery would salvage protects its session as it would after the salvage. What a
     step can only learn by failing (a full disk, a permission change meanwhile) is not predicted.
     A session whose lock is held elsewhere is protected (:data:`BUSY`) for the pass in both modes.
+    The listing shows what a recovery would leave: a clean reserve at the size of its records
+    (without the preallocated tail), a damaged one with the part saved from it; the scan counts
+    these entries in ``projected``, and nothing may be deleted from such a listing.
     A recovery keeps the times of the file it cuts or copies, so a session just recovered is
     judged by its true age, as the check-only pass judges it."""
     if scan.kind != "ledger" or scan.unsafe or not scan.exists:
@@ -1082,6 +1092,11 @@ def _commit_recovered(
         if try_stat_at(fs, ctx.dir_fd, new) is not None:
             _unrecoverable(scan, session, name, f"a file already has the next part name {new}")
             return "stop"
+        # A recovery cuts the reserve's preallocated tail, so the part has the size of its
+        # records: the listing counts that.
+        session.files[session.files.index(reserve)] = replace(reserve, size=cut)
+        session.projected_parts += 1
+        scan.projected += 1
         ctx.next_part += 1
         return "unchanged"
     with signals_held():  # the rename and its record are one step
@@ -1090,8 +1105,12 @@ def _commit_recovered(
                 fs.ftruncate(fd, cut)
                 # The cut moved the file's times to now; the part keeps the reserve's own, so
                 # the session is judged by when it was last active and not by when it was
-                # recovered.
-                fs.utime_ns(fd, st.st_atime_ns, st.st_mtime_ns)
+                # recovered. Where that cannot be done the part looks fresh, which only
+                # protects it longer, so the recovery goes on and the record says so.
+                try:
+                    fs.utime_ns(fd, st.st_atime_ns, st.st_mtime_ns)
+                except OSError as exc:
+                    record["utime_error"] = exc.strerror or str(exc)
                 fs.fdatasync(fd)
                 rename_noreplace(ctx.dir_fd, name, new, fd, fs=fs)
         except Collision:
@@ -1111,6 +1130,26 @@ def _commit_recovered(
         ctx.report("ledger.recovered", record)
         ctx.next_part += 1
     return "changed"
+
+
+def _project_part(
+    scan: DirScan, session: Session, source: FileEntry, number: int, size: int
+) -> None:
+    """Add the part a recovery would save from ``source`` (check-only), ``size`` bytes with the
+    times of ``source``, as a listing entry no file of the directory backs."""
+    scan.projected += 1
+    session.projected_parts += 1
+    session.files.append(
+        replace(
+            source,
+            name=part_name(_stamp_of(session), session.id, number),
+            number=number,
+            role=PROJECTED,
+            ino=-scan.projected,  # no inode of the directory's is negative
+            size=size,
+            nlink=1,
+        )
+    )
 
 
 def _salvage(
@@ -1134,6 +1173,8 @@ def _salvage(
             _unrecoverable(scan, session, name, f"a file named {damaged} already exists")
             return "stop"
         scan.damaged_kept.add(session.id)  # the set-aside original protects the session
+        # the original keeps its bytes under its new name, and the saved prefix is a new part
+        _project_part(scan, session, reserve, ctx.next_part, cut)
         scan.messages.append(
             f"reserve {name} is damaged: a recovery would save {format_size(cut)} as part "
             f"p{ctx.next_part:04d} and keep the rest as {damaged}"
@@ -1168,7 +1209,8 @@ def _salvage(
                 ctx, name, damaged, st.st_size, 0, set_aside, failure=None, copy_began=False
             )
         raise
-    return _finish_salvage(ctx, fd, name, damaged, st.st_size, cut, set_aside)
+    times = (st.st_atime_ns, st.st_mtime_ns)  # from before the facts were read
+    return _finish_salvage(ctx, fd, name, damaged, st.st_size, cut, times, set_aside)
 
 
 def _report_interrupted_salvage(
@@ -1239,14 +1281,16 @@ def _finish_salvage(
     damaged: str,
     size: int,
     cut: int,
+    times: tuple[int, int],
     set_aside: dict[str, Any] | None = None,
 ) -> str:
     """Copy the first ``cut`` bytes of the set-aside original (``fd``) into the session's next
     part, and say how it ended: ``ledger.recovered`` when the part is committed,
     ``ledger.recovery_incomplete`` when it is not. Either record is handed out here, by whoever
     ends the step, so a scan that outlives the process's exit wait still leaves its trace.
-    ``set_aside``: fields of a set-aside rename that committed with a leftover or an unsynced
-    directory, added to the record."""
+    ``times``: the original's access and modification times (ns) from before it was read, which
+    the part takes. ``set_aside``: fields of a set-aside rename that committed with a leftover or
+    an unsynced directory, added to the record."""
     scan, session = ctx.scan, ctx.session
     scan.handled.add(damaged)
     step = {  # from here the copy runs to its end; cut = size - kept
@@ -1259,7 +1303,7 @@ def _finish_salvage(
     }
     with _stepping(ctx, step):
         try:
-            new, error, copied = _copy_prefix(ctx, fd, cut)
+            new, error, copied = _copy_prefix(ctx, fd, cut, times)
         except Interrupted as stop:
             _report_interrupted_salvage(
                 ctx,
@@ -1281,7 +1325,7 @@ def _finish_salvage(
         **(set_aside or {}),
     }
     if copied:
-        record["copy"] = copied  # its commit left the temporary name, or the sync failed
+        record["copy"] = copied  # its commit left the temporary name, or a sync or utime failed
     if new is None:
         record["error"] = error
         scan.incompletes.append(record)
@@ -1323,6 +1367,7 @@ class _Check:
     size: int = 0
     part: str = ""
     fd: int = -1  # open on the file when pending and the caller asked to keep it
+    times: tuple[int, int] = (0, 0)  # access and modification time (ns) before any read
 
 
 def _check_damaged(
@@ -1355,6 +1400,7 @@ def _check_damaged(
         ):
             check.why = "it is not a regular file of yours, or over 1 GiB"
             return check
+        check.times = (st.st_atime_ns, st.st_mtime_ns)
         first = fs.pread(fd, HEAD_BYTES + 1, 0)
         head = parse_head(first)
         if (
@@ -1453,9 +1499,14 @@ def _resume_salvage(ctx: RecoveryContext, entry: FileEntry) -> str:
         return "unchanged"  # saved already, or not judgeable: the report says which
     try:
         name = entry.name.removesuffix(".damaged")
-        return _finish_salvage(ctx, check.fd, name, entry.name, check.size, check.cut)
+        return _finish_salvage(ctx, check.fd, name, entry.name, check.size, check.cut, check.times)
     finally:
         close_quietly(fs, check.fd)
+
+
+def _numbered(entry: FileEntry) -> bool:
+    """Whether ``entry`` holds a part number of its session (a part, or a projected one)."""
+    return entry.is_part or entry.role == PROJECTED
 
 
 def classify_damaged(fs: FileSystem, scan: DirScan) -> None:
@@ -1498,8 +1549,15 @@ def classify_damaged(fs: FileSystem, scan: DirScan) -> None:
                 unfinished = True
                 if check.state == "pending":
                     scan.pending_damaged.add(entry.name)
-                scan.unrecoverable.add(session.id)
                 scan.messages.append(_unfinished_message(entry, check))
+                if check.state == "pending" and scan.check_only:
+                    # A recovery would finish the copy and keep the original, which protects
+                    # the session as it does after the copy.
+                    number = max((f.number for f in session.files if _numbered(f)), default=1)
+                    _project_part(scan, session, entry, number + 1, check.cut)
+                    scan.damaged_kept.add(session.id)
+                else:
+                    scan.unrecoverable.add(session.id)
             temps = [t for t in session.temps if t.name not in scan.handled]
             if temps and not unfinished:
                 scan.unrecoverable.add(session.id)
@@ -1526,14 +1584,18 @@ def _unfinished_message(entry: FileEntry, check: _Check) -> str:
     )
 
 
-def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, str, dict[str, Any]]:
+def _copy_prefix(
+    ctx: RecoveryContext, fd: int, cut: int, times: tuple[int, int]
+) -> tuple[str | None, str, dict[str, Any]]:
     """Copy the first ``cut`` bytes of ``fd`` to the session's next free part name through a
     temporary file. Returns ``(part name, "", commit)``, or ``(None, why, {})``; ``commit``
     holds the fields of a commit that renamed but left the temporary name behind
-    (``leftover``) or could not sync the directory (``sync_error``), else is empty.
+    (``leftover``) or could not sync the directory (``sync_error``), and ``utime_error`` when
+    the original's times could not be given to the part; else it is empty.
 
     A temporary file an earlier attempt of this session left for that part is continued when its
-    content is exactly the start of the source; any other file is left alone."""
+    content is exactly the start of the source; any other file is left alone. The part gets
+    ``times`` (the source's access and modification time in ns, taken before it was read)."""
     fs, session = ctx.fs, ctx.session
     new = ""
     for _ in range(NAME_TRIES):
@@ -1556,6 +1618,7 @@ def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, s
         return True
 
     commit: dict[str, Any] = {}
+    restored: dict[str, Any] = {}  # utime_error, when the times could not be given to the part
     try:
         with TempOutput(
             ctx.scan.path / new,
@@ -1571,8 +1634,10 @@ def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, s
                     raise OSError(errno.EIO, "the reserve ended early")
                 out.write(block)
                 offset += len(block)
-            source = fs.fstat(fd)  # the part keeps the original's times (see _commit_recovered)
-            fs.utime_ns(out.fd, source.st_atime_ns, source.st_mtime_ns)
+            try:
+                fs.utime_ns(out.fd, *times)
+            except OSError as exc:  # the part looks fresh, which only protects it
+                restored["utime_error"] = exc.strerror or str(exc)
             try:
                 out.commit()
             except LeftoverAfterCommit as exc:  # renamed all the same
@@ -1582,13 +1647,13 @@ def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, s
             except Interrupted as stop:
                 if out.committed:  # the signal was acted on once the part was durable
                     ctx.committed_part = new
-                    ctx.committed_copy = _commit_fields(stop.replaced)
+                    ctx.committed_copy = {**restored, **_commit_fields(stop.replaced)}
                 raise
     except Collision:
         return None, f"a file appeared at {new}", {}
     except OSError as exc:
         return None, exc.strerror or str(exc), {}
-    return new, "", commit
+    return new, "", {**restored, **commit}
 
 
 def _stamp_of(session: Session) -> str:
@@ -1610,9 +1675,10 @@ def full_scan(
     on_record: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> DirScan:
     """Scan, probe liveness, recover leftover reserves (a ledger directory; ``recover=False``
-    only looks: no lock is taken and no reserve is read, so a short command pays for the listing
-    alone), account for the salvaged originals, then decide the protections - the one pass a
-    warning check and a prune both start from.
+    only looks: no lock is taken on a reserve and none is read, so a short command pays for the
+    listing and the bounded check of the ``.damaged`` originals), account for the salvaged
+    originals, then decide the protections - the one pass a warning check and a prune both
+    start from.
 
     ``check_only`` (without ``recover``) is the prune that may not recover, a dry run with no
     usable ledger: it makes the checks of a recovery, locks and reads included, so the sessions
@@ -1628,6 +1694,7 @@ def full_scan(
             scan.carry_to(again)
             scan = again
             live = liveness(fs, path, scan, now, own_session)
+        scan.check_only = check_only
         classify_damaged(fs, scan)
     apply_protection(fs, scan, keep_recent=keep_recent, live=live, has_recording=has_recording)
     return scan

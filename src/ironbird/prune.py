@@ -164,6 +164,9 @@ def execute_plan(
     fresh one by default) is filled as the sessions are done, so a caller whose prune a signal
     ends can still say how far it got.
     """
+    assert not plan.scan.projected, (
+        "a check-only listing is a projection: nothing is deleted from it"
+    )
     outcome = Outcome() if outcome is None else outcome
     try:
         dir_fd = fs.open_dir(plan.scan.path)
