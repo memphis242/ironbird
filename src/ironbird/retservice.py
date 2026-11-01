@@ -243,14 +243,7 @@ class Retention:
     def _note_abandoned(self, thread: threading.Thread) -> None:
         step = self._control.step
         if thread.is_alive() and step is not None and self._control.stepping.is_set():
-            self._ledger.record(
-                "state",
-                "ledger.recovery_incomplete",
-                **step,
-                abandoned=True,
-                error="the process ended before the copy did; the next long session or prune "
-                "finishes it from the .damaged file",
-            )
+            self._ledger.record("state", "ledger.recovery_incomplete", **step, abandoned=True)
 
     # -- results ----------------------------------------------------------------------------------
 

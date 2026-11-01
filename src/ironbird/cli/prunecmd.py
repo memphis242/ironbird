@@ -157,6 +157,16 @@ def work(
     def record_recovery(event: str, fields: dict[str, Any]) -> None:
         ledger.record("state", event, **fields)
 
+    # A recovery renames files, so it needs the trace the ledger keeps; a dry run without a
+    # ledger lists what is there and recovers nothing.
+    recover = ledger.enabled
+    if kind == "ledger" and not recover:
+        console.err(
+            f"warning {Code.LED_DIR.value}: the action ledger cannot be used, so leftover "
+            "reserves were not recovered (a recovery must leave a trace); fix the ledger "
+            "and run again"
+        )
+
     # Each recovery step is ledgered as it ends, so a signal that ends the scan leaves a record
     # of every file it changed.
     scan = full_scan(
@@ -167,12 +177,18 @@ def work(
         own_session=ledger.session_id if kind == "ledger" else None,
         keep_recent=keep,
         has_recording=recording_blocks(recordings, now, older),
+        recover=recover,
         on_record=record_recovery,
     )
-    for message in scan.messages:
+    for message in (*scan.messages, *([scan.partial] if scan.partial else [])):
         console.err(f"warning {Code.RET_SCAN.value}: {term(message, 1000, err=True)}")
-    if scan.partial:
-        console.err(f"warning {Code.RET_SCAN.value}: {term(scan.partial, 1000, err=True)}")
+        ledger.warn(  # shown above; the ledger gets it in full
+            Code.RET_SCAN,
+            message,
+            event="retention.warning",
+            display=False,
+            directory=str(directory),
+        )
     plan = make_plan(scan, older_than_s=older, until_under=flags.until_under, now=now)
     ledger.record(
         "action",

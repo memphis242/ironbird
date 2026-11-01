@@ -23,6 +23,7 @@ from ironbird.retention import (
     UNREADABLE,
     UNRECOVERABLE,
     DirScan,
+    ScanControl,
     full_scan,
 )
 from ironbird.retnotices import Notices
@@ -260,6 +261,53 @@ def test_a_scan_that_outlives_the_exit_wait_writes_its_own_recovered_record(
     for row in _final_records(state):
         if row["event"].startswith("ledger.recover"):
             assert row["kept"] + row["cut"] == size, row
+
+
+def _clean_reserve(state: Path) -> Path:
+    body = (reserve_header(sid(1)) + rec(10)).encode()
+    return make_reserve(state, 1, 1, body, now=NOW)
+
+
+def test_the_rename_of_a_clean_reserve_says_it_is_stepping(state: Path) -> None:
+    _clean_reserve(state)
+    control = ScanControl()
+    fs = FaultFs()
+    seen: list[tuple[bool, dict[str, Any] | None]] = []
+
+    def watch(fd: int, length: int) -> None:
+        seen.append((control.stepping.is_set(), control.step))
+        return REAL_FS.ftruncate(fd, length)
+
+    fs.override("ftruncate", watch)
+    result = scan(state, fs, control=control)
+    assert seen and all(stepping and step for stepping, step in seen)
+    assert not control.stepping.is_set() and control.step is None
+    assert result.recoveries[0]["new"] is not None
+
+
+def test_a_rename_that_outlives_the_exit_wait_is_abandoned_and_said_so(tmp_path: Path) -> None:
+    ledger, retention, fs, state = _long_rig(tmp_path)
+    make_session(state, 1, age_days=3, now=NOW)
+    _clean_reserve(state)
+    gate = fs.block("fdatasync")
+    ledger.begin_exit()
+    ledger.record("action", "x")
+    retention.start()
+    assert gate.entered.wait(10)  # the scan thread is inside the commit of the reserve
+    started = time.monotonic()
+    retention.finish()  # waits its share of the exit budget for a step under way
+    assert time.monotonic() - started < 0.9
+    ledger.finish()
+    ledger.close()
+    gate.gate.set()  # type: ignore[union-attr]
+    thread = retention._thread
+    assert thread is not None
+    thread.join(10)
+    rows = _final_records(state)
+    (abandoned,) = [r for r in rows if r["event"] == "ledger.recovery_incomplete"]
+    assert abandoned["abandoned"] is True and abandoned["kept"] + abandoned["cut"] == 4096
+    assert "reserve" in abandoned["error"]
+    assert "ledger.recovered" in [r["event"] for r in rows]  # the thread finished it after all
 
 
 def test_the_scan_thread_hands_its_record_over_as_each_step_ends(tmp_path: Path) -> None:

@@ -1333,7 +1333,8 @@ Deliverables
        own thread when the step ends (not when someone collects the result): `ledger.recovered`
        (old name, new part, bytes kept and cut, the `.damaged` name) when the part is committed,
        `ledger.recovery_incomplete` (the same, with the error) when it is not or when the exit
-       gave up waiting for it (`abandoned`), and `IB-RET-004` is shown once:
+       gave up waiting for it (`abandoned`; the clean reserve's truncate-and-rename is a step the
+       exit waits for in the same way, and abandoned the same way), and `IB-RET-004` is shown once:
        `warning IB-RET-004: reserve 20261030T120000Z-0123456789ab.r0001.reserve was damaged: 812 KiB saved as part p0004, the rest kept as r0001.reserve.damaged; inspect or delete that file`.
        When (b) fails, the line says the records could not be saved and that the whole file is kept
        as `.damaged`. A `.damaged` file, and a salvage's dot-temporary file, are states every scan
@@ -1630,7 +1631,9 @@ Deliverables
   `ib ledger prune [--older-than AGE] [--until-under SIZE] [--keep N] [--dry-run] [--yes] [--format line|json]`.
   - *Needs a ledger*: a deletion must leave a trace, so with `IB-LED-002` (configuration)
     prune refuses to delete (exit 1, nothing deleted), as transmitting commands do;
-    `--dry-run` still lists. A stalled ledger (transient, such as the full disk prune is
+    `--dry-run` still lists, but recovers no leftover reserve (a recovery renames files and must
+    leave a trace): a warning with `IB-LED-002` says so. Every `IB-RET-004` line the scan
+    shows is also a `retention.warning` record in the ledger, in full. A stalled ledger (transient, such as the full disk prune is
     run to fix) does not refuse: the `prune.*` records are queued, the deletions usually
     free the space to write them, and the short-command exit line reports any left
     unwritten.
@@ -3130,12 +3133,18 @@ As built (where the build differs from, or settles, the text above)
      `IB-EXP-001` or `IB-EXP-002`, `repair` `IB-REC-001`, and a committed output whose only trouble
      was the directory sync (a warning without a signal) names nothing; the recovery steps of
      retention (the prune command runs them in the main thread) handle such a failure themselves
-     (the session is protected, a message says so) and name nothing. Each such step, a rename
+     (the session is protected, a message says so) and name nothing more; a salvage copy's own
+     failure that a signal replaced (a full disk) is the `error` of its `ledger.recovery_incomplete`
+     record. Each such step, a rename
      together with its record, runs in one held scope and is ledgered as it ends (`full_scan`'s
      `on_record`; the prune command writes `ledger.recovered` and `ledger.recovery_incomplete`
      that way, not after the scan), so a signal that ends the scan leaves a record of every file
      it changed; a salvage copy a signal cuts is recorded as `ledger.recovery_incomplete` with
-     `interrupted` (`ledger.recovered` when the part was committed by then). `_run` ledgers and shows the
+     `interrupted` and an `error` that tells the cases apart (the signal came before the copy
+     began; it came while the copy ran; it took the place of the disk failure named in the text),
+     or as `ledger.recovered` with `interrupted` when the part was committed by then, which keeps
+     the leftover temporary name or the unsynced directory of that commit under `copy`, as an
+     uninterrupted salvage does. `_run` ledgers and shows the
      one failure that is named besides the interruption (an `IronbirdError` as it is, anything else
      as `IB-INT-001` with its traceback) and nothing from the `__context__` chain, so an error
      handled on purpose when the signal was acted on (the `replay --follow` head-wait retry, in
@@ -3158,9 +3167,11 @@ As built (where the build differs from, or settles, the text above)
   during the read of a configuration that is a FIFO). A prune interrupted between two sessions
   says how many of the N it had deleted (`deleted K of N ... before the interruption`, and a
   `prune.interrupted` record) and shows the `IB-RET-` warnings of the sessions it skipped, before
-  the interruption notice. Every line `main()` writes to stderr outside a command run goes through
-  a `BoundedWriter` closed after `CLOSE_WAIT_S`, since the handlers stay installed there and a full
-  stderr pipe must not leave the process killable only by `SIGKILL`.
+  the interruption notice. Every line `main()` writes to stderr outside a command run (`_stderr_line`)
+  starts no thread, so it is written even when none can be started: the descriptor is polled for
+  room for up to `CLOSE_WAIT_S`, then the line, cut to `PIPE_BUF` bytes, goes out in one `write`
+  (dropped when there was no room), since the handlers stay installed there and a full stderr pipe
+  must not leave the process killable only by `SIGKILL`.
   The session facts a recording keeps are read once: `load_config` digests the bytes it parsed
   (`SystemConfig.sha256`, read-only) and `Session.codec_for` keeps the bytes of the CCDD and the
   two header profiles it built the codec from (`Session.definitions_of`); META and the embedded
@@ -3178,8 +3189,11 @@ As built (where the build differs from, or settles, the text above)
   records `ledger.note` `retire_leftover` (the part, the reserve name left, the reason); recovery
   records `leftover` and `leftover_error` in `ledger.recovered`, and the next scan completes the
   rename (the reserve name is unlinked once it and the part, or its own `.damaged` set-aside, are
-  checked to be the same inode with two links; a completed set-aside is recorded with `new` null
-  and is not counted as recovered); a salvage copy whose temporary name stays records it under
+  checked to be the same inode with two links; the completion is a `ledger.recovered` record
+  with `completed` true, so a reader adding up `kept` skips it: the process that renamed and
+  recorded the `leftover` already counted those bytes, while after a crash between link and
+  unlink the completion is the only record; a completed set-aside has `new` null and is not
+  counted as recovered); a salvage copy whose temporary name stays records it under
   `copy` and its one `IB-RET-004` line says to delete it. `export.write_to_file` and
   `write_to_directory` hold the signals across `ExitStack.enter_context` until the stack holds the
   cleanup, and fill an optional `WriteProgress` (the temporary output and the result). A member that

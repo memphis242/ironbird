@@ -14,6 +14,7 @@ import json
 import math
 import os
 import resource
+import select
 import signal
 import sys
 import time
@@ -29,7 +30,7 @@ import typer
 from ironbird import render
 from ironbird.ccdd.model import EventSeverity, MessageKind
 from ironbird.cli import prunecmd
-from ironbird.cli.output import CLOSE_WAIT_S, BoundedWriter, Console
+from ironbird.cli.output import CLOSE_WAIT_S, WRITE_SLICE, BoundedWriter, Console
 from ironbird.codec import Codec
 from ironbird.config import RecordingConfig, RetentionConfig, SystemConfig, find_config, load_config
 from ironbird.errors import Code, IronbirdError
@@ -2604,14 +2605,34 @@ def export_command(
 
 
 def _stderr_line(text: str) -> None:
-    """Line on stderr for errors raised outside a command run, through a :class:`BoundedWriter`
-    closed after :data:`CLOSE_WAIT_S`: the handlers stay installed here and never kill the
-    process, so a stderr nobody reads must not be able to block it for good."""
-    if sys.stderr is None:  # closed with ``2>&-``; there is nobody to tell
+    """Line on stderr for errors raised outside a command run, with no thread: the handlers stay
+    installed here and never kill the process, so a stderr nobody reads must not be able to
+    block it for good, and a process that cannot start a thread still says what failed.
+
+    The descriptor is polled for room for up to :data:`CLOSE_WAIT_S`, then the line (cut to
+    :data:`WRITE_SLICE` bytes, which a pipe takes whole or not at all) goes out in one ``write``.
+    A line that finds no room in that time is dropped. Stderr is line-buffered, so no earlier
+    text waits in the stream."""
+    stream = sys.stderr
+    if stream is None:  # closed with ``2>&-``; there is nobody to tell
         return
-    line = BoundedWriter(sys.stderr)
-    line.write(term(text, 1000, err=True))
-    line.close(CLOSE_WAIT_S)
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    body = term(text, 1000, err=True).encode(encoding, "backslashreplace")
+    if len(body) >= WRITE_SLICE:  # leave room for the newline, and never end inside a character
+        body = body[: WRITE_SLICE - 1].decode(encoding, "ignore").encode(encoding)
+    line = body + b"\n"
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):  # not a descriptor (an in-process capture)
+        with contextlib.suppress(OSError, ValueError):
+            stream.write(line.decode(encoding, "replace"))
+            stream.flush()
+        return
+    poller = select.poll()
+    poller.register(fd, select.POLLOUT)
+    with contextlib.suppress(OSError):  # a reader that went away has nobody to tell either
+        if poller.poll(int(CLOSE_WAIT_S * 1000)):
+            os.write(fd, line)
 
 
 def _fill_standard_descriptors() -> None:

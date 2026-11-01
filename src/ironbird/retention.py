@@ -26,7 +26,7 @@ import stat
 import threading
 import time
 from bisect import bisect_right
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -267,7 +267,9 @@ class ScanControl:
 
     ``stop`` asks the scan not to begin any further recovery step; ``stepping`` is set while a
     step that must not be cut short is under way (a salvage after its original was set aside),
-    so the waiter can give it the time to end instead of exiting mid-copy."""
+    so the waiter can give it the time to end instead of exiting mid-copy. ``step`` holds the
+    fields of the ``ledger.recovery_incomplete`` record the waiter writes if it gives up on it
+    (including ``error``)."""
 
     stop: threading.Event = field(default_factory=threading.Event)
     stepping: threading.Event = field(default_factory=threading.Event)
@@ -753,6 +755,7 @@ class RecoveryContext:
     on_record: Callable[[str, dict[str, Any]], None] | None = None
     dirty: bool = False  # a file was renamed: the listing is stale
     committed_part: str = ""  # the part a salvage copy committed as a signal ended it
+    committed_copy: dict[str, Any] = field(default_factory=dict)  # leftover fields of that commit
 
     @property
     def stopping(self) -> bool:
@@ -763,6 +766,23 @@ class RecoveryContext:
         collected, which a process that is already exiting never does."""
         if self.on_record is not None:
             self.on_record(event, dict(fields))
+
+
+@contextlib.contextmanager
+def _stepping(ctx: RecoveryContext, step: dict[str, Any]) -> Generator[None]:
+    """Tell whoever waits on the scan (``ctx.control``) that a step that must run to its end is
+    under way, and what it is: ``step`` holds the fields of the ``ledger.recovery_incomplete``
+    record the waiter writes if it gives up on the step (``error`` included)."""
+    control = ctx.control
+    if control is not None:
+        control.step = step
+        control.stepping.set()
+    try:
+        yield
+    finally:
+        if control is not None:
+            control.stepping.clear()
+            control.step = None
 
 
 def _unrecoverable(scan: DirScan, session: Session, name: str, why: str) -> None:
@@ -815,9 +835,10 @@ def recover_directory(
 
 def _not_a_failure(replaced: BaseException) -> BaseException | None:
     """What a signal that took the place of a raw file-system failure of a recovery step is
-    reported as: nothing. Each step handles such a failure itself (the session is protected and
-    a message says so) and the scan ends with the signal; the reserve is either untouched or
-    renamed whole, and the next scan finds it as it is."""
+    reported as: nothing more. A salvage copy's failure is in the ``ledger.recovery_incomplete``
+    record of that salvage (:func:`_report_interrupted_salvage`) before this runs; any other
+    step is a rename that either happened and was recorded or did not happen, so the reserve is
+    untouched or renamed whole and the next scan finds it as it is."""
     return None if isinstance(replaced, OSError) else replaced
 
 
@@ -990,10 +1011,20 @@ def _complete_interrupted_rename(
                     "kept": 0,
                     "cut": st.st_size,
                     "damaged": other.name,
+                    "completed": True,
                 }
             else:
+                # ``completed``: the rename is finished here. When the process that renamed
+                # lived to record it (a ``leftover``), that record counted the same bytes;
+                # after a crash between link and unlink this is the only record there is.
                 scan.recovered += 1
-                record = {"old": name, "new": other.name, "kept": st.st_size, "cut": 0}
+                record = {
+                    "old": name,
+                    "new": other.name,
+                    "kept": st.st_size,
+                    "cut": 0,
+                    "completed": True,
+                }
             scan.recoveries.append(record)
             ctx.report("ledger.recovered", record)
         return "changed"
@@ -1006,7 +1037,14 @@ def _commit_recovered(
     fs, scan, session, name = ctx.fs, ctx.scan, ctx.session, reserve.name
     new = part_name(_stamp_of(session), session.id, ctx.next_part)
     record: dict[str, Any] = {"old": name, "new": new, "kept": cut, "cut": st.st_size - cut}
-    with signals_held():  # the rename and its record are one step
+    step = {
+        "old": name,
+        "cut": st.st_size,
+        "kept": 0,
+        "error": "the process ended before the rename did; the next long session or prune "
+        "recovers the reserve",
+    }
+    with _stepping(ctx, step), signals_held():  # the rename and its record are one step
         try:
             fs.ftruncate(fd, cut)
             fs.fdatasync(fd)
@@ -1070,7 +1108,9 @@ def _salvage(
             ctx.dirty = True
     except Interrupted:
         if renamed:  # set aside, and the signal came before the copy began
-            _report_interrupted_salvage(ctx, name, damaged, st.st_size, 0, set_aside)
+            _report_interrupted_salvage(
+                ctx, name, damaged, st.st_size, 0, set_aside, failure=None, copy_began=False
+            )
         raise
     return _finish_salvage(ctx, fd, name, damaged, st.st_size, cut, set_aside)
 
@@ -1082,11 +1122,16 @@ def _report_interrupted_salvage(
     size: int,
     cut: int,
     set_aside: dict[str, Any],
+    *,
+    failure: BaseException | None,
+    copy_began: bool,
 ) -> None:
     """Hand out the record of a salvage a signal ended: ``ledger.recovered`` when the copy had
-    been committed as a part by then (``ctx.committed_part``), else
-    ``ledger.recovery_incomplete``, where the original is kept whole as ``damaged`` and the next
-    long session or prune finishes the copy. ``cut``: the bytes the copy was to save."""
+    been committed as a part by then (``ctx.committed_part``, with the leftover fields of that
+    commit under ``copy``), else ``ledger.recovery_incomplete``, where the original is kept whole
+    as ``damaged`` and the next long session or prune finishes the copy. ``cut``: the bytes the
+    copy was to save. ``failure``: the file-system failure the signal took the place of, which
+    the record's ``error`` names; ``copy_began``: whether the copy had started."""
     record: dict[str, Any] = {
         "old": name,
         "new": ctx.committed_part or None,
@@ -1097,11 +1142,19 @@ def _report_interrupted_salvage(
         "interrupted": True,
     }
     if ctx.committed_part:
+        if ctx.committed_copy:
+            record["copy"] = ctx.committed_copy
         ctx.report("ledger.recovered", record)
         return
-    record["error"] = (
-        "a signal ended the copy; the next long session or prune finishes it from the .damaged file"
-    )
+    finish = "the next long session or prune finishes it from the .damaged file"
+    if isinstance(failure, OSError):
+        record["error"] = f"{failure.strerror or failure}; a signal ended the copy; {finish}"
+    elif copy_began:
+        record["error"] = f"a signal ended the copy; {finish}"
+    else:
+        record["error"] = (
+            f"a signal came after the original was set aside, before the copy began; {finish}"
+        )
     ctx.report("ledger.recovery_incomplete", record)
 
 
@@ -1111,6 +1164,16 @@ def _leftover_fields(exc: LeftoverAfterCommit) -> dict[str, Any]:
     if exc.sync_error is not None:
         fields["sync_error"] = exc.sync_error
     return fields
+
+
+def _commit_fields(replaced: BaseException | None) -> dict[str, Any]:
+    """The record fields of the commit failure a signal took the place of, when that commit
+    renamed all the same (empty: it was clean, or the failure is none of those)."""
+    if isinstance(replaced, LeftoverAfterCommit):
+        return _leftover_fields(replaced)
+    if isinstance(replaced, SyncAfterCommit):
+        return {"sync_error": replaced.strerror}
+    return {}
 
 
 def _finish_salvage(
@@ -1130,24 +1193,29 @@ def _finish_salvage(
     directory, added to the record."""
     scan, session = ctx.scan, ctx.session
     scan.handled.add(damaged)
-    control = ctx.control
-    if control is not None:
-        control.step = {
-            "old": name,
-            "damaged": damaged,
-            "cut": size,
-            "kept": 0,
-        }  # cut = size - kept
-        control.stepping.set()  # from here the copy runs to its end
-    try:
-        new, error, copied = _copy_prefix(ctx, fd, cut)
-    except Interrupted:
-        _report_interrupted_salvage(ctx, name, damaged, size, cut, set_aside or {})
-        raise
-    finally:
-        if control is not None:
-            control.stepping.clear()
-            control.step = None
+    step = {  # from here the copy runs to its end; cut = size - kept
+        "old": name,
+        "damaged": damaged,
+        "cut": size,
+        "kept": 0,
+        "error": "the process ended before the copy did; the next long session or prune "
+        "finishes it from the .damaged file",
+    }
+    with _stepping(ctx, step):
+        try:
+            new, error, copied = _copy_prefix(ctx, fd, cut)
+        except Interrupted as stop:
+            _report_interrupted_salvage(
+                ctx,
+                name,
+                damaged,
+                size,
+                cut,
+                set_aside or {},
+                failure=stop.replaced,
+                copy_began=True,
+            )
+            raise
     record: dict[str, Any] = {
         "old": name,
         "new": new,
@@ -1451,9 +1519,10 @@ def _copy_prefix(ctx: RecoveryContext, fd: int, cut: int) -> tuple[str | None, s
                 commit = _leftover_fields(exc)
             except SyncAfterCommit as exc:  # renamed; the rename is not undone
                 commit = {"sync_error": exc.strerror}
-            except Interrupted:
+            except Interrupted as stop:
                 if out.committed:  # the signal was acted on once the part was durable
                     ctx.committed_part = new
+                    ctx.committed_copy = _commit_fields(stop.replaced)
                 raise
     except Collision:
         return None, f"a file appeared at {new}", {}

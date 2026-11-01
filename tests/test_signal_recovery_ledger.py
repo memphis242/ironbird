@@ -247,3 +247,148 @@ def test_the_pre_ledger_interrupted_line_cannot_block_the_exit_on_a_full_stderr(
             proc.kill()
         os.close(read_end)
         os.close(write_end)
+
+
+# -- what a signal that ends a salvage copy still tells the ledger ----
+
+
+def _damaged_reserve(state: Path, now: float) -> Path:
+    make_session(state, 1, age_days=3, now=now)
+    line = json.dumps({"session": sid(1), "n": 10, "kind": "action", "event": "x" * 200}) + "\n"
+    body = (reserve_header(sid(1)) + line * 20).encode() + b"\x00" * 16 + b"junk after NUL\n"
+    return make_reserve(state, 1, 1, body, now=now)
+
+
+def _prune_with(state: Path, hook: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", hook + CLI_MAIN, "ledger", "prune", "--dry-run"],
+        env={**_env(state), "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+# The salvage copy is committed by link (no renameat2), the unlink of the temporary name fails
+# (LeftoverAfterCommit), and a SIGTERM lands inside the commit's held scope.
+HOOK_LEFTOVER_THEN_SIGNAL = """
+import errno, os, signal
+import ironbird.fsops as fsops
+_r = fsops.FileSystem.renameat2_noreplace
+def renameat2_noreplace(self, dir_fd, old, new):
+    if old.startswith('.') and old.endswith('.tmp'):
+        return None                                   # unavailable: the link path
+    return _r(self, dir_fd, old, new)
+fsops.FileSystem.renameat2_noreplace = renameat2_noreplace
+_u = fsops.FileSystem.unlink_at
+def unlink_at(self, dir_fd, name):
+    if name.startswith('.') and name.endswith('.tmp'):
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise OSError(errno.EACCES, 'denied')
+    return _u(self, dir_fd, name)
+fsops.FileSystem.unlink_at = unlink_at
+"""
+
+
+def test_leftover_of_interrupted_salvage_commit_is_recorded(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    _damaged_reserve(state, time.time())
+    done = _prune_with(state, HOOK_LEFTOVER_THEN_SIGNAL)
+    assert done.returncode == 143, done.stderr
+    (temp,) = [p.name for p in state.iterdir() if p.name.endswith(".tmp")]
+    (recovered,) = _events(state, "ledger.recovered")
+    assert recovered["interrupted"] is True and recovered["new"]
+    copy = recovered["copy"]
+    assert isinstance(copy, dict) and copy["leftover"] == temp and copy["leftover_error"]
+
+
+HOOK_ENOSPC_THEN_SIGNAL = """
+import errno, os, signal, threading
+import ironbird.fsops as fsops
+_w = fsops.FileSystem.write
+def write(self, fd, data):
+    if threading.current_thread() is not threading.main_thread():
+        return _w(self, fd, data)
+    os.kill(os.getpid(), signal.SIGTERM)
+    raise OSError(errno.ENOSPC, 'No space left on device')
+fsops.FileSystem.write = write
+"""
+
+
+def test_enospc_with_signal_is_recorded(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    _damaged_reserve(state, time.time())
+    done = _prune_with(state, HOOK_ENOSPC_THEN_SIGNAL)
+    assert done.returncode == 143, done.stderr
+    (incomplete,) = _events(state, "ledger.recovery_incomplete")
+    assert incomplete["interrupted"] is True and incomplete["new"] is None
+    assert "space" in str(incomplete["error"]), incomplete
+
+
+# -- the lines main() writes outside a command run need no thread ----
+
+NO_THREADS = """
+import threading
+def _refuse(self):
+    raise RuntimeError("can't start new thread")
+threading.Thread.start = _refuse
+"""
+
+
+def test_a_usage_error_is_printed_when_no_thread_can_be_started(tmp_path: Path) -> None:
+    done = subprocess.run(
+        [sys.executable, "-c", NO_THREADS + CLI_MAIN, "--no-such-flag"],
+        env=_env(tmp_path / "state"),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=60,
+        check=False,
+    )
+    assert done.returncode == 2, (done.returncode, done.stderr)
+    assert "IB-CLI-" in done.stderr and "--no-such-flag" in done.stderr, done.stderr
+
+
+# The command runs with threads; only the line main() writes after it cannot start one.
+NO_THREADS_FOR_THE_LINE = """
+import threading
+import ironbird.cli.main as cli_main
+_line = cli_main._stderr_line
+def _stderr_line(text):
+    def refuse(self):
+        raise RuntimeError("can't start new thread")
+    threading.Thread.start = refuse
+    _line(text)
+cli_main._stderr_line = _stderr_line
+"""
+
+
+def test_the_interrupted_line_is_printed_when_no_thread_can_be_started(tmp_path: Path) -> None:
+    fifo = tmp_path / "fifo.toml"
+    os.mkfifo(fifo)  # nobody writes: the read waits for a writer
+    rec = tmp_path / "x.ibrec"
+    record(rec, [frame(i) for i in range(1, 4)])
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            NO_THREADS_FOR_THE_LINE + CLI_MAIN,
+            *("-c", str(fifo), "rec", "info", str(rec)),
+        ],
+        env=_env(tmp_path / "state"),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(2.0)  # in the read of the FIFO
+        assert proc.poll() is None
+        proc.send_signal(signal.SIGTERM)
+        _, err = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 143, (proc.returncode, err)
+    assert "interrupted (SIGTERM)" in err, err
