@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import errno
 import inspect
 import json
@@ -40,7 +41,15 @@ from ironbird.cli.output import (
     write_within,
 )
 from ironbird.codec import Codec
-from ironbird.config import RecordingConfig, RetentionConfig, SystemConfig, find_config, load_config
+from ironbird.config import (
+    MAX_EXPORT_JOBS,
+    ExportConfig,
+    RecordingConfig,
+    RetentionConfig,
+    SystemConfig,
+    find_config,
+    load_config,
+)
 from ironbird.errors import Code, IronbirdError
 from ironbird.filter import Filter
 from ironbird.fsops import REAL_FS
@@ -70,6 +79,14 @@ from ironbird.recording.export import (
     write_to_file,
 )
 from ironbird.recording.export import export as run_export
+from ironbird.recording.pexport import (
+    ConfigDefinitions,
+    Definitions,
+    EmbeddedDefinitions,
+    ParallelOptions,
+    default_jobs,
+    make_options,
+)
 from ironbird.recording.player import Ending, OutputFormat, compile_where, play
 from ironbird.recording.reader import Damage
 from ironbird.recording.render import damage_summary, info_json, info_lines, size_text
@@ -1867,6 +1884,7 @@ def _replay_definitions(
     *,
     command: str = "replay",
     records: tuple[str, str, str] = _REPLAY_DEFS_RECORDS,
+    config: SystemConfig | None = None,
 ) -> tuple[dict[str, Codec], dict[str, str] | None, IronbirdError | None]:
     """The codecs frames are decoded with, the node aliases a filter may use, and why there are
     no codecs when ``lenient`` let that pass.
@@ -1875,12 +1893,13 @@ def _replay_definitions(
     (``IB-REC-009`` when they cannot be used) and says once, as information, when the current
     configuration's files differ; ``--defs config`` uses the configuration's files with the
     recording's packet cap. Nothing is built when ``needed`` is false (hex output, no filter);
-    ``lenient`` (hex output) carries on without codecs when they cannot be had."""
+    ``lenient`` (hex output) carries on without codecs when they cannot be had. ``config`` is the
+    configuration ``--defs config`` uses when the caller has loaded it already."""
     if not needed:
         return {}, None, None
     try:
         if defs is DefsSource.CONFIG:
-            config = _config_for_defs(glob)
+            config = config if config is not None else _config_for_defs(glob)
             codecs = config_codecs(config, replay.nodes, replay.max_packet_bytes, command)
             return codecs, {n.alias: n.name for n in config.nodes.values()}, None
         codecs = embedded_codecs(
@@ -2391,6 +2410,18 @@ def export_command(
             ),
         ),
     ] = False,
+    jobs: Annotated[
+        int | None,
+        typer.Option(
+            "--jobs",
+            min=1,
+            max=MAX_EXPORT_JOBS,
+            help=(
+                "Worker processes for a large recording (default: [export] jobs, else one per "
+                "core). 1 decodes in this process. The output is the same either way."
+            ),
+        ),
+    ] = None,
     verbose: VerboseOption = False,
 ) -> None:
     """Export a recording to CSV, text or JSON Lines.
@@ -2446,6 +2477,8 @@ def export_command(
                     force=force,
                     directory=directory,
                 )
+            export_config = run.config.export if run.config is not None else ExportConfig()
+            workers = jobs if jobs is not None else export_config.jobs or default_jobs()
             ledger.record(
                 "action",
                 "export.start",
@@ -2461,6 +2494,7 @@ def export_command(
                 defs=defs.value,
                 skip_damage=skip_damage,
                 force=force,
+                jobs=workers,
             )
             replaying = Replay(
                 files,
@@ -2484,6 +2518,7 @@ def export_command(
             _report_missing_parts(replaying, ledger, console)
             if output is not None:
                 _warn_stale_temporaries(output, ledger, console)
+            loaded = _config_for_defs(base) if defs is DefsSource.CONFIG else None
             codecs, aliases, _ = _replay_definitions(
                 base,
                 replaying,
@@ -2494,6 +2529,7 @@ def export_command(
                 console,
                 command="export",
                 records=_EXPORT_DEFS_RECORDS,
+                config=loaded,
             )
             flt: Filter | None = None
             if where is not None:
@@ -2518,6 +2554,35 @@ def export_command(
             if candidates:
                 replaying.select_mids(frozenset.intersection(*candidates))
 
+            pool: ParallelOptions | None = None
+            if workers > 1:
+                recipe: Definitions
+                if loaded is not None:
+                    recipe = ConfigDefinitions.of(
+                        loaded.path,
+                        loaded.sha256,
+                        loaded.nodes,
+                        tuple(replaying.nodes),
+                        replaying.max_packet_bytes,
+                        "export",
+                    )
+                else:
+                    recipe = EmbeddedDefinitions.of(replaying, EXPORT_HINT)
+                pool = make_options(
+                    replaying,
+                    recipe,
+                    fmt,
+                    jobs=workers,
+                    where=where,
+                    aliases=aliases,
+                    messages=tuple(names),
+                    header_fields=header_fields,
+                    raw_enums=raw_enums,
+                    directory=directory,
+                    min_bytes=export_config.pool_min_bytes,
+                    range_bytes=export_config.range_bytes,
+                )
+
             def run_it(dest: Destination) -> ExportResult:
                 return run_export(
                     replaying,
@@ -2530,6 +2595,7 @@ def export_command(
                     raw_enums=raw_enums,
                     single=single,
                     directory=directory,
+                    parallel=pool,
                 )
 
             sync: str | None = None
@@ -2555,6 +2621,8 @@ def export_command(
                     )
             ending = result.ending.value
             rows = result.rows
+            if pool is not None and pool.report.workers:
+                ledger.record("state", "export.pool", **dataclasses.asdict(pool.report))
             if sync is not None:
                 warning = term(sync, 600, err=True)
                 ledger.record("warning", Code.EXP_WRITE.value, summary=warning, output=output)

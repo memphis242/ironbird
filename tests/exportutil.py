@@ -4,6 +4,7 @@ payload bytes, and a reader that turns an exported table back into rows of cells
 from __future__ import annotations
 
 import csv
+import dataclasses
 import hashlib
 import json
 import math
@@ -30,6 +31,7 @@ from ironbird.recording.export import (
     write_to_file,
 )
 from ironbird.recording.format import BlobKind
+from ironbird.recording.pexport import EmbeddedDefinitions, PoolReport, make_options
 from ironbird.recording.player import compile_where
 from ironbird.recording.replay import Replay, TimeSpec
 from ironbird.recording.writer import BlobSpec
@@ -348,11 +350,18 @@ def export_in_process(
     end: TimeSpec | None = None,
     codecs: dict[str, Codec] | None = None,
     destination: Destination | None = None,
+    jobs: int = 1,
+    range_bytes: int = 4096,
+    min_bytes: int = 0,
+    report: PoolReport | None = None,
 ) -> tuple[ExportResult, Replay]:
     """Do what ``ib export`` does (open, definitions, filter, selection, write) and return the
-    result. ``output`` ``None`` with a ``destination`` writes there instead of a file."""
+    result. ``output`` ``None`` with a ``destination`` writes there instead of a file. ``jobs``
+    above 1 decodes in that many worker processes, in ranges of ``range_bytes``, whatever the size
+    of the recording (``min_bytes``); the recording's embedded definitions are what they use."""
     files = [paths] if isinstance(paths, Path) else list(paths)
     replaying = Replay(files, skip_damage=skip_damage, start=start, end=end)
+    codecs_given = codecs is not None
     try:
         if codecs is None:
             codecs = embedded_codecs(
@@ -382,6 +391,25 @@ def export_in_process(
                 selected=flt.nodes if flt else None,
             )
 
+        parallel = None
+        if jobs > 1:
+            assert codecs_given is False, "workers rebuild the embedded definitions"
+            parallel = make_options(
+                replaying,
+                EmbeddedDefinitions.of(replaying, ""),
+                fmt,
+                jobs=jobs,
+                where=where,
+                messages=tuple(dict.fromkeys(messages)),
+                header_fields=header_fields,
+                raw_enums=raw_enums,
+                directory=directory,
+                min_bytes=min_bytes,
+                range_bytes=range_bytes,
+            )
+            if report is not None:
+                parallel = dataclasses.replace(parallel, report=report)
+
         def run(dest: Destination) -> ExportResult:
             return export(
                 replaying,
@@ -394,6 +422,7 @@ def export_in_process(
                 raw_enums=raw_enums,
                 single=single,
                 directory=directory,
+                parallel=parallel,
             )
 
         if destination is not None:

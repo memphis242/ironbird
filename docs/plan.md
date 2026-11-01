@@ -158,7 +158,9 @@ Processes:
    filters, exports, search over large recordings. Jobs are chunked by file offset;
    workers read the recording themselves, so only offsets go in and compact results
    come out. At these rates most recordings decode fast enough in one process, so the
-   pool is created lazily and only for jobs over a size threshold.
+   pool is created lazily and only for jobs over a size threshold. Built for `ib export`
+   in step 2m (below); replay with field filters and search over large recordings reuse
+   the same ranges later.
 
 **How processes are launched.** Everything is started by ironbird itself as the
 invoking user: no daemons installed, no services, no root, no setuid.
@@ -363,7 +365,7 @@ interface, later sub-steps build on it unchanged.
 | 2j | Variable-length payloads | 2i (codec overlap), 2h | counted and tail arrays in CCDD, encode and decode |
 | 2k | Serial transport | 2b, 2c, 2i | `transport = "serial"` links with resync and reconnect |
 | 2l | Stage 2 acceptance, throughput gate, docs | all | end-to-end cFS scenario, 10k pkt/s gate |
-| 2m | Parallel export decode | export | worker pool by file offset; one-hour export re-measured with 200-byte frames |
+| 2m | Parallel export decode | export | worker pool by file offset (built); one-hour export re-measured with 200-byte frames: 199-217 s -> 55-70 s at the floor |
 
 Parallel lanes once 2b is merged: {2c -> 2d}, {2e}, {2f}, {2i}; then 2g, 2h, 2j, 2k.
 
@@ -2664,9 +2666,10 @@ Deliverables
   would later delete an export as if it were a ledger part or a recording. Write
   errors are `IB-EXP-001` and remove the temporary file (or the files this process
   created in the temporary directory, then the directory) through the failure helper.
-- Single process, streaming, constant memory. The decode worker pool stays unbuilt
-  until a 2l benchmark shows a one-hour recording exports in over 60 s (2l measured 99 s at the
-  1k packets/s floor and 987 s at the 10k target: the trigger is met, the decision is open; see 2l).
+- Single process, streaming, constant memory. The decode worker pool stayed unbuilt until a 2l
+  benchmark showed a one-hour recording exporting in over 60 s (2l measured 99 s at the 1k packets/s
+  floor and 987 s at the 10k target); it was built in 2m, and a recording under 8 MiB is still
+  exported in this one process.
 
 Untrusted input: string cells sanitized (control characters escaped) and formula-leading
 cells (`=`, `+`, `-`, `@`, their fullwidth forms, tab, CR, LF, behind any leading whitespace)
@@ -3784,7 +3787,7 @@ Built (all items below are done; the differences from the first design are state
   200 bytes with more fields per row, so the per-row rate measured here is probably optimistic for the target
   and the 987 s figure is a lower bound; re-measure with 200-byte frames before relying on it. Decided by
   the user: build the pool, in step 2m (below), before Stage 3 feature work; performance ranks right after
-  correctness (CLAUDE.md).
+  correctness (CLAUDE.md). Built; the 200-byte re-measurement is in 2m.
 - `[recording] max_buffer_bytes` and `min_free_bytes` take the size grammar of `[ledger]` and `[retention]` (an
   integer of bytes or a string such as `"64MiB"`), with the same range checks and `IB-CFG-003` errors (found
   in review: the README showed strings the loader refused). `min_free_bytes = 0` is the integer 0 (the string
@@ -3797,6 +3800,122 @@ Built (all items below are done; the differences from the first design are state
   Throughput section (the gate commands, the measured figures, the export cost) and the Stage 2 cFS tests in
   Development; the stale "Stage 1" intro is replaced. `tools/cfs/README.md` and `NOTES.md` section 8 describe
   the generator and the TO_LAB limit.
+
+### 2m - Parallel export decode
+
+Built. `ib export` decodes a large recording in a pool of worker processes and writes the same bytes
+the single process writes (priority order of CLAUDE.md: correctness, then performance, then error
+handling and code quality). Code: `src/ironbird/recording/pexport.py` (the pool and the proof of
+equality), with `RecordingReader.items(start=, stop=)` and its seeding in `reader.py`, the part-level
+methods of `Replay` in `replay.py`, `make_pipeline` in `export.py` (the one place a frame becomes a
+row, used by the single process and by every worker), `[export]` in `config.py`, `ib export --jobs`.
+
+- **Ranges.** A part is cut into byte ranges of `[export] range_bytes` (4 MiB; the measured time is flat
+  from 512 KiB to 8 MiB, and 16 MiB is 25% slower from tail imbalance). Job 0 begins at the first
+  record after META. Every other range begins at a *guess*: the first record boundary at or after its
+  byte offset, found with the reader's own resynchronisation (`RecordingReader.find_boundary`: a
+  record that passes every rule and is followed by a second valid record, the scan `items()` uses
+  after damage; never a second parser). A worker reads its range itself (`pread` through the same
+  reader, so every length is validated before it is unpacked, and a malformed record is damage, never
+  an exception) and returns the text of its rows (no header row), the tally, the damage, the
+  definitions it made, which seeded entries it relied on, its first and last sequence numbers and
+  where it stopped. Only offsets and a seed (the streams, sources, last sequence number) go in.
+- **Why the result is the single process's result.** The walk through a part is deterministic: the
+  record at an offset has a length, the next record is there, and what a record means depends on the
+  streams and sources defined, the last sequence number and (for a resync) the work spent so far. The
+  parent takes results strictly in file order and accepts a range read from a guess only if the range
+  is clean (no damage, no reader error, no worker fault), began exactly where the previous range
+  ended, relied on seeded definitions that are in force at that point as they were in the seed (the
+  reader records which stream and source ids a frame or GAP found in the seed and had not defined
+  itself, `Lookups`), defined nothing the walk has defined differently, and has a first sequence number
+  above the last one before it. Anything else is read again as an *exact* job (start and state from the
+  walk) whose result stands whatever it holds. So damage, a torn tail, a record of an unknown critical
+  type, a sequence number that goes back, a stream defined late or twice, and a boundary found in the
+  middle of a frame (a recording forged to hold a valid chain inside a payload) all end up decided by
+  the exact state; a range that ends the walk early discards every range after it. The cost of
+  damage is that the damaged ranges are read twice.
+- **Tables and order.** CSV tables are keyed by (message name, columns). A worker opens tables in its
+  own order; the parent attaches each block to its table (`Layouts.table_for`) in file order, so the
+  files, stems (`<name>.2`), header rows and first-appearance order are the single process's. A single
+  table that would need a second layout is `IB-CLI-001` from the parent at the same row.
+- **Memory.** At most `2 x workers` ranges are submitted and not yet written; results are written in
+  order and dropped. The report (`export.pool` in the ledger: `max_pending`, `max_text_bytes`) shows
+  it; the parent's peak RSS is the same with and without workers (145 MiB in the benchmark, almost
+  all of it the interpreter and the imports).
+- **Output closing.** A destination that takes one line at a time and may refuse (stdout) is written
+  line by line and counted row by row as far as it takes them (one category byte per row), so the
+  rows and tallies are the single process's. What is read ahead of the refusal is not: `rejected`,
+  `skipped_no_definitions`, `not_written` and `frames_read` cover the range being decoded.
+- **Processes.** `spawn`, never `fork`. The pool is started lazily by the export that needs it
+  (`WorkerPool`, which a caller may keep for many exports) under `sigmask.masked()`, so the threads it
+  starts never take a shutdown signal. Workers unblock the mask they inherit, ignore SIGINT and SIGHUP
+  (Ctrl-C reaches the whole process group, and only the parent acts on it) and keep SIGTERM at its
+  default so the parent can terminate them; a thread in each worker exits the process if the parent is
+  gone (a SIGKILLed export leaves no worker behind within a second). The parent waits for results in
+  50 ms slices with `checkpoint()` between, so a signal ends the export with 130/143/129 as it does
+  in one process; the temporary output is removed by the same cleanup, and the workers are terminated
+  (killed after 5 s) on any abnormal end. A worker that dies, a pool that cannot start (a process or
+  thread limit) and a worker fault are `IB-EXP-003` (one line: what failed and to run again or with
+  `--jobs 1`; the traceback or the cause is in the ledger record). Definitions are rebuilt in each
+  worker from the bytes the parent built from (`--defs recording`: the embedded blobs) or, for
+  `--defs config`, from the configuration with a digest of the definition files that a worker checks
+  before it decodes (a file edited during the export is `IB-EXP-003`, not a different decode).
+- **When the pool is used.** `--jobs N` (1..64) beats `[export] jobs`, which beats the default of one
+  worker per core the process may run on; 1 never uses workers. A recording whose parts together are
+  under `[export] pool_min_bytes` (8 MiB, the least that is two ranges) is exported in the calling
+  process, and so is each part with fewer than two ranges, a part being written (its writer holds the
+  lock), a followed recording, a range that selects nothing, and a part read through the index with
+  chunks skipped (`--from`/`--to`, or a `--where`/`--message` MID set that rules chunks out). The pool
+  starts about a quarter of a second after the first range is submitted.
+- **Measured** (`tests/bench/test_export_pool_bench.py`, 4 vCPU Xeon 2.1 GHz, a quiet host), packets of the
+  target's shape (200 bytes, one message of 62 fields, `tests/bench/targetshape.py`), CSV:
+
+  | frames | file | one process | four workers | speedup |
+  |--------|------|-------------|--------------|---------|
+  | 40,000 | 9 MiB | 15,400-17,300 rows/s | 31,600-32,400 rows/s | 1.9-2.1 |
+  | 400,000 | 96 MiB | 16,600-18,100 rows/s | 51,400-65,000 rows/s | 3.1-3.6 |
+
+  (Two runs on a shared host; the ranges are the spread.) A one-hour recording of such packets takes
+  199-217 s at the 1k packets/s floor in one process and 55-70 s with four workers (the 60 s bar is met
+  in the better run and missed by 10 s in the other; the floor hour at 200 bytes is within 2x of it, as
+  2l said); at the 10k target 1,987-2,166 s and 554-700 s, so the target hour needs more cores (or the
+  deferred items below) to get under a minute. The 75-byte housekeeping packets of the 2l benchmark
+  export at 101,800 rows/s with four workers (28,100-36,500 in one process): 35 s per floor hour. The 2l figures (36,500
+  rows/s, 99 s and 987 s) were for 75-byte housekeeping packets of 5 fields; 200-byte packets of 62
+  fields cost twice as much per row, as 2l said they would. Crossover (one process / four workers,
+  hk packets and target packets): below 8 MiB nothing is shared (1.0); 9 MiB 1.7; 11.6 MiB 1.9;
+  13.4 MiB 2.3. Four workers use all four cores (the parent is a few percent of one).
+  `test_the_pool_is_faster_and_writes_the_same_file` is the CI-sized check (40,000 frames, ranges of
+  1 MiB): the same bytes, no reruns, at least 1.3x with three or more cores (0.8x with fewer).
+- **Tests.** `tests/test_export_pool.py`: a differential over everything an export leaves (files and
+  bytes, tally, damage reported, the replay's own counts, the error) between one process and the pool
+  in 4 KiB ranges: clean recordings in every format with every option, filters, `--message`s, split
+  sets, a missing part, damage in a part; recordings built record by record (a stream and a source
+  defined late and used rarely, a stream defined again differently, a sequence number that goes back
+  exactly at the start of a range, a record of an unknown critical type, a frame of an undefined
+  stream); 36 random mutations (flips, zeroed and cut and duplicated and swapped stretches, garbage,
+  truncation) with and without `--skip-damage`; damage at the edges of the first ranges; torn tails;
+  the checked-in malformed corpora; the `rec_corpus` damage cases spliced into a large file; an output
+  that closes; the reader's range read; the acceptance rule; workers that cannot start; the
+  `[export]` table. Mutating the acceptance rule (no sequence check, damage counted as clean, no
+  definition check) fails one of them each. `tests/test_export_pool_cli.py`: the CLI with
+  `--jobs 1` and `--jobs 3` writes the same files and the same stderr; `--defs config`; stdout;
+  damage (exit 5); `--jobs`/`[export]` precedence; a bad `--jobs` is usage; SIGINT, SIGTERM, SIGHUP
+  (130/143/129) and a group-wide SIGINT at a point where the workers are up and the temporary output
+  exists leave no output, no temporary file, no worker, no leaked semaphore; a SIGKILLed worker is
+  `IB-EXP-003` and leaves nothing; a SIGKILLed export leaves no worker; the output is published only
+  after the last range.
+- **Deferred.** (1) Chunk skipping: a part read with jumps is exported in the calling process (the jumps
+  reset the sequence check and learn definitions from skipped heads; each segment between jumps could
+  be a range). (2) Parts are exported one after another (the pool idles at the end of each part and
+  ramps at the start of the next; one ramp costs about a range per worker). (3) The first ranges are
+  seeded from the head of the file, so a stream or source defined later costs one rerun per range
+  submitted before it is known (at most `2 x workers` per new definition). (4) A recording with
+  damage reads the damaged ranges twice. (5) The workers do not stream a range back before it is
+  complete (a range is at most a few tens of MiB of text). (6) Replay with field filters and
+  search over recordings do not use the pool yet. (7) A reader that never takes stdout (`IB-OUT-*`)
+  behaves as before: the writer blocks the parent. (8) The antagonistic review the project requires
+  before a merge to `main` is the root session's and is not done here.
 
 ### Error codes added in Stage 2
 
@@ -3842,6 +3961,7 @@ Built (all items below are done; the differences from the first design are state
 | `IB-FLT-004` | `FLT_LIMIT` | filter too long, deep or wide | 2f |
 | `IB-EXP-001` | `EXP_WRITE` | cannot write export output | 2h |
 | `IB-EXP-002` | `EXP_EXISTS` | export output exists (pass `--force`), is the input, or is a file retention manages (`--force` does not apply to these two) | 2h |
+| `IB-EXP-003` | `EXP_WORKER` | an export worker process died (killed, out of memory), failed to return a result, or could not be started; the message says to run again or with `--jobs 1`; the cause or traceback is in the ledger | 2m |
 | `IB-DEC-008` | `DEC_COUNT` | variable-length count above the CCDD maximum | 2j |
 | `IB-DEC-009` | `DEC_OVERRUN` | variable-length data runs past the packet end | 2j |
 

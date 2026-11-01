@@ -98,6 +98,7 @@ class Code(StrEnum):
     # Export
     EXP_WRITE = "IB-EXP-001"  # the export output could not be written
     EXP_EXISTS = "IB-EXP-002"  # the export output exists, is the input, or is a managed file
+    EXP_WORKER = "IB-EXP-003"  # an export worker process failed (died, or could not decode)
     # Engine
     ENG_LAG = "IB-ENG-001"  # a consumer fell behind: frames not shown to it (sinks still saw them)
     # System resources

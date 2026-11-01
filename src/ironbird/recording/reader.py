@@ -132,6 +132,19 @@ class Damage:
 
 
 @dataclass(slots=True)
+class Lookups:
+    """What a read that began from a seeded state (see :meth:`RecordingReader.seed_state`) asked of
+    the definitions it did not make itself: the stream and source ids a frame or GAP record found
+    in the seed. The read is what the one from the start of the file would have made if the state
+    there agrees with the seed on exactly these."""
+
+    streams: set[int] = field(default_factory=set)
+    sources: set[int] = field(default_factory=set)
+    local_streams: set[int] = field(default_factory=set)
+    local_sources: set[int] = field(default_factory=set)
+
+
+@dataclass(slots=True)
 class _State:
     streams: dict[int, Stream] = field(default_factory=dict)
     sources: dict[int, str] = field(default_factory=dict)
@@ -168,6 +181,11 @@ class RecordingReader:
         self.locked = False
         self._state = _State()
         self._work = 0  # bytes read and CRC-checked this pass, charged against the budget
+        self.budget_asked = False  # the budget was consulted (a resync scan ran) in this pass
+        self.position = 0  # where :meth:`items` last was: the offset of the next record to read
+        self.reached_stop = False  # :meth:`items` ended because the record at ``stop`` was due
+        self._definitions: list[tuple[Any, ...]] | None = None
+        self._lookups: Lookups | None = None
         self._known_size = 0
         self._buf = b""
         self._base = 0
@@ -270,6 +288,11 @@ class RecordingReader:
         return self._state.streams
 
     @property
+    def sources(self) -> Mapping[int, str]:
+        """The sources defined so far, by id (grows as records are read)."""
+        return self._state.sources
+
+    @property
     def max_packet_bytes(self) -> int:
         return self.meta.max_packet_bytes
 
@@ -277,6 +300,59 @@ class RecordingReader:
     def body_start(self) -> int:
         """Offset of the first record after META."""
         return self._start
+
+    @property
+    def work(self) -> int:
+        """Bytes read and CRC-checked so far this pass, charged against the resync budget."""
+        return self._work
+
+    def seed_state(
+        self,
+        streams: Mapping[int, Stream],
+        sources: Mapping[int, str],
+        last_seq: int,
+        work: int,
+    ) -> None:
+        """Begin as if the records before the first one read had defined ``streams`` and
+        ``sources``, the last frame among them had sequence number ``last_seq`` and ``work`` bytes
+        had been charged: for a read that starts inside a file (see :meth:`items`) on behalf of
+        one that began at the start. Call before :meth:`items`."""
+        assert not self._state.streams and not self._state.sources and self._state.last_seq == 0
+        self._state.streams.update(streams)
+        self._state.sources.update(sources)
+        self._state.last_seq = last_seq
+        self._work = work
+
+    def restart_work(self, work: int) -> None:
+        """Charge ``work`` bytes from here on and forget that the budget was consulted (a scan
+        that only located where to begin does not count)."""
+        self._work = work
+        self.budget_asked = False
+
+    def track_lookups(self) -> Lookups:
+        """Start recording which definitions of the seed the records read from here on rely on;
+        the returned object fills as :meth:`items` runs."""
+        self._lookups = Lookups()
+        return self._lookups
+
+    def log_definitions(self) -> list[tuple[Any, ...]]:
+        """Start keeping the stream and source definitions applied from here on, as
+        ``("stream", Stream)`` and ``("source", id, text)`` in the order they took effect; the
+        returned list grows as :meth:`items` runs."""
+        self._definitions = []
+        return self._definitions
+
+    @property
+    def last_seq(self) -> int:
+        """The sequence number of the last frame accepted (0: none)."""
+        return self._state.last_seq
+
+    def find_boundary(self, offset: int) -> int | None:
+        """The offset of the first record at or after ``offset`` (rounded up to the alignment)
+        that passes every rule and is followed by another valid record: the scan a resync after
+        damage does, for a read that starts inside a file. ``None``: there is none."""
+        found, _ = self._resync(offset - fmt.ALIGN)
+        return found
 
     def read_at(self, offset: int, size: int) -> bytes:
         """Up to ``size`` raw bytes at ``offset`` (fewer at the end of the file)."""
@@ -386,6 +462,11 @@ class RecordingReader:
             if found is None:
                 raise _Bad(f"frame names undefined source {src}")
             source = found
+        if (lookups := self._lookups) is not None:
+            if sid not in lookups.local_streams:
+                lookups.streams.add(sid)
+            if src != fmt.OTHER_SOURCE and src not in lookups.local_sources:
+                lookups.sources.add(src)
         if bits & FLAG_HAS_MID:
             peeked: int | None = mid
         elif mid:
@@ -446,6 +527,12 @@ class RecordingReader:
                     gap = fmt.decode_gap(body)
                     if gap.stream != fmt.NO_STREAM and gap.stream not in streams:
                         raise _Bad(f"GAP names undefined stream {gap.stream}")
+                    if (
+                        self._lookups is not None
+                        and gap.stream != fmt.NO_STREAM
+                        and gap.stream not in self._lookups.local_streams
+                    ):
+                        self._lookups.streams.add(gap.stream)
                     return gap, None
                 case RecordType.BLOB:
                     return fmt.decode_blob(body, hashlib.sha256), None
@@ -483,8 +570,16 @@ class RecordingReader:
                 self._state.last_seq = effect[1]
             case "stream":
                 self._state.streams[effect[1].id] = effect[1]
+                if self._definitions is not None:
+                    self._definitions.append(effect)
+                if self._lookups is not None:
+                    self._lookups.local_streams.add(effect[1].id)
             case "source":
                 self._state.sources[effect[1]] = effect[2]
+                if self._definitions is not None:
+                    self._definitions.append(effect)
+                if self._lookups is not None:
+                    self._lookups.local_sources.add(effect[1])
             case _:
                 pass
 
@@ -524,6 +619,7 @@ class RecordingReader:
 
     def _over_budget(self) -> bool:
         """Whether this pass has done more work than its file size allows a resync."""
+        self.budget_asked = True
         return self._work > WORK_FLOOR + WORK_FACTOR * self.size()
 
     def _resync(self, damaged_at: int) -> tuple[int | None, bool]:
@@ -594,6 +690,8 @@ class RecordingReader:
         *,
         skip: Callable[[int], int | None] | None = None,
         wait: Callable[[], bool] | None = None,
+        start: int | None = None,
+        stop: int | None = None,
     ) -> Iterator[Item | Damage]:
         """Every valid record after META in file order, and a :class:`Damage` where the file is
         not valid records. Stops at damage unless ``skip_damage``; a torn tail always ends it.
@@ -605,11 +703,23 @@ class RecordingReader:
         boundary or inside a record, or a bad record has no valid chain after it yet, ``wait()``
         is called, and ``True`` means "the file may have grown, look again". Only when it returns
         ``False`` is the end of the file the end of the data: a torn tail, as without ``wait``.
+
+        ``start`` is the offset of the record to begin with (default: the one after META; the
+        caller vouches that a record begins there, and a record that does not pass its rules is
+        damage like any other); ``stop``, the offset from which no record is read: reading ends
+        before the first record that begins at or after it, with :attr:`reached_stop` set and
+        :attr:`position` the offset of that record. Reading a range this way leaves the state
+        the records before ``start`` would have left to :meth:`seed_state`.
         """
         state = self._state
-        offset = self._start
+        offset = self._start if start is None else start
+        self.reached_stop = False
         while True:
             checkpoint()  # a shutdown signal ends every reading loop here, once per record
+            self.position = offset
+            if stop is not None and offset >= stop:
+                self.reached_stop = True
+                return
             if skip is not None and (jump := skip(offset)) is not None:
                 assert jump > offset, "a skip moves forward"
                 offset = jump
@@ -801,4 +911,4 @@ def open_reader(path: Path | str, *, skip_damage: bool = False) -> RecordingRead
     return RecordingReader(path, skip_damage=skip_damage)
 
 
-__all__ = ["READ_BLOCK", "Damage", "Item", "RecordingReader", "open_reader"]
+__all__ = ["READ_BLOCK", "Damage", "Item", "Lookups", "RecordingReader", "open_reader"]
