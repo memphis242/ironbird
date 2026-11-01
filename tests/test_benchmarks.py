@@ -24,6 +24,7 @@ import yaml
 
 from conftest import EXAMPLES, REPO
 from filter_defs import make_frame
+from hosttiming import needs_a_quiet_host
 from ironbird import render
 from ironbird.ccdd.json_adapter import parse_model
 from ironbird.ccdd.loader import load_ccdd
@@ -50,17 +51,6 @@ LISTEN_FILTER_OVERHEAD_RATIO = 1.8  # the same with a decode-level filter evalua
 FLOOR_PPS = 1_000  # the plan's hard floor, aggregate packets per second
 TARGET_PPS = 10_000  # the plan's design target
 PACKET_BYTES = 200  # the plan's average packet size
-
-# A guard whose threshold is a rate or a cost ratio measured on the host. Under xdist the other
-# workers keep every core busy, so such a measurement says more about the scheduler than about
-# the tool: a listener off-CPU for a few milliseconds overruns a socket buffer capped by a small
-# net.core.rmem_max (212992 on GitHub runners), and a timed loop shares its core with another
-# test. These run, and are enforced, in the serial run of this file (CI's "Benchmarks" step,
-# ``pytest tests/test_benchmarks.py -n0``), as pytest-benchmark's own ceilings are.
-needs_a_quiet_host = pytest.mark.skipif(
-    "PYTEST_XDIST_WORKER" in os.environ,
-    reason="host-timing guard: enforced by the serial run (pytest tests/test_benchmarks.py -n0)",
-)
 
 
 def _check_ceiling(benchmark: Any, ceiling: float) -> None:

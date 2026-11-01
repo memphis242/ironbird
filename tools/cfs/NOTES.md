@@ -499,18 +499,42 @@ apps in the verification set have none.
 
 `tools/cfs/apps/ib_test` is the app that does. It is built with the bundle (`build.sh` copies it to
 `apps/ib_test` and lists it in `sample_defs/targets.cmake`) and started by `run.sh` when `CFS_APPS`
-names it. Topic IDs `0xE0` and `0xE1`, above every topic the bundle uses (`0xC9` is the highest).
+names it. Topic IDs `0xE0` to `0xE3`, above every topic the bundle uses (`0xC9` is the highest).
 
 | Message | MID | Layout after the cFE header |
 |---------|-----|-----------------------------|
-| commands | `0x18E0` | fc 0 NOOP, fc 1 RESET_COUNTERS, fc 3 SEND_VAR: header only (8 bytes) |
+| commands | `0x18E0` | fc 0 NOOP, fc 1 RESET_COUNTERS, fc 3 SEND_VAR, fc 5 GEN_STOP, fc 6 GEN_SEND_STATUS: header only (8 bytes) |
+| `IB_TEST_GEN_START` (fc 4) | `0x18E0` | `u32 Rate` (1..10000 packets/s), `u32 Count` (0 = until stopped); 16 bytes |
 | `IB_TEST_SET_DATA` (fc 2) | `0x18E0` | `u16 Count`, `u32 Entries[Count]`, then the string to the end of the packet (0..122 bytes, no NUL); size 10 + 4 Count + length |
 | `IB_TEST_SEND_HK` | `0x18E1` | header only |
-| `IB_TEST_HK` | `0x08E0` | `u8 CmdCounter`, `u8 ErrCounter`, `u16 Entries`, `u16 TextLen`, `u16 Spare` (24 bytes) |
+| `IB_TEST_HK` | `0x08E0` | `u8 CmdCounter`, `u8 ErrCounter`, `u16 Entries`, `u16 TextLen`, `u16 HkCounter` (24 bytes) |
 | `IB_TEST_VAR` | `0x08E1` | the same layout as SET_DATA: 18..396 bytes |
+| `IB_TEST_GEN` | `0x08E2` | `u32 Serial`, `u32 Run`, `u8 Fill[176]` with `Fill[i] = (u8)(Serial + i)`: 200 bytes |
+| `IB_TEST_GEN_STATUS` | `0x08E3` | `u32 Run`, `u32 Rate`, `u32 Target`, `u32 Sent`, `u8 State` (0 idle, 1 running, 2 finished, 3 stopped), `u8 Spare`, `u16 MaxBurst`: 36 bytes |
 
 SET_DATA is checked against the layout byte for byte: a count above 64, a count that runs past the
 packet, or a string above 122 bytes bumps `ErrCounter` (event 5 `IB_TEST: ... rejected`) and stores
 nothing. A good one stores the data, bumps `CmdCounter`, and publishes `IB_TEST_VAR`. TO_LAB does not
-forward the two telemetry MIDs by default; add them with `TO_LAB_ADD_PKT Stream=0x8E0` and
-`Stream=0x8E1`. Both are little-endian, as everything else on this target.
+forward the telemetry MIDs by default; add them with `TO_LAB_ADD_PKT Stream=0x8E0` (and `0x8E1`, `0x8E2`,
+`0x8E3`). Everything is little-endian, as everywhere else on this target.
+
+Throughput generator (stage 2l). `IB_TEST_GEN_START` starts a run in a child task (`IB_TEST_GEN`): every
+1 ms it publishes the packets due since the run's start at `Rate` (at most 16 per tick, so a late tick
+catches up on the next ones; the clock is `CFE_PSP_GetTime`, the platform timebase, which on the Linux PSP
+is `CLOCK_MONOTONIC`, so a wall-clock step does not move the schedule) until `Count` packets are out (state finished, one event, one status packet),
+or `IB_TEST_GEN_STOP` (state stopped). A START while a run is on, a rate outside 1..10000 or a STOP with no run
+bumps `ErrCounter`. Its state is guarded by one mutex held across a burst, so the `Sent` a status packet
+reports is exactly what was published. The run's packet count is 64-bit and the due count is computed from
+whole seconds and the remainder separately, so neither overflows in a `Count = 0` run; `Serial` and the status
+`Sent` are the low 32 bits of the count and wrap to 0 by design after 2^32 packets (about 5 days at 10k/s). The
+command pipe holds 32 messages and each subscription may queue that many (`CFE_SB_SubscribeEx`; the software bus
+default is 4). The layout and these limits are asserted at compile time in `ib_test.h`;
+`tests/cfs/test_generator_schedule.py` runs the tick against a fake clock across both wraps.
+
+Measured limit (development host, 4 vCPU): the stock TO_LAB forwards through a telemetry pipe of depth 50
+(`OS_QUEUE_MAX_DEPTH` in `build-native_std/osal_public_api/osconfig.gen`; `TO_LAB_ADD_PKT BufLimit` must be
+below it). At 1k packets/s nothing is lost. At 10k packets/s the software bus overflows that pipe whenever
+TO_LAB's forwarding task is off-CPU for a few milliseconds (about 4% of 30,000 packets in one run);
+`CFE_SB_HousekeepingTlm` `PipeOverflowErrorCounter` (`SB_HK`) counts exactly those drops. A lossless 10k
+packets/s source needs a deeper pipe (`OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's `TLM_PIPE_DEPTH`), a platform
+configuration change not made here.

@@ -2325,6 +2325,66 @@
           "description": "Tail string: the rest of the packet"
         }
       ]
+    },
+    {
+      "name": "IB_TEST_GEN_START",
+      "kind": "command",
+      "mid": "0x18E0",
+      "function_code": 4,
+      "description": "ironbird's test app: start the throughput generator, fixed-size IB_TEST_GEN telemetry at Rate packets/s (refused while a run is on)",
+      "fields": [
+        {"name": "Rate", "type": "uint32", "units": "packets/s", "description": "Packets per second, 1 to 10000"},
+        {"name": "Count", "type": "uint32", "description": "Packets to send; 0 runs until IB_TEST_GEN_STOP"}
+      ]
+    },
+    {
+      "name": "IB_TEST_GEN_STOP",
+      "kind": "command",
+      "mid": "0x18E0",
+      "function_code": 5,
+      "description": "ironbird's test app: stop the throughput generator and publish IB_TEST_GEN_STATUS",
+      "fields": []
+    },
+    {
+      "name": "IB_TEST_GEN_SEND_STATUS",
+      "kind": "command",
+      "mid": "0x18E0",
+      "function_code": 6,
+      "description": "ironbird's test app: publish IB_TEST_GEN_STATUS",
+      "fields": []
+    },
+    {
+      "name": "IB_TEST_GEN",
+      "kind": "telemetry",
+      "mid": "0x08E2",
+      "description": "ironbird's test app throughput generator: 200-byte telemetry, Fill[i] = (Serial + i) mod 256",
+      "category": "other",
+      "fields": [
+        {"name": "Serial", "type": "uint32", "description": "0 for the first packet of a run, then +1"},
+        {"name": "Run", "type": "uint32", "description": "Run number: 1 for the first IB_TEST_GEN_START after power-on"},
+        {"name": "Fill", "type": "bytes[176]", "description": "Fixed filler derived from Serial"}
+      ]
+    },
+    {
+      "name": "IB_TEST_GEN_STATUS",
+      "kind": "telemetry",
+      "mid": "0x08E3",
+      "description": "ironbird's test app generator status: published when a run ends and on IB_TEST_GEN_SEND_STATUS",
+      "category": "status",
+      "fields": [
+        {"name": "Run", "type": "uint32", "description": "Run number"},
+        {"name": "Rate", "type": "uint32", "units": "packets/s", "description": "Rate of the run"},
+        {"name": "Target", "type": "uint32", "description": "Count asked for; 0 = until stopped"},
+        {"name": "Sent", "type": "uint32", "description": "Packets published in the run so far"},
+        {
+          "name": "State",
+          "type": "uint8",
+          "description": "Generator state",
+          "enum": {"IDLE": 0, "RUNNING": 1, "FINISHED": 2, "STOPPED": 3}
+        },
+        {"name": "Spare", "type": "uint8", "description": "Always 0"},
+        {"name": "MaxBurst", "type": "uint16", "description": "Most packets published in one 1 ms tick"}
+      ]
     }
   ]
 }

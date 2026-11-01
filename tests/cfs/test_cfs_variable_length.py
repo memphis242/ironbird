@@ -113,22 +113,22 @@ def _var(g: Ground, command: str, *args: str, flags: tuple[str, ...] = ()) -> di
     return g.wait_for("IB_TEST_VAR", lambda _: True, start=start, timeout=10.0)["fields"]
 
 
-# SEND_HK requests sent so far to this module's one cFS instance. Every HK packet carries
-# ``hk_counter``, the count of requests the app has answered, so the reply to the Nth request is
-# the packet with ``hk_counter`` N. A reply to a request sent before a command has a number at
-# or below the count taken before that command was sent and is never taken as fresh.
-_HK_REQUESTS = [0]
+# Every HK packet carries ``hk_counter``, the count of requests the app has answered, so the reply
+# to the Nth request sent to a cFS instance is the packet with ``hk_counter`` N
+# (``Ground.hk_requests`` counts them per instance; each module starts its own). A reply to a
+# request sent before a command has a number at or below the count taken before that command was
+# sent and is never taken as fresh.
 
 
 def _hk(g: Ground, timeout: float = 10.0) -> dict[str, object]:
     """Fields of an HK packet that answers a request sent after this call began (so after every
     command sent before it); a late reply to an older request is skipped, not taken."""
-    first = _HK_REQUESTS[0] + 1  # the number of the first request this call sends
+    first = g.hk_requests + 1  # the number of the first request this call sends
     start = g.count()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         g.send("IB_TEST_SEND_HK")
-        _HK_REQUESTS[0] += 1
+        g.hk_requests += 1
         retry = time.monotonic() + 1.0
         while time.monotonic() < retry:
             for packet in g.since(start, "IB_TEST_HK"):

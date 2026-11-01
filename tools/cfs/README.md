@@ -34,8 +34,11 @@ stock cFS lacks (a counted array and a tail string, decision D6). `build.sh` cop
 `tools/cfs/apps/` into the checkout's `apps/`, lists it once in `sample_defs/targets.cmake` and checks
 that `cf/<app>.so` was built; `run.sh` adds `ib_test` to the startup script when `CFS_APPS` names it.
 Its commands are `IB_TEST_NOOP`, `IB_TEST_RESET_COUNTERS`, `IB_TEST_SET_DATA` (counted array and tail
-string, stored and published as `IB_TEST_VAR`), `IB_TEST_SEND_VAR` and `IB_TEST_SEND_HK`; telemetry MIDs
-0x08E0 (HK) and 0x08E1 (VAR) are not in TO_LAB's table, so a test adds them with `TO_LAB_ADD_PKT`.
+string, stored and published as `IB_TEST_VAR`), `IB_TEST_SEND_VAR` and `IB_TEST_SEND_HK`, and a throughput generator
+(`IB_TEST_GEN_START Rate=1..10000 Count=N`, `IB_TEST_GEN_STOP`, `IB_TEST_GEN_SEND_STATUS`) that publishes
+fixed-size 200-byte telemetry (`IB_TEST_GEN`, with `IB_TEST_GEN_STATUS` at the end of a run); telemetry MIDs
+0x08E0 (HK), 0x08E1 (VAR), 0x08E2 (GEN) and 0x08E3 (GEN_STATUS) are not in TO_LAB's table, so a test adds them
+with `TO_LAB_ADD_PKT` (`BufLimit` below 50).
 The layouts are in `apps/ib_test/fsw/src/ib_test.h` and `examples/ccdd/cfs.json`.
 
 Behind the agent proxy a failed clone is a proxy problem, see `/root/.ccr/README.md`.

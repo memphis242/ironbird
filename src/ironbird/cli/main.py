@@ -1530,6 +1530,15 @@ def record(
                     helper.cancel()
                 await asyncio.gather(*helpers, return_exceptions=True)
                 await capture.close()
+                held = capture.stats()
+                session.ledger.record(
+                    "state",
+                    "record.capture",
+                    offered=held.frames,
+                    queue_not_shown=held.not_shown,
+                    queue_peak_bytes=held.peak_bytes,
+                    unread=held.unread,
+                )
         return scope.exit_code(0)
 
     _run(ctx, as_node, verbose, body, "record")

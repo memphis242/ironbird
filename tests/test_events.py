@@ -106,6 +106,8 @@ def test_example_ccdd_categories() -> None:
         "TO_LAB_DATA_TYPES": "commanded",
         "IB_TEST_HK": "housekeeping",
         "IB_TEST_VAR": "commanded",
+        "IB_TEST_GEN": "other",
+        "IB_TEST_GEN_STATUS": "status",
     }
     long_event = cfs.by_name["EVS_LONG_EVENT"]
     assert long_event.event is not None
