@@ -288,9 +288,9 @@ ib replay run1.ibrec --follow                                 # a recording stil
 
 `ib export FILE... [-o OUT] [--format csv|text|jsonl] [--message NAME ...] [--where EXPR]
 [--from T] [--to T] [--header-fields] [--raw-enums] [--defs recording|config] [--skip-damage]
-[--force] [--jobs N]` writes a recording to files other tools read. It decodes exactly as `ib replay` does
-(same definitions, same `--where`, `--from`/`--to` and `--skip-damage`), needs no configuration
-and sends nothing.
+[--force] [--jobs N]` writes a recording to files other tools read. It decodes exactly as
+`ib replay` does (same definitions, same `--where`, `--from`/`--to` and `--skip-damage`), needs no
+configuration and sends nothing.
 
 ```bash
 ib export run1.ibrec -o run1-csv                               # a directory: one CSV per message
@@ -356,26 +356,337 @@ ib export run1.ibrec --format text --from +90s --to +2m -o minute.txt
   past it) or a part of a split recording is missing; the output exists and holds everything read.
   1 for `IB-REC-004..009`, `IB-EXP-*`; 2 for usage and `IB-FLT-*`.
 - **Cost and workers.** A recording of 8 MiB or more is decoded by a pool of worker processes, one per
-  core by default (`--jobs N`, or `[export] jobs` in the configuration; `--jobs 1` decodes in the
-  calling process, and so does a smaller recording, since starting the workers costs about a quarter
-  of a second). The file is cut into byte ranges (`[export] range_bytes`, 4MiB); each worker reads
-  its range itself through the same reader as every other command, decodes it exactly as the single
-  process does and sends back only the text of the rows, which the export writes in file order, at
-  most two ranges per worker in flight, so memory does not grow with the recording. **The output is
-  the same bytes in every format and with every option, with one worker or many**, and a damaged
-  recording ends at the same place with the same coded error (`IB-REC-006`/`007`, exit 5), because
-  a range that does not hold up (damage, a definition that appeared late, a sequence number that
-  goes back, a record boundary found in the wrong place) is read again, with the exact state, before
-  it is used. A recording read through the index because `--from`/`--to` or `--where` rule chunks
-  out, one still being written, and a followed one are exported in the calling process. A worker
-  that dies (killed, out of memory) or cannot start is `IB-EXP-003` (the message says to run again
-  or with `--jobs 1`; the cause is in the ledger), and Ctrl-C or SIGTERM ends the export (130/143),
-  terminates the workers and leaves nothing: they ignore SIGINT and SIGHUP, which only the export
-  acts on, and exit by themselves if the export is killed. `[export] pool_min_bytes` (8MiB; `0`
-  for always) moves the size from which workers are used. The ledger records the start (options,
-  workers), the pool (`export.pool`: ranges, ranges read again) and the end (counts per table, how it
-  ended). Measured on the development host (4 vCPU): 62-field, 200-byte packets as CSV, 18,100 rows/s
-  in one process and 51,000 to 65,000 rows/s with four workers (the host is shared; two runs).
+  core by default (the cores this process may run on, as its CPU affinity and control-group quota say,
+  at most 64; `--jobs N`, or `[export] jobs` in the configuration; `--jobs 1` decodes in the calling
+  process, and so does a smaller recording, since starting the workers costs about a quarter of a
+  second). The file is cut into byte ranges (`[export] range_bytes`, 4MiB); each worker reads its
+  range itself through the same reader as every other command, decodes it exactly as the single
+  process does and sends back only the text of the rows, which the export writes in file order.
+  Memory does not grow with the recording or the width of its rows: a result carries at most 8 MiB
+  of row text (a worker that reaches that stops, and the export asks for the rest of the range),
+  ranges are planned shorter when the rows are wide, at most two ranges per worker are in flight, and
+  the rows waiting plus those expected from the ranges still running stay within 32 MiB (each worker
+  always has one range): on rows of 70 KiB from 1 KiB frames the export of four workers peaks at
+  62 MiB where one process peaks at 36 MiB, and runs 3.3 times faster.
+  **The files and standard output are the same bytes in every format and with every option, with one
+  worker or many, and so are the tally, the damage reported and the exit code**, also when the reader
+  of standard output goes away (`| head`), because a range that does not hold up (damage, a
+  definition that appeared late, a sequence number that goes back, a record boundary found in the
+  wrong place) is read again, with the exact state, before it is used. (After a reader went away,
+  the count of frames read differs, since workers read whole ranges.) A recording that is renamed
+  or replaced while it is exported is read to the end from the file the export opened, in the calling
+  process, as with `--jobs 1`. A recording read through the index because `--from`/`--to` or
+  `--where` rule chunks out, one still being written, and a followed one are exported in the calling
+  process. A worker that dies (killed, out of memory) or cannot start is `IB-EXP-003` (the message
+  says to run again or with `--jobs 1`; the cause is in the ledger), and Ctrl-C, SIGTERM or SIGHUP
+  (also one sent to the whole process group) ends the export (130/143/129), terminates the workers
+  and leaves nothing: they ignore SIGINT and SIGHUP, which only the export acts on, and exit by
+  themselves if the export is killed. `[export] pool_min_bytes` (8MiB; `0` for always) moves the
+  size from which workers are used. The ledger records the start (options, workers), the pool
+  (`export.pool`: ranges, ranges read again, ranges cut short or read in the calling process) and the
+  end (counts per table, how it ended). Measured on the development host (4 vCPU): 62-field,
+  200-byte packets as CSV, 18,100 rows/s in one process and 51,000 to 67,000 rows/s with four workers
+  (the host is shared; two runs).
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Normal end: done, `--count` reached, `--timeout` elapsed without `--count` (`ib record --duration` elapsed), or the reader of stdout went away (`\| head -1`); `ib rec check` of a recording that is clean, or only torn at its tail |
+| 1 | Runtime error (`error IB-...`), `find` with no match; `ib rec check` found mid-file damage (or, with `--strict`, a recording not closed cleanly); a recording failed to write (`IB-REC-002`) |
+| 2 | Usage, configuration, CCDD or header-profile error |
+| 3 | `listen`, `events` or `respond` had `--count N` and `--timeout` elapsed first |
+| 5 | The output was produced, but the input recording was damaged mid-file: `ib rec repair` left valid frames after the damage out of the copy; `ib replay` or `ib export` stopped at the damage (or, with `--skip-damage`, went past it) or a part of a split recording is missing |
+| 6 | A command or reply went out but its ledger record was never written, or may have been lost to a deferred sync or close error (`IB-LED-004`). Same tier as 4 and wins over 4 and 5; an error (1, 2), 3 or a signal takes precedence. A `respond` that withheld replies under `on_full = "refuse_commands"` exits 1 |
+| 4 | The command otherwise succeeded but stdout lines were lost (`IB-OUT-002`): dropped while stdout was not draining, abandoned when a signal cut the final drain short, or stdout is closed (`>&-`). An error (1, 2), 3, 5 or a signal (128+n) takes precedence. A `send` that exits 4 still went out |
+| 128+n | Ended by signal n: 130 (Ctrl-C), 129 (SIGHUP), 143 (SIGTERM). The ledger is flushed first; an interrupted `send` says whether the command went out |
+
+Output never blocks the tool while it runs: a stalled stdout (unread pipe, paused pager) drops
+lines with one coalesced `IB-OUT-001` notice instead of freezing signals and `--timeout`; the
+ledger keeps everything. When the command ends normally it then waits, with no deadline, for a
+slow reader to take the lines already queued (one `IB-OUT-003` warning line, also in the ledger, says so
+after 2 s; a signal abandons them), so `--timeout` bounds the run, not the output: lines may keep
+draining after it. `ib listen --count N | slow-consumer` is lossless only while the backlog fits
+the 512 KiB output queue; beyond that the overflow is dropped while stdout is not draining, and
+the command exits 4 with the counts in the `IB-OUT-002` line. Whatever was lost is
+summed up in one `IB-OUT-002` line, in the ledger, and in exit code 4. Datagrams the kernel drops because the socket buffer is full are reported as
+`IB-TX-004`. Memory is bounded under a flood: a datagram longer than `max_packet_bytes` is cut by
+the kernel's own copy (`IB-DEC-002` reports its size on the wire), and a front-end that cannot keep
+up holds at most 32 MiB of received frames; those it was not shown are reported as `IB-ENG-001`
+(a recorder sees them regardless). A socket read that fails is reported as `IB-TX-003`; one that
+cannot recover ends the command with that error. If the kernel grants a smaller receive buffer than requested, `IB-TX-005` is shown as a
+warning (once per session; capture continues and exit codes are unchanged): ask an admin to
+raise `net.core.rmem_max` (`sysctl -w net.core.rmem_max=...`).
+
+The ledger directory is an absolute `$IRONBIRD_STATE_DIR` (a relative one is refused), else an absolute `$XDG_STATE_HOME/ironbird`,
+else `~/.local/state/ironbird`. `send` and `respond` refuse to run (`IB-LED-002`, nothing sent)
+when the state directory is unusable: a relative path, no home, no permission, a read-only file
+system, a path through a file. When the directory is usable but the disk or the system fails
+(disk or quota full, I/O error, out of descriptors, a hung file server), they send and warn
+(`IB-LED-004`, exit 6 if the record is never written) under the default `on_full = "continue"`,
+or refuse (exit 1) under `on_full = "refuse_commands"`.
+
+## Serial links
+
+A link with `transport = "serial"` carries both directions over one device (a UART, or a USB
+adapter such as `/dev/serial/by-id/usb-FTDI_...`). You need access to the device (usually the
+`dialout` group); ironbird never needs root. `examples/cfs-serial.toml` is a full example.
+
+```toml
+[[links]]
+name = "fc-uart"
+from = "ground"
+to = "fc"
+transport = "serial"
+serial = { device = "/dev/serial/by-id/usb-FTDI_...", baud = 115200, data_bits = 8,
+           parity = "none", stop_bits = 1, flow = "none" }
+framing = { kind = "header_length", sync = "", max_idle_ms = 50, require_known_mid = true }
+```
+
+| Key | Values |
+|-----|--------|
+| `serial.device` | absolute path, required |
+| `serial.baud` | 50 to 12000000, required |
+| `serial.data_bits` | 5, 6, 7, 8 (default 8) |
+| `serial.parity` | `none` (default), `even`, `odd`, `mark`, `space` |
+| `serial.stop_bits` | 1 (default), 1.5, 2 (Linux sends 2 for 1.5) |
+| `serial.flow` | `none` (default), `rtscts`, `xonxoff` |
+| `framing.kind` | `header_length` (the only one): the header profile's length field cuts the stream |
+| `framing.sync` | hex marker of up to 8 bytes that precedes every packet (consumed, not recorded); default none |
+| `framing.max_idle_ms` | 1 to 10000 (default 50): silence after which a pending packet is settled; at least 4 character times at the baud rate (the default is raised for a slow line, a smaller value in the file is refused) |
+| `framing.require_known_mid` | default `true`: the CCDD bounds what a header may claim. A length above 1.25 times the largest packet the CCDD defines for this end (telemetry or commands) is not a packet header, so a false header cannot swallow the real packets behind it; a MID the CCDD lacks, or a size it disagrees with, is still framed (a packet that grew a little is not lost) and the decode reports it (`IB-DEC-006`, `IB-DEC-007`). The framer counts those packets and the ledger records the total when the link closes (`rx.ccdd_mismatch`). `false`: the CCDD is not consulted and only `max_packet_bytes` bounds a claim |
+
+How the stream is cut. A byte stream has no packet boundaries, so a candidate header must look
+right (length between the smallest and the largest packet, the fixed fields) and, with a checksum
+in the profile, the whole packet must pass it. The CCDD does not decide what a packet is: one
+whose MID or payload size it does not define is still a packet, and the decode reports the
+mismatch. With `require_known_mid` it only limits how long a header may claim to be (see above),
+and a real packet larger than that limit is skipped as garbage (`IB-TX-007`).
+A profile without a checksum proves less, so a packet is also confirmed by a plausible header
+right behind it or by `max_idle_ms` of silence: the last packet before a pause waits that long, and
+a packet followed at once by line noise is not believed (use a header profile with a trailer
+checksum, such as `examples/headers/ccsds_pec_tlm.toml`, where that matters). Bytes that are not
+packets are kept, not dropped: they are recorded as `garbage` frames, a partial packet the line
+leaves incomplete is a `stale` frame, and each run is reported as `IB-TX-007` (coalesced; the
+ledger has the first bytes). A recording therefore holds the line byte for byte.
+
+Frame times are taken when the read that completed a frame returns; a USB adapter adds its own
+latency timer (an FTDI defaults to 16 ms). That is documented, not corrected.
+
+One process owns the device at a time (`flock`): a second `ib` on it fails with `IB-TX-006`, so a
+`listen` and a `send` take turns (a `respond` on the flight side answers on the same device).
+Errors a user can act on: a missing device (`IB-TX-001`: check the cable, list
+`/dev/serial/by-id`), no permission (`IB-TX-001`: it names the device's group and says to log in
+again after being added), a device two links of one process both name (`IB-TX-006`),
+a device already in use (`IB-TX-006`). If the device goes away after it was opened (an unplugged
+adapter, `EIO`/`ENXIO`), the link is down, not the command: `IB-TX-008` is shown once, the device is
+reopened with a backoff of 0.5 s to 5 s, a recording gets `link_down` and `link_up` marks and one
+`link_down` gap for the outage (its frame count is unknown, so the gap counts the interruption), and
+`IB-TX-008` is shown once more as an info line when the link is back. A `send` while the link is down is
+not sent (`IB-TX-008`). Closing the device may drop DTR on real hardware (the Linux default); a
+device that resets on DTR needs that handled on its side.
+
+## Events and telemetry categories
+
+cFS events are the most important telemetry. `ib events [--node X ...] [--min-type error]
+[--format line|json]` listens on every telemetry link of all (or the selected) nodes and
+prints only events: time, node, app, type, id, message. They also show in `ib listen`. The
+ledger records every received event in full.
+
+Telemetry messages carry a `category` in the CCDD, in priority order: `event`,
+`command_response`, `housekeeping`, `status`, `commanded`, `other` (default). An event message
+also has an `event` mapping naming its app/id/type/message fields; see `docs/plan.md`
+("Telemetry categories and events") and `examples/ccdd/cfs.json`.
+
+## Variable-length payloads
+
+A CCDD in schema `ironbird-ccdd/1` can end a message with fields whose size is on the wire:
+
+```json
+{"name": "Count",   "type": "uint16"},
+{"name": "Entries", "type": "uint32[]", "count": "Count", "max": 64},
+{"name": "Text",    "type": "char[]",   "length": "remaining", "max": 122}
+```
+
+The element type is a scalar, `char` or `bytes`. `count` names the fixed field that holds the number
+of elements, `length` the one that holds the number of bytes, and `"remaining"` takes the rest of the
+packet (last field only). `max` is required (`min` defaults to 0); the count field is an unsigned
+integer in the fixed fields, which all come first, and must be able to hold `max`. At most 8 such
+fields per message; the message's `min_payload`/`max_payload` follow from them.
+
+A received packet is checked at ingest like any other: a payload outside the message's range is
+`IB-DEC-007`, a count above `max` is `IB-DEC-008` (the offset is the count field), data that runs
+past the end of the packet is `IB-DEC-009`, and bytes left after the last field are `IB-DEC-007`.
+Values are tuples (`Entries`), text (`Text`, up to the first NUL) or bytes. `listen` shows the first 16
+elements and `...(+N)`; `--format json` carries the whole list; a CSV cell holds `[1 2 3]`.
+
+```bash
+ib send fc MOCK_LOAD_DATA Entries=1,2,3 Text=hello     # Count is filled in; [1,2,3] works too
+ib send fc MOCK_LOAD_DATA Count=9 Entries=1,2 Text=x --allow-count-mismatch   # fault injection
+```
+
+A `Count` that disagrees with the data is `IB-ENC-002` unless `--allow-count-mismatch` is given (a
+usage error on a command with no count or length field); the ledger's `send.request` record carries
+`allow_count_mismatch` and a `send.fault` record carries the `given` and `implied` value of each
+count that went out wrong (nothing when they agree). A number array cannot be used in a
+`--where` filter (`char[]` and `bytes[]` can).
+
+## Filtering with --where
+
+`ib listen NODE --where EXPR` and `ib events --where EXPR` show only the frames the expression
+matches (`--mid` stays and combines with it by `and`). The expression is compiled against the
+CCDD of the nodes in use before anything is opened, so a typo fails at once with a coded one-line
+error (`IB-FLT-001` syntax, `-002` unknown or ambiguous name, `-003` literal or operator that does
+not fit, `-004` over a limit; exit 2); `--verbose` adds the expression with a caret under the
+column and up to three close names.
+
+```bash
+ib listen fc --where 'msg == MOCK_HK and cmd_counter > 0'
+ib listen fc --where 'category in [event, command_response] and not mode == SAFE'
+ib events --where 'event.type >= error and event.app == "SAMPLE_APP"'
+```
+
+Grammar: `expr = term {or term}`, `term = factor {and factor}`, `factor = not factor | (expr) |
+name op literal`; `op` is `== != < <= > >= in [a, b] contains "text"`. Literals: integers (`-1`,
+`0x1f`), decimals (`-0.5`), quoted text (`"..."` or `'...'`), bare words (message, category, enum,
+node and severity names; quote one that is a keyword) and ISO 8601 times with `Z` or an offset
+(`2026-10-29T12:00:00.5Z`; local times are refused).
+
+| Names | Meaning |
+|-------|---------|
+| `seq time len node link dir kind source mid truncated garbage` | the frame itself (`len` is the size on the wire) |
+| `category msg` | from the MID alone (`msg` of a command frame needs its header check) |
+| `status` | `ok`, `malformed` or `unknown` (the ingest check) |
+| `fc hdr.<field> event.app event.id event.type event.text` | decoded (`event.type` orders DEBUG < ... < CRITICAL) |
+| `<MSG>.<field>`, bare `<field>` | a CCDD field (a bare field means any message that has it) |
+
+A predicate on something the frame does not have is false (`not` inverts it). Reserved names always
+win: a bare `mid` or `seq` is the frame's whatever a CCDD calls its fields, so a CCDD update never
+changes what a script means; write `MSG.field` (`TLM_A.mid`) for a CCDD field with such a name.
+`in [a, b]` is `== a or == b`, item by item per message (a label one message's enum lacks is simply
+never equal there), and `x != L` is `not x == L` for every message that has `x`. A float literal is
+rounded to the field's width (`ratio == 0.1` matches a stored float32 0.1) and a decimal compared
+with an integer is exact. `node ==` accepts a node's alias. `event.type >= error` shows what
+`--min-type error` shows, including events whose type has no severity. A filter that can never
+match (`msg == A and msg == B`, or MIDs outside `--mid`) is refused with `IB-FLT-003`. Limits: 4096
+characters, 1024 tokens outside `in` lists, 32 levels of `not` and parentheses, 1024 `in` items,
+numbers of at most 40 characters. A frame whose MID cannot match is never decoded for the filter,
+and neither is a serial garbage frame (it is malformed whatever its bytes say). Malformed frames
+are reported at ingest as before and `listen` shows decoded packets only, so
+`--where 'status == malformed'` selects them for replay and
+export, not for `listen`.
+
+## Header profiles
+
+A header profile (`examples/headers/*.toml`) declares the header fields in wire order, as
+big-endian bitfields packed MSB-first. What a profile can say beyond a field's width and value:
+
+| Key | Where | Meaning |
+|-----|-------|---------|
+| `endian = "little"` | a field | stored least significant byte first; only for a field that starts on a byte boundary and fills whole bytes (a little-endian bitfield is ambiguous and refused) |
+| `[[trailer.fields]]` | the profile | fields after the payload, fixed (`value = N`) or the one checksum; the payload is the packet minus header minus trailer |
+| `span` | a checksum field | the bytes it covers: `"packet"` (default), `"header"`, `"payload"`, or `{ start = N, end = -M }` (byte N up to M bytes before the packet end); the checksum field is zeroed if it lies inside the span |
+| `mid_fields` | the profile | any fields in any position; the MID is their values joined in list order, first listed most significant (cFE MsgId V2 spreads it over three places), at most 32 bits for a codec |
+| `[time]` | the profile | `epoch = "1980-01-01T00:00:00Z"` (the instant the counter is zero; a zone is required, whole second, 1900..2200) and `leap_seconds = N` (counter = UTC - epoch + leap; a TAI counter has 37); applies to the `computed = "time_seconds"` and `"time_subseconds"` fields. Without `[time]` the counter is Unix seconds |
+
+`crc16_ccitt` (CRC-16/CCITT-FALSE) is the CCSDS packet error control code; with the PEC as a trailer
+it covers `{ start = 0, end = -2 }` (`examples/headers/ccsds_pec_tlm.toml`). At most one checksum per
+profile. `ccsds_v1_cfs_tlm_cfe_time.toml` is `ccsds_v1_cfs_tlm.toml` with the cFE mission epoch
+(1980-01-01, TAI, 37 leap seconds; `tools/cfs/NOTES.md`): `examples/ironbird.toml` (real cFS) uses
+it, so `htime` is the right UTC instant. `ccsds_v1_cfs_tlm.toml` counts Unix seconds, which is what
+the mock vehicle (`ib respond`, `examples/mock.toml`) stamps. `cfe_msgid_v2_{cmd,tlm}.toml` are the
+cFE MsgId V2 headers, with the cFE defaults for the extended header (EDS version 1, little-endian
+flag, system id 0x42 = the sample spacecraft id).
+
+The decoded header time is `htime` in a filter (`--where 'htime >= 2026-10-29T12:00:00Z'`, UTC, with
+the same time literals as `time`); it is false for a packet whose profile has no seconds field.
+Trailer fields are `hdr.<name>` like header fields.
+
+An input field of a profile (`default = N`) takes, highest priority first, `ib send NODE CMD --header field=N` (repeatable), the message's CCDD
+`"header": {"field": N}`, and the profile default. Names must be input fields (the function code
+field comes from the command); values must fit the field. A bad name or width is `IB-HDR-003` for
+`--header` and `IB-ENC-004` when a CCDD is paired with the profile.
+
+A profile is untrusted input like any other file: unknown keys, overlapping or repeated MID fields,
+a span that cuts through its own checksum field or cannot fit any packet, a trailer that is not a
+whole number of bytes, a contradictory byte order and a bad epoch are all `IB-HDR-002` with the
+field path; a span that does not fit one particular packet is `IB-ENC-004` for a CCDD message and
+`IB-DEC-005` for a received packet.
+
+## Configuration
+
+One TOML file (`--config`, `$IRONBIRD_CONFIG`). Unknown keys are refused by name (`IB-CFG-*`, exit 2).
+Sizes are bytes or `"64MiB"`, durations `"10min"`. Defaults are in the second column.
+
+| Table | Key | Default / values |
+|-------|-----|------------------|
+| `[ironbird]` | `acts_as` | the node this process plays (`--as` overrides) |
+| | `max_packet_bytes` | 2048 (64..65535): longer datagrams are cut and reported |
+| `[nodes.NAME]` | `alias`, `description` | alias defaults to the name |
+| | `ccdd`, `ccdd_adapter` | CCDD file, `"json"` |
+| | `command_header`, `telemetry_header` | header profile files (`examples/headers`) |
+| `[[nodes.NAME.responses]]` | `on`, `reply`, `fields`, `echo`, `accepted_counter`, `rejected_counter` | what `respond` answers |
+| `[[links]]` | `name`, `from`, `to`, `transport` | `transport` is `"udp"` (default) or `"serial"` |
+| (udp) | `command_endpoint`, `telemetry_endpoint` | `"host:port"` |
+| (serial) | `[links.serial]`, `[links.framing]` | see Serial links |
+| `[recording]` | `dir` | `$IRONBIRD_RECORD_DIR`, else the XDG data directory |
+| | `fsync` | `"chunk"`, `"always"` or `"never"` |
+| | `max_buffer_bytes` | 256MiB |
+| | `min_free_bytes` | 1GiB |
+| | `embed_definitions` | `true` |
+| `[ledger]` | `event_bytes_per_hour`, `evidence_bytes_per_hour` | 160MiB, 32MiB, or `"unlimited"` |
+| | `evidence_raw_bytes_per_second`, `essential_reserve_bytes`, `max_file_bytes` | 256KiB, 32MiB, 32MiB |
+| | `on_full` | `"continue"` or `"refuse_commands"` |
+| `[retention]` | `max_age`, `max_total_bytes` | 7d, 8GiB, or `"unlimited"` (warnings only) |
+| | `keep_recent`, `warn_interval`, `scan_interval` | 10, 24h, 10min |
+| `[export]` | `jobs` | one per core, 1 to 64 (1: never use workers) |
+| | `pool_min_bytes`, `range_bytes` | 8MiB (0: always use workers), 4MiB (a multiple of 8, 4KiB to 256MiB) |
+
+Environment: `IRONBIRD_CONFIG`, `IRONBIRD_STATE_DIR` (ledger; absolute), `IRONBIRD_RECORD_DIR`
+(recordings), `XDG_STATE_HOME`, `XDG_DATA_HOME`.
+
+Shipped files:
+
+- `examples/ironbird.toml` - ground plus a real cFS flight computer (CI_LAB 1234, TO_LAB 2234), telemetry header time in the cFE epoch.
+- `examples/mock.toml` - ironbird-vs-ironbird on distinct ports, with response rules, telemetry header time in Unix seconds.
+- `examples/cfs-serial.toml` - ground plus a real cFS over a serial link, through `tools/cfs/serial_bridge.py` (a pty joined to CI_LAB / TO_LAB).
+- `examples/headers/*.toml` - header profiles (bit widths, fixed/computed fields, checksum).
+- `examples/ccdd/*.json` - placeholder CCDD JSON (`ironbird-ccdd/1`; `ironbird-ccdd/0` files still load).
+
+## Development
+
+```bash
+pytest -n auto
+ruff check . && ruff format --check .
+pyright
+```
+
+With no `node` on PATH, pyright downloads the official Node.js build, which needs
+`libatomic.so.1`: on RHEL 8 / Oracle Linux 8 run `dnf install libatomic` first.
+
+Real-cFS acceptance tests (opt-in, serial, need `tools/cfs/build.sh` first):
+
+```bash
+IRONBIRD_CFS=1 pytest tests/cfs -n0      # or: pytest tests/cfs -m cfs -n0
+```
+
+A plain `pytest` skips them. They start and stop cFS themselves and need UDP 1234 and 2234
+and `/dev/shm/osal:RAM` free (one instance per host). `tests/cfs/test_stage2_acceptance.py` is the
+Stage 2 scenario (a 60 s recording of a live session, replay, export, and a recorder killed with
+SIGKILL then repaired); `tests/cfs/test_cfs_generator.py` drives the `ib_test` throughput source, and
+`tests/cfs/test_generator_schedule.py` runs its schedule arithmetic on the host against a fake clock. CI
+runs all of `tests/cfs` in the `cfs` and `el8-cfs` jobs, and the throughput gate (`pytest tests/bench
+-n0`) serially next to the benchmarks.
+
+Test corpus of malformed inputs: `tests/corpus/malformed/`. Add a file there for every parser bug.
+
+Internals: the engine (`src/ironbird/engine.py`) turns whatever a transport receives into
+immutable `Frame`s, numbers them, runs the cheap `Codec.check`, hands each frame to its sinks
+(a recorder, later) and then to each consumer's own bounded queue, so a slow consumer never costs
+a captured frame. Malformed and unknown frames are consumers' frames too; they are reported once,
+coalesced, at ingest. `Session.capture()` gives the raw frames, `Session.decoder()` decodes them.
+Throughput guards: `pytest tests/test_benchmarks.py -n0 -s` prints the loopback ingest-only rate
+(receive side alone) and the end-to-end `ib listen` result at 10k packets/s.
 
 ## Throughput
 
@@ -400,8 +711,8 @@ fails. Measured on the development host (4 vCPU Xeon 2.1 GHz): at 10k packets/s 
 a core (48-51 us per frame), RSS stays near 32 MiB, the buffer peaks under 1.5 MiB of its 256 MiB, and
 141 MiB are written per minute (8.3 GiB per hour). `ib export` runs at about 36,000 rows/s as CSV on the
 75-byte housekeeping packet and 18,100 rows/s on the 200-byte, 62-field packet of the 10k target; with four
-workers (the default on four cores) the 200-byte export runs at 51,000 to 65,000 rows/s (x3.1 to x3.6), so a
-one-hour recording takes about 200-220 s at 1k packets/s in one process and 55-70 s with workers, and 33-36
+workers (the default on four cores) the 200-byte export runs at 51,000 to 67,000 rows/s (x3.1 to x3.6), so a
+one-hour recording takes about 200-220 s at 1k packets/s in one process and 54-70 s with workers, and 33-36
 minutes at 10k packets/s in one process and 9-12 minutes with workers. The ironbird side
 never loses a datagram it was handed; the cFS side of a 10k packets/s source is limited by TO_LAB's
 software-bus pipe (`tools/cfs/NOTES.md`, section 8).

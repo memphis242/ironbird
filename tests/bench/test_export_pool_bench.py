@@ -122,6 +122,7 @@ def test_the_pool_is_faster_and_writes_the_same_file(tmp_path: Path) -> None:
     ]
     pool = [e for e in events if e["event"] == "export.pool"]
     assert len(pool) == 1 and pool[0]["workers"] == workers and pool[0]["reruns"] == 0
+    assert pool[0]["continued"] == 0 and pool[0]["local"] == 0
     # With fewer than three cores the pool cannot be much faster; it must not be slower.
     assert speedup >= (CI_MIN_SPEEDUP if cores() >= 3 else 0.8), (single_s, pooled_s)
 

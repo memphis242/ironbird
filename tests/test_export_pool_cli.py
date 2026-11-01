@@ -16,9 +16,13 @@ from typing import Any
 import pytest
 
 from exportutil import hk_and_status
-from poolutil import clean_recording
+from ironbird.recording import format as fmt
+from ironbird.recording.format import MarkKind, RecordType
+from ironbird.recording.writer import RecorderOptions
+from poolutil import RX, SERIAL, TX, builder_recording, clean_recording, mixed_frames, write_builder
+from poolwide import wide_recording
 from recutil import CLI_MAIN, write_config
-from replayutil import child_env
+from replayutil import STEP_NS, T0, child_env, hk, write_recording
 
 # Named semaphores in /dev/shm belong to whichever process made them: they can only be told apart
 # when no other test runs beside this one.
@@ -380,3 +384,259 @@ def test_the_export_commits_only_when_the_last_range_is_written(
     assert run.out.is_file() and run.temporaries() == []
     assert "leaked" not in err
     wait_until(lambda: not any(alive(p) for p in run.workers), 10, "the workers to end")
+
+
+# -- the findings of the review of the pull request ---------------------------------------------
+
+
+def piped(
+    tmp_path: Path, env: dict[str, str], config: Path, source: Path, jobs: str, *args: str
+) -> tuple[str, list[str]]:
+    """``ib export SOURCE --jobs N ARGS | head -n 1 | md5sum``: what the pipe delivered with the
+    exit status of ``ib``, and what ``ib`` said (but for its summary)."""
+    command = (
+        f"{sys.executable} -c {CLI_MAIN!r} --config {config} export {source} --jobs {jobs} "
+        f"{' '.join(args)} 2>{tmp_path / 'err'} | head -n 1 | md5sum; echo rc=${{PIPESTATUS[0]}}"
+    )
+    done = subprocess.run(
+        ["bash", "-c", command],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    errors = (tmp_path / "err").read_text().splitlines()
+    # the summary says how many rows were written before the pipe was seen to be closed
+    return done.stdout, [line for line in errors if not line.startswith("export: read")]
+
+
+@pytest.mark.parametrize("extra", [[], ["--skip-damage"]])
+@pytest.mark.parametrize("fmt", ["text", "jsonl"])
+def test_a_reader_that_goes_away_ends_the_export_with_the_same_status_and_messages(
+    tmp_path: Path, env: dict[str, str], config: Path, fmt: str, extra: list[str]
+) -> None:
+    """``| head -n 1`` on a recording with damage much further on than a pipe holds: the single
+    process stops at the broken pipe and never reads the damage; the damage must not be reported
+    (nor change the exit status) because a worker read the range that holds it."""
+    big = clean_recording(tmp_path / "big.ibrec", 40000)
+    data = bytearray(big.read_bytes())
+    at = 900_000  # inside the first range, a megabyte of text further on than a pipe takes
+    data[at : at + 200] = bytes(200)
+    damaged = tmp_path / "damaged.ibrec"
+    damaged.write_bytes(bytes(data))
+    table = '[export]\npool_min_bytes = 0\nrange_bytes = "1MiB"\n'
+    wide, _, _ = write_config(tmp_path, table)
+    single = piped(tmp_path, env, wide, damaged, "1", "--format", fmt, *extra)
+    pooled = piped(tmp_path, env, wide, damaged, "3", "--format", fmt, *extra)
+    assert single == pooled
+    assert "rc=0" in single[0] and not any("IB-REC" in line for line in single[1]), single
+
+
+def test_a_recording_renamed_during_the_export_is_exported_from_the_file_opened(
+    tmp_path: Path, env: dict[str, str], config: Path, big: Path
+) -> None:
+    """Retention or a user files the recording away (and another takes its name) while the export
+    runs: one process holds the file open and carries on, and so must the pool."""
+    expected = tmp_path / "expected.txt"
+    done = ib(
+        tmp_path, env, config, str(big), "--format", "text", "-o", str(expected), "--jobs", "1"
+    )
+    assert done.returncode == 0, done.stderr
+    other = tmp_path / "other.ibrec"
+    options = RecorderOptions(min_free_bytes=0, chunk_bytes=6000)
+    write_recording(other, mixed_frames(3000, start=7), options=options, streams=(RX, TX, SERIAL))
+    for how in ("replaced", "gone"):
+        source = tmp_path / f"{how}.ibrec"
+        source.write_bytes(big.read_bytes())
+        run = Stalled(tmp_path, env, config, source, "text")
+        source.rename(tmp_path / f"{how}.moved")
+        if how == "replaced":
+            os.link(other, source)
+        run.go.write_text("go")
+        err = run.finish()
+        assert run.proc.returncode == 0, err
+        assert run.out.read_bytes() == expected.read_bytes(), how
+        assert "Traceback" not in err and "IB-EXP" not in err
+        run.out.unlink()
+        run.mark.unlink()
+        run.go.unlink()
+        pools = [e for e in ledger_events(tmp_path) if e["event"] == "export.pool"]
+        assert pools[-1]["local"] >= 1, pools[-1]
+
+
+def test_a_huge_core_count_is_capped_at_the_most_workers_there_can_be(
+    tmp_path: Path, env: dict[str, str], config: Path, big: Path
+) -> None:
+    program = (
+        "import os; os.sched_getaffinity = lambda pid: set(range(200)); "
+        "from ironbird.recording import pexport; pexport.cpu_quota = lambda: None; " + CLI_MAIN
+    )
+    args = ["--format", "text", "-o", str(tmp_path / "out.txt")]
+    done = subprocess.run(
+        [sys.executable, "-c", program, "--config", str(config), "export", str(big), *args],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    events = [e for e in ledger_events(tmp_path) if e["event"] == "export.pool"]
+    assert events and events[0]["workers"] == 64
+
+
+def test_a_hangup_sent_to_the_whole_process_group_ends_the_export_with_one_line(
+    tmp_path: Path, env: dict[str, str], config: Path, big: Path
+) -> None:
+    """A closed terminal hangs up every process of the session at once, the workers and the
+    resource tracker among them: the export ends 129 with its one line, not a page of leaked
+    semaphore warnings and tracebacks."""
+    run = Stalled(tmp_path, env, config, big, "text", new_session=True)
+    os.killpg(os.getpgid(run.proc.pid), signal.SIGHUP)
+    err = run.finish()
+    assert run.proc.returncode == 129, err
+    assert [line for line in err.splitlines() if line.strip()] == ["interrupted (SIGHUP)"], err
+    run.assert_clean()
+
+
+@pytest.mark.parametrize("jobs", ["2", "3"])
+def test_a_marks_only_stretch_then_a_sequence_reset_exports_the_same_through_the_cli(
+    tmp_path: Path, env: dict[str, str], config: Path, jobs: str
+) -> None:
+    builder = builder_recording(300)
+    seq = 301
+    while len(builder.out) < 60_000:
+        builder.out += b""
+        builder.add(RecordType.MARK, fmt.encode_mark(T0, MarkKind.SIGNAL, "operator note " * 4))
+    for reset in range(1, 200):
+        builder.frame(
+            reset,
+            data=hk(reset),
+            stream=0,
+            source=0,
+            mid=0x890,
+            time_ns=T0 + (seq + reset) * STEP_NS,
+        )
+    source = write_builder(builder, tmp_path / "marks.ibrec")
+    codes: list[tuple[int, str, bytes]] = []
+    for extra in ([], ["--skip-damage"]):
+        out = tmp_path / f"out-{jobs}.txt"
+        done = ib(
+            tmp_path,
+            env,
+            config,
+            str(source),
+            "--format",
+            "text",
+            "-o",
+            str(out),
+            "--jobs",
+            jobs,
+            *extra,
+        )
+        base = ib(
+            tmp_path,
+            env,
+            config,
+            str(source),
+            "--format",
+            "text",
+            "-o",
+            str(tmp_path / "ref.txt"),
+            "--jobs",
+            "1",
+            *extra,
+        )
+        codes.append((done.returncode, done.stderr.replace(out.name, "X"), out.read_bytes()))
+        assert (done.returncode, done.stderr.replace(out.name, "X"), out.read_bytes()) == (
+            base.returncode,
+            base.stderr.replace("ref.txt", "X"),
+            (tmp_path / "ref.txt").read_bytes(),
+        )
+        out.unlink()
+        (tmp_path / "ref.txt").unlink()
+    assert "IB-REC-007" in codes[0][1] and codes[0][2].count(b"\n") == 300
+
+
+def test_a_long_run_of_zeros_at_the_end_does_not_cost_a_scan_per_range(
+    tmp_path: Path, env: dict[str, str]
+) -> None:
+    """A crash can leave a file extended with zeros. Every range that begins in them looks for a
+    first record; each must give up at the end of its own range, not scan to the end of the file:
+    the pool takes about as long as one process, not a scan of the tail per range as long."""
+    config, _, _ = write_config(tmp_path, "[export]\npool_min_bytes = 0\nrange_bytes = 32768\n")
+    rec = clean_recording(tmp_path / "tail.ibrec", 3000)
+    with open(rec, "r+b") as handle:
+        handle.truncate(rec.stat().st_size + (384 << 20))
+    took: dict[str, float] = {}
+    for jobs in ("1", "4"):
+        started = time.monotonic()
+        args = ["--format", "text", "-o", str(tmp_path / f"o{jobs}"), "--jobs", jobs]
+        done = ib(tmp_path, env, config, str(rec), "--skip-damage", *args)
+        took[jobs] = time.monotonic() - started
+        assert done.returncode == 5, done.stderr
+    assert (tmp_path / "o1").read_bytes() == (tmp_path / "o4").read_bytes()
+    assert took["4"] < 1.5 * took["1"] + 1, took
+
+
+def test_wide_rows_do_not_grow_the_memory_of_the_export(
+    tmp_path: Path, env: dict[str, str]
+) -> None:
+    """Rows that are tens of KiB each from a frame of one KiB: a range makes hundreds of MiB of
+    text. With the bounds of a result and of the text waiting scaled down to a few hundred KiB,
+    the peak memory of the parent is that of one process plus a small constant."""
+    config, _, _ = write_config(tmp_path, "[export]\npool_min_bytes = 0\nrange_bytes = 131072\n")
+    rec = wide_recording(tmp_path / "wide.ibrec", 1400)
+    peaks: dict[str, int] = {}
+    for jobs in ("1", "4"):
+        peaks[jobs] = peak_rss_kib(
+            tmp_path,
+            env,
+            config,
+            [
+                "export",
+                str(rec),
+                "--format",
+                "text",
+                "-o",
+                str(tmp_path / f"o{jobs}"),
+                "--jobs",
+                jobs,
+            ],
+        )
+    assert (tmp_path / "o1").read_bytes() == (tmp_path / "o4").read_bytes()
+    assert peaks["4"] <= peaks["1"] + 16 * 1024, peaks
+
+
+# The parent's peak resident size, with the pool's bounds scaled down: ``main()`` of the CLI, then
+# ``ru_maxrss`` to a file. (``make_options`` takes the bounds; a version without them runs as is.)
+_MEASURED = """
+import functools, inspect, os, resource, sys
+from ironbird.cli import main as cli
+if "text_cap" in inspect.signature(cli.make_options).parameters:
+    cli.make_options = functools.partial(cli.make_options, text_cap=256 * 1024, text_budget=1 << 20)
+try:
+    code = cli.main()
+finally:
+    with open(os.environ["IB_RSS"], "w") as f:
+        f.write(str(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss))
+sys.exit(code)
+"""
+
+
+def peak_rss_kib(tmp_path: Path, env: dict[str, str], config: Path, args: list[str]) -> int:
+    marker = tmp_path / "rss"
+    done = subprocess.run(
+        [sys.executable, "-c", _MEASURED, "--config", str(config), *args],
+        env={**env, "IB_RSS": str(marker)},
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    return int(marker.read_text())

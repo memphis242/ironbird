@@ -21,7 +21,9 @@ made:
 - what it took from its seed (the streams and sources its frames named that it had not defined
   itself) is in force there as it was in the seed, and what it defined does not contradict what
   the walk has defined;
-- its first frame's sequence number is above the last one before it.
+- its first frame's sequence number is above the last one before it;
+- or it holds no record at all, because none begins inside it (the scan for a first record reads
+  no further than the end of the range) and the walk is already past its end.
 
 Otherwise the range is read again with the exact state and start (:class:`Job.exact`), and its
 result stands whatever it holds: damage, a reader error and an end at the damage are then exactly
@@ -30,12 +32,30 @@ early (damage that stops it, the end of the file) discards every range after it.
 with damage is handled as the single process handles it, at the cost of reading the damaged ranges
 twice.
 
-**Bounded memory.** At most :data:`WINDOW_PER_WORKER` ranges per worker are submitted and not yet
-written; their results are written in order and dropped. Nothing buffers the recording.
+**The file read is the file opened.** The parent holds the recording open and tells each worker
+its identity (device and inode). A worker whose name leads somewhere else (the file was renamed or
+replaced) or nowhere reads nothing; the parent then reads that range and every later one itself,
+from the file it holds, exactly as the single process would.
+
+**Bounded memory.** A result carries at most :data:`RESULT_TEXT_CAP` characters of rows (and at
+most :data:`MAX_RANGE_EVENTS` damage and gap notes): a worker that reaches either stops at a
+record boundary, and the parent asks for the rest of the range with an exact job from there. At
+most :data:`WINDOW_PER_WORKER` ranges per worker are submitted and not yet written, and no more
+than the bytes of rows waiting plus the largest result seen for each range still running fit in
+:data:`PENDING_TEXT_BUDGET` (at least one range per worker is always running). Results are written
+in order and dropped. Ranges are planned one after another and are shorter when the rows are wide
+(:meth:`_Runner._length`), so that a result is rarely cut. Nothing buffers the recording.
+
+**When the output closes** (standard output into ``head``) the single process stops at the row
+the output refused. A worker notes how many rows came before each damage and gap record, and the
+parent applies them only up to the rows the output took, so the damage reported and the tally are
+those of the single process.
 
 **Processes.** Workers are started with the ``spawn`` method, ignore SIGINT and SIGHUP (the parent
 coordinates), exit if the parent goes away, and are terminated when the export ends abnormally (a
-signal, an error, the output closing). A worker that dies is ``IB-EXP-003``.
+signal, an error, the output closing). The pool, and with it the resource tracker it starts, is
+created with the shutdown signals blocked, so a hangup sent to the process group reaches the parent
+alone. A worker that dies is ``IB-EXP-003``.
 
 Untrusted input: everything a worker reads is validated by the reader before it is decoded, and
 what comes back is plain data that the parent checks against the walk before it is used.
@@ -47,7 +67,6 @@ import concurrent.futures as cf
 import contextlib
 import dataclasses
 import hashlib
-import itertools
 import multiprocessing
 import os
 import signal
@@ -95,23 +114,74 @@ from ironbird.recording.player import Ending
 from ironbird.recording.reader import Damage, RecordingReader
 from ironbird.recording.replay import JumpTable, Replay, gap_in_range
 from ironbird.sigmask import HANDLED_SIGNALS, WAIT_SLICE_S, checkpoint, masked
+from ironbird.units import MIB
 
 RANGE_BYTES: Final = DEFAULT_RANGE_BYTES
 MIN_POOL_BYTES: Final = DEFAULT_POOL_MIN_BYTES
 MAX_JOBS: Final = MAX_EXPORT_JOBS
 WINDOW_PER_WORKER: Final = 2  # ranges submitted and not yet written, per worker
+RESULT_TEXT_CAP: Final = 8 * MIB  # characters of rows one result carries before the range is cut
+PENDING_TEXT_BUDGET: Final = 32 * MIB  # characters of rows waiting or expected, over all ranges
+MIN_RANGE_TEXT: Final = 256 * 1024  # the least text a range is planned to make, however wide
+FIRST_RANGE_DIVISOR: Final = 32  # ranges planned before any width is known are this much shorter
+MAX_RANGE_EVENTS: Final = 1000  # damage and gap notes one result carries before the range is cut
 PARENT_WATCH_S: Final = 1.0  # how often a worker looks for its parent
 STOP_WAIT_S: Final = 5.0  # how long terminated workers are waited for before they are killed
 ALIGN: Final = fmt.ALIGN
 assert RANGE_BYTES % ALIGN == 0 and MIN_RANGE_BYTES % ALIGN == 0
 
 
-def default_jobs() -> int:
-    """The workers to use when nothing says: one per core this process may run on."""
+CGROUP_ROOT: Final = Path("/sys/fs/cgroup")
+PROC_CGROUP: Final = Path("/proc/self/cgroup")
+_CGROUP_FILE_BYTES: Final = 256
+
+
+def _cgroup_text(path: Path) -> str | None:
     try:
-        return max(1, len(os.sched_getaffinity(0)))
+        with path.open("rb") as handle:
+            return handle.read(_CGROUP_FILE_BYTES).decode("ascii", "replace")
+    except OSError:
+        return None
+
+
+def cpu_quota(root: Path = CGROUP_ROOT, membership: Path = PROC_CGROUP) -> int | None:
+    """The whole cores the control group this process is in may use (the smallest ``cpu.max``
+    quota from its group up to the root, rounded up), or ``None`` when no limit is set or the
+    host has no unified hierarchy."""
+    text = _cgroup_text(membership)
+    if text is None:
+        return None
+    relative = ""
+    for line in text.splitlines():
+        if line.startswith("0::"):
+            relative = line[3:].strip()
+    parts = [p for p in relative.split("/") if p and p not in (".", "..")]
+    if not root.joinpath(*parts).is_dir():
+        parts = []  # a namespace whose paths are not under this root: only its top is known
+    found: int | None = None
+    for depth in range(len(parts), -1, -1):
+        limit = _cgroup_text(root.joinpath(*parts[:depth]) / "cpu.max")
+        fields = limit.split() if limit is not None else []
+        if len(fields) != 2 or not (fields[0].isdecimal() and fields[1].isdecimal()):
+            continue  # "max" (no limit), or a file that is not a quota
+        quota, period = int(fields[0]), int(fields[1])
+        if period > 0 and quota > 0:
+            cores = -(-quota // period)
+            found = cores if found is None else min(found, cores)
+    return found
+
+
+def default_jobs() -> int:
+    """The workers to use when nothing says: one per core this process may run on (its CPU
+    affinity, and the quota of its control group), at most :data:`MAX_JOBS`."""
+    try:
+        cores = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):  # pragma: no cover - not Linux
-        return max(1, os.cpu_count() or 1)
+        cores = os.cpu_count() or 1
+    quota = cpu_quota()
+    if quota is not None:
+        cores = min(cores, quota)
+    return max(1, min(cores, MAX_JOBS))
 
 
 # -- definitions, rebuilt in each worker ------------------------------------------------------
@@ -283,6 +353,9 @@ class Job:
     start_ns: int | None
     end_ns: int | None
     shape: Shape
+    identity: tuple[int, int]  # (device, inode) of the file the parent has open
+    text_cap: int  # characters of rows after which the range is cut short
+    event_cap: int  # damage and gap notes after which the range is cut short
 
 
 @dataclass(slots=True)
@@ -312,20 +385,25 @@ class Outcome:
     used_sources: list[int] = field(default_factory=list)
     work: int = 0  # bytes charged to the resync budget by the range
     trailer: bool = False
+    seen: bool = False  # the parent has learned from its size
+    partial: bool = False  # cut short at a cap: the range goes on from ``end``
+    moved: bool = False  # the name does not lead to the file the parent has open: nothing was read
     damage: list[Damage] = field(default_factory=list)
+    damage_rows: list[int] = field(default_factory=list)  # rows made before each damage
     failure: tuple[str, str, str] | None = None  # (code, summary, details) the reader raised
     crash: str | None = None  # a worker fault, as text
     frames_read: int = 0
     frames_in_range: int = 0
-    gaps: int = 0
-    gap_lost: int = 0
+    gap_marks: list[tuple[int, int, int]] = field(default_factory=list)
+    """``(rows made before, gaps, frames lost)``: the gap records in range, run together when no
+    row came between them."""
     counts: ExportResult = field(default_factory=ExportResult)
     blocks: list[Block] = field(default_factory=list)
     categories: bytes | None = None
 
     @property
     def clean(self) -> bool:
-        return self.crash is None and self.failure is None and not self.damage
+        return self.crash is None and self.failure is None and not self.damage and not self.moved
 
 
 # -- the worker -------------------------------------------------------------------------------
@@ -338,6 +416,7 @@ class _BlockDestination:
 
     def __init__(self, single_stream: bool) -> None:
         self.parts: list[list[str]] = [[]] if single_stream else []
+        self.chars = 0  # characters held, headers included
 
     def member(self, name: str) -> int:
         self.parts.append([])
@@ -345,6 +424,7 @@ class _BlockDestination:
 
     def write(self, handle: int, text: str) -> bool:
         self.parts[handle].append(text)
+        self.chars += len(text)
         return True
 
     def flush(self) -> None:
@@ -380,18 +460,36 @@ class _Worker:
             found = self._shapes[shape] = (where, selection)
         return found
 
-    def run(self, job: Job) -> Outcome:
+    def _open(self, job: Job) -> RecordingReader | None:
+        """The reader of the file the parent has open, or ``None`` when the name no longer
+        leads to it."""
+        try:
+            reader = RecordingReader(job.path, skip_damage=job.shape.skip_damage)
+        except IronbirdError:
+            return None
+        if reader.identity != job.identity:
+            reader.close()
+            return None
+        return reader
+
+    def run(self, job: Job, local: RecordingReader | None = None) -> Outcome:
+        """The outcome of ``job``. ``local``: the reader of the file, when the caller has it open
+        (the parent reading a range itself); it is left open."""
         shape = job.shape
         where, selection = self._compiled(shape)
         out = Outcome(job.index)
-        reader = RecordingReader(job.path, skip_damage=shape.skip_damage)
+        reader = local if local is not None else self._open(job)
+        if reader is None:
+            out.moved = True
+            return out
         try:
             seed = job.seed
             reader.seed_state(seed.streams, seed.sources, seed.last_seq, seed.work)
             if job.exact:
                 begin: int | None = job.guess
             else:
-                begin = reader.find_boundary(job.guess)
+                limit = job.stop if job.stop is not None else reader.size()
+                begin = reader.find_boundary(job.guess, limit)
                 reader.restart_work(seed.work)
             out.start = begin
             if begin is None:
@@ -412,12 +510,18 @@ class _Worker:
                 directory=shape.directory,
                 categories=shape.categories,
             )
+            cut: int | None = None
             try:
-                self._read(reader, job, begin, out, pipe)
+                cut = self._read(reader, job, begin, out, pipe, dest)
             except IronbirdError as exc:
                 out.failure = (exc.code.value, exc.summary, exc.detail_text())
-            out.end = reader.position
-            out.reached_stop = reader.reached_stop
+            if cut is None:
+                out.end = reader.position
+                out.reached_stop = reader.reached_stop
+            elif job.stop is not None and cut >= job.stop:
+                out.end, out.reached_stop = cut, True
+            else:
+                out.end, out.partial = cut, True
             out.last_seq = reader.last_seq
             out.definitions = definitions
             out.used_streams = sorted(lookups.streams)
@@ -427,17 +531,40 @@ class _Worker:
             self._collect(pipe, dest, out)
             return out
         finally:
-            reader.close()
+            if local is None:
+                reader.close()
 
     def _read(
-        self, reader: RecordingReader, job: Job, begin: int, out: Outcome, pipe: Pipeline
-    ) -> None:
-        """The loop of :meth:`Replay.read_part`, over a range, into ``pipe``."""
+        self,
+        reader: RecordingReader,
+        job: Job,
+        begin: int,
+        out: Outcome,
+        pipe: Pipeline,
+        dest: _BlockDestination,
+    ) -> int | None:
+        """The loop of :meth:`Replay.read_part`, over a range, into ``pipe``. Returns the offset
+        of the record to go on from when the range was cut short (the text or the notes reached
+        their caps), at a record boundary the single process passes through too; ``None`` when
+        the range was read to its end."""
         start, end = job.start_ns, job.end_ns
         step = pipe.step
-        for item in reader.items(start=begin, stop=job.stop):
+        kinds = pipe.categories
+        # A range read from a guess is used only if it holds no damage, so it need not look
+        # past any: the parent reads it again from the exact state.
+        for item in reader.items(start=begin, stop=job.stop, halt_on_damage=not job.exact):
+            rows = len(kinds) if kinds is not None else 0
             if isinstance(item, Damage):
                 out.damage.append(item)
+                out.damage_rows.append(rows)
+                # Reading goes on after damage only when asked to; what follows is then the
+                # same whether it is read here or from the offset the reader resumed at.
+                if (
+                    job.shape.skip_damage
+                    and item.resumed_at is not None
+                    and self._full(job, out, dest)
+                ):
+                    return item.resumed_at
                 continue
             match item.rtype:
                 case RecordType.FRAME:
@@ -451,14 +578,27 @@ class _Worker:
                         continue
                     out.frames_in_range += 1
                     step(frame)
+                    if self._full(job, out, dest):
+                        return item.end
                 case RecordType.GAP:
                     gap: fmt.Gap = item.value
                     if gap_in_range(gap, start, end):
-                        out.gaps += 1
-                        if gap.reason is not GapReason.LINK_DOWN:
-                            out.gap_lost += gap.lost
+                        lost = gap.lost if gap.reason is not GapReason.LINK_DOWN else 0
+                        marks = out.gap_marks
+                        if marks and marks[-1][0] == rows:
+                            marks[-1] = (rows, marks[-1][1] + 1, marks[-1][2] + lost)
+                        else:
+                            marks.append((rows, 1, lost))
+                        if self._full(job, out, dest):
+                            return item.end
                 case _:
                     pass
+        return None
+
+    @staticmethod
+    def _full(job: Job, out: Outcome, dest: _BlockDestination) -> bool:
+        """Whether the range has made all a result may carry."""
+        return dest.chars >= job.text_cap or len(out.damage) + len(out.gap_marks) >= job.event_cap
 
     def _collect(self, pipe: Pipeline, dest: _BlockDestination, out: Outcome) -> None:
         out.counts = pipe.result
@@ -498,12 +638,14 @@ def _watch_parent(parent: int) -> None:
 
 def _init_worker(definitions: Definitions, parent: int) -> None:
     """Run once in each worker process: the parent coordinates shutdown, so Ctrl-C and a hangup
-    reach the parent only; the parent's blocked signals (the pool is started with them blocked)
-    are unblocked so it can still terminate the worker."""
-    signal.pthread_sigmask(signal.SIG_UNBLOCK, HANDLED_SIGNALS)
+    reach the parent only. The worker starts with the shutdown signals blocked (the pool is made
+    with them blocked), so one that arrived while it started is pending: SIGINT and SIGHUP are
+    set to be ignored before the mask is lifted, so such a signal is dropped, not raised in the
+    middle of this function; SIGTERM keeps its default so the parent can terminate the worker."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, HANDLED_SIGNALS)
     threading.Thread(target=_watch_parent, args=(parent,), daemon=True).start()
     try:
         _Process.worker = _Worker(definitions)
@@ -544,6 +686,9 @@ def make_options(
     min_bytes: int = MIN_POOL_BYTES,
     range_bytes: int = RANGE_BYTES,
     pool: WorkerPool | None = None,
+    text_cap: int = RESULT_TEXT_CAP,
+    text_budget: int = PENDING_TEXT_BUDGET,
+    event_cap: int = MAX_RANGE_EVENTS,
 ) -> ParallelOptions:
     """The options of an export of ``replay`` with ``jobs`` workers: ``definitions`` says how a
     worker rebuilds the codecs the parent decodes with; the rest repeats what the export was given
@@ -560,7 +705,17 @@ def make_options(
         directory,
         replay.skips_damage,
     )
-    return ParallelOptions(jobs, definitions, shape, min_bytes, range_bytes, pool)
+    return ParallelOptions(
+        jobs,
+        definitions,
+        shape,
+        min_bytes,
+        range_bytes,
+        pool,
+        text_cap=text_cap,
+        text_budget=text_budget,
+        event_cap=event_cap,
+    )
 
 
 @dataclass(slots=True)
@@ -571,6 +726,8 @@ class PoolReport:
     parts_pooled: int = 0
     ranges: int = 0
     reruns: int = 0  # ranges read again because a guess did not hold
+    continued: int = 0  # ranges cut short at the caps and read on from there
+    local: int = 0  # ranges the parent read itself because the file moved from under its name
     max_pending: int = 0  # most ranges submitted and not yet written
     max_text_bytes: int = 0  # most characters of rows held at once, results waiting included
 
@@ -589,17 +746,22 @@ class WorkerPool:
         self.broken = False
 
     def submit(self, job: Job) -> cf.Future[Outcome]:
-        if self._executor is None:
-            self._executor = cf.ProcessPoolExecutor(
-                max_workers=self.jobs,
-                mp_context=multiprocessing.get_context("spawn"),
-                initializer=_init_worker,
-                initargs=(self.definitions, os.getpid()),
-            )
         try:
-            with (
-                masked()
-            ):  # threads and processes the pool starts here never take a shutdown signal
+            # The pool's helper threads and processes (the workers, and the resource tracker the
+            # pool's queues start) are made with the shutdown signals blocked, so a hangup or an
+            # interrupt sent to the process group reaches the parent alone. Two scopes: starting
+            # the resource tracker leaves SIGINT and SIGTERM unblocked in the thread that did it
+            # (multiprocessing unblocks them after the spawn), and the workers must not inherit
+            # that.
+            if self._executor is None:
+                with masked():
+                    self._executor = cf.ProcessPoolExecutor(
+                        max_workers=self.jobs,
+                        mp_context=multiprocessing.get_context("spawn"),
+                        initializer=_init_worker,
+                        initargs=(self.definitions, os.getpid()),
+                    )
+            with masked():
                 future = self._executor.submit(run_job, job)
         except BrokenProcessPool as exc:
             raise self.died(exc) from exc
@@ -661,7 +823,9 @@ class WorkerPool:
 class ParallelOptions:
     """Whether and how an export uses the pool. ``jobs``: workers (1: never); ``min_bytes``: the
     size of the files below which the export stays in this process; ``range_bytes``: the size of
-    a range; ``pool``: workers kept by the caller (``None``: the export starts its own)."""
+    a range; ``pool``: workers kept by the caller (``None``: the export starts its own);
+    ``text_cap``, ``text_budget`` and ``event_cap``: the bounds on what a result carries and on
+    what is waiting at once (see the module)."""
 
     jobs: int
     definitions: Definitions
@@ -670,10 +834,14 @@ class ParallelOptions:
     range_bytes: int = RANGE_BYTES
     pool: WorkerPool | None = None
     report: PoolReport = field(default_factory=PoolReport)
+    text_cap: int = RESULT_TEXT_CAP
+    text_budget: int = PENDING_TEXT_BUDGET
+    event_cap: int = MAX_RANGE_EVENTS
 
     def __post_init__(self) -> None:
         assert 1 <= self.jobs <= MAX_JOBS
         assert self.range_bytes >= MIN_RANGE_BYTES and self.range_bytes % ALIGN == 0
+        assert self.text_cap >= 1 and self.text_budget >= 1 and self.event_cap >= 1
         assert self.pool is None or self.pool.definitions == self.definitions
 
     def wanted(self, replay: Replay) -> bool:
@@ -772,6 +940,10 @@ class _Runner:
         self._shape = dataclasses.replace(options.shape, categories=self._per_line)
         self._pool = pool
         self._live: dict[int, cf.Future[Outcome]] = {}
+        self._moved = False  # the file is no longer under its name: this process reads it all
+        self._local: _Worker | None = None
+        self._largest = 0  # an estimate of the most text a running range will return
+        self._ratio = 0.0  # an estimate of the characters of text a byte of the file makes
 
     def _waiting_text(self) -> int:
         """Characters of row text in the results that have come back and are not yet written."""
@@ -780,6 +952,52 @@ class _Runner:
             if future.done() and not future.cancelled() and future.exception() is None:
                 total += sum(len(block.text) for block in future.result().blocks)
         return total
+
+    def _room(self, live: int) -> bool:
+        """Whether another range may be submitted when ``live`` are submitted and not yet
+        written: the window is not full, and the rows waiting plus the rows the ranges still
+        running are expected to return (as much as the largest recent result, until one is seen:
+        as much as a result may carry) fit in the budget; each worker always has one range."""
+        options = self._options
+        if live >= options.jobs * WINDOW_PER_WORKER:
+            return False
+        running = sum(1 for future in self._live.values() if not future.done())
+        if running < options.jobs:
+            return True
+        expected = min(options.text_cap, self._largest) if self._largest else options.text_cap
+        return self._waiting_text() + running * expected <= options.text_budget
+
+    def _note_size(self, outcome: Outcome) -> None:
+        """Learn how large a result is, and how much text a byte of the file makes (once)."""
+        if outcome.seen:
+            return
+        outcome.seen = True
+        size = sum(len(block.text) for block in outcome.blocks)
+        self._largest = max(size, self._largest * 7 // 8)
+        if outcome.start is not None and outcome.end > outcome.start:
+            self._ratio = max(size / (outcome.end - outcome.start), self._ratio * 7 / 8)
+
+    def _observe(self) -> None:
+        """Learn from the results that have come back, written or not."""
+        for future in self._live.values():
+            if future.done() and not future.cancelled() and future.exception() is None:
+                self._note_size(future.result())
+
+    def _length(self) -> int:
+        """The size of the next range. Before any result has shown how much text a byte of the
+        file makes, a short one (the first window of ranges is the one that cannot be sized).
+        After, the configured size, or less when the rows are so wide that it would make more
+        text than a worker's share of the budget (the ranges running together, and the ones
+        waiting behind them, then fit in it) and a result may carry: a range whose text passes
+        the cap is cut and read on serially, which shares nothing."""
+        options = self._options
+        if self._ratio <= 0:
+            length = options.range_bytes // FIRST_RANGE_DIVISOR
+        else:
+            share = options.text_budget // (2 * options.jobs)
+            text = max(MIN_RANGE_TEXT, min(options.text_cap * 3 // 4, share))
+            length = min(options.range_bytes, int(text / self._ratio))
+        return max(MIN_RANGE_BYTES, length - length % ALIGN)
 
     def cancel(self) -> None:
         """Drop the ranges still waiting for a worker."""
@@ -859,67 +1077,153 @@ class _Runner:
         replay = self._replay
         options, report = self._options, self._report
         body = reader.body_start
-        count = -(-(size - body) // options.range_bytes)
-        assert count >= 2
-        bounds = [body] + [_align_up(body + i * options.range_bytes) for i in range(1, count)]
-        assert all(a < b for a, b in itertools.pairwise(bounds))
+        walk = _Walk(end=body, work=reader.work)  # the work of the single process at this point
         guess_seed = self._head_seed(reader, size)
-        walk = _Walk(end=body)
-        window = options.jobs * WINDOW_PER_WORKER
+        edges = [body]  # edges[k]: where range k begins; the last range has no edge after it
+        last = False  # the last range (it reads to the end of the file) is planned
         jobs: dict[int, Job] = {}
         futures = self._live
         futures.clear()
+        self._moved = False
+        self._largest, self._ratio = 0, 0.0
         report.parts_pooled += 1
         damaged = closed = False
         submitted = 0
 
-        def submit(index: int, *, exact: bool, guess: int, seed: Seed) -> None:
-            stop = bounds[index + 1] if index + 1 < count else None
-            job = Job(index, path, guess, stop, exact, seed, start, end, self._shape)
-            jobs[index] = job
-            futures[index] = self._pool.submit(job)
+        def planned() -> int:
+            return len(edges) if last else len(edges) - 1
+
+        def plan() -> None:
+            """Decide where the next range that has no end yet stops."""
+            nonlocal last
+            stop = _align_up(edges[-1] + self._length())
+            if stop >= size:
+                last = True
+            else:
+                edges.append(stop)
+
+        def job_of(index: int, *, exact: bool, guess: int, seed: Seed) -> Job:
+            return Job(
+                index,
+                path,
+                guess,
+                edges[index + 1] if index + 1 < len(edges) else None,
+                exact,
+                seed,
+                start,
+                end,
+                self._shape,
+                reader.identity,
+                options.text_cap,
+                options.event_cap,
+            )
+
+        def submit(job: Job) -> None:
+            jobs[job.index] = job
+            futures[job.index] = self._pool.submit(job)
             report.workers = self._pool.jobs
 
-        for index in range(count):
-            while submitted < count and submitted - index < window:
+        def exactly(index: int) -> Outcome:
+            """Range ``index`` read from where the walk is, with the state it has."""
+            job = job_of(index, exact=True, guess=walk.end, seed=walk.seed())
+            if not self._moved:
+                submit(job)
+                outcome = self._await(futures[index])
+                if not outcome.moved:
+                    return outcome
+                self._leave_pool(jobs)
+            report.local += 1
+            return self._here(job, reader)
+
+        def fetch(index: int) -> Outcome:
+            """The outcome of the first read of range ``index``, once it is what the walk reads."""
+            job = jobs.get(index)
+            if job is None or self._moved:
+                return exactly(index)
+            outcome = self._await(futures[index])
+            if outcome.moved:
+                self._leave_pool(jobs)
+                return exactly(index)
+            limit = job.stop if job.stop is not None else size
+            if not job.exact and not self._accepted(job, outcome, walk, limit):
+                report.reruns += 1
+                return exactly(index)
+            return outcome
+
+        index = 0
+        while True:
+            while not self._moved and not (last and submitted >= len(edges)):
+                self._observe()
+                if submitted >= planned():
+                    plan()
+                if not self._room(submitted - index):
+                    break
                 if submitted == 0:
-                    submit(0, exact=True, guess=body, seed=walk.seed())
+                    submit(job_of(0, exact=True, guess=body, seed=walk.seed()))
                 else:
                     seed = walk.seed() if walk.streams else guess_seed
-                    submit(submitted, exact=False, guess=bounds[submitted], seed=seed)
+                    submit(job_of(submitted, exact=False, guess=edges[submitted], seed=seed))
                 submitted += 1
                 report.ranges += 1
                 report.max_pending = max(report.max_pending, submitted - index)
-            outcome = self._await(futures[index])
-            job = jobs[index]
-            if not job.exact and not self._accepted(job, outcome, walk):
-                report.reruns += 1
-                submit(index, exact=True, guess=walk.end, seed=walk.seed())
-                outcome = self._await(futures[index])
-            report.max_text_bytes = max(report.max_text_bytes, self._waiting_text())
-            futures.pop(index, None)
-            jobs.pop(index, None)
-            refused = not self._write(outcome, reader, path)
-            damaged = damaged or bool(outcome.damage)
-            closed = closed or outcome.trailer
-            if refused:
-                return False
-            if outcome.failure is not None:
-                code, summary, details = outcome.failure
-                raise IronbirdError(Code(code), summary, details=details)
-            if outcome.crash is not None:
-                raise self._crashed(outcome.crash)
-            walk.apply(outcome.definitions)
-            walk.last_seq = outcome.last_seq
-            walk.work += outcome.work
-            walk.end = outcome.end
-            if replay.ended_by_damage or (not outcome.reached_stop and index + 1 < count):
+            while index >= planned():
+                plan()
+            outcome = fetch(index)
+            while True:
+                self._note_size(outcome)
+                report.max_text_bytes = max(report.max_text_bytes, self._waiting_text())
+                futures.pop(index, None)
+                jobs.pop(index, None)
+                if outcome.start is None:
+                    break  # no record begins in the range and the walk is past it
+                refused = not self._write(outcome, reader, path)
+                damaged = damaged or bool(outcome.damage)
+                closed = closed or outcome.trailer
+                if refused:
+                    return False
+                if outcome.failure is not None:
+                    code, summary, details = outcome.failure
+                    raise IronbirdError(Code(code), summary, details=details)
+                if outcome.crash is not None:
+                    raise self._crashed(outcome.crash)
+                walk.apply(outcome.definitions)
+                if outcome.first_seq is not None:  # a range without frames leaves the sequence
+                    walk.last_seq = outcome.last_seq
+                walk.work += outcome.work
+                assert not outcome.partial or outcome.end > walk.end, "a cut range goes on"
+                walk.end = outcome.end
+                if not outcome.partial:
+                    break
+                report.continued += 1
+                outcome = exactly(index)
+            index += 1
+            if replay.ended_by_damage or (outcome.start is not None and not outcome.reached_stop):
+                break
+            if last and index >= len(edges):
                 break
         for future in futures.values():
             future.cancel()
         futures.clear()
         replay.finish_part(reader, damaged=damaged, closed=closed)
         return True
+
+    def _leave_pool(self, jobs: dict[int, Job]) -> None:
+        """The workers cannot read the file under its name: the rest of the part is read here."""
+        self._moved = True
+        self.cancel()
+        jobs.clear()
+
+    def _here(self, job: Job, reader: RecordingReader) -> Outcome:
+        """``job`` run in this process, on the file this process has open."""
+        if self._local is None:
+            try:
+                self._local = _Worker(self._options.definitions)
+            except _Changed as exc:
+                raise IronbirdError(
+                    Code.EXP_WORKER,
+                    f"{exc}; run the export again, or with --jobs 1 to decode in one process",
+                ) from exc
+        return self._local.run(job, reader)
 
     def _head_seed(self, reader: RecordingReader, size: int) -> Seed:
         """The streams and sources the head of the file defines: what the first ranges are
@@ -933,11 +1237,16 @@ class _Runner:
                 sources[item.value[0]] = item.value[1]
         return Seed(streams, sources, 0, 0)
 
-    def _accepted(self, job: Job, outcome: Outcome, walk: _Walk) -> bool:
-        """Whether a range read from a guess is what the walk reads: see the module."""
+    @staticmethod
+    def _accepted(job: Job, outcome: Outcome, walk: _Walk, limit: int) -> bool:
+        """Whether a range read from a guess is what the walk reads: see the module. ``limit``:
+        where the range ends (the end of the file for the last)."""
+        if not outcome.clean:
+            return False
+        if outcome.start is None:  # no record begins in the range
+            return walk.end >= limit
         return (
-            outcome.clean
-            and outcome.start == walk.end
+            outcome.start == walk.end
             and walk.agrees_with(job.seed, outcome)
             and (outcome.first_seq is None or outcome.first_seq > walk.last_seq)
         )
@@ -955,21 +1264,21 @@ class _Runner:
 
     def _write(self, outcome: Outcome, reader: RecordingReader, path: Path) -> bool:
         """Put the range's rows, tally and damage where the single process would have; ``False``:
-        the output refused a row."""
+        the output refused a row (the damage and gaps after it are not noted: the single process
+        stops there and never reads them)."""
         replay, pipe = self._replay, self._pipe
         stats = replay.stats
         stats.frames_read += outcome.frames_read
         stats.frames_in_range += outcome.frames_in_range
-        replay.note_gaps(outcome.gaps, outcome.gap_lost)
-        for damage in outcome.damage:
-            replay.note_damage(damage, reader, path)
         result = pipe.result
         counts = outcome.counts
         result.skipped_no_definitions += counts.skipped_no_definitions
         result.not_written += counts.not_written
         result.rejected.update(counts.rejected)
+        events = _Events(replay, outcome, reader, path)
         if self._per_line:
-            return self._write_lines(outcome)
+            return self._write_lines(outcome, events)
+        events.up_to(None)
         result.absorb_rows(counts)
         tables = pipe.tables
         for block in outcome.blocks:
@@ -990,10 +1299,10 @@ class _Runner:
             self._dest.write(handle, block.text)
         return True
 
-    def _write_lines(self, outcome: Outcome) -> bool:
+    def _write_lines(self, outcome: Outcome, events: _Events) -> bool:
         """A destination that takes a line at a time and may refuse one (standard output: one
         stream, so one table at most): the rows are written one by one and counted as far as it
-        takes them."""
+        takes them, with the damage and gaps that came before each."""
         pipe = self._pipe
         result = pipe.result
         blocks = [b for b in outcome.blocks if b.text]
@@ -1008,7 +1317,8 @@ class _Runner:
                 table = pipe.tables.table_for(*blocks[0].key)
         handle = table.handle if table is not None else 0
         taken = 0
-        for kind in outcome.categories or b"":
+        for row, kind in enumerate(outcome.categories or b""):
+            events.up_to(row)
             if not kind & NO_LINE:
                 if not self._dest.write(handle, lines[taken] + "\n"):
                     return False
@@ -1017,13 +1327,47 @@ class _Runner:
                     table.rows += 1
             result.tally(kind & ~NO_LINE)
         assert taken == len(lines)
+        events.up_to(None)
         return True
+
+
+class _Events:
+    """The damage and gap records of one range, noted in the replay as the rows before them are
+    taken by the output."""
+
+    def __init__(
+        self, replay: Replay, outcome: Outcome, reader: RecordingReader, path: Path
+    ) -> None:
+        assert len(outcome.damage) == len(outcome.damage_rows)
+        self._replay = replay
+        self._outcome = outcome
+        self._reader = reader
+        self._path = path
+        self._damage = 0
+        self._gaps = 0
+
+    def up_to(self, rows: int | None) -> None:
+        """Note every record that came after at most ``rows`` rows (``None``: all that are left)."""
+        outcome, replay = self._outcome, self._replay
+        while self._damage < len(outcome.damage) and (
+            rows is None or outcome.damage_rows[self._damage] <= rows
+        ):
+            replay.note_damage(outcome.damage[self._damage], self._reader, self._path)
+            self._damage += 1
+        while self._gaps < len(outcome.gap_marks) and (
+            rows is None or outcome.gap_marks[self._gaps][0] <= rows
+        ):
+            _, gaps, lost = outcome.gap_marks[self._gaps]
+            replay.note_gaps(gaps, lost)
+            self._gaps += 1
 
 
 __all__ = [
     "MAX_JOBS",
     "MIN_POOL_BYTES",
+    "PENDING_TEXT_BUDGET",
     "RANGE_BYTES",
+    "RESULT_TEXT_CAP",
     "ConfigDefinitions",
     "Definitions",
     "EmbeddedDefinitions",

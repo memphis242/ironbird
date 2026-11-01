@@ -25,7 +25,15 @@ from ironbird.recording.export import (
     export,
 )
 from ironbird.recording.format import MarkKind, RecordType
-from ironbird.recording.pexport import EmbeddedDefinitions, PoolReport, WorkerPool, make_options
+from ironbird.recording.pexport import (
+    MAX_RANGE_EVENTS,
+    PENDING_TEXT_BUDGET,
+    RESULT_TEXT_CAP,
+    EmbeddedDefinitions,
+    PoolReport,
+    WorkerPool,
+    make_options,
+)
 from ironbird.recording.player import compile_where
 from ironbird.recording.reader import Damage
 from ironbird.recording.replay import Replay, TimeSpec
@@ -123,9 +131,13 @@ def run_export(
     range_bytes: int = RANGE,
     single: bool | None = None,
     pool: WorkerPool | bool | None = True,
+    text_cap: int = RESULT_TEXT_CAP,
+    text_budget: int = PENDING_TEXT_BUDGET,
+    event_cap: int = MAX_RANGE_EVENTS,
 ) -> Run:
     """Do what ``ib export`` does, with ``jobs`` workers when above 1 (ranges of ``range_bytes``
-    whatever the size of the files). Errors are returned, not raised."""
+    whatever the size of the files; ``text_cap``, ``text_budget`` and ``event_cap`` as in
+    :func:`make_options`). Errors are returned, not raised."""
     paths = [files] if isinstance(files, Path) else list(files)
     damage: list[tuple[Any, ...]] = []
 
@@ -177,6 +189,9 @@ def run_export(
                 min_bytes=0,
                 range_bytes=range_bytes,
                 pool=kept if pool is True else (pool or None),
+                text_cap=text_cap,
+                text_budget=text_budget,
+                event_cap=event_cap,
             )
             parallel = dataclasses.replace(parallel, report=report)
         result = export(

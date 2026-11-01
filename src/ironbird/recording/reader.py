@@ -181,7 +181,6 @@ class RecordingReader:
         self.locked = False
         self._state = _State()
         self._work = 0  # bytes read and CRC-checked this pass, charged against the budget
-        self.budget_asked = False  # the budget was consulted (a resync scan ran) in this pass
         self.position = 0  # where :meth:`items` last was: the offset of the next record to read
         self.reached_stop = False  # :meth:`items` ended because the record at ``stop`` was due
         self._definitions: list[tuple[Any, ...]] | None = None
@@ -316,18 +315,15 @@ class RecordingReader:
         """Begin as if the records before the first one read had defined ``streams`` and
         ``sources``, the last frame among them had sequence number ``last_seq`` and ``work`` bytes
         had been charged: for a read that starts inside a file (see :meth:`items`) on behalf of
-        one that began at the start. Call before :meth:`items`."""
-        assert not self._state.streams and not self._state.sources and self._state.last_seq == 0
-        self._state.streams.update(streams)
-        self._state.sources.update(sources)
-        self._state.last_seq = last_seq
+        one that began at the start. Replaces whatever the reader knew; call before
+        :meth:`items`."""
+        self._state = _State(dict(streams), dict(sources), last_seq)
         self._work = work
 
     def restart_work(self, work: int) -> None:
-        """Charge ``work`` bytes from here on and forget that the budget was consulted (a scan
-        that only located where to begin does not count)."""
+        """Charge ``work`` bytes from here on (a scan that only located where to begin does not
+        count)."""
         self._work = work
-        self.budget_asked = False
 
     def track_lookups(self) -> Lookups:
         """Start recording which definitions of the seed the records read from here on rely on;
@@ -347,11 +343,13 @@ class RecordingReader:
         """The sequence number of the last frame accepted (0: none)."""
         return self._state.last_seq
 
-    def find_boundary(self, offset: int) -> int | None:
+    def find_boundary(self, offset: int, limit: int | None = None) -> int | None:
         """The offset of the first record at or after ``offset`` (rounded up to the alignment)
-        that passes every rule and is followed by another valid record: the scan a resync after
-        damage does, for a read that starts inside a file. ``None``: there is none."""
-        found, _ = self._resync(offset - fmt.ALIGN)
+        and before ``limit`` (``None``: anywhere in the file) that passes every rule and is
+        followed by another valid record: the scan a resync after damage does, for a read that
+        starts inside a file. ``None``: there is none; the scan reads no further than ``limit``,
+        so a stretch with no records in it costs its own length."""
+        found, _ = self._resync(offset - fmt.ALIGN, limit)
         return found
 
     def read_at(self, offset: int, size: int) -> bytes:
@@ -619,21 +617,25 @@ class RecordingReader:
 
     def _over_budget(self) -> bool:
         """Whether this pass has done more work than its file size allows a resync."""
-        self.budget_asked = True
         return self._work > WORK_FLOOR + WORK_FACTOR * self.size()
 
-    def _resync(self, damaged_at: int) -> tuple[int | None, bool]:
-        """The offset of the next valid record after damage at ``damaged_at``, or ``None``.
+    def _resync(self, damaged_at: int, limit: int | None = None) -> tuple[int | None, bool]:
+        """The offset of the next valid record after damage at ``damaged_at``, or ``None``. With
+        a ``limit``, only a record that begins before it counts, and nothing at or past it is
+        read for the search.
 
         The second value says the scan gave up (the pass's work budget ran out on implausible
-        record headers) instead of reaching the end of the file.
+        record headers) instead of reaching the end of the file or the limit.
         """
         position = (damaged_at + fmt.ALIGN) & ~(fmt.ALIGN - 1)
         step = SMALL_BLOCK  # doubles up to a block: a record close by is cheap, a long scan fast
         while True:
             checkpoint()  # a shutdown signal ends a long scan here
+            if limit is not None and position >= limit:
+                return None, False
+            want = step if limit is None else min(step, limit - position)
             try:
-                block = os.pread(self._fd, step + 16, position)
+                block = os.pread(self._fd, want + 16, position)
             except OSError as exc:
                 raise IronbirdError(
                     Code.REC_FORMAT,
@@ -642,7 +644,7 @@ class RecordingReader:
                 ) from exc
             if len(block) < fmt.ENVELOPE_SIZE:
                 return None, False
-            for match in _CANDIDATE.finditer(block, 4, step + 7):
+            for match in _CANDIDATE.finditer(block, 4, want + 7):
                 candidate = position + match.start() - 4
                 if candidate & (fmt.ALIGN - 1):
                     continue
@@ -651,9 +653,9 @@ class RecordingReader:
                     return None, True
                 if self._chain_valid(candidate):
                     return candidate, False
-            if len(block) <= step:
+            if len(block) <= want:
                 return None, False
-            position += step
+            position += want
             step = min(step * 2, READ_BLOCK)
 
     # -- iteration --
@@ -692,6 +694,7 @@ class RecordingReader:
         wait: Callable[[], bool] | None = None,
         start: int | None = None,
         stop: int | None = None,
+        halt_on_damage: bool = False,
     ) -> Iterator[Item | Damage]:
         """Every valid record after META in file order, and a :class:`Damage` where the file is
         not valid records. Stops at damage unless ``skip_damage``; a torn tail always ends it.
@@ -710,7 +713,12 @@ class RecordingReader:
         before the first record that begins at or after it, with :attr:`reached_stop` set and
         :attr:`position` the offset of that record. Reading a range this way leaves the state
         the records before ``start`` would have left to :meth:`seed_state`.
+
+        ``halt_on_damage`` (not with ``wait``): at the first damage, yield a :class:`Damage` that
+        says where it is (its ``span`` is 0 and ``resumed_at`` ``None``: the scan for what follows
+        is not made) and end, for a caller that only needs to know the read is not clean.
         """
+        assert wait is None or not halt_on_damage
         state = self._state
         offset = self._start if start is None else start
         self.reached_stop = False
@@ -747,6 +755,9 @@ class RecordingReader:
                 except _Bad as bad:
                     reason = str(bad)
             if reason is not None:
+                if halt_on_damage:
+                    yield Damage(offset, 0, False, reason, None, False, incomplete)
+                    return
                 found, gave_up = self._resync(offset)
                 if found is None and not gave_up and wait is not None and wait():
                     continue  # more of the file may make a valid chain; look again
@@ -779,6 +790,9 @@ class RecordingReader:
                 # Bytes after a trailer: another file appended, or a trailer that was not the
                 # last record. Reading on (when asked to) finds whatever valid records follow.
                 found = None
+                if halt_on_damage:
+                    yield Damage(offset, 0, False, "bytes after the trailer", None, True)
+                    return
                 if self._skip_damage:
                     found, _ = self._resync(offset - fmt.ALIGN)
                 resumed = Damage(
