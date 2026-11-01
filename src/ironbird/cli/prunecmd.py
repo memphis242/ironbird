@@ -9,6 +9,7 @@ leave a trace), so with ``IB-LED-002`` it refuses to delete; ``--dry-run`` still
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -22,6 +23,7 @@ from ironbird.errors import Code, IronbirdError
 from ironbird.fsops import REAL_FS, FileSystem
 from ironbird.ledger import Ledger, default_state_dir
 from ironbird.prune import (
+    Outcome,
     Plan,
     confirmed,
     execute_plan,
@@ -32,10 +34,12 @@ from ironbird.prune import (
 )
 from ironbird.recording.session import default_recording_dir
 from ironbird.render import term
-from ironbird.retention import DirScan, full_scan, recording_blocks
+from ironbird.retention import FUTURE, LIVE, DirScan, full_scan, recording_blocks
+from ironbird.sigmask import Interrupted, wait_readable
 from ironbird.units import format_size, parse_count, parse_duration, parse_size
 
 MAX_SKIPS_SHOWN: Final = 5
+MAX_ANSWER_BYTES: Final = 4096  # an answer at the prompt is read up to its line end or this
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +114,25 @@ def _json_plan(plan: Plan, now: float) -> dict[str, Any]:
     }
 
 
+def _unrecovered_reserves(scan: DirScan) -> int:
+    """Files a recovery would have handled, as distinct files: the leftover reserves of every
+    session but the live ones and those another process holds (:data:`BUSY`: a recovery is
+    skipped there with a ledger too, but for the reserves it had passed before the lock that
+    stopped it), and the ``.damaged`` originals whose records are in no part."""
+    files: set[tuple[int, int]] = set()
+    for session in scan.sessions.values():
+        if LIVE in session.protected or FUTURE in session.protected:
+            continue
+        if session.id in scan.busy:
+            files.update(
+                (f.dev, f.ino) for f in session.reserves if f.name in scan.passed_before_busy
+            )
+            continue
+        files.update((f.dev, f.ino) for f in session.reserves)
+        files.update((f.dev, f.ino) for f in session.damaged if f.name in scan.pending_damaged)
+    return len(files)
+
+
 def work(
     kind: str,
     flags: PruneFlags,
@@ -149,6 +172,16 @@ def work(
         recordings = full_scan(
             fs, recordings_dir, "recording", now=now, own_session=None, keep_recent=keep
         )
+
+    def record_recovery(event: str, fields: dict[str, Any]) -> None:
+        ledger.record("state", event, **fields)
+
+    # A recovery renames files, so it needs the trace the ledger keeps; a dry run without a
+    # ledger renames nothing, but still runs the checks that protect a session from a prune.
+    recover = ledger.enabled
+
+    # Each recovery step is ledgered as it ends, so a signal that ends the scan leaves a record
+    # of every file it changed.
     scan = full_scan(
         fs,
         directory,
@@ -157,15 +190,28 @@ def work(
         own_session=ledger.session_id if kind == "ledger" else None,
         keep_recent=keep,
         has_recording=recording_blocks(recordings, now, older),
+        recover=recover,
+        check_only=not recover,
+        on_record=record_recovery,
     )
-    for recovery in scan.recoveries:
-        ledger.record("state", "ledger.recovered", **recovery)
-    for incomplete in scan.incompletes:
-        ledger.record("state", "ledger.recovery_incomplete", **incomplete)
-    for message in scan.messages:
+    if kind == "ledger" and not recover:
+        left = _unrecovered_reserves(scan)
+        if left:
+            console.err(
+                f"warning {Code.LED_DIR.value}: the action ledger cannot be used, so {left} "
+                "leftover reserve(s) or set-aside original(s) were not recovered (a recovery "
+                "must leave a trace); fix the ledger and run again"
+            )
+    for message in (*scan.messages, *([scan.partial] if scan.partial else [])):
         console.err(f"warning {Code.RET_SCAN.value}: {term(message, 1000, err=True)}")
-    if scan.partial:
-        console.err(f"warning {Code.RET_SCAN.value}: {term(scan.partial, 1000, err=True)}")
+        ledger.warn(  # shown above; the ledger gets it in full
+            Code.RET_SCAN,
+            message,
+            event="retention.warning",
+            display=False,
+            shown=True,
+            directory=str(directory),
+        )
     plan = make_plan(scan, older_than_s=older, until_under=flags.until_under, now=now)
     ledger.record(
         "action",
@@ -241,7 +287,23 @@ def _confirm_and_delete(
     def record(event: str, **fields: Any) -> None:
         ledger.record("action", event, **fields)
 
-    outcome = execute_plan(fs, plan, record)
+    outcome = Outcome()
+    try:
+        execute_plan(fs, plan, record, outcome)
+    except Interrupted:
+        ledger.record(
+            "action",
+            "prune.interrupted",
+            deleted_sessions=outcome.deleted_sessions,
+            of=len(plan.candidates),
+            deleted_bytes=outcome.deleted_bytes,
+        )
+        console.err(
+            f"deleted {outcome.deleted_sessions} of {len(plan.candidates)} {what} "
+            f"({format_size(outcome.deleted_bytes)}) before the interruption"
+        )
+        _show_skips(outcome, console)
+        raise
     summary = (
         f"deleted {outcome.deleted_sessions} {what} ({format_size(outcome.deleted_bytes)}, "
         f"{outcome.deleted_files} files)"
@@ -249,6 +311,13 @@ def _confirm_and_delete(
     if outcome.gone_files:
         summary += f"; {outcome.gone_files} files were already gone"
     console.out(summary)
+    _show_skips(outcome, console)
+    return 1 if outcome.skipped or unreachable else 0
+
+
+def _show_skips(outcome: Outcome, console: Console) -> None:
+    """One ``RET_PRUNE`` warning for each of the first :data:`MAX_SKIPS_SHOWN` sessions the
+    prune left in place, then the count of the rest."""
     for session, reason in outcome.skipped[:MAX_SKIPS_SHOWN]:
         console.err(
             f"warning {Code.RET_PRUNE.value}: session {term(session, 40, err=True)} not deleted: "
@@ -259,13 +328,24 @@ def _confirm_and_delete(
             f"warning {Code.RET_PRUNE.value}: {len(outcome.skipped) - MAX_SKIPS_SHOWN} more "
             "sessions not deleted (see the ledger)"
         )
-    return 1 if outcome.skipped or unreachable else 0
 
 
 def _ask(question: str) -> str:
+    """The answer typed at the terminal, up to its line end (``""`` at its end or failure).
+
+    Read from the descriptor once it has data, so a shutdown signal ends the wait for the
+    answer (see :func:`~ironbird.sigmask.wait_readable`)."""
     sys.stderr.write(question)
     sys.stderr.flush()
+    answer = b""
     try:
-        return sys.stdin.readline()
-    except (OSError, ValueError):
+        fd = sys.stdin.fileno()
+        while b"\n" not in answer and len(answer) < MAX_ANSWER_BYTES:
+            wait_readable(fd)
+            chunk = os.read(fd, MAX_ANSWER_BYTES)
+            if not chunk:
+                break
+            answer += chunk
+    except (AttributeError, OSError, ValueError):
         return ""
+    return answer.split(b"\n", 1)[0].decode("utf-8", "replace")  # the first line only

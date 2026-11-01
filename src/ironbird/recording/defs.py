@@ -25,6 +25,7 @@ from ironbird.codec import Codec
 from ironbird.config import SystemConfig
 from ironbird.errors import Code, IronbirdError
 from ironbird.frame import Stream
+from ironbird.fsops import read_capped
 from ironbird.header import MAX_PROFILE_FILE_BYTES, load_profile, load_profile_bytes
 from ironbird.recording import format as fmt
 from ironbird.recording.format import BlobKind, RecordType
@@ -231,8 +232,7 @@ def config_codecs(
 
 def _file_digest(path: Path, limit: int) -> str | None:
     try:
-        with path.open("rb") as handle:
-            raw = handle.read(limit + 1)
+        raw = read_capped(path, limit)
     except OSError:
         return None
     return hashlib.sha256(raw).hexdigest() if len(raw) <= limit else None

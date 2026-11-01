@@ -27,7 +27,7 @@ from ironbird.recording.format import RecordType
 from ironbird.recording.reader import Damage, Item, RecordingReader
 from ironbird.retention import is_managed_name
 from ironbird.sanitize import clean
-from ironbird.sigmask import Hold, naming_replaced
+from ironbird.sigmask import Hold, checkpoint, naming_replaced
 
 MAX_FINDINGS: Final = 100
 MAX_HOLES: Final = 1000  # holes kept for display; the count covers them all
@@ -759,6 +759,7 @@ def _closing_records(
 def _copy(reader: RecordingReader, out: TempOutput, length: int) -> None:
     offset = 0
     while offset < length:
+        checkpoint()  # a shutdown signal ends a long copy here
         block = reader.read_at(offset, min(COPY_BLOCK, length - offset))
         if not block:
             raise OSError(5, "the recording is shorter than the valid prefix measured")

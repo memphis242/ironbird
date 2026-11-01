@@ -6,14 +6,17 @@ Ports are in 58000-58999; nothing here touches the fixed cFS ports.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
+import struct
 import subprocess
 import sys
+import termios
 import time
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import pytest
 
@@ -42,6 +45,11 @@ def env(tmp_path: Path) -> dict[str, str]:
     environment["IRONBIRD_CONFIG"] = str(path)
     environment["PORTS"] = f"{command_port},{telemetry_port}"
     return environment
+
+
+def pipe_bytes(pipe: IO[bytes]) -> int:
+    """Bytes written into ``pipe`` and not yet read (the reading end of a child's stdout)."""
+    return struct.unpack("i", fcntl.ioctl(pipe.fileno(), termios.FIONREAD, b"\0" * 4))[0]
 
 
 def ports(env: dict[str, str]) -> tuple[int, int]:
@@ -546,7 +554,15 @@ def test_a_signal_ends_a_replay_that_is_blocked_on_a_reader_that_never_reads(
     )
     assert proc.stdout is not None and proc.stderr is not None
     try:
-        time.sleep(2.0)
+        # Output in the pipe means the command runs, its signal handlers in place since before
+        # it began. A wait timed from the spawn would race the interpreter's start on a busy
+        # host: a signal that lands before the handlers ends the process by the signal (-15).
+        deadline = time.monotonic() + 60
+        while not pipe_bytes(proc.stdout):
+            assert proc.poll() is None, proc.stderr.read().decode()
+            assert time.monotonic() < deadline, "the replay wrote nothing"
+            time.sleep(0.01)
+        time.sleep(2.0)  # the pipe and the output queue fill
         assert proc.poll() is None  # held up by the reader, not finished and not dropping lines
         started = time.monotonic()
         proc.send_signal(signal.SIGTERM)
@@ -748,6 +764,78 @@ def test_a_signal_while_the_head_of_a_new_part_is_awaited_reports_no_error(
     assert "interrupted (SIGINT)" in err and Code.REC_FORMAT.value not in err, err
     errors = [e for e in ledger_events(tmp_path) if e["kind"] == "error"]
     assert errors == [], errors
+
+
+# Child-side hooks: the follow says when it starts waiting for more of the recording, either for
+# the file to grow (``grow``: the file has no trailer yet) or for its next part (``part``).
+_FOLLOW_WAIT_HOOKS = """
+import os
+from pathlib import Path
+from ironbird.recording import replay
+WHERE, MARK = os.environ["IB_TEST_WINDOW"], Path(os.environ["IB_TEST_MARK"])
+real_waiter, real_wait_for_file = replay.Follower.waiter, replay.Follower.wait_for_file
+
+def waiter(self, size):
+    wait = real_waiter(self, size)
+    def marked():
+        if WHERE == "grow":
+            MARK.touch()
+        return wait()
+    return marked
+
+def wait_for_file(self, path):
+    if WHERE == "part":
+        MARK.touch()
+    return real_wait_for_file(self, path)
+
+replay.Follower.waiter, replay.Follower.wait_for_file = waiter, wait_for_file
+"""
+
+
+@pytest.mark.parametrize("where", ["grow", "part"])
+def test_a_signal_ends_a_follow_that_waits_for_more_of_a_live_recording(
+    tmp_path: Path, env: dict[str, str], where: str
+) -> None:
+    """A live writer holds its lock and writes nothing more: the follow waits with no end of
+    its own, and SIGTERM ends it at once, by the signal."""
+    path = tmp_path / "live.ibrec"
+    write_recording(path, hk_frames(3))
+    if where == "grow":  # no trailer yet: the writer is still in the middle of the file
+        reader = RecordingReader(path)
+        try:
+            trailer = reader.read_trailer()
+        finally:
+            reader.close()
+        assert trailer is not None
+        os.truncate(path, trailer[0])
+    mark = tmp_path / "waiting"
+    lock = os.open(path, os.O_RDONLY)
+    fcntl.flock(lock, fcntl.LOCK_EX)  # a live writer
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _FOLLOW_WAIT_HOOKS + CLI_MAIN, "replay", str(path), "--follow"],
+        env={**env, "IB_TEST_WINDOW": where, "IB_TEST_MARK": str(mark)},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not mark.exists():
+            assert proc.poll() is None, proc.communicate()[1]
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        _, err = proc.communicate(timeout=60)
+        took = time.monotonic() - started
+    finally:
+        os.close(lock)
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 128 + signal.SIGTERM, err
+    assert took < 30 and "interrupted (SIGTERM)" in err and "Traceback" not in err, err
+    stops = [e["reason"] for e in ledger_events(tmp_path) if e["event"] == "replay.stop"]
+    assert stops == ["interrupted"], err
 
 
 def test_replay_never_modifies_the_recording(tmp_path: Path, env: dict[str, str]) -> None:

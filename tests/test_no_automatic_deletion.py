@@ -83,6 +83,9 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
     ("config.py", "dynamic"): {"parse_config"},
     ("frame.py", "dynamic"): {"Frame._replace"},
     ("cli/main.py", "overwrite"): {"_fill_standard_descriptors"},
+    # a second, non-blocking description of the already open stderr (``/proc/self/fd/N``),
+    # written one error line
+    ("cli/output.py", "overwrite"): {"write_within"},
     ("recording/writer.py", "overwrite"): {"create_exclusive"},
     # the recorder removes the partial file it created itself when a start fails
     ("recording/writer.py", "removal"): {"_discard_partial"},

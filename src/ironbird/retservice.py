@@ -30,7 +30,6 @@ from ironbird.config import RetentionConfig
 from ironbird.errors import Code
 from ironbird.fsops import REAL_FS, FileSystem
 from ironbird.ledger import Ledger
-from ironbird.ledgergate import start_thread
 from ironbird.retention import (
     DirScan,
     ScanControl,
@@ -39,6 +38,7 @@ from ironbird.retention import (
     recording_blocks,
 )
 from ironbird.retnotices import Notices
+from ironbird.sigmask import start_thread
 from ironbird.units import MIB, compact_duration, format_duration, format_size
 
 PROJECTION_INTERVAL_S: Final = 10.0
@@ -162,7 +162,10 @@ class Retention:
         own = self._ledger.session_id
         keep = self._cfg.keep_recent
         # A short command only looks: recovering a reserve rewrites files, and a command about
-        # to exit must not leave that half done. Long sessions and prune recover.
+        # to exit must not leave that half done; it takes no lock on a reserve and reads none a
+        # writer may hold (``.reserve``). It does check the ``.damaged`` originals of earlier
+        # salvages (a 4 KiB head each, and at most MAX_DAMAGED_CHECK_BYTES in all), as every
+        # scan does. Long sessions and prune recover.
         recover = self._long
         recordings: DirScan | None = None
         if self._recording_dir is not None:
@@ -243,14 +246,7 @@ class Retention:
     def _note_abandoned(self, thread: threading.Thread) -> None:
         step = self._control.step
         if thread.is_alive() and step is not None and self._control.stepping.is_set():
-            self._ledger.record(
-                "state",
-                "ledger.recovery_incomplete",
-                **step,
-                abandoned=True,
-                error="the process ended before the copy did; the next long session or prune "
-                "finishes it from the .damaged file",
-            )
+            self._ledger.record("state", "ledger.recovery_incomplete", **step, abandoned=True)
 
     # -- results ----------------------------------------------------------------------------------
 

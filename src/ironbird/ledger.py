@@ -78,6 +78,7 @@ from ironbird.ledgertiers import (
     TokenBucket,
 )
 from ironbird.notice import Level, Notice, level_of
+from ironbird.sigmask import wait_event
 from ironbird.units import format_duration, format_size
 
 FORCE_AGE_S: Final = 1.0
@@ -196,6 +197,7 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "prune.delete": Tier.ESSENTIAL,
         "prune.gone": Tier.ESSENTIAL,
         "prune.skip": Tier.ESSENTIAL,
+        "prune.interrupted": Tier.ESSENTIAL,
     }
 )
 #: Patterns of the record names built from a variable (``f"{name}.ending"``), for the same test.
@@ -653,7 +655,9 @@ class Ledger:
         aborted the budget."""
         if self._budget is not None:
             return self._budget.wait(event, cap, floor=floor)
-        return event.wait(self._join_timeout_s if cap is None else min(cap, self._join_timeout_s))
+        return wait_event(
+            event, self._join_timeout_s if cap is None else min(cap, self._join_timeout_s)
+        )
 
     def set_warn_gate(self, gate: Callable[[Code], bool]) -> None:
         """Cross-process rate limit of the start-of-session warnings (``IB-LED-006/008/009``):
@@ -1122,6 +1126,7 @@ class Ledger:
         key: str | None = None,
         event: str = "ledger.warning",
         display: bool = True,
+        shown: bool | None = None,
         **fields: Any,
     ) -> None:
         """Ledger a warning in full and display it (coalesced).
@@ -1130,12 +1135,16 @@ class Ledger:
         display is gated. A ``gated`` warning (or one with its own ``gate``) is displayed
         through the cross-process rate limit, which is asked on a worker thread, never here: the
         display follows when the answer is in (at the latest at :meth:`finish` or :meth:`close`).
-        ``display=False`` only ledgers."""
+        ``display=False`` only ledgers; ``shown`` then sets the record's ``shown`` (it defaults
+        to ``display``), for a caller that displayed the warning itself. A warning whose display
+        a rate limit decides records the answer instead."""
         asked: Callable[[], bool] | None = gate
         if asked is None and gated and not self._default_gate:
             asked = functools.partial(self._warn_gate, code)
         if not display or asked is None:
-            number = self._record_warning(code, summary, event, fields, shown=display)
+            number = self._record_warning(
+                code, summary, event, fields, shown=display if shown is None else shown
+            )
             if display:
                 self._display_warning(code, level, slow, key, summary, number, True)
             return
@@ -1357,8 +1366,8 @@ class Ledger:
         done = threading.Event()
         box: list[Any] = []
         self._writer.submit("open", (done, box))
-        if not done.wait(self._open_timeout_s):
-            return  # an open step is blocked: transient, the stall watchdog takes over
+        if not wait_event(done, self._open_timeout_s):
+            return  # an open step is blocked, or a signal is owed: transient, the watchdog resumes
         failure = box[0] if box else None
         if isinstance(failure, ConfigFailure):
             self.disable()  # and the records queued meanwhile go with it

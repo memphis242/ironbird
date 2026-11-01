@@ -12,6 +12,7 @@ import json
 import os
 import pty
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -154,6 +155,41 @@ def test_the_prompt_confirms_only_y_or_yes_and_anything_else_deletes_nothing(
         assert not any(sid(i) in name for i in range(1, 5) for name in after)
     else:
         assert all(after[name] == before[name] for name in before) and len(after) >= len(before)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+def test_a_signal_at_the_prompt_ends_prune_by_it_and_deletes_nothing(
+    state: Path, sig: signal.Signals
+) -> None:
+    """The prompt waits for a line from the terminal; Ctrl-C (or a SIGTERM) ends that wait."""
+    old_sessions(state)
+    before = digest(state)
+    master, slave = pty.openpty()
+    env = {"IRONBIRD_STATE_DIR": str(state), "PATH": "/usr/bin:/bin"}
+    proc = subprocess.Popen(
+        [*CMD, *PRUNE], stdin=slave, stderr=slave, stdout=subprocess.PIPE, env=env, cwd=REPO
+    )
+    os.close(slave)
+    seen = b""
+    try:
+        deadline = time.monotonic() + 60
+        while b"[y/N]" not in seen:
+            assert proc.poll() is None and time.monotonic() < deadline, seen
+            ready, _, _ = select.select([master], [], [], 0.1)
+            if ready:
+                seen += os.read(master, 4096)
+        proc.send_signal(sig)
+        proc.communicate(timeout=60)
+    finally:
+        os.close(master)
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 128 + sig, seen
+    after = digest(state)
+    assert all(after.get(name) == digest_ for name, digest_ in before.items())
+    names = [event["event"] for event in session_records(state)]
+    assert "cli.signal" in names
+    assert "prune.confirmed" not in names and "prune.declined" not in names
 
 
 def test_without_a_terminal_and_without_yes_the_list_is_printed_and_nothing_is_deleted(

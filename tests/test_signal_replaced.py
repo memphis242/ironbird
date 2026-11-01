@@ -28,7 +28,7 @@ from ironbird.recording.export import (
     write_to_file,
 )
 from ironbird.retention import full_scan
-from ironbird.sigmask import Interrupted
+from ironbird.sigmask import Interrupted, deliver, discard
 from retutil import make_reserve, make_session, reserve_header, sid
 from support.faultfs import FaultFs
 
@@ -38,22 +38,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-class _Raised(Interrupted):
-    pass
-
-
 @pytest.fixture(autouse=True)
-def raising_hup() -> Iterator[None]:
-    """SIGHUP runs a handler that raises :class:`_Raised`."""
+def delivering_hup() -> Iterator[None]:
+    """SIGHUP runs a handler that delivers it, as the CLI's does outside an event loop."""
 
     def handler(signum: int, _frame: object) -> None:
-        raise _Raised(signum)
+        deliver(signum)
 
     previous = signal.signal(signal.SIGHUP, handler)
     try:
         yield
     finally:
         signal.signal(signal.SIGHUP, previous)
+        discard()
 
 
 def _hup_then(failure: BaseException) -> Callable[..., Any]:
@@ -70,7 +67,7 @@ def _eio() -> OSError:
     return OSError(errno.EIO, os.strerror(errno.EIO))
 
 
-def _replaced(caught: pytest.ExceptionInfo[_Raised]) -> BaseException | None:
+def _replaced(caught: pytest.ExceptionInfo[Interrupted]) -> BaseException | None:
     return caught.value.replaced
 
 
@@ -112,7 +109,7 @@ def test_a_signal_that_replaces_a_failed_file_step_names_the_export_error(
     fs = FaultFs()
     fs.override(method, _hup_then(failure))
     out = tmp_path / "out.txt"
-    with pytest.raises(_Raised) as caught:
+    with pytest.raises(Interrupted) as caught:
         write_to_file(out, force=False, run=_file_run(rec), fs=fs)
     replaced = _replaced(caught)
     assert isinstance(replaced, IronbirdError) and replaced.code is code, replaced
@@ -141,7 +138,7 @@ def test_a_signal_that_replaces_a_failed_directory_step_names_the_export_error(
 
     fs.override(method, open_at_member if method == "open_at" else _hup_then(failure))
     out = tmp_path / "out"
-    with pytest.raises(_Raised) as caught:
+    with pytest.raises(Interrupted) as caught:
         write_to_directory(out, run=_dir_run(rec), fs=fs)
     replaced = _replaced(caught)
     assert isinstance(replaced, IronbirdError) and replaced.code is code, replaced
@@ -155,7 +152,7 @@ def test_a_signal_that_replaces_only_a_directory_sync_after_the_commit_names_not
     fs = FaultFs()
     fs.override("fsync", _hup_then(_eio()))
     out = tmp_path / "out.txt"
-    with pytest.raises(_Raised) as caught:
+    with pytest.raises(Interrupted) as caught:
         write_to_file(out, force=False, run=_file_run(rec), fs=fs)
     assert _replaced(caught) is None
     assert out.exists()
@@ -173,7 +170,7 @@ def test_a_signal_that_replaces_a_failed_repair_step_names_the_repair_error(
     fs = FaultFs()
     fs.override("renameat2_noreplace", _hup_then(failure))
     out = tmp_path / "fixed.ibrec"
-    with pytest.raises(_Raised) as caught:
+    with pytest.raises(Interrupted) as caught:
         rec_inspect.repair(rec, out, fs=fs)
     replaced = _replaced(caught)
     assert isinstance(replaced, IronbirdError) and replaced.code is Code.REC_CREATE, replaced
@@ -194,7 +191,7 @@ def test_a_signal_that_replaces_a_failed_recovery_rename_names_no_error(tmp_path
     reserve = make_reserve(state, 1, 1, body, now=now)
     fs = FaultFs()
     fs.override("renameat2_noreplace", _hup_then(FileExistsError(errno.EEXIST, "exists")))
-    with pytest.raises(_Raised) as caught:
+    with pytest.raises(Interrupted) as caught:
         full_scan(fs, state, "ledger", now=now, own_session=None, keep_recent=0)
     assert _replaced(caught) is None
     assert reserve.exists(), "nothing was renamed"
