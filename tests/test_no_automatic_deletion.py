@@ -81,7 +81,13 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
     ("atomicfile.py", "overwrite"): {"TempOutput._adopt", "TempDirOutput._reopen"},
     # the export's own worker processes (``spawn``, never ``fork``), which run only ironbird's
     # functions on byte ranges of a recording and delete nothing
-    ("recording/pexport.py", "subprocess"): {"", "WorkerPool.__init__", "WorkerPool.submit"},
+    ("recording/pexport.py", "subprocess"): {
+        "",
+        "serve",
+        "_Slot.__init__",
+        "WorkerPool.poll",
+        "WorkerPool._start",
+    },
     # attribute lookups by a computed name on the program's own record types
     ("config.py", "dynamic"): {"parse_config"},
     ("frame.py", "dynamic"): {"Frame._replace"},

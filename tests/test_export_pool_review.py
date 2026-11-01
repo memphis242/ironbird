@@ -514,16 +514,27 @@ def test_the_default_number_of_workers_is_capped_and_respects_the_quota(
 def test_the_pool_and_the_helpers_it_starts_are_made_with_the_shutdown_signals_blocked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import concurrent.futures as cf
+    import multiprocessing.context
+    from multiprocessing import resource_tracker
 
-    seen: list[set[int]] = []
-    real = cf.ProcessPoolExecutor
+    seen: dict[str, list[set[int]]] = {"tracker": [], "worker": []}
 
-    def building(*args: Any, **kwargs: Any) -> cf.ProcessPoolExecutor:
-        seen.append({int(s) for s in signal.pthread_sigmask(signal.SIG_BLOCK, [])})
-        return real(*args, **kwargs)
+    def blocked() -> set[int]:
+        return {int(s) for s in signal.pthread_sigmask(signal.SIG_BLOCK, [])}
 
-    monkeypatch.setattr(cf, "ProcessPoolExecutor", building)
+    ensure = resource_tracker.ensure_running
+    start = multiprocessing.context.SpawnProcess.start
+
+    def tracking() -> None:
+        seen["tracker"].append(blocked())
+        ensure()
+
+    def starting(self: Any) -> None:
+        seen["worker"].append(blocked())
+        start(self)
+
+    monkeypatch.setattr(resource_tracker, "ensure_running", tracking)
+    monkeypatch.setattr(multiprocessing.context.SpawnProcess, "start", starting)
     definitions = pexport.EmbeddedDefinitions(
         Path("x"),
         {},
@@ -535,14 +546,15 @@ def test_the_pool_and_the_helpers_it_starts_are_made_with_the_shutdown_signals_b
     )
     pool = pexport.WorkerPool(definitions, 2)
     try:
-        # a job that no worker will accept is enough to build the executor
-        future = pool.submit(job_of())
-        assert future is not None
+        # a job that no worker will accept is enough to start one
+        ticket = pool.submit(job_of())
+        assert ticket is not None
     finally:
         pool.close(abnormal=True)
-    assert len(seen) == 1
-    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
-        assert int(signum) in seen[0], signum
+    assert len(seen["worker"]) == 1 and seen["tracker"]
+    for mask in (*seen["worker"], *seen["tracker"]):
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            assert int(signum) in mask, signum
 
 
 _MASKS = """
@@ -646,4 +658,6 @@ def test_random_damage_with_tiny_caps_and_an_output_that_closes_exports_the_same
             text_cap=rng.choice((1, 500, 5000)),
             event_cap=rng.choice((1, 3, 1000)),
         )
-        assert_same(single, pooled, counts=False, closed=refuse is not None, label=f"{seed} {skip}")
+        assert_same(
+            single, pooled, counts=refuse is None, closed=refuse is not None, label=f"{seed} {skip}"
+        )

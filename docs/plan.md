@@ -154,7 +154,7 @@ Processes:
      decode only candidates. **Hold** = UI stops advancing its view (it keeps reading
      into its scroll-back, engine continues); **pause** = engine stops recording;
      **stop** = engine closes the session.
-3. **Decode workers** (`ProcessPoolExecutor`) only for bulk jobs: replay with field
+3. **Decode workers** (spawned processes, one pipe each; see 2m) only for bulk jobs: replay with field
    filters, exports, search over large recordings. Jobs are chunked by file offset;
    workers read the recording themselves, so only offsets go in and compact results
    come out. At these rates most recordings decode fast enough in one process, so the
@@ -2288,8 +2288,8 @@ As built (where the build differs from, or settles, the text above)
   is a warning unless `--strict`), `ib rec repair IN OUT [--force]` (exit 5 when valid frames
   after mid-file damage were left out; the synthesised closing chunk has no monotonic times; a clean
   recording repairs to identical bytes). `info` answers from the index and chunk summaries, so it
-  does not notice a damaged frame; `check` does. The CLI gained an `offline` runner (no config,
-  no session) for the `rec` commands, and `Session.record_routes`, `event_routes`, `respond_route`
+  does not notice a damaged frame; `check` does. The CLI gained an `offline` runner (no session; a
+  configuration only if one is found, see 2m) for the `rec` commands, and `Session.record_routes`, `event_routes`, `respond_route`
   and `streams_for`.
 - Config `[recording]`: `dir`, `fsync`, `max_buffer_bytes` (1 MiB to 64 GiB), `min_free_bytes`,
   `embed_definitions`; definition files above 8 MiB (64 KiB for profiles) refuse the recording
@@ -3823,7 +3823,8 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   resynchronisation (`RecordingReader.find_boundary(offset, limit)`: a record that passes every rule
   and is followed by a second valid record, the scan `items()` uses after damage; never a second
   parser; the scan reads no further than the end of the range, so a stretch of zeros costs its own
-  length once and not the rest of the file for every range in it). A worker reads its range itself (`pread` through the same
+  length once and not the rest of the file for every range in it; a record that begins at the end of the range
+  belongs to the next range, and an offset that is not aligned is rounded up, never down). A worker reads its range itself (`pread` through the same
   reader, so every length is validated before it is unpacked, and a malformed record is damage, never
   an exception) and returns the text of its rows (no header row), the tally, the damage, the
   definitions it made, which seeded entries it relied on, its first and last sequence numbers and
@@ -3855,10 +3856,15 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   `MAX_RANGE_EVENTS` (1000) damage and gap notes: a worker that reaches either stops at a record
   boundary (after a frame, a gap, or damage it resumed past) and the parent submits an exact job from
   there for the rest of the range (`continued` in the report), with the state the walk has after the
-  part it took. At most `2 x workers` ranges are submitted and not yet written, and a range is
-  submitted beyond the first one per worker only while the rows waiting plus the largest recent result
-  for each range still running fit in `PENDING_TEXT_BUDGET` (32 MiB). Results are written in order and
-  dropped. The report (`export.pool` in the ledger: `max_pending`, `max_text_bytes`, `continued`)
+  part it took. At most `2 x workers` ranges are submitted and not yet written, so the rows held (in the
+  parent and in the workers, whose finished results wait in their pipes until the parent takes them)
+  never pass `2 x workers x RESULT_TEXT_CAP` (64 MiB with four workers, 1 GiB at the 64-worker
+  maximum). A range is submitted beyond the first one per worker only while the rows waiting plus the
+  largest recent result for each range still running fit in `PENDING_TEXT_BUDGET` (32 MiB); that
+  estimate follows what has come back, so the budget holds in steady state, and after a stretch of narrow rows
+  followed by wide ones the ranges already submitted can all be wide and the held rows come to the
+  `2 x workers x RESULT_TEXT_CAP` figure until the first wide results are seen and the next ranges
+  are planned shorter. Results are written in order and dropped. The report (`export.pool` in the ledger: `max_pending`, `max_text_bytes`, `continued`)
   shows it. The parent's peak RSS is that of one process plus a small constant whatever the width of
   the rows: on the wide-row recording of the review (1000 enum fields of 64 characters, 70 KiB of text
   per 1 KiB frame, 4 MiB, 266 MiB of text, ranges of 1 MiB configured) one process peaks at 36 MiB
@@ -3866,45 +3872,78 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   most); before the bounds the same export peaked at 378 MiB (144 MB waiting) in 17.6 s, and grew with
   the width of the rows and the size of the ranges. The bounds without the shorter ranges (cut and
   continued serially) kept the memory but not the speed: 56 s.
-- **Output closing.** A destination that takes one line at a time and may refuse (stdout) is written
-  line by line and counted row by row as far as it takes them (one category byte per row), so the
-  rows and tallies are the single process's. A worker also notes how many rows came before each
-  damage and each GAP record, and the parent notes them only up to the row the output took (the
-  single process stops reading at the refused row), so the damage reported, the gaps counted and
-  therefore the exit code and messages under `| head` are the single process's. What is read ahead
-  of the refusal is not: `rejected`, `skipped_no_definitions`, `not_written` and `frames_read` cover
-  the range being decoded.
+- **Output closing and failing.** A worker records the kind of each row it makes (one byte per row; for
+  CSV, which table each line went to) and how many rows came before each damage and each GAP record. A
+  range that holds damage or gaps, and every range for a destination that takes one line at a time and
+  may refuse (stdout), is written row by row with the damage and gaps noted between the rows where
+  they came and the tally counted as far as the output takes them (a table is opened by its first row).
+  The single process stops reading at the row an output refuses and at the row whose line made a file
+  flush fail (a full disk); so the damage reported, the gaps counted and the exit code and messages
+  under `| head` or after `IB-EXP-001` are the single process's (found in review: the damage and gaps of
+  a range were noted before its rows were written, so a failing write reported the damage that came
+  after the row it failed at). A range without damage or gaps goes to a file destination in blocks, and
+  the file destination flushes after the line that fills its buffer wherever in a block that line is,
+  so the flush that fails is at the same row as in one process (`FileDestination.write`). What is read
+  ahead of a refusal is not the single process's: `rejected`, `skipped_no_definitions`,
+  `not_written` and `frames_read` cover the range being decoded.
 - **The file read is the file opened.** The parent holds each part open and gives every job its
   identity (device, inode). A worker opens by name and reads nothing if the name leads elsewhere or
   nowhere (`Outcome.moved`); the parent then reads that range, and all the rest of the part, itself
   on the descriptor it holds (`report.local`), so a recording renamed, replaced or deleted during an
   export (retention, a user) is exported as the single process exports it.
-- **Processes.** `spawn`, never `fork`. The pool is started lazily by the export that needs it
-  (`WorkerPool`, which a caller may keep for many exports) under `sigmask.masked()`, so the executor,
-  the threads and processes it starts, and the multiprocessing resource tracker its queues start, never
-  take a shutdown signal (a hangup sent to the process group reaches the parent alone: 129 and the one
+- **Processes.** `spawn`, never `fork`. The pool is owned (`WorkerPool`, which a caller may keep for many
+  exports; started lazily by the export that needs it, a worker at a time as jobs are submitted): one
+  `multiprocessing.Process` and one duplex `multiprocessing.Pipe` per worker, the parent's copy of the
+  worker's end closed after the start so that a worker that dies is an end of file on its pipe; jobs and
+  results are pickled messages over that pipe (the tool's own typed data between a process and its own
+  child on a private socket pair; nothing read from a recording is ever unpickled as code), each worker
+  has up to two jobs sent (one running, one ready; a job message over 16 KiB goes only to an idle worker so a
+  send never waits on a busy one), and the parent reads on the calling thread with
+  `multiprocessing.connection.wait` in 50 ms slices. There is no manager thread and no queue shared
+  between workers. (Found in review: the executor this replaced had a manager thread that read the
+  results; after the export terminated its workers part way through sending a result, that thread
+  blocked reading a message that was never completed and the interpreter waited for it at exit, forever;
+  about one run in ten with the output closing at a random row. `tests/test_export_pool_exit.py` runs
+  that in a fresh process 16 times per mode and the CLI at four stops, and fails on the executor.) The
+  processes and the resource tracker the first of them starts are created under `sigmask.masked()`, so
+  none of them takes a shutdown signal (a hangup sent to the process group reaches the parent alone: 129 and the one
   `interrupted` line, no flood of tracker warnings). Workers set SIGINT and SIGHUP to be ignored (Ctrl-C reaches the whole
   process group, and only the parent acts on it) and SIGTERM to its default (so the parent can
   terminate them) while the mask they inherit still holds, then lift it, so a signal that came while
-  a worker started is dropped, not raised in its setup (the pool is made in two masked scopes, since
-  starting the resource tracker unblocks SIGINT and SIGTERM in the thread that does it); a thread in each worker exits the process if the parent is
+  a worker started is dropped, not raised in its setup (the tracker and each process are started in
+  separate masked scopes, since starting the resource tracker unblocks SIGINT and SIGTERM in the thread that
+  does it); a thread in each worker exits the process if the parent is
   gone (a SIGKILLed export leaves no worker behind within a second). The parent waits for results in
   50 ms slices with `checkpoint()` between, so a signal ends the export with 130/143/129 as it does
   in one process; the temporary output is removed by the same cleanup, and the workers are terminated
-  (killed after 5 s) on any abnormal end. A worker that dies, a pool that cannot start (a process or
-  thread limit) and a worker fault are `IB-EXP-003` (one line: what failed and to run again or with
+  (killed after 5 s) on any abnormal end; a finished export tells idle workers to go by closing their
+  pipes and terminates one still holding a job nobody wants. A worker that dies, a result that cannot
+  be pickled or read back, a pool that cannot start (a process or file limit) and a worker fault are `IB-EXP-003` (one line: what failed and to run again or with
   `--jobs 1`; the traceback or the cause is in the ledger record). Definitions are rebuilt in each
   worker from the bytes the parent built from (`--defs recording`: the embedded blobs) or, for
   `--defs config`, from the configuration with a digest of the definition files that a worker checks
-  before it decodes (a file edited during the export is `IB-EXP-003`, not a different decode).
+  before it decodes (a file edited during the export is `IB-EXP-003`, not a different decode). The
+  parent reads a range itself (the file moved from under its name) with the codecs it decodes with,
+  not codecs rebuilt from the configuration.
 - **When the pool is used.** `--jobs N` (1..64) beats `[export] jobs`, which beats the default of one
   worker per core the process may run on (its CPU affinity and the `cpu.max` quota of its cgroup v2
-  group and the groups above it, rounded up), at most 64; 1 never uses workers. A recording whose parts together are
+  group and the groups above it, rounded up; a group that cannot be examined, such as `EACCES`, is no
+  limit; the membership file is read up to 64 KiB), at most 64; 1 never uses workers. A recording whose parts together are
   under `[export] pool_min_bytes` (8 MiB, the least that is two ranges) is exported in the calling
   process, and so is each part with fewer than two ranges, a part being written (its writer holds the
   lock), a followed recording, a range that selects nothing, and a part read through the index with
   chunks skipped (`--from`/`--to`, or a `--where`/`--message` MID set that rules chunks out). The pool
   starts about a quarter of a second after the first range is submitted.
+- **Configuration errors of offline commands** (since 2e, found in the second review of 2m). The
+  configuration is read before the ledger opens, since its `[ledger]` table sets the ledger's allowances;
+  an offline command (`export`, `replay`, `rec info|check|repair|prune`, `ledger prune`) kept the error and
+  ran on defaults, so an `[export]` or `[retention]` table that did not load was ignored without a word.
+  Now no configuration file at all (nothing found by `-c`, `$IRONBIRD_CONFIG`, `./ironbird.toml`, the
+  XDG directory) is still not an error for these tools, but a file that is found (or named with `-c`) and
+  cannot be loaded ends the command before it does anything: the one-line coded `IB-CFG-001|002|003`
+  error (`--verbose` adds the cause), exit 2, the error in full in the ledger. `tests/test_offline_config_error.py`:
+  a TOML syntax error, a value of the wrong kind, an unknown `[export]` key and an unknown `[ledger]` key,
+  for each of those commands.
 - **Measured** (`tests/bench/test_export_pool_bench.py`, 4 vCPU Xeon 2.1 GHz, a quiet host), packets of the
   target's shape (200 bytes, one message of 62 fields, `tests/bench/targetshape.py`), CSV:
 
@@ -3915,7 +3954,10 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
 
   (Four runs on a shared host; the ranges are the spread. The last two, after the fixes of the review
   below: 17,474 and 36,744 rows/s at 40,000 frames, 19,198 and 67,213 at 400,000 (x3.50; 188 s ->
-  54 s per floor hour), with no range read again or read in the calling process.) A one-hour recording of such packets takes
+  54 s per floor hour), with no range read again or read in the calling process.) With the owned pool of the second review (a pipe per worker in place of the executor), measured the
+  same way on the same host: 17,157 and 35,482 rows/s at 40,000 frames (x2.07), 19,468 and 69,387 at 400,000
+  (x3.56; 52 s per floor hour), the parent's peak RSS 145 MiB with and without workers. The executor, measured just before on the
+  same host: 19,143 and 36,446 rows/s (x1.90), 20,116 and 69,578 (x3.46): no slower. A one-hour recording of such packets takes
   178-217 s at the 1k packets/s floor in one process and 55-70 s with four workers (the 60 s bar is met
   in the better run and missed by 10 s in the other; the floor hour at 200 bytes is within 2x of it, as
   2l said); at the 10k target 1,777-2,166 s and 554-700 s, so the target hour needs more cores (or the
@@ -3957,6 +3999,14 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   sequence resets, runs of marks, definitions that appear and change, raw damage, bad CRCs, torn
   ends) in every format and option, with an output that closes and tiny caps; 6 seeds of each of
   three kinds in CI, `IRONBIRD_POOL_FUZZ_SEEDS=N` for N (60 seeds of each kind were run on the final code).
+  Second review (`tests/test_export_pool_exit.py`, `tests/test_export_pool_review2.py`,
+  `tests/test_offline_config_error.py`), each failing on the commit reviewed: the hang at exit described
+  under Processes; a failing write told of the damage and gaps after the row it failed at (a disk that
+  fills at a range of limits, over a damaged recording and a recording with gaps, compared with one
+  process: the error, the bytes that reached the disk, the damage and the gaps); a boundary at the limit
+  of the scan; a control group that cannot be examined; and a configuration that is found and cannot be
+  loaded, which an offline command ignored without a word (see Configuration errors of offline commands). The caps fuzz compares the
+  replay's own counts too whenever the output did not close.
 - **Deferred.** (1) Chunk skipping: a part read with jumps is exported in the calling process (the jumps
   reset the sequence check and learn definitions from skipped heads; each segment between jumps could
   be a range). (2) Parts are exported one after another (the pool idles at the end of each part and
@@ -3971,7 +4021,10 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   rows' width to keep that rare, but the first window of ranges is planned before any width is
   known (they are 1/32 of `range_bytes`). (9) When the walk leaves the pool because the file moved, the rest of the part is decoded
   in the calling process. (10) A resync scan over zeros runs at about 80 MB/s in every mode (the
-  single process included); a faster scan would help a crash-extended file.
+  single process included); a faster scan would help a crash-extended file. (11) A directory export (several CSV tables, one shared
+  write buffer) whose write fails in a range that holds no damage or gaps fails at the end of a
+  table's block, not at the row where one process would; the damage noted may then differ by what lies
+  between. A range with damage or gaps is exact.
 
 ### Error codes added in Stage 2
 

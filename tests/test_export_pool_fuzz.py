@@ -107,4 +107,6 @@ def test_caps_and_a_closing_output_on_a_random_recording_end_the_same(
                 **extra,
             )
             label = f"seed={seed} skip={skip} {fmt_} refuse={refuse}"
-            assert_same(single, pooled, counts=False, closed=refuse is not None, label=label)
+            assert_same(
+                single, pooled, counts=refuse is None, closed=refuse is not None, label=label
+            )

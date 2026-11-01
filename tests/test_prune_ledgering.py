@@ -43,7 +43,7 @@ def test_a_dry_run_without_a_usable_ledger_recovers_nothing_and_says_so(
     err = io.StringIO()
     console = Console(io.StringIO(), err)
     dead = Ledger(tmp_path / "no-ledger", session_id="a" * 12, enabled=False)
-    code = prunecmd.work("ledger", FLAGS, None, None, dead, console, verbose=False)
+    code = prunecmd.work("ledger", FLAGS, None, dead, console, verbose=False)
     console.close()
     assert code == 0
     assert reserve.exists() and sorted(p.name for p in state.iterdir()) == before

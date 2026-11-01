@@ -780,9 +780,10 @@ def _run(
     is left to the command, which ledgers it.
 
     ``transmits`` commands (they put packets on a link) refuse to run without a ledger.
-    ``offline`` runs instead of ``body``, synchronously and with no configuration or session: it
-    is for commands that only read or write files (``ib rec ...``); a signal still ends it
-    orderly.
+    ``offline`` runs instead of ``body``, synchronously and with no session: it is for commands
+    that only read or write files (``ib rec ...``); it does without a configuration that is not
+    found, but a configuration that is found and cannot be loaded ends the command with that
+    error; a signal still ends it orderly.
     """
     base: Globals = ctx.obj
     glob = Globals(base.config, as_node or base.role, base.verbose or verbose)
@@ -790,7 +791,8 @@ def _run(
     run = _Run(console, glob.verbose)
     # The configuration is read before the ledger opens: its [ledger] table sets the allowances,
     # the reserve and the full-disk policy. A session command reports a bad one from its own
-    # body (and ledgers it); the offline commands do without a configuration.
+    # body (and ledgers it); an offline command reports one that is found but cannot be loaded
+    # before it runs, and does without one that is not found.
     try:
         config_path = find_config(glob.config)
     except IronbirdError as exc:
@@ -854,7 +856,8 @@ def _run(
             _check_descriptors()
             checkpoint()  # a signal that came while the ledger opened ends the command here
             if offline is not None:
-                code = offline(ledger, console, run)
+                refused = _offline_config_error(run, ledger)
+                code = refused if refused is not None else offline(ledger, console, run)
             else:
                 assert body is not None
                 main_coro = _main(glob, ledger, body, run)
@@ -900,6 +903,20 @@ def _run(
         _STATE.detach()  # from here a signal is only recorded; _finish announces it
         code = _finish(name, run, ledger, console, code)
     raise typer.Exit(code)
+
+
+def _offline_config_error(run: _Run, ledger: Ledger) -> int | None:
+    """For an offline command: ``None`` when the configuration is usable or there is none to find
+    (the tools that only read files do without one); otherwise the error is ledgered and shown
+    and its exit code returned, so the command never runs on defaults in place of a configuration
+    that is there but cannot be loaded (its ``[ledger]``, ``[export]``, ``[retention]`` and
+    ``[recording]`` tables would be ignored without a word)."""
+    exc = run.config_error
+    if exc is None or run.config_missing:
+        return None
+    ledger.record_error(exc)
+    _print_error(run.console, exc, run.verbose)
+    return exc.exit_code
 
 
 def _exit_for(reason: str, count: int | None, got: int) -> int:
@@ -1810,7 +1827,6 @@ def _prune_command(
             kind,
             flags,
             run.config,
-            None if run.config_missing else run.config_error,
             ledger,
             console,
             verbose=run.verbose,
@@ -2581,6 +2597,7 @@ def export_command(
                     directory=directory,
                     min_bytes=export_config.pool_min_bytes,
                     range_bytes=export_config.range_bytes,
+                    codecs=codecs,
                 )
 
             def run_it(dest: Destination) -> ExportResult:

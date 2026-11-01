@@ -280,6 +280,19 @@ class FileDestination:
         return 0
 
     def write(self, handle: int, text: str) -> bool:
+        """Queue ``text``. The buffer is flushed after the line that brings it to
+        :data:`FILE_BUFFER_BYTES`, wherever in ``text`` that line is, so a block of lines reaches
+        the file in the same pieces as the same lines written one at a time."""
+        room = FILE_BUFFER_BYTES - self._size
+        while len(text) >= room:
+            cut = text.find("\n", room - 1) + 1
+            if cut == 0 or cut >= len(text):
+                break
+            self._buffer.append(text[:cut])
+            self._size += cut
+            self.flush()
+            text = text[cut:]
+            room = FILE_BUFFER_BYTES
         self._buffer.append(text)
         self._size += len(text)
         if self._size >= FILE_BUFFER_BYTES:
@@ -347,14 +360,14 @@ class _Plan:
     """How the packets of one message become rows."""
 
     message: Message
-    table: _Table
+    table: Table
     mid_cell: str
     header_names: tuple[str, ...]
     converters: tuple[Callable[[object], object], ...]
 
 
 @dataclass(slots=True)
-class _Table:
+class Table:
     """One output file of a directory (or the single file): its handle and rows so far."""
 
     stem: str
@@ -461,23 +474,23 @@ class Layouts:
         self._raw_enums = raw_enums
         self._single = single
         self._plans: dict[int, _Plan] = {}
-        self._tables: dict[tuple[str, tuple[str, ...]], _Table] = {}
+        self._tables: dict[tuple[str, tuple[str, ...]], Table] = {}
         self._layouts: Counter[str] = Counter()
         self._used_stems: set[str] = set()
-        self.all: list[_Table] = []
-        self.malformed: _Table | None = None
+        self.all: list[Table] = []
+        self.malformed: Table | None = None
         if directory:
             self.malformed = self._open(MALFORMED_STEM, MALFORMED_COLUMNS)
 
-    def _open(self, stem: str, columns: Sequence[str], key: TableKey | None = None) -> _Table:
+    def _open(self, stem: str, columns: Sequence[str], key: TableKey | None = None) -> Table:
         assert stem.casefold() not in self._used_stems
         self._used_stems.add(stem.casefold())
-        table = _Table(stem, self._dest.member(f"{stem}.csv"), key=key)
+        table = Table(stem, self._dest.member(f"{stem}.csv"), key=key)
         self.all.append(table)
         self._dest.write(table.handle, csv_line([safe_cell(c) for c in columns]))
         return table
 
-    def table_for(self, name: str, columns: tuple[str, ...]) -> _Table:
+    def table_for(self, name: str, columns: tuple[str, ...]) -> Table:
         """The table of message ``name`` with ``columns``: opened (its header row written) the
         first time it is asked for. ``IB-CLI-001`` for a second layout in a single-table
         destination."""
@@ -1243,6 +1256,8 @@ __all__ = [
     "Pipeline",
     "Selection",
     "StdoutDestination",
+    "Table",
+    "TableKey",
     "WriteProgress",
     "check_messages",
     "check_single_layout",

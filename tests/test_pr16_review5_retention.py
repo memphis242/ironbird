@@ -575,7 +575,7 @@ def _prune_json(
     console = Console(out, err)
     ledger = Ledger(tmp_path / f"ledger-{name}", session_id="a" * 12, enabled=ledger_enabled)
     flags = prunecmd.PruneFlags(365 * 86400, 5 * MIB, 0, True, False, True)
-    prunecmd.work("ledger", flags, None, None, ledger, console, verbose=False)
+    prunecmd.work("ledger", flags, None, ledger, console, verbose=False)
     console.close()
     plan = json.loads(out.getvalue().splitlines()[-1])
     return (
@@ -604,7 +604,7 @@ def _dry_run_stderr(state: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     console = Console(out, err)
     ledger = Ledger(tmp_path / "off", session_id="a" * 12, enabled=False)
     flags = prunecmd.PruneFlags(86400, None, 0, True, False, True)
-    prunecmd.work("ledger", flags, None, None, ledger, console, verbose=False)
+    prunecmd.work("ledger", flags, None, ledger, console, verbose=False)
     console.close()
     return err.getvalue()
 

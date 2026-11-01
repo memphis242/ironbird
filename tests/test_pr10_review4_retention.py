@@ -50,7 +50,7 @@ def _dry_run(
     ledger = Ledger(tmp_path / ("on" if enabled else "off"), session_id="a" * 12, enabled=enabled)
     if enabled:
         ledger.open()
-    code = prunecmd.work("ledger", DRY_RUN_JSON, None, None, ledger, console, verbose=False)
+    code = prunecmd.work("ledger", DRY_RUN_JSON, None, ledger, console, verbose=False)
     console.close()
     if enabled:
         ledger.finish()

@@ -40,42 +40,59 @@ from the file it holds, exactly as the single process would.
 **Bounded memory.** A result carries at most :data:`RESULT_TEXT_CAP` characters of rows (and at
 most :data:`MAX_RANGE_EVENTS` damage and gap notes): a worker that reaches either stops at a
 record boundary, and the parent asks for the rest of the range with an exact job from there. At
-most :data:`WINDOW_PER_WORKER` ranges per worker are submitted and not yet written, and no more
-than the bytes of rows waiting plus the largest result seen for each range still running fit in
-:data:`PENDING_TEXT_BUDGET` (at least one range per worker is always running). Results are written
-in order and dropped. Ranges are planned one after another and are shorter when the rows are wide
-(:meth:`_Runner._length`), so that a result is rarely cut. Nothing buffers the recording.
+most :data:`WINDOW_PER_WORKER` ranges per worker are submitted and not yet written, so the rows
+held, in the parent and in the workers, never pass ``WINDOW_PER_WORKER x workers x
+RESULT_TEXT_CAP`` characters. A range is submitted beyond the first one per worker only while the
+bytes of rows waiting plus the largest result seen for each range still running fit in
+:data:`PENDING_TEXT_BUDGET`; that estimate follows what came back, so after a stretch of narrow
+rows the ranges already submitted may all turn out wide, and the held rows then come to the
+first figure. Results are written in order and dropped. Ranges are planned one after another and
+are shorter when the rows are wide (:meth:`_Runner._length`), so that a result is rarely cut.
+Nothing buffers the recording.
 
 **When the output closes** (standard output into ``head``) the single process stops at the row
-the output refused. A worker notes how many rows came before each damage and gap record, and the
-parent applies them only up to the rows the output took, so the damage reported and the tally are
-those of the single process.
+the output refused, and when a write fails (a full disk) it stops at the row that made the file
+flush. A worker notes how many rows came before each damage and gap record, and what kind of row
+each was; a range that holds damage or gaps, or that goes to an output taking one line at a time,
+is written row by row with the damage and gaps noted between the rows where they came, so the
+damage reported and the tally are those of the single process whichever row the output stops at.
+A file destination flushes after the line that fills its buffer wherever that line is in a
+block, so a failing flush is at the same row either way.
 
 **Processes.** Workers are started with the ``spawn`` method, ignore SIGINT and SIGHUP (the parent
 coordinates), exit if the parent goes away, and are terminated when the export ends abnormally (a
-signal, an error, the output closing). The pool, and with it the resource tracker it starts, is
-created with the shutdown signals blocked, so a hangup sent to the process group reaches the parent
-alone. A worker that dies is ``IB-EXP-003``.
+signal, an error, the output closing). The pool is owned: one process and one pipe per worker, jobs
+and results over that pipe, no helper thread and no queue shared between workers, so a worker that
+is terminated or dies part way through a message is an end of file on its pipe and nothing waits
+for bytes that will not come. The parent waits in :func:`multiprocessing.connection.wait` in short
+slices. The processes, and the resource tracker the first of them starts, are created with the
+shutdown signals blocked, so a hangup sent to the process group reaches the parent alone. A worker
+that dies, or whose result cannot be read, is ``IB-EXP-003``.
 
 Untrusted input: everything a worker reads is validated by the reader before it is decoded, and
-what comes back is plain data that the parent checks against the walk before it is used.
+what comes back is plain data that the parent checks against the walk before it is used. Jobs and
+results are pickled over the private pipe between the parent and its own worker; nothing read from
+a recording or the wire is ever unpickled, and a message that is not the result asked for is
+``IB-EXP-003``.
 """
 
 from __future__ import annotations
 
-import concurrent.futures as cf
+import array
 import contextlib
 import dataclasses
 import hashlib
 import multiprocessing
 import os
+import pickle
 import signal
 import threading
 import time
 import traceback
+from collections import deque
 from collections.abc import Mapping
-from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
+from multiprocessing import connection, resource_tracker
 from pathlib import Path
 from typing import Any, Final
 
@@ -106,6 +123,7 @@ from ironbird.recording.export import (
     ExportResult,
     Pipeline,
     Selection,
+    Table,
     TableKey,
     make_pipeline,
 )
@@ -133,22 +151,24 @@ assert RANGE_BYTES % ALIGN == 0 and MIN_RANGE_BYTES % ALIGN == 0
 
 CGROUP_ROOT: Final = Path("/sys/fs/cgroup")
 PROC_CGROUP: Final = Path("/proc/self/cgroup")
-_CGROUP_FILE_BYTES: Final = 256
+_CPU_MAX_BYTES: Final = 256  # "max 100000" or "<quota> <period>"
+_MEMBERSHIP_BYTES: Final = 64 * 1024  # one line per hierarchy; a unified host has one
 
 
-def _cgroup_text(path: Path) -> str | None:
+def _cgroup_text(path: Path, limit: int) -> str | None:
+    """Up to ``limit`` bytes of a control group file as text, ``None`` when it cannot be read."""
     try:
         with path.open("rb") as handle:
-            return handle.read(_CGROUP_FILE_BYTES).decode("ascii", "replace")
+            return handle.read(limit).decode("ascii", "replace")
     except OSError:
         return None
 
 
 def cpu_quota(root: Path = CGROUP_ROOT, membership: Path = PROC_CGROUP) -> int | None:
     """The whole cores the control group this process is in may use (the smallest ``cpu.max``
-    quota from its group up to the root, rounded up), or ``None`` when no limit is set or the
-    host has no unified hierarchy."""
-    text = _cgroup_text(membership)
+    quota from its group up to the root, rounded up), or ``None`` when no limit is set, the host
+    has no unified hierarchy, or the group cannot be examined."""
+    text = _cgroup_text(membership, _MEMBERSHIP_BYTES)
     if text is None:
         return None
     relative = ""
@@ -156,11 +176,15 @@ def cpu_quota(root: Path = CGROUP_ROOT, membership: Path = PROC_CGROUP) -> int |
         if line.startswith("0::"):
             relative = line[3:].strip()
     parts = [p for p in relative.split("/") if p and p not in (".", "..")]
-    if not root.joinpath(*parts).is_dir():
+    try:
+        under_root = root.joinpath(*parts).is_dir()
+    except OSError:  # a directory that cannot be looked at (EACCES, EIO): no limit is known
+        return None
+    if not under_root:
         parts = []  # a namespace whose paths are not under this root: only its top is known
     found: int | None = None
     for depth in range(len(parts), -1, -1):
-        limit = _cgroup_text(root.joinpath(*parts[:depth]) / "cpu.max")
+        limit = _cgroup_text(root.joinpath(*parts[:depth]) / "cpu.max", _CPU_MAX_BYTES)
         fields = limit.split() if limit is not None else []
         if len(fields) != 2 or not (fields[0].isdecimal() and fields[1].isdecimal()):
             continue  # "max" (no limit), or a file that is not a quota
@@ -367,6 +391,7 @@ class Block:
     malformed: bool
     rows: int
     text: str
+    handle: int = 0  # the table in the worker that made it (what ``Outcome.order`` names)
 
 
 @dataclass(slots=True)
@@ -400,6 +425,11 @@ class Outcome:
     counts: ExportResult = field(default_factory=ExportResult)
     blocks: list[Block] = field(default_factory=list)
     categories: bytes | None = None
+    """The kind of each row, in the order they were made (``NO_LINE`` set: no line); ``None``
+    unless the parent writes row by row or the range holds damage or gaps."""
+    order: array.array[int] | None = None
+    """With ``categories`` and more than one block: the :attr:`Block.handle` each line belongs to,
+    line by line in the order they were made."""
 
     @property
     def clean(self) -> bool:
@@ -415,15 +445,20 @@ class _BlockDestination:
     per_line = False
 
     def __init__(self, single_stream: bool) -> None:
+        self.single_stream = single_stream
         self.parts: list[list[str]] = [[]] if single_stream else []
         self.chars = 0  # characters held, headers included
+        self.order = array.array("I")  # the table of each row line (CSV: not the header rows)
 
     def member(self, name: str) -> int:
         self.parts.append([])
         return len(self.parts) - 1
 
     def write(self, handle: int, text: str) -> bool:
-        self.parts[handle].append(text)
+        parts = self.parts[handle]
+        if parts or self.single_stream:  # the first part of a table is its header row
+            self.order.append(handle)
+        parts.append(text)
         self.chars += len(text)
         return True
 
@@ -437,8 +472,10 @@ class _Worker:
 
     MAX_SHAPES: Final = 16
 
-    def __init__(self, definitions: Definitions) -> None:
-        self.codecs = definitions.build()
+    def __init__(self, definitions: Definitions, codecs: Mapping[str, Codec] | None = None) -> None:
+        """``codecs``: the codecs the caller decodes with, when it has them (the parent); a worker
+        process builds its own from ``definitions``."""
+        self.codecs = codecs if codecs is not None else definitions.build()
         self._shapes: dict[Shape, tuple[Filter | None, Selection | None]] = {}
 
     def _compiled(self, shape: Shape) -> tuple[Filter | None, Selection | None]:
@@ -508,7 +545,7 @@ class _Worker:
                 raw_enums=shape.raw_enums,
                 single=False,  # the parent keeps the one table of a single-table export
                 directory=shape.directory,
-                categories=shape.categories,
+                categories=True,
             )
             cut: int | None = None
             try:
@@ -528,7 +565,7 @@ class _Worker:
             out.used_sources = sorted(lookups.sources)
             out.work = reader.work - seed.work
             out.trailer = reader.trailer is not None
-            self._collect(pipe, dest, out)
+            self._collect(shape, pipe, dest, out)
             return out
         finally:
             if local is None:
@@ -550,10 +587,11 @@ class _Worker:
         start, end = job.start_ns, job.end_ns
         step = pipe.step
         kinds = pipe.categories
+        assert kinds is not None
         # A range read from a guess is used only if it holds no damage, so it need not look
         # past any: the parent reads it again from the exact state.
         for item in reader.items(start=begin, stop=job.stop, halt_on_damage=not job.exact):
-            rows = len(kinds) if kinds is not None else 0
+            rows = len(kinds)
             if isinstance(item, Damage):
                 out.damage.append(item)
                 out.damage_rows.append(rows)
@@ -600,7 +638,8 @@ class _Worker:
         """Whether the range has made all a result may carry."""
         return dest.chars >= job.text_cap or len(out.damage) + len(out.gap_marks) >= job.event_cap
 
-    def _collect(self, pipe: Pipeline, dest: _BlockDestination, out: Outcome) -> None:
+    @staticmethod
+    def _collect(shape: Shape, pipe: Pipeline, dest: _BlockDestination, out: Outcome) -> None:
         out.counts = pipe.result
         tables = pipe.tables
         if tables is None:
@@ -617,9 +656,14 @@ class _Worker:
                 parts = dest.parts[table.handle]
                 text = "".join(parts[1:])  # the first part is the header row
                 if text:
-                    out.blocks.append(Block(table.key, table is tables.malformed, table.rows, text))
-        if pipe.categories is not None:
+                    out.blocks.append(
+                        Block(table.key, table is tables.malformed, table.rows, text, table.handle)
+                    )
+        if shape.categories or out.damage or out.gap_marks:
+            assert pipe.categories is not None
             out.categories = bytes(pipe.categories)
+            if len(out.blocks) > 1:
+                out.order = dest.order
 
 
 class _Process:
@@ -668,6 +712,29 @@ def run_job(job: Job) -> Outcome:
         return Outcome(job.index, crash=traceback.format_exc())
 
 
+def serve(conn: connection.Connection, definitions: Definitions, parent: int) -> None:
+    """The main function of a worker process: build the state, then answer the jobs that come
+    over ``conn`` one at a time until the parent closes its end (or is gone). A result that cannot
+    be pickled is answered with a crash outcome naming why."""
+    _init_worker(definitions, parent)
+    with contextlib.closing(conn):
+        while True:
+            try:
+                job = pickle.loads(conn.recv_bytes())  # noqa: S301 - the parent's own message
+            except (EOFError, OSError):
+                return
+            outcome = run_job(job)
+            try:
+                reply = pickle.dumps(outcome, pickle.HIGHEST_PROTOCOL)
+            except Exception:
+                crash = Outcome(job.index, crash=traceback.format_exc())
+                reply = pickle.dumps(crash, pickle.HIGHEST_PROTOCOL)
+            try:
+                conn.send_bytes(reply)
+            except OSError:
+                return
+
+
 # -- the parent -------------------------------------------------------------------------------
 
 
@@ -689,11 +756,13 @@ def make_options(
     text_cap: int = RESULT_TEXT_CAP,
     text_budget: int = PENDING_TEXT_BUDGET,
     event_cap: int = MAX_RANGE_EVENTS,
+    codecs: Mapping[str, Codec] | None = None,
 ) -> ParallelOptions:
     """The options of an export of ``replay`` with ``jobs`` workers: ``definitions`` says how a
     worker rebuilds the codecs the parent decodes with; the rest repeats what the export was given
     (the filter as text, since a compiled filter does not travel). ``pool``: workers that are
-    already running, for these ``definitions`` (the export does not end them)."""
+    already running, for these ``definitions`` (the export does not end them); ``codecs``: the
+    codecs the export decodes with, which the parent reuses for a range it reads itself."""
     shape = Shape(
         fmt,
         where,
@@ -715,6 +784,7 @@ def make_options(
         text_cap=text_cap,
         text_budget=text_budget,
         event_cap=event_cap,
+        codecs=codecs,
     )
 
 
@@ -732,55 +802,147 @@ class PoolReport:
     max_text_bytes: int = 0  # most characters of rows held at once, results waiting included
 
 
+class Ticket:
+    """A submitted job: waiting for a worker, running, or answered (an outcome, or the error that
+    ended the pool before it was)."""
+
+    __slots__ = ("cancelled", "data", "error", "job", "outcome")
+
+    def __init__(self, job: Job, data: bytes) -> None:
+        self.job = job
+        self.data: bytes | None = data  # the job as sent; dropped once sent
+        self.outcome: Outcome | None = None
+        self.error: IronbirdError | None = None
+        self.cancelled = False  # nobody wants the answer any more
+
+    def done(self) -> bool:
+        return self.outcome is not None or self.error is not None
+
+    def result(self) -> Outcome:
+        """The outcome, or the error that ended the pool first; the ticket must be done."""
+        if self.error is not None:
+            raise self.error
+        assert self.outcome is not None
+        return self.outcome
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class _Slot:
+    """A worker process and the pipe to it: the tickets sent to it and not yet answered, oldest
+    first (a worker answers in the order it was asked)."""
+
+    __slots__ = ("conn", "process", "sent")
+
+    def __init__(self, process: Any, conn: connection.Connection) -> None:
+        self.process = process
+        self.conn = conn
+        self.sent: deque[Ticket] = deque()
+
+
 class WorkerPool:
     """Worker processes that decode ranges for exports that use ``definitions``. An export starts
     one when it needs it and ends it when it is done; a caller that runs many exports may keep one
-    (``with WorkerPool(...) as pool``) and hand it to each."""
+    (``with WorkerPool(...) as pool``) and hand it to each.
+
+    The pool is owned end to end: one spawned process and one pipe per worker, no helper thread,
+    no queue shared between workers. A worker's end of its pipe is the only other copy of it, so
+    a worker that dies (killed, out of memory, ended mid-message) is an end of file on its pipe,
+    never a read that waits for bytes that will not come. Only the calling thread reads the pipes:
+    :meth:`poll` waits in short slices, so a shutdown signal is acted on between two."""
+
+    #: Jobs sent to a worker and not yet answered: the one running and one ready behind it, so a
+    #: worker that finishes starts at once instead of after the parent has seen its result.
+    DEPTH: Final = 2
+    #: A job message longer than this goes only to a worker with nothing outstanding: two unread
+    #: messages (the one being read and the next) then always fit in a pipe's buffer, and a send
+    #: never waits for a worker that is busy.
+    AHEAD_BYTES: Final = 16 * 1024
 
     def __init__(self, definitions: Definitions, jobs: int) -> None:
         assert 1 <= jobs <= MAX_JOBS
         self.definitions = definitions
         self.jobs = jobs
-        self._executor: cf.ProcessPoolExecutor | None = None
-        self._processes: list[Any] = []
+        self._slots: list[_Slot] = []
+        self._queued: deque[Ticket] = deque()  # submitted, not yet sent to a worker
+        self._error: IronbirdError | None = None
         self.broken = False
 
-    def submit(self, job: Job) -> cf.Future[Outcome]:
+    # -- the tickets --
+
+    def submit(self, job: Job) -> Ticket:
+        """Queue ``job`` and hand it to a worker as soon as one can take it (starting a worker
+        when all those running are busy and fewer than ``jobs`` exist)."""
+        if self._error is not None:
+            raise self._error
         try:
-            # The pool's helper threads and processes (the workers, and the resource tracker the
-            # pool's queues start) are made with the shutdown signals blocked, so a hangup or an
-            # interrupt sent to the process group reaches the parent alone. Two scopes: starting
-            # the resource tracker leaves SIGINT and SIGTERM unblocked in the thread that did it
-            # (multiprocessing unblocks them after the spawn), and the workers must not inherit
-            # that.
-            if self._executor is None:
-                with masked():
-                    self._executor = cf.ProcessPoolExecutor(
-                        max_workers=self.jobs,
-                        mp_context=multiprocessing.get_context("spawn"),
-                        initializer=_init_worker,
-                        initargs=(self.definitions, os.getpid()),
-                    )
-            with masked():
-                future = self._executor.submit(run_job, job)
-        except BrokenProcessPool as exc:
-            raise self.died(exc) from exc
-        except (OSError, RuntimeError) as exc:  # a process or thread limit, memory
-            self.broken = True
-            reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
-            raise IronbirdError(
-                Code.EXP_WORKER,
-                f"cannot start export workers ({reason[:200]}); run the export with --jobs 1 to "
-                "decode in one process",
-                details=f"{type(exc).__name__}: {exc}",
-                cause=exc,
-            ) from exc
-        self._processes = list(getattr(self._executor, "_processes", {}).values())
-        return future
+            data = pickle.dumps(job, pickle.HIGHEST_PROTOCOL)
+        except Exception as exc:
+            raise self._undeliverable("a job could not be sent to a worker", exc) from exc
+        ticket = Ticket(job, data)
+        self._queued.append(ticket)
+        self._dispatch()
+        return ticket
+
+    def pending(self) -> bool:
+        """Whether a ticket is queued or sent and has no answer yet."""
+        return bool(self._queued) or any(slot.sent for slot in self._slots)
+
+    def poll(self, timeout: float = 0.0) -> None:
+        """Receive every result that is ready (waiting up to ``timeout`` seconds for the first)
+        and send the queued jobs to the workers that have room. Raises nothing for a worker that
+        died or an answer that cannot be read: the pool is then broken and the tickets without an
+        answer carry the error."""
+        self._dispatch()
+        busy: dict[Any, _Slot] = {slot.conn: slot for slot in self._slots if slot.sent}
+        if not busy:
+            return
+        for ready in connection.wait(list(busy), timeout):
+            if self._error is not None:
+                break
+            self._receive(busy[ready])
+        self._dispatch()
+
+    def _receive(self, slot: _Slot) -> None:
+        try:
+            reply = pickle.loads(slot.conn.recv_bytes())  # noqa: S301 - our own worker's message
+        except (EOFError, OSError) as exc:
+            self._fail(self.died(exc))
+            return
+        except Exception as exc:  # bytes that are not an outcome
+            self._fail(
+                self._undeliverable("an export worker returned a result that cannot be read", exc)
+            )
+            return
+        ticket = slot.sent.popleft()
+        if not isinstance(reply, Outcome) or reply.index != ticket.job.index:
+            self._fail(
+                self._undeliverable(
+                    "an export worker returned the wrong result",
+                    AssertionError(
+                        f"asked for range {ticket.job.index}, got {type(reply).__name__}"
+                    ),
+                )
+            )
+            return
+        if not ticket.cancelled:
+            ticket.outcome = reply
+
+    def _fail(self, error: IronbirdError) -> None:
+        """The pool is of no more use: every ticket without an answer ends with ``error``."""
+        self.broken = True
+        self._error = error
+        waiting = [*self._queued, *(t for slot in self._slots for t in slot.sent)]
+        for ticket in waiting:
+            if not ticket.done():
+                ticket.error = error
+        self._queued.clear()
+        for slot in self._slots:
+            slot.sent.clear()
 
     def died(self, exc: BaseException) -> IronbirdError:
-        """The error for a pool whose worker process died; the pool is of no more use."""
-        self.broken = True
+        """The error for a worker process that died; the pool is of no more use."""
         return IronbirdError(
             Code.EXP_WORKER,
             "an export worker process died (killed, or out of memory); run the export again, or "
@@ -789,28 +951,116 @@ class WorkerPool:
             cause=exc,
         )
 
+    @staticmethod
+    def _undeliverable(summary: str, exc: BaseException) -> IronbirdError:
+        return IronbirdError(
+            Code.EXP_WORKER,
+            f"{summary}; run the export again, or with --jobs 1 to decode in one process",
+            details="".join(traceback.format_exception(exc)),
+            cause=exc,
+        )
+
+    # -- the workers --
+
+    def _dispatch(self) -> None:
+        """Send queued jobs, in order, to the workers with room."""
+        queued = self._queued
+        while queued and self._error is None:
+            ticket = queued[0]
+            if ticket.cancelled:
+                queued.popleft()
+                continue
+            assert ticket.data is not None
+            slot = self._slot_for(len(ticket.data))
+            if slot is None:
+                return
+            queued.popleft()
+            try:
+                slot.conn.send_bytes(ticket.data)
+            except OSError as exc:  # the worker is gone
+                slot.sent.append(ticket)
+                self._fail(self.died(exc))
+                return
+            ticket.data = None
+            slot.sent.append(ticket)
+
+    def _slot_for(self, size: int) -> _Slot | None:
+        """The worker to send a job of ``size`` bytes to: the least loaded, or a new one when
+        every worker has a job and fewer than ``jobs`` exist; ``None``: none has room."""
+        slots = self._slots
+        best = min(slots, key=lambda slot: len(slot.sent), default=None)
+        if (best is None or best.sent) and len(slots) < self.jobs:
+            best = self._start()
+        assert best is not None
+        load = len(best.sent)
+        if load >= self.DEPTH or (load and size > self.AHEAD_BYTES):
+            return None
+        return best
+
+    def _start(self) -> _Slot:
+        """Start a worker. The pool's processes, and the resource tracker the first of them
+        starts, are made with the shutdown signals blocked, so a hangup or an interrupt sent to
+        the process group reaches the parent alone. Two scopes: starting the resource tracker
+        leaves SIGINT and SIGTERM unblocked in the thread that did it (multiprocessing unblocks
+        them after the spawn), and a worker must not inherit that."""
+        context = multiprocessing.get_context("spawn")
+        ours = theirs = None
+        try:
+            ours, theirs = context.Pipe()
+            with masked():
+                resource_tracker.ensure_running()
+            process = context.Process(
+                target=serve,
+                args=(theirs, self.definitions, os.getpid()),
+                name="ironbird-export-worker",
+                daemon=True,
+            )
+            with masked():
+                process.start()
+        except (OSError, RuntimeError) as exc:  # a process or file limit, memory
+            if ours is not None:
+                ours.close()
+            self.broken = True
+            reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+            self._error = IronbirdError(
+                Code.EXP_WORKER,
+                f"cannot start export workers ({reason[:200]}); run the export with --jobs 1 to "
+                "decode in one process",
+                details=f"{type(exc).__name__}: {exc}",
+                cause=exc,
+            )
+            raise self._error from exc
+        finally:
+            if theirs is not None:
+                theirs.close()  # the worker holds the only other copy: its death is our end of file
+        slot = _Slot(process, ours)
+        self._slots.append(slot)
+        return slot
+
     def close(self, *, abnormal: bool = False) -> None:
-        """End the workers: idle ones just exit; after an error or a signal (``abnormal``) they
-        are terminated, and killed if they do not go."""
-        pool, self._executor = self._executor, None
-        if pool is None:
-            return
-        processes = list(getattr(pool, "_processes", {}).values()) or self._processes
-        if abnormal or self.broken:
-            pool.shutdown(wait=False, cancel_futures=True)
-            for process in processes:
+        """End the workers: idle ones are told to go (their pipe closes) and exit; after an error
+        or a signal (``abnormal``), and any worker still holding a job nobody wants, they are
+        terminated, and killed if they do not go within :data:`STOP_WAIT_S`."""
+        slots, self._slots = self._slots, []
+        for ticket in (*self._queued, *(t for slot in slots for t in slot.sent)):
+            ticket.cancel()
+        self._queued.clear()
+        stop = abnormal or self.broken
+        for slot in slots:
+            if stop or slot.sent:
                 with contextlib.suppress(Exception):
-                    process.terminate()
-            deadline = time.monotonic() + STOP_WAIT_S
-            for process in processes:
-                with contextlib.suppress(Exception):
-                    process.join(max(0.0, deadline - time.monotonic()))
-                    if process.is_alive():
-                        process.kill()
-                        process.join()
-        else:
-            pool.shutdown(wait=True, cancel_futures=True)
-        self._processes = []
+                    slot.process.terminate()
+            with contextlib.suppress(Exception):
+                slot.conn.close()
+        deadline = time.monotonic() + STOP_WAIT_S
+        for slot in slots:
+            process = slot.process
+            with contextlib.suppress(Exception):
+                process.join(max(0.0, deadline - time.monotonic()))
+                if process.is_alive():
+                    process.kill()
+                    process.join()
+                process.close()
 
     def __enter__(self) -> WorkerPool:
         return self
@@ -825,7 +1075,7 @@ class ParallelOptions:
     size of the files below which the export stays in this process; ``range_bytes``: the size of
     a range; ``pool``: workers kept by the caller (``None``: the export starts its own);
     ``text_cap``, ``text_budget`` and ``event_cap``: the bounds on what a result carries and on
-    what is waiting at once (see the module)."""
+    what is waiting at once (see the module); ``codecs``: what the export decodes with."""
 
     jobs: int
     definitions: Definitions
@@ -837,6 +1087,7 @@ class ParallelOptions:
     text_cap: int = RESULT_TEXT_CAP
     text_budget: int = PENDING_TEXT_BUDGET
     event_cap: int = MAX_RANGE_EVENTS
+    codecs: Mapping[str, Codec] | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         assert 1 <= self.jobs <= MAX_JOBS
@@ -939,7 +1190,7 @@ class _Runner:
         self._per_line = bool(getattr(dest, "per_line", False))
         self._shape = dataclasses.replace(options.shape, categories=self._per_line)
         self._pool = pool
-        self._live: dict[int, cf.Future[Outcome]] = {}
+        self._live: dict[int, Ticket] = {}
         self._moved = False  # the file is no longer under its name: this process reads it all
         self._local: _Worker | None = None
         self._largest = 0  # an estimate of the most text a running range will return
@@ -948,9 +1199,9 @@ class _Runner:
     def _waiting_text(self) -> int:
         """Characters of row text in the results that have come back and are not yet written."""
         total = 0
-        for future in self._live.values():
-            if future.done() and not future.cancelled() and future.exception() is None:
-                total += sum(len(block.text) for block in future.result().blocks)
+        for ticket in self._live.values():
+            if ticket.outcome is not None:
+                total += sum(len(block.text) for block in ticket.outcome.blocks)
         return total
 
     def _room(self, live: int) -> bool:
@@ -961,7 +1212,7 @@ class _Runner:
         options = self._options
         if live >= options.jobs * WINDOW_PER_WORKER:
             return False
-        running = sum(1 for future in self._live.values() if not future.done())
+        running = sum(1 for ticket in self._live.values() if not ticket.done())
         if running < options.jobs:
             return True
         expected = min(options.text_cap, self._largest) if self._largest else options.text_cap
@@ -978,10 +1229,11 @@ class _Runner:
             self._ratio = max(size / (outcome.end - outcome.start), self._ratio * 7 / 8)
 
     def _observe(self) -> None:
-        """Learn from the results that have come back, written or not."""
-        for future in self._live.values():
-            if future.done() and not future.cancelled() and future.exception() is None:
-                self._note_size(future.result())
+        """Take in the results that have come back, and learn from them, written or not."""
+        self._pool.poll()
+        for ticket in self._live.values():
+            if ticket.outcome is not None:
+                self._note_size(ticket.outcome)
 
     def _length(self) -> int:
         """The size of the next range. Before any result has shown how much text a byte of the
@@ -1001,27 +1253,18 @@ class _Runner:
 
     def cancel(self) -> None:
         """Drop the ranges still waiting for a worker."""
-        for future in self._live.values():
-            future.cancel()
+        for ticket in self._live.values():
+            ticket.cancel()
         self._live.clear()
 
-    def _await(self, future: cf.Future[Outcome]) -> Outcome:
-        """The outcome of ``future``, waiting in slices so a shutdown signal is acted on."""
-        while not future.done():
-            cf.wait([future], timeout=WAIT_SLICE_S)
+    def _await(self, ticket: Ticket) -> Outcome:
+        """The outcome of ``ticket``, waiting in slices so a shutdown signal is acted on."""
+        pool = self._pool
+        while not ticket.done():
+            assert pool.pending(), "a ticket that is waited for is queued or running"
+            pool.poll(WAIT_SLICE_S)
             checkpoint()
-        try:
-            return future.result()
-        except BrokenProcessPool as exc:
-            raise self._pool.died(exc) from exc
-        except Exception as exc:  # a result that could not be sent back, a worker out of memory
-            raise IronbirdError(
-                Code.EXP_WORKER,
-                "an export worker failed to return its result; run the export again, or with "
-                "--jobs 1 to decode in one process",
-                details="".join(traceback.format_exception(exc)),
-                cause=exc,
-            ) from exc
+        return ticket.result()
 
     # -- the parts --
 
@@ -1082,8 +1325,8 @@ class _Runner:
         edges = [body]  # edges[k]: where range k begins; the last range has no edge after it
         last = False  # the last range (it reads to the end of the file) is planned
         jobs: dict[int, Job] = {}
-        futures = self._live
-        futures.clear()
+        tickets = self._live
+        tickets.clear()
         self._moved = False
         self._largest, self._ratio = 0, 0.0
         report.parts_pooled += 1
@@ -1120,7 +1363,7 @@ class _Runner:
 
         def submit(job: Job) -> None:
             jobs[job.index] = job
-            futures[job.index] = self._pool.submit(job)
+            tickets[job.index] = self._pool.submit(job)
             report.workers = self._pool.jobs
 
         def exactly(index: int) -> Outcome:
@@ -1128,7 +1371,7 @@ class _Runner:
             job = job_of(index, exact=True, guess=walk.end, seed=walk.seed())
             if not self._moved:
                 submit(job)
-                outcome = self._await(futures[index])
+                outcome = self._await(tickets[index])
                 if not outcome.moved:
                     return outcome
                 self._leave_pool(jobs)
@@ -1140,7 +1383,7 @@ class _Runner:
             job = jobs.get(index)
             if job is None or self._moved:
                 return exactly(index)
-            outcome = self._await(futures[index])
+            outcome = self._await(tickets[index])
             if outcome.moved:
                 self._leave_pool(jobs)
                 return exactly(index)
@@ -1172,7 +1415,7 @@ class _Runner:
             while True:
                 self._note_size(outcome)
                 report.max_text_bytes = max(report.max_text_bytes, self._waiting_text())
-                futures.pop(index, None)
+                tickets.pop(index, None)
                 jobs.pop(index, None)
                 if outcome.start is None:
                     break  # no record begins in the range and the walk is past it
@@ -1201,9 +1444,9 @@ class _Runner:
                 break
             if last and index >= len(edges):
                 break
-        for future in futures.values():
-            future.cancel()
-        futures.clear()
+        for ticket in tickets.values():
+            ticket.cancel()
+        tickets.clear()
         replay.finish_part(reader, damaged=damaged, closed=closed)
         return True
 
@@ -1216,8 +1459,9 @@ class _Runner:
     def _here(self, job: Job, reader: RecordingReader) -> Outcome:
         """``job`` run in this process, on the file this process has open."""
         if self._local is None:
+            options = self._options
             try:
-                self._local = _Worker(self._options.definitions)
+                self._local = _Worker(options.definitions, options.codecs)
             except _Changed as exc:
                 raise IronbirdError(
                     Code.EXP_WORKER,
@@ -1265,7 +1509,12 @@ class _Runner:
     def _write(self, outcome: Outcome, reader: RecordingReader, path: Path) -> bool:
         """Put the range's rows, tally and damage where the single process would have; ``False``:
         the output refused a row (the damage and gaps after it are not noted: the single process
-        stops there and never reads them)."""
+        stops there and never reads them).
+
+        A range with no damage and no gaps, for an output that takes whole blocks, is written
+        block by block. Otherwise the rows are written one at a time with the damage and gaps
+        noted between them where they came, so an output that fails part way has been told of
+        exactly the damage and gaps the single process had met by then."""
         replay, pipe = self._replay, self._pipe
         stats = replay.stats
         stats.frames_read += outcome.frames_read
@@ -1275,10 +1524,9 @@ class _Runner:
         result.skipped_no_definitions += counts.skipped_no_definitions
         result.not_written += counts.not_written
         result.rejected.update(counts.rejected)
-        events = _Events(replay, outcome, reader, path)
-        if self._per_line:
-            return self._write_lines(outcome, events)
-        events.up_to(None)
+        if outcome.categories is not None:
+            return self._write_rows(outcome, _Events(replay, outcome, reader, path))
+        assert not outcome.damage and not outcome.gap_marks
         result.absorb_rows(counts)
         tables = pipe.tables
         for block in outcome.blocks:
@@ -1299,36 +1547,59 @@ class _Runner:
             self._dest.write(handle, block.text)
         return True
 
-    def _write_lines(self, outcome: Outcome, events: _Events) -> bool:
-        """A destination that takes a line at a time and may refuse one (standard output: one
-        stream, so one table at most): the rows are written one by one and counted as far as it
-        takes them, with the damage and gaps that came before each."""
+    def _write_rows(self, outcome: Outcome, events: _Events) -> bool:
+        """The rows of a range written one by one and counted as far as the output takes them,
+        with the damage and gaps that came before each. A table is opened when its first row is
+        written, as the single process opens it."""
         pipe = self._pipe
         result = pipe.result
         blocks = [b for b in outcome.blocks if b.text]
-        assert len(blocks) <= 1
-        lines: list[str] = []
-        table = None
-        if blocks:
-            lines = blocks[0].text.split("\n")
-            assert lines.pop() == ""
-            if pipe.tables is not None:
-                assert blocks[0].key is not None
-                table = pipe.tables.table_for(*blocks[0].key)
-        handle = table.handle if table is not None else 0
-        taken = 0
-        for row, kind in enumerate(outcome.categories or b""):
+        lines: list[list[str]] = []
+        for block in blocks:
+            block_lines = block.text.split("\n")
+            assert block_lines.pop() == ""
+            lines.append(block_lines)
+        index_of = {block.handle: i for i, block in enumerate(blocks)}
+        order = outcome.order
+        assert len(blocks) <= 1 or order is not None
+        cursors = [0] * len(blocks)
+        handles: list[int | None] = [None] * len(blocks)
+        owners: list[Table | None] = [None] * len(blocks)
+        write = self._dest.write
+        taken = 0  # lines written so far, over all tables
+        assert outcome.categories is not None
+        for row, kind in enumerate(outcome.categories):
             events.up_to(row)
             if not kind & NO_LINE:
-                if not self._dest.write(handle, lines[taken] + "\n"):
+                at = index_of[order[taken]] if order is not None else 0
+                handle = handles[at]
+                if handle is None:
+                    handle, owners[at] = self._open(blocks[at])
+                    handles[at] = handle
+                if not write(handle, lines[at][cursors[at]] + "\n"):
                     return False
+                cursors[at] += 1
                 taken += 1
+                table = owners[at]
                 if table is not None:
                     table.rows += 1
             result.tally(kind & ~NO_LINE)
-        assert taken == len(lines)
+        assert cursors == [len(block_lines) for block_lines in lines]
         events.up_to(None)
         return True
+
+    def _open(self, block: Block) -> tuple[int, Table | None]:
+        """The handle in the output, and the table, that ``block``'s rows go to (the table is
+        opened if it was not)."""
+        tables = self._pipe.tables
+        if tables is None:
+            return 0, None
+        if block.malformed:
+            assert tables.malformed is not None
+            return tables.malformed.handle, tables.malformed
+        assert block.key is not None
+        table = tables.table_for(*block.key)
+        return table.handle, table
 
 
 class _Events:

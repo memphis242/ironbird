@@ -347,9 +347,11 @@ class RecordingReader:
         """The offset of the first record at or after ``offset`` (rounded up to the alignment)
         and before ``limit`` (``None``: anywhere in the file) that passes every rule and is
         followed by another valid record: the scan a resync after damage does, for a read that
-        starts inside a file. ``None``: there is none; the scan reads no further than ``limit``,
-        so a stretch with no records in it costs its own length."""
-        found, _ = self._resync(offset - fmt.ALIGN, limit)
+        starts inside a file. ``None``: there is none; a record that begins at ``limit`` is not
+        before it, and the scan reads no further than ``limit``, so a stretch with no records
+        in it costs its own length."""
+        aligned = (offset + fmt.ALIGN - 1) & ~(fmt.ALIGN - 1)
+        found, _ = self._resync(aligned - fmt.ALIGN, limit)
         return found
 
     def read_at(self, offset: int, size: int) -> bytes:
@@ -648,6 +650,8 @@ class RecordingReader:
                 candidate = position + match.start() - 4
                 if candidate & (fmt.ALIGN - 1):
                     continue
+                if limit is not None and candidate >= limit:
+                    return None, False
                 self._work += CANDIDATE_COST
                 if self._over_budget():
                     return None, True

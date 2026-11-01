@@ -192,6 +192,7 @@ def run_export(
                 text_cap=text_cap,
                 text_budget=text_budget,
                 event_cap=event_cap,
+                codecs=codecs,
             )
             parallel = dataclasses.replace(parallel, report=report)
         result = export(

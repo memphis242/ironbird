@@ -525,12 +525,12 @@ def test_a_range_is_accepted_only_if_the_walk_agrees_with_what_it_relied_on() ->
 def test_workers_that_cannot_start_are_a_coded_error(
     clean: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import concurrent.futures as cf
+    import multiprocessing.context
 
-    def refuse(self: object, *args: object, **kwargs: object) -> None:
+    def refuse(self: object) -> None:
         raise BlockingIOError(11, "Resource temporarily unavailable")
 
-    monkeypatch.setattr(cf.ProcessPoolExecutor, "submit", refuse)
+    monkeypatch.setattr(multiprocessing.context.SpawnProcess, "start", refuse)
     pooled = run_export(clean, jobs=JOBS, pool=False)
     assert pooled.error is not None and pooled.error[0] == Code.EXP_WORKER.value
     assert "--jobs 1" in pooled.error[1] and "Resource temporarily" in pooled.error[1]
