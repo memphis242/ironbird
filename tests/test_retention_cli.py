@@ -330,6 +330,7 @@ def test_rec_prune_works_on_the_recording_directory_and_never_touches_the_ledger
     recordings = tmp_path / "rec"
     for i in range(1, 4):
         make_session(recordings, i, age_days=30, recording=True, parts=2)
+    recordings.chmod(0o700)  # not group/other-writable whatever the umask (IB-RET-006)
     ledger_file = make_session(state, 1, age_days=30)[0]
     mock_config_path.write_text(
         mock_config_path.read_text() + f'\n[recording]\ndir = "{recordings}"\n'

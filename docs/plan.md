@@ -1640,7 +1640,13 @@ Deliverables
     anything else is ignored and rewritten;
   - rewritten in place under the lock (`pwrite` at 0, then `ftruncate`), so no temporary
     file exists; a rewrite torn by a crash reads as invalid and is rewritten, at worst
-    repeating one warning.
+    repeating one warning;
+  - every record is exactly 4 KiB, so the `ftruncate` cuts nothing and a lockless reader
+    between the two calls reads a whole record. A lockless `pread` inside the `pwrite` can
+    still be torn: without a lock, a read that does not parse is repeated up to 3 times; if
+    none parses and the reads differ, the answer is given from an empty state and the file is
+    not rewritten (a torn read never erases other processes' timestamps); if all agree, the
+    file is invalid and is repaired as above.
 - `max_age = "unlimited"` or `max_total_bytes = "unlimited"` turns that warning off.
 - **Prune: deletion only on explicit confirmation.** `ib ledger prune` and `ib rec prune`
   share `retention.py` (2d builds both; 2e only feeds the recorder's byte rate):
@@ -2146,6 +2152,11 @@ As built (where the build differs from, or settles, the text above)
   failing `utime` is recorded (`utime_error`) and the recovery goes on; a salvaged part takes
   the original's access time from before the read; the `IB-LED-002` count says "leftover
   reserve(s) or set-aside original(s)" and leaves out sessions another process holds.
+- **PR #18 review (fixed).** A lockless `pread` can see a torn 4 KiB image inside one `pwrite`
+  (about 0.3-0.6% of reads in a two-writer probe): the notices file is read again up to 3 times
+  where there is no lock, and a read that stays torn is answered without rewriting the file. The
+  retention CLI test of `ib rec prune` no longer depends on the umask (it sets the mode of the
+  recording directory it makes).
 - **Deferred.** The stderr line for exit 6 found only at the final close is written through a
   bounded late writer. `write_within` on a terminal or FIFO whose reopen through
   `/proc/self/fd` is refused (`EACCES`, `ENOENT`, `EBUSY`; a terminal handed to another user by

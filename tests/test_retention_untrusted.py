@@ -27,7 +27,14 @@ from ironbird.config import (
 from ironbird.errors import Code, IronbirdError
 from ironbird.fsops import REAL_FS
 from ironbird.retention import full_scan, scan_directory
-from ironbird.retnotices import FILE_NAME, MAX_BYTES, Notices, parse_notices, render_notices
+from ironbird.retnotices import (
+    FILE_NAME,
+    MAX_BYTES,
+    TORN_RETRIES,
+    Notices,
+    parse_notices,
+    render_notices,
+)
 from ironbird.units import GIB, KIB, MIB, TIB
 from retutil import DAY, make_session, sid, stamp
 from support.faultfs import FaultFs
@@ -282,11 +289,14 @@ def test_eight_parallel_callers_without_locks_repeat_at_most_a_few_lines(tmp_pat
     assert 1 <= sum(results) <= 8  # a race may repeat one line, never one per call
 
 
-def test_an_unlocked_rewrite_is_never_read_half_done(tmp_path: Path) -> None:
+def test_an_unlocked_reader_between_pwrite_and_ftruncate_reads_a_whole_record(
+    tmp_path: Path,
+) -> None:
     """Without a lock, a reader can run between a rewrite's ``pwrite`` and its ``ftruncate``
     (another process, or another thread while the writer's system call releases the GIL). What
     it reads there is a whole record of the rewrite, never the new text over the tail of the old
-    one, which would read as invalid and repeat the warning."""
+    one, which would read as invalid and repeat the warning. This narrows the race only: a read
+    that overlaps the ``pwrite`` itself can be torn, which the retry tests below cover."""
     state = tmp_path / "st"
     state.mkdir(mode=0o700)
 
@@ -312,6 +322,90 @@ def test_an_unlocked_rewrite_is_never_read_half_done(tmp_path: Path) -> None:
     writer = Notices(state, fs=writer_fs, wall=lambda: 1_700_000_100.0)
     assert writer.allow("IB-LED-006", state, 60)  # the interval is over: shown and rewritten
     assert seen == [False]  # shown 0.5 s ago by the writer: not again
+
+
+def _unlocked_fs() -> FaultFs:
+    fs = FaultFs()
+    fs.fail("flock", errno.ENOLCK)
+    return fs
+
+
+def _two_entry_image(state: Path) -> bytes:
+    """A valid notices file holding two entries, written through an unlocked caller."""
+    writer = Notices(state, fs=_unlocked_fs(), wall=lambda: 1_700_000_000.0)
+    assert writer.allow("IB-RET-001", state, 86400) and writer.allow("IB-RET-002", state, 86400)
+    return (state / FILE_NAME).read_bytes()
+
+
+def _torn(image: bytes) -> bytes:
+    """What a ``pread`` inside a ``pwrite`` can return: the head of one image, the tail of another,
+    cut inside the JSON of both."""
+    other = render_notices(
+        {"IB-LED-006@/x": 1_700_000_050.0, "IB-LED-008@/y": 1_700_000_060.5}, None
+    )
+    for cut in range(20, 120):
+        torn = image[:cut] + other[cut:]
+        if parse_notices(torn, 2e9) == ({}, None):
+            return torn
+    raise AssertionError("no tearing point gives an invalid image")
+
+
+def test_an_unlocked_read_torn_inside_a_pwrite_is_retried_and_keeps_the_others_entries(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "st"
+    state.mkdir(mode=0o700)
+    image = _two_entry_image(state)
+    fs = _unlocked_fs()
+    reads: list[bytes] = []
+
+    def pread(fd: int, length: int, offset: int) -> bytes:
+        data = REAL_FS.pread(fd, length, offset)
+        reads.append(_torn(data) if not reads else data)  # the first read only is torn
+        return reads[-1]
+
+    fs.override("pread", pread)
+    now = 1_700_000_100.0
+    notices = Notices(state, fs=fs, wall=lambda: now)
+    assert not notices.allow("IB-RET-001", state, 86400)  # still within its interval
+    assert len(reads) == 2 and (state / FILE_NAME).read_bytes() == image  # nothing was erased
+    assert notices.allow("IB-LED-009", state, 86400)
+    shown, _ = parse_notices((state / FILE_NAME).read_bytes(), now + 1)
+    assert set(shown) == {f"{c}@{state}" for c in ("IB-RET-001", "IB-RET-002", "IB-LED-009")}
+
+
+def test_an_unlocked_read_that_stays_torn_answers_and_leaves_the_file_alone(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "st"
+    state.mkdir(mode=0o700)
+    image = _two_entry_image(state)
+    fs = _unlocked_fs()
+    calls = {"n": 0}
+
+    def pread(fd: int, length: int, offset: int) -> bytes:
+        calls["n"] += 1
+        torn = bytearray(_torn(REAL_FS.pread(fd, length, offset)))
+        torn[calls["n"] : calls["n"] + 1] = b"#"  # a different tear on every read
+        return bytes(torn)
+
+    fs.override("pread", pread)
+    notices = Notices(state, fs=fs, wall=lambda: 1_700_000_100.0)
+    assert notices.allow("IB-RET-001", state, 86400)  # no state to rate-limit against: shown
+    assert calls["n"] == 1 + TORN_RETRIES
+    assert (state / FILE_NAME).read_bytes() == image  # and the others' timestamps are intact
+
+
+def test_a_really_invalid_file_is_repaired_unlocked_too(tmp_path: Path) -> None:
+    state = tmp_path / "st"
+    state.mkdir(mode=0o700)
+    (state / FILE_NAME).write_bytes(b"not json at all")
+    os.chmod(state / FILE_NAME, 0o600)
+    notices = Notices(state, fs=_unlocked_fs())
+    assert notices.allow("IB-RET-001", state, 86400)
+    assert not notices.allow("IB-RET-001", state, 86400)  # rewritten: now there is a record
+    shown, _ = parse_notices((state / FILE_NAME).read_bytes(), time.time() + 5)
+    assert list(shown) == [f"IB-RET-001@{state}"]
 
 
 def test_a_symlink_or_foreign_file_as_the_notices_file_is_not_written(tmp_path: Path) -> None:
