@@ -18,6 +18,7 @@ import pytest
 
 from ironbird.cli import prunecmd
 from ironbird.cli.output import Console
+from ironbird.errors import Code, IronbirdError
 from ironbird.fsops import REAL_FS, FileSystem
 from ironbird.ledger import Ledger
 from ironbird.prune import Plan, execute_plan, list_lines, make_plan
@@ -129,8 +130,9 @@ def test_nothing_is_deleted_from_a_check_only_listing(tmp_path: Path) -> None:
     assert checked.projected > 0
     plan = make_plan(checked, older_than_s=DAY, until_under=None, now=now)
     assert [c.session.id for c in plan.candidates] == [sid(1)]
-    with pytest.raises(AssertionError):
+    with pytest.raises(IronbirdError) as raised:
         execute_plan(REAL_FS, plan, lambda *a, **k: None)
+    assert raised.value.code is Code.INTERNAL
     assert len(list((tmp_path / "check").iterdir())) == 2
 
 

@@ -223,6 +223,12 @@ class DirScan:
     unrecoverable: set[str] = field(default_factory=set)
     busy: set[str] = field(default_factory=set)  # a lock held elsewhere kept a recovery out
     damaged_kept: set[str] = field(default_factory=set)  # saved, original kept as .damaged
+    # Sessions a check-only recovery got as far as finishing the salvages of (it would resume
+    # their pending .damaged originals); classify_damaged projects only for these.
+    would_resume: set[str] = field(default_factory=set)
+    # Reserves a check-only recovery got past before a lock held elsewhere stopped it in their
+    # session: a recovery with a ledger would have handled them.
+    passed_before_busy: set[str] = field(default_factory=set)
     unreadable: set[str] = field(default_factory=set)  # a file that could not be examined
     # .damaged files this scan produced or ended, and salvage temporaries it already reported
     handled: set[str] = field(default_factory=set)
@@ -256,7 +262,8 @@ class DirScan:
             self.handled,
             self.check_budget,
         )
-        other.busy = self.busy
+        other.busy, other.would_resume = self.busy, self.would_resume
+        other.passed_before_busy = self.passed_before_busy
 
     def total_bytes(self) -> int:
         """Bytes of all pattern files, hard links counted once."""
@@ -935,7 +942,7 @@ def _recover_locked(ctx: RecoveryContext, held: list[int]) -> bool:
     the salvages that were cut short."""
     scan, session = ctx.scan, ctx.session
     changed = False
-    for reserve in session.reserves:
+    for index, reserve in enumerate(session.reserves):
         if ctx.stopping:
             return changed
         try:
@@ -947,12 +954,19 @@ def _recover_locked(ctx: RecoveryContext, held: list[int]) -> bool:
             return changed
         if outcome == "skip":  # a lock held elsewhere: the session is protected for this pass
             scan.busy.add(session.id)
+            if ctx.check_only:
+                scan.passed_before_busy.update(r.name for r in session.reserves[:index])
             return changed
         changed |= outcome == "changed"
         if outcome == "stop":
             break
+    if ctx.check_only and not ctx.stopping:
+        # the reserves are done without a lock held elsewhere or a failing file system: a real
+        # recovery goes on to the salvages that were cut short (they are not run here, the
+        # session being protected by its .damaged file anyway)
+        scan.would_resume.add(session.id)
     for entry in session.damaged:
-        if ctx.stopping or ctx.check_only:  # a session with a .damaged file is protected anyway
+        if ctx.stopping or ctx.check_only:
             break
         if entry.name in scan.handled:
             continue
@@ -1550,9 +1564,11 @@ def classify_damaged(fs: FileSystem, scan: DirScan) -> None:
                 if check.state == "pending":
                     scan.pending_damaged.add(entry.name)
                 scan.messages.append(_unfinished_message(entry, check))
-                if check.state == "pending" and scan.check_only:
+                if check.state == "pending" and scan.check_only and session.id in scan.would_resume:
                     # A recovery would finish the copy and keep the original, which protects
-                    # the session as it does after the copy.
+                    # the session as it does after the copy. One that would not reach this
+                    # session (live, future-dated, busy, no part 1, no locks) leaves the
+                    # original unrecovered, as it does after a real run.
                     number = max((f.number for f in session.files if _numbered(f)), default=1)
                     _project_part(scan, session, entry, number + 1, check.cut)
                     scan.damaged_kept.add(session.id)

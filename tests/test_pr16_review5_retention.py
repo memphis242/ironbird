@@ -6,6 +6,7 @@ the ``IB-LED-002`` warning counts the ``.damaged`` originals a recovery would fi
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import io
 import json
@@ -441,6 +442,159 @@ def test_a_reserve_locked_elsewhere_protects_its_session(tmp_path: Path, check_o
     assert BUSY in scan.sessions[sid(1)].protected
 
 
+# -- a pending .damaged original is projected only where a recovery would resume it --------------
+
+
+class _NoLocksFs(FileSystem):
+    def flock(self, fd: int, operation: int) -> None:
+        raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+
+
+def _pending_damaged_bytes(s: int) -> bytes:
+    pad = "x" * 1000
+    records = "".join(
+        json.dumps({"session": sid(s), "n": 10 + i, "kind": "action", "event": "t", "p": pad})
+        + "\n"
+        for i in range(2048)
+    )
+    return (reserve_header(sid(s)) + records).encode() + b"\0" * 8 + b"junk"
+
+
+def _build_pending(d: Path, now: float, scenario: str) -> Path:
+    """Session 1 (the oldest) holds a pending ``.damaged`` original of about 2 MiB; sessions 2 and
+    3 are plain. Returns session 1's part 1."""
+    d.mkdir(mode=0o700)
+    (part1,) = make_session(d, 1, age_days=30, now=now)
+    original = make_reserve(d, 1, 1, _pending_damaged_bytes(1), age_days=30, now=now, pad_to=0)
+    original.rename(d / (original.name + ".damaged"))
+    make_session(d, 2, age_days=20, size=1 * MIB, now=now)
+    make_session(d, 3, age_days=10, size=1 * MIB, now=now)
+    if scenario == "future":
+        os.utime(part1, (now + 3600, now + 3600))
+    elif scenario == "no_part1":
+        part1.unlink()
+    return part1
+
+
+def _staged_scan(
+    fs: FileSystem, d: Path, now: float, *, check_only: bool, lock_after_probe: Path | None
+) -> DirScan:
+    """``full_scan`` with the lock of ``lock_after_probe`` taken between the liveness probe and
+    the recovery: a writer that started after the probe."""
+    scan = scan_directory(fs, d, "ledger")
+    live = liveness(fs, d, scan, now, None)
+    holder = -1
+    if lock_after_probe is not None:
+        holder = os.open(lock_after_probe, os.O_RDONLY)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        if recover_directory(fs, scan, live, None, check_only=check_only):
+            again = scan_directory(fs, d, "ledger")
+            scan.carry_to(again)
+            scan = again
+            live = liveness(fs, d, scan, now, None)
+    finally:
+        if holder >= 0:
+            os.close(holder)
+    scan.check_only = check_only
+    classify_damaged(fs, scan)
+    apply_protection(fs, scan, keep_recent=0, live=live)
+    return scan
+
+
+PENDING_SCENARIOS = [
+    "resumable",
+    "future",
+    "no_part1",
+    "enolck",
+    "held_at_probe",
+    "busy_after_probe",
+]
+
+
+@pytest.mark.parametrize("scenario", PENDING_SCENARIOS)
+def test_a_pending_damaged_original_is_projected_only_where_a_recovery_resumes_it(
+    tmp_path: Path, scenario: str
+) -> None:
+    now = time.time()
+    scans: list[DirScan] = []
+    holders: list[int] = []
+    try:
+        for name in ("check", "real"):
+            d = tmp_path / name
+            part1 = _build_pending(d, now, scenario)
+            fs: FileSystem = _NoLocksFs() if scenario == "enolck" else REAL_FS
+            if scenario == "held_at_probe":
+                holder = os.open(part1, os.O_RDONLY)
+                fcntl.flock(holder, fcntl.LOCK_EX)
+                holders.append(holder)
+            scans.append(
+                _staged_scan(
+                    fs,
+                    d,
+                    now,
+                    check_only=name == "check",
+                    lock_after_probe=part1 if scenario == "busy_after_probe" else None,
+                )
+            )
+    finally:
+        for holder in holders:
+            os.close(holder)
+    checked, real = scans
+    report = f"{scenario}: check {_protected(checked)} real {_protected(real)}"
+    assert _protected(checked) == _protected(real), report
+    assert _candidates(checked, now) == _candidates(real, now), report
+    assert checked.total_bytes() == real.total_bytes(), report
+    for until in (1, 1 * MIB, 3 * MIB, 5 * MIB):
+        a = make_plan(checked, older_than_s=None, until_under=until, now=now)
+        b = make_plan(real, older_than_s=None, until_under=until, now=now)
+        assert [c.session.id for c in a.candidates] == [c.session.id for c in b.candidates], report
+        assert (a.total_bytes, a.selected_bytes, a.unreachable) == (
+            b.total_bytes,
+            b.selected_bytes,
+            b.unreachable,
+        ), report  # IB-RET-005 is shown for an unreachable target
+        assert a.protected == b.protected, report
+        assert _listing(a, now) == _listing(b, now), report
+    if scenario == "resumable":
+        assert checked.projected == 1  # the one place the projection is a prediction
+    else:
+        assert checked.projected == 0, report
+
+
+def _prune_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str, *, ledger_enabled: bool
+) -> tuple[list[str], int, bool, dict[str, int]]:
+    name = "on" if ledger_enabled else "off"
+    state = tmp_path / name / "state"
+    state.parent.mkdir()
+    _build_pending(state, time.time(), scenario)
+    monkeypatch.setenv("IRONBIRD_STATE_DIR", str(state))
+    monkeypatch.setenv("IRONBIRD_RECORDING_DIR", str(tmp_path / name / "rec"))
+    out, err = io.StringIO(), io.StringIO()
+    console = Console(out, err)
+    ledger = Ledger(tmp_path / f"ledger-{name}", session_id="a" * 12, enabled=ledger_enabled)
+    flags = prunecmd.PruneFlags(365 * 86400, 5 * MIB, 0, True, False, True)
+    prunecmd.work("ledger", flags, None, None, ledger, console, verbose=False)
+    console.close()
+    plan = json.loads(out.getvalue().splitlines()[-1])
+    return (
+        [s["session"] for s in plan["sessions"]],
+        plan["total_bytes"],
+        plan["unreachable"],
+        plan["protected_bytes"],
+    )
+
+
+@pytest.mark.parametrize("scenario", ["future", "no_part1"])
+def test_a_dry_run_without_a_ledger_lists_what_one_with_a_ledger_lists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    off = _prune_json(tmp_path, monkeypatch, scenario, ledger_enabled=False)
+    on = _prune_json(tmp_path, monkeypatch, scenario, ledger_enabled=True)
+    assert off == on
+
+
 # -- IB-LED-002 counts the .damaged originals a recovery would finish ----------------------
 
 
@@ -472,3 +626,18 @@ def test_led002_warning_counts_a_reserve_that_is_also_a_damaged_original_once(
     _build(state, "interrupted_setaside")
     err = _dry_run_stderr(state, tmp_path, monkeypatch)
     assert "1 leftover reserve(s) or set-aside original(s)" in err
+
+
+def test_led002_count_includes_the_reserves_passed_before_a_lock_held_elsewhere(
+    tmp_path: Path,
+) -> None:
+    """The lock is taken after the liveness probe (a probe would call the session live), so the
+    check-only recovery passes the first reserve and stops at the second."""
+    d = tmp_path / "state"
+    d.mkdir(mode=0o700)
+    make_session(d, 1, age_days=3, now=NOW)
+    make_reserve(d, 1, 1, _clean(1), now=NOW)
+    second = make_reserve(d, 1, 2, _clean(1), now=NOW)
+    scan = _staged_scan(REAL_FS, d, NOW, check_only=True, lock_after_probe=second)
+    assert BUSY in scan.sessions[sid(1)].protected
+    assert prunecmd._unrecovered_reserves(scan) == 1

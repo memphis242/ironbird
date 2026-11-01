@@ -117,11 +117,16 @@ def _json_plan(plan: Plan, now: float) -> dict[str, Any]:
 def _unrecovered_reserves(scan: DirScan) -> int:
     """Files a recovery would have handled, as distinct files: the leftover reserves of every
     session but the live ones and those another process holds (:data:`BUSY`: a recovery is
-    skipped there with a ledger too), and the ``.damaged`` originals whose records are in no
-    part."""
+    skipped there with a ledger too, but for the reserves it had passed before the lock that
+    stopped it), and the ``.damaged`` originals whose records are in no part."""
     files: set[tuple[int, int]] = set()
     for session in scan.sessions.values():
-        if LIVE in session.protected or FUTURE in session.protected or session.id in scan.busy:
+        if LIVE in session.protected or FUTURE in session.protected:
+            continue
+        if session.id in scan.busy:
+            files.update(
+                (f.dev, f.ino) for f in session.reserves if f.name in scan.passed_before_busy
+            )
             continue
         files.update((f.dev, f.ino) for f in session.reserves)
         files.update((f.dev, f.ino) for f in session.damaged if f.name in scan.pending_damaged)

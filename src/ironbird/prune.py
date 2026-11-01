@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
+from ironbird.errors import Code, IronbirdError
 from ironbird.fsops import INSPECT_FLAGS, FileSystem, close_quietly
 from ironbird.retention import (
     DirScan,
@@ -164,9 +165,12 @@ def execute_plan(
     fresh one by default) is filled as the sessions are done, so a caller whose prune a signal
     ends can still say how far it got.
     """
-    assert not plan.scan.projected, (
-        "a check-only listing is a projection: nothing is deleted from it"
-    )
+    if plan.scan.projected:
+        raise IronbirdError(
+            Code.INTERNAL,
+            "a check-only listing was given to a prune that deletes; nothing was deleted",
+            f"{plan.scan.projected} projected entries in {plan.scan.path}",
+        )
     outcome = Outcome() if outcome is None else outcome
     try:
         dir_fd = fs.open_dir(plan.scan.path)

@@ -1666,10 +1666,14 @@ Deliverables
     reserve at the size of its records (the cut drops the preallocated tail, so
     `--until-under`, the totals and `IB-RET-005` do not count it), a damaged one with the part
     saved from it, a pending `.damaged` original with the part its copy would add (the session
-    kept as `damaged reserve kept`, as after the copy). The scan is marked `projected` and
-    `execute_plan` asserts it is not given one. The check-only listing and a real prune's agree
+    kept as `damaged reserve kept`, as after the copy) only where a recovery would reach the
+    session's salvages (`DirScan.would_resume`: not live or future-dated, not held by another
+    process, with a part 1 and usable locks); any other session keeps the original as an
+    `unrecoverable reserve`, as after a real run. The scan is marked `projected` and
+    `execute_plan` raises `IB-INT-001` if given one (an explicit raise, so `-O` keeps it). The check-only listing and a real prune's agree
     on the sessions listed, the totals and the protected-bytes line (tested over 19 states,
-    with a 32 MiB reserve). The one divergence is accepted: an interrupted rename or set-aside
+    with a 32 MiB reserve, and over a pending `.damaged` original under a future mtime, no part 1,
+    no locks, a part 1 lock held at the probe and one taken after it). The one divergence is accepted: an interrupted rename or set-aside
     (a reserve name that is a second name of a part or of its `.damaged` file) is protected as
     hard-linked by the check-only pass, while a real recovery unlinks the name and may list the
     session (or, for a set-aside, keep it as `damaged reserve kept`); it errs on the safe side
