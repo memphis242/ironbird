@@ -6,7 +6,9 @@ of ``IRONBIRD_BENCH_EXPORT_FRAMES`` frames (600,000 by default: ten minutes at t
 floor), exports it and a tenth of it with the real command, checks that the rate does not fall as
 the file grows (what the extrapolation rests on), and prints the time a one-hour recording would
 take at the floor (3.6 M frames) and at the 10k packets/s target (36 M frames). Nothing is
-asserted about the verdict: the plan records it. Opt in with ``IRONBIRD_BENCH_EXPORT=1``.
+asserted about the verdict: the plan records it. The frames are the small housekeeping message
+(about 75 bytes), not the 200-byte packets of the 10k target, so the rate is optimistic for
+those. Opt in with ``IRONBIRD_BENCH_EXPORT=1``.
 """
 
 from __future__ import annotations

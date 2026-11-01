@@ -138,6 +138,7 @@ class Ground:
     env: dict[str, str]
     packets: list[tuple[float, Packet]] = field(default_factory=list)
     output_enabled: bool = False
+    hk_requests: int = 0  # IB_TEST_SEND_HK commands sent to this cFS instance (see ``_hk``)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _proc: subprocess.Popen[str] | None = None
     _reader: threading.Thread | None = None

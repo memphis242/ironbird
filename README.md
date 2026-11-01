@@ -82,14 +82,14 @@ pointer names the part too: `[ledger n=1234 file=<stamp>-<session>.p0003]`.
 | `ib nodes` | List nodes, aliases and links, and check every definition file | below |
 | `ib find TEXT` | Search commands and telemetry by name, MID or description | below |
 | `ib send NODE CMD [name=value ...]` | Encode and send one command | below |
-| `ib listen [NODE] [--where EXPR] [--record PATH]` | Decode and print incoming packets | Filtering |
+| `ib listen NODE [--where EXPR] [--record PATH]` | Decode and print incoming packets | Filtering |
 | `ib events [--min-type T] [--where EXPR]` | Print only cFS events from every telemetry link | below |
 | `ib respond --as NODE` | Act as a flight node: answer commands with configured telemetry | below |
 | `ib record [NODE ...] [--duration S] [--count N] [--split S]` | Capture every frame into a recording | Recording |
-| `ib rec info\|check\|repair FILE` | Summarise, verify, or copy the valid prefix of a recording | Recording |
+| `ib rec info\|check FILE`, `ib rec repair IN OUT` | Summarise or verify a recording, or copy its valid prefix to a new file | Recording |
 | `ib rec prune`, `ib ledger prune` | Delete old recordings or ledger sessions after confirmation | The ledger under load |
-| `ib replay FILE [--where EXPR] [--from T] [--to T] [--follow]` | Play a recording back as `listen` shows it | Replay |
-| `ib export FILE -o OUT [--format csv\|text\|jsonl]` | Export a recording to tables, text or JSON Lines | Export |
+| `ib replay FILE... [--where EXPR] [--from T] [--to T] [--follow]` | Play a recording back as `listen` shows it | Replay |
+| `ib export FILE... [-o OUT] [--format csv\|text\|jsonl]` | Export a recording to tables, text or JSON Lines | Export |
 
 ## The ledger under load, a full disk, and retention
 
@@ -202,8 +202,9 @@ ib rec repair /data/run1.ibrec /data/run1.fixed.ibrec [--force]
   left out. `ib rec info` reads the trailer, index and chunk summaries, not frames (a missing or
   bad index falls back to a full read, `IB-REC-008`); `ib rec check` reads everything.
 - **Config.** `[recording]`: `dir`, `fsync = "chunk" | "always" | "never"`,
-  `max_buffer_bytes` (default 256 MiB), `min_free_bytes` (default 1 GiB: recording refuses to start
-  below it, `IB-REC-010`), `embed_definitions` (default true). `ib record` warns (`IB-REC-010`)
+  `max_buffer_bytes` (default 256 MiB, 1 MiB to 64 GiB), `min_free_bytes` (default 1 GiB, 0 to 1 PiB:
+  recording refuses to start below it, `IB-REC-010`), `embed_definitions` (default true). Both sizes take
+  bytes or a string such as `"64MiB"`, like the `[ledger]` and `[retention]` sizes. `ib record` warns (`IB-REC-010`)
   when the disk would fill within 10 minutes.
 - **Splitting.** `--split 1GiB` or `--split 1h` starts `NAME.p0002.ibrec`, ... each a complete file
   naming the session, its part number and the previous part's last sequence number; part 1 stays
@@ -641,7 +642,8 @@ IRONBIRD_CFS=1 pytest tests/cfs -n0      # or: pytest tests/cfs -m cfs -n0
 A plain `pytest` skips them. They start and stop cFS themselves and need UDP 1234 and 2234
 and `/dev/shm/osal:RAM` free (one instance per host). `tests/cfs/test_stage2_acceptance.py` is the
 Stage 2 scenario (a 60 s recording of a live session, replay, export, and a recorder killed with
-SIGKILL then repaired); `tests/cfs/test_cfs_generator.py` drives the `ib_test` throughput source. CI
+SIGKILL then repaired); `tests/cfs/test_cfs_generator.py` drives the `ib_test` throughput source, and
+`tests/cfs/test_generator_schedule.py` runs its schedule arithmetic on the host against a fake clock. CI
 runs all of `tests/cfs` in the `cfs` and `el8-cfs` jobs, and the throughput gate (`pytest tests/bench
 -n0`) serially next to the benchmarks.
 
@@ -659,8 +661,11 @@ Throughput guards: `pytest tests/test_benchmarks.py -n0 -s` prints the loopback 
 
 Design target 10k packets/s (200-byte packets) with zero capture loss; hard floor 1k packets/s.
 `tests/bench/` holds the gate: a separate loopback process sends valid telemetry at a fixed rate into an
-`ib record` subprocess, and the run must record every datagram, in order, with no kernel, queue or buffer
-drop, a bounded buffer peak and RSS, and a reported CPU share.
+`ib record` subprocess, and the run must record every datagram, in order, with no kernel or recorder-buffer
+drop, nothing left unread by the `--count` loop (`queue_not_shown` of the `record.capture` ledger record counts
+the frames that loop skipped; the recorder sees every frame regardless, so it is not recording loss), a bounded
+buffer peak and RSS, and a reported CPU share. The blaster's catch-up after a stall is capped at 64 datagrams per
+millisecond.
 
 ```bash
 pytest tests/bench -n0 -s                                  # the 1k floor for 15 s: what CI runs
@@ -673,6 +678,7 @@ The 10k run is compared with `tests/bench/baseline.json` (CPU per frame, peak RS
 fails. Measured on the development host (4 vCPU Xeon 2.1 GHz): at 10k packets/s `ib record` uses about half
 a core (48-51 us per frame), RSS stays near 32 MiB, the buffer peaks under 1.5 MiB of its 256 MiB, and
 141 MiB are written per minute (8.3 GiB per hour). `ib export` runs at about 36,000 rows/s as CSV: a
-one-hour recording takes about 100 s at 1k packets/s and 16 minutes at 10k packets/s. The ironbird side
+one-hour recording takes about 100 s at 1k packets/s and 16 minutes at 10k packets/s (measured on
+about 75-byte frames; the 200-byte packets of the 10k target have more fields per row, so expect more). The ironbird side
 never loses a datagram it was handed; the cFS side of a 10k packets/s source is limited by TO_LAB's
 software-bus pipe (`tools/cfs/NOTES.md`, section 8).

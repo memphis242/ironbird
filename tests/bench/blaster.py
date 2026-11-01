@@ -3,8 +3,11 @@ template whose little-endian ``uint32`` at ``--serial-offset`` is the datagram's
 
 Run as a script (``python blaster.py --port P --rate R --count N --template-hex H
 --serial-offset O``) from the throughput gate. The schedule is absolute, ``index / rate`` after the
-start, so a datagram late by a scheduler hiccup is followed by a catch-up burst instead of
+start, so a datagram late by a scheduler hiccup is followed by catch-up bursts instead of
 shifting every later one, and the run takes ``count / rate`` seconds whenever the host keeps up.
+No more than ``MAX_BATCH`` datagrams go out between two sleeps (the next ones wait a tick), so a
+blaster that was descheduled catches up at a bounded rate and its bursts stay within what the
+receiver's socket buffer holds.
 One JSON object is printed at the end: ``sent``, ``elapsed_s`` and ``max_lag_ms`` (how far
 behind its slot the latest datagram ever went out).
 """
@@ -19,7 +22,9 @@ import sys
 import time
 
 TICK_S = 0.001  # datagrams are sent in batches, one batch per tick of the schedule
-MAX_BATCH = 4096
+# At most this many datagrams per tick (64k/s): about 50 KiB of kernel memory, within the 208 KiB
+# socket buffer a runner may cap net.core.rmem_max at.
+MAX_BATCH = 64
 
 
 def blast(
@@ -35,6 +40,7 @@ def blast(
     clock = time.perf_counter
     sleep = time.sleep
     sent = 0
+    burst = 0  # datagrams sent since the last sleep, never more than MAX_BATCH
     max_lag = 0.0
     start = clock()
     while sent < count:
@@ -42,12 +48,18 @@ def blast(
         due = min(count, int(now * rate) + 1)
         if due > sent:
             max_lag = max(max_lag, now - sent / rate)
-            for index in range(sent, min(due, sent + MAX_BATCH)):
+            batch_end = min(due, sent + MAX_BATCH - burst)
+            for index in range(sent, batch_end):
                 pack_into("<I", packet, serial_offset, index)
                 send(packet, target)
-            sent = min(due, sent + MAX_BATCH)
+            burst += batch_end - sent
+            sent = batch_end
+            if burst >= MAX_BATCH:  # the rest of what is due goes out after the next tick
+                sleep(TICK_S)
+                burst = 0
         else:
             sleep(min(TICK_S, max(0.0, sent / rate - now)))
+            burst = 0
     elapsed = clock() - start
     sock.close()
     return {"sent": sent, "elapsed_s": elapsed, "max_lag_ms": max_lag * 1000.0}

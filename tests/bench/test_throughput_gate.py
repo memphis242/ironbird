@@ -4,8 +4,8 @@ subprocess, and the recording, the ledger and /proc say what happened.
 Two runs, one set of checks:
 
 * the floor, 1k packets/s, on any runner (``FLOOR_SECONDS`` of it, to fit CI time): every
-  datagram is recorded in order, and nothing is dropped by the kernel, the capture queue or the
-  recorder's buffer;
+  datagram is recorded in order, nothing is dropped by the kernel or the recorder's buffer, and the
+  ``--count`` loop left no frame unread;
 * the design target, 10k packets/s for 60 s, on the development host (opt in with
   ``IRONBIRD_BENCH_10K=1``): the same checks, a bound on the recorder's CPU share, and a
   comparison with ``baseline.json``, where a CPU cost per frame or a peak RSS more than 20% above
@@ -51,7 +51,8 @@ def _report(name: str, result: GateResult) -> None:
         f"\n{name}: {result.recorded}/{result.sent} recorded at {result.rate:,} pkt/s over "
         f"{result.blast_s:.1f} s (blaster at most {result.blast_max_lag_ms:.1f} ms late); "
         f"kernel drops {result.kernel_gap_lost} (socket counter {result.udp_socket_drops}), "
-        f"queue drops {result.queue_not_shown}, buffer peak {result.peak_pending_bytes / 1024:.0f} "
+        f"unread by the --count loop {result.queue_not_shown}, "
+        f"buffer peak {result.peak_pending_bytes / 1024:.0f} "
         f"KiB of {result.max_buffer_bytes >> 20} MiB, RSS {result.rss_before_kib / 1024:.0f} -> "
         f"{result.rss_peak_kib / 1024:.0f} MiB, CPU {result.cpu_share * 100:.0f}% of a core "
         f"({result.cpu_us_per_frame:.0f} us per frame), file {result.file_bytes >> 20} MiB"
@@ -75,7 +76,7 @@ def _assert_lossless(result: GateResult) -> None:
     )
     assert result.recorded_total == result.sent and result.in_order
     assert result.kernel_gap_lost == 0 and result.udp_socket_drops == 0
-    assert result.queue_not_shown == 0
+    assert result.queue_not_shown == 0  # the loop kept up; the recorder sees every frame anyway
     assert result.overrun_frames == 0 and result.gap_records == 0
     assert result.status == "closed"
     # the blaster kept to the schedule, so the rate that was measured is the rate that was asked

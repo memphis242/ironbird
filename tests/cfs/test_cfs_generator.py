@@ -6,10 +6,13 @@ consecutive serials, a filler derived from the serial, and a status packet; its 
 validated) and what ironbird makes of the stream:
 
 * at 1k packets/s nothing is lost anywhere between the app and the recording;
-* at 10k packets/s ``ib record`` loses nothing it was handed (no kernel, queue or buffer drop, no
-  duplicate, nothing out of order). cFS's own software bus can overflow TO_LAB's pipe when its
-  forwarding task is descheduled for a few milliseconds; the SB housekeeping counts those drops
-  (``PipeOverflowErrorCounter``), and every packet missing from the recording is one of them.
+* at 10k packets/s ``ib record`` loses nothing silently: no duplicate, nothing out of order, no
+  recorder-buffer or capture-queue loss, and every packet missing from the recording is accounted
+  for, either by cFS (its software bus can overflow TO_LAB's pipe when the forwarding task is
+  descheduled for a few milliseconds; SB housekeeping counts those drops in
+  ``PipeOverflowErrorCounter``) or by a ``kernel_drop`` GAP record in the recording itself, which
+  a loaded CI runner can produce. A run with zero kernel drops is enforced by the throughput gate
+  (``tests/bench``), whose blaster is not subject to cFS's pipe.
 
 Opt-in (marker ``cfs``), like the other tests here. The gate with a loopback blaster, for ironbird
 alone, is ``tests/bench``.
@@ -158,7 +161,12 @@ def test_one_thousand_packets_a_second_reach_the_recording_exactly(
         count,
     )
     assert status["State"] == STATE_FINISHED
-    assert [serial for _, serial, _, _ in found] == list(range(count))  # all of them, in order
+    serials = [serial for _, serial, _, _ in found]
+    # all of them, in order; if not, say who lost them (cFS's software bus, or the kernel's socket)
+    assert serials == list(range(count)), (
+        f"{count - len(found)} of {count} packets missing; SB pipe overflows "
+        f"{result['sb_overflow']}, ironbird gaps {_info(result['env'], result['out'])['gaps']}"
+    )
     _assert_intact(found, int(status["Run"]))
     counts = [seq for seq, _, _, _ in found]
     assert all((b - a) % 16384 == 1 for a, b in itertools.pairwise(counts))
@@ -170,7 +178,7 @@ def test_one_thousand_packets_a_second_reach_the_recording_exactly(
     assert one[0]["fields"]["Serial"] == 17 and one[0]["fields"]["Run"] == status["Run"]
 
 
-def test_ten_thousand_packets_a_second_are_not_lost_by_ironbird(
+def test_ten_thousand_packets_a_second_are_not_lost_silently_by_ironbird(
     generator_output: Ground, tmp_path: Path
 ) -> None:
     count = 30_000
@@ -180,17 +188,22 @@ def test_ten_thousand_packets_a_second_are_not_lost_by_ironbird(
     assert status["Sent"] == count and status["State"] == STATE_FINISHED
     _assert_intact(found, int(status["Run"]))
     report = _info(result["env"], result["out"])
-    assert report["status"] == "closed" and report["gaps"]["total"] == 0, report["gaps"]
+    assert report["status"] == "closed"
+    by_reason = report["gaps"]["lost_by_reason"]
+    kernel = int(by_reason.get("kernel_drop", 0))
+    # a frame ironbird lost is a recorded kernel drop; the recorder's buffer and the capture queue
+    # lose none, and no frame is missing without a GAP record saying so
+    assert set(by_reason) <= {"kernel_drop"}, by_reason
     assert report["missing_frames"] == 0
     lost = count - len(found)
     print(
         f"\ncFS generator at 10k/s: {len(found)}/{count} recorded, {lost} lost, "
-        f"SB pipe overflows {result['sb_overflow']}, largest burst {status['MaxBurst']}"
+        f"SB pipe overflows {result['sb_overflow']}, kernel drops {kernel}, "
+        f"largest burst {status['MaxBurst']}"
     )
-    assert lost >= 0
-    # every missing packet is a software-bus overflow inside cFS; other MIDs overflow too, so the
-    # counter can exceed the loss by a few
-    assert 0 <= result["sb_overflow"] - lost <= 100, (lost, result["sb_overflow"])
+    # every missing packet is a software-bus overflow inside cFS (the counter also counts other
+    # pipes, so it can exceed the loss) or a kernel drop that ironbird recorded
+    assert 0 <= lost <= result["sb_overflow"] + kernel, (lost, result["sb_overflow"], kernel)
 
 
 def test_the_generator_validates_its_commands(generator_output: Ground) -> None:
@@ -221,3 +234,39 @@ def test_the_generator_validates_its_commands(generator_output: Ground) -> None:
     again = g.fresh("IB_TEST_GEN_STATUS", "IB_TEST_GEN_SEND_STATUS")
     assert again["Sent"] == sent and again["State"] == STATE_STOPPED  # stopped means stopped
     assert errors() == 4
+
+
+@pytest.mark.parametrize(
+    ("command", "args", "delta"),
+    [
+        ("IB_TEST_GEN_START", ("Rate=100", "Count=10"), "-1"),
+        ("IB_TEST_GEN_START", ("Rate=100", "Count=10"), "-4"),
+        ("IB_TEST_GEN_STOP", (), "-1"),
+        ("IB_TEST_GEN_SEND_STATUS", (), "-1"),
+    ],
+    ids=["start-1", "start-4", "stop-1", "send_status-1"],
+)
+def test_a_generator_command_of_the_wrong_length_is_rejected_and_not_run(
+    generator_output: Ground, command: str, args: tuple[str, ...], delta: str
+) -> None:
+    """The header claims fewer bytes than the command has: the app counts an error, runs nothing
+    (no run starts or stops, no status is published) and leaves the command counter alone."""
+    g = generator_output
+    status_before = g.fresh("IB_TEST_GEN_STATUS", "IB_TEST_GEN_SEND_STATUS")
+    before = _hk(g)
+    mark = g.count()
+
+    done = g.send(command, *args, flags=("--length-delta", delta))
+    assert "(mid 0x" in done.stdout  # ib itself reports the send as normal
+
+    after = _hk(g)
+    assert (_counter(after, "err_counter") - _counter(before, "err_counter")) % 256 == 1
+    assert after["cmd_counter"] == before["cmd_counter"]  # nothing ran
+    assert not g.since(mark, "IB_TEST_GEN"), "a rejected command started a run"
+    assert not g.since(mark, "IB_TEST_GEN_STATUS"), "a rejected command published a status"
+    status_after = g.fresh("IB_TEST_GEN_STATUS", "IB_TEST_GEN_SEND_STATUS")
+    assert (status_after["Run"], status_after["State"], status_after["Sent"]) == (
+        status_before["Run"],
+        status_before["State"],
+        status_before["Sent"],
+    )

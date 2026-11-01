@@ -520,10 +520,16 @@ forward the telemetry MIDs by default; add them with `TO_LAB_ADD_PKT Stream=0x8E
 
 Throughput generator (stage 2l). `IB_TEST_GEN_START` starts a run in a child task (`IB_TEST_GEN`): every
 1 ms it publishes the packets due since the run's start at `Rate` (at most 16 per tick, so a late tick
-catches up on the next ones) until `Count` packets are out (state finished, one event, one status packet),
+catches up on the next ones; the clock is `CFE_PSP_GetTime`, the platform timebase, which on the Linux PSP
+is `CLOCK_MONOTONIC`, so a wall-clock step does not move the schedule) until `Count` packets are out (state finished, one event, one status packet),
 or `IB_TEST_GEN_STOP` (state stopped). A START while a run is on, a rate outside 1..10000 or a STOP with no run
 bumps `ErrCounter`. Its state is guarded by one mutex held across a burst, so the `Sent` a status packet
-reports is exactly what was published. The layout is asserted at compile time in `ib_test.h`.
+reports is exactly what was published. The run's packet count is 64-bit and the due count is computed from
+whole seconds and the remainder separately, so neither overflows in a `Count = 0` run; `Serial` and the status
+`Sent` are the low 32 bits of the count and wrap to 0 by design after 2^32 packets (about 5 days at 10k/s). The
+command pipe holds 32 messages and each subscription may queue that many (`CFE_SB_SubscribeEx`; the software bus
+default is 4). The layout and these limits are asserted at compile time in `ib_test.h`;
+`tests/cfs/test_generator_schedule.py` runs the tick against a fake clock across both wraps.
 
 Measured limit (development host, 4 vCPU): the stock TO_LAB forwards through a telemetry pipe of depth 50
 (`OS_QUEUE_MAX_DEPTH` in `build-native_std/osal_public_api/osconfig.gen`; `TO_LAB_ADD_PKT BufLimit` must be

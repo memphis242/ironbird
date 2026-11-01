@@ -20,12 +20,14 @@
  *   carry no payload. A run is refused while another is running.
  *
  *   GEN telemetry payload (IB_TEST_GEN_PACKET_BYTES in all): uint32 Serial (0 for the first packet
- *   of a run, then +1), uint32 Run (the run number, 1 for the first START after power-on), then
+ *   of a run, then +1; the low 32 bits of the run's packet count, so a run of 2^32 packets or more
+ *   wraps to 0 by design), uint32 Run (the run number, 1 for the first START after power-on), then
  *   IB_TEST_GEN_FILL_BYTES of Fill, where Fill[i] = (uint8)(Serial + i).
  *
  *   GEN_STATUS telemetry payload: uint32 Run, uint32 Rate, uint32 Target (the Count asked for),
- *   uint32 Sent (packets published in the run so far), uint8 State, uint8 Spare, uint16 MaxBurst
- *   (the most packets published in one 1 ms tick; a large value says the task was descheduled).
+ *   uint32 Sent (packets published in the run so far, modulo 2^32 like Serial), uint8 State,
+ *   uint8 Spare, uint16 MaxBurst (the most packets published in one 1 ms tick; a large value says
+ *   the task was descheduled).
  *   Published when a run ends (count reached or GEN_STOP) and on GEN_SEND_STATUS.
  *
  * The layouts are what ironbird's CCDD file examples/ccdd/cfs.json describes.
@@ -44,6 +46,7 @@
 
 /* Generator limits. The burst cap keeps one tick's packets within what TO_LAB's telemetry pipe
  * (depth 50, subscription limit below that) holds when the task has fallen behind its schedule. */
+#define IB_TEST_NS_PER_SEC        1000000000ULL
 #define IB_TEST_GEN_MAX_RATE      10000
 #define IB_TEST_GEN_FILL_BYTES    176
 #define IB_TEST_GEN_PACKET_BYTES  200
@@ -83,7 +86,11 @@
 #define IB_TEST_GEN_STOP_CC       5
 #define IB_TEST_GEN_SEND_STATUS_CC 6
 
-#define IB_TEST_PIPE_DEPTH 32
+/* The command pipe holds IB_TEST_PIPE_DEPTH messages, and each subscription may have that many
+ * queued: the software bus defaults to 4 per subscription, which a burst of commands overruns
+ * while the pipe has room. */
+#define IB_TEST_PIPE_DEPTH     32
+#define IB_TEST_PIPE_MSG_LIMIT IB_TEST_PIPE_DEPTH
 #define IB_TEST_PIPE_NAME  "IB_TEST_CMD_PIPE"
 
 #define IB_TEST_INIT_EID     1
@@ -178,10 +185,10 @@ typedef struct
     uint32 Run;
     uint32 Rate;
     uint32 Target;
-    uint32 Sent;
+    uint64 Sent; /* packets published in the run; the packets carry its low 32 bits */
     uint8  State;
     uint16 MaxBurst;
-    int64  StartNs;
+    int64  StartNs; /* the PSP time at GEN_START */
 
     IB_TEST_GenTlm_t       Tlm;
     IB_TEST_GenStatusTlm_t StatusTlm;
@@ -232,8 +239,20 @@ IB_TEST_ASSERT_SIZE(GenFill, offsetof(IB_TEST_GenPayload_t, Fill) == 8);
 IB_TEST_ASSERT_SIZE(GenTlm, sizeof(IB_TEST_GenTlm_t) == IB_TEST_GEN_PACKET_BYTES);
 IB_TEST_ASSERT_SIZE(GenStatusPayload, sizeof(IB_TEST_GenStatusPayload_t) == 4 + 4 + 4 + 4 + 1 + 1 + 2);
 IB_TEST_ASSERT_SIZE(GenStatusTlm, sizeof(IB_TEST_GenStatusTlm_t) == 16 + 20);
+IB_TEST_ASSERT_SIZE(PipeLimitIsDepth, IB_TEST_PIPE_MSG_LIMIT == IB_TEST_PIPE_DEPTH);
+IB_TEST_ASSERT_SIZE(PipeDepthFitsU16, IB_TEST_PIPE_DEPTH >= 1 && IB_TEST_PIPE_DEPTH <= 0xFFFF);
+IB_TEST_ASSERT_SIZE(PipeDepthFitsOsal, IB_TEST_PIPE_DEPTH <= OS_QUEUE_MAX_DEPTH);
 IB_TEST_ASSERT_SIZE(GenBurstFitsPipe, IB_TEST_GEN_MAX_BURST < 50);
 IB_TEST_ASSERT_SIZE(GenRateFitsTicks, IB_TEST_GEN_MAX_RATE <= 1000 * IB_TEST_GEN_MAX_BURST * IB_TEST_GEN_TICK_MS);
+
+/* The schedule arithmetic is 64-bit for every elapsed time an int64 nanosecond count holds: the
+ * product of the remainder of a second and the rate, and of whole seconds and the rate, fit. */
+IB_TEST_ASSERT_SIZE(GenSentIs64, sizeof(((IB_TEST_Gen_t *)0)->Sent) == 8);
+IB_TEST_ASSERT_SIZE(GenRemainderFits,
+                    (IB_TEST_NS_PER_SEC - 1) <= (0xFFFFFFFFFFFFFFFFULL / IB_TEST_GEN_MAX_RATE));
+IB_TEST_ASSERT_SIZE(GenWholeSecondsFit,
+                    (9223372036854775807ULL / IB_TEST_NS_PER_SEC) <=
+                        ((0xFFFFFFFFFFFFFFFFULL - 2 * IB_TEST_GEN_MAX_RATE) / IB_TEST_GEN_MAX_RATE));
 
 void IB_TEST_Main(void);
 

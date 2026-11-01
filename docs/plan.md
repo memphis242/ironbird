@@ -3707,18 +3707,32 @@ Built (all items below are done; the differences from the first design are state
 - `ib_test` throughput source (D6): `GEN_START` (fc 4, `Rate` 1..10000 packets/s, `Count`, 0 = until
   stopped), `GEN_STOP` (fc 5) and `GEN_SEND_STATUS` (fc 6) drive a child task that publishes `IB_TEST_GEN`
   (MID `0x08E2`, 200 bytes: `Serial`, `Run`, `Fill[176]` with `Fill[i] = Serial + i`) on a 1 ms tick from the
-  run's start time and rate (a late tick catches up, at most 16 packets per tick) and `IB_TEST_GEN_STATUS`
+  run's start time and rate, read from `CFE_PSP_GetTime` (the platform timebase, `CLOCK_MONOTONIC` on the Linux
+  PSP, so a wall-clock step cannot move the schedule; a late tick catches up, at most 16 packets per tick) and
+  `IB_TEST_GEN_STATUS`
   (`0x08E3`: run, rate, target, sent, state, largest burst) when a run ends. A run is refused while another is
   on; the rate, the sizes and the state are checked like every other command, with the app's rejection event
   (`got N, limit M`). Packets go out with the generator's mutex held, so a command sees whole bursts and the
-  `Sent` it reports is exact. `ib_test.h` asserts the layout at compile time (sizes, offsets, burst against the
-  pipe depth, rate against the tick), and `tests/test_ib_test_layout.py` checks the header's topic IDs,
+  `Sent` it reports is exact. The run's packet count is 64-bit and the packets due are computed from whole
+  seconds and the sub-second remainder separately, so a `Count = 0` run cannot overflow either (the 32-bit
+  count passed 2^32 after about 5 days at 10k/s, and elapsed nanoseconds times the rate passed 2^64 after about
+  21 days, both found in review); `Serial` and the status `Sent` stay `uint32` and wrap to 0 by design.
+  The command pipe's subscriptions use `CFE_SB_SubscribeEx` with the message limit equal to the pipe depth (32;
+  the software bus default of 4 was overrun by a burst of commands while the pipe had room), asserted at
+  compile time. `ib_test.h` asserts the layout at compile time (sizes, offsets, burst against the
+  pipe depth, rate against the tick, the 64-bit schedule products, the message limit),
+  `tests/cfs/test_generator_schedule.py` runs the real tick code on the host against a fake clock across both
+  wraps (the harness `ib_test_schedule_harness.c` includes `ib_test.c`; it needs the cFS headers, not cFS
+  running), and `tests/test_ib_test_layout.py` checks the header's topic IDs,
   function codes and sizes against `examples/ccdd/cfs.json` without building cFS. The messages were added to
   `examples/ccdd/cfs.json`, which stands in for the CCDD (this repository has no CSV sources or generator for
   it; the JSON is the maintained file). `tests/cfs/test_cfs_generator.py`: 3000 packets at 1k/s reach the
   recording exactly (all serials, in order, fills right, sequence counts consecutive, zero SB overflow); the
-  commands are validated; 30,000 packets at 10k/s are not lost by ironbird (recorder, queue and kernel
-  counters zero, none repeated or out of order). Measured finding: the stock TO_LAB forwards through a
+  commands are validated, and a GEN_START, GEN_STOP or GEN_SEND_STATUS whose header claims too few bytes is
+  rejected, counted and not run; at 10k/s nothing is lost silently by ironbird (none repeated or out of order, no
+  recorder-buffer or capture-queue loss, and every missing packet is accounted for by cFS's SB overflow counter or
+  by a `kernel_drop` GAP record in the recording; the exact zero-kernel-drop check on an otherwise idle host is the
+  throughput gate's, since a loaded CI runner can drop datagrams in the kernel). Measured finding: the stock TO_LAB forwards through a
   telemetry pipe of depth 50 (`OS_QUEUE_MAX_DEPTH`, subscription limit at most 49), and at 10k packets/s the
   software bus overflows it when TO_LAB's task is off-CPU for a few milliseconds (28,886 of 30,000 recorded on
   the development host); every missing packet is counted by SB housekeeping (`PipeOverflowErrorCounter`
@@ -3727,11 +3741,14 @@ Built (all items below are done; the differences from the first design are state
   `TLM_PIPE_DEPTH`), a platform configuration change that is not made here (deferred).
 - Throughput gate (`tests/bench/`, `gate.py`, `blaster.py`, `test_throughput_gate.py`). The blaster is a
   separate process that sends 200-byte valid telemetry (`GATE_TLM`: `uint32 serial` plus a string) to the
-  recorder's UDP port on an absolute schedule (a late slot is followed by a catch-up burst); `ib record
+  recorder's UDP port on an absolute schedule (a late slot is followed by catch-up bursts of at most 64
+  datagrams per 1 ms tick, so a descheduled blaster cannot exceed the receive buffer;
+  `tests/bench/test_blaster.py`); `ib record
   --count N` (a subprocess) records it. The checks are exact: frames recorded equal datagrams sent, the
   `serial` of every frame is the next one in order, no GAP record, the kernel's own drop counter for the
-  socket (`/proc/net/udp`) and the capture queue's refused frames (new ledger record `record.capture`) are
-  zero, the recorder's buffer never refused a frame, the recording is closed, and the recorder's stderr
+  socket (`/proc/net/udp`) and `queue_not_shown` (new ledger record `record.capture`: the frames the `--count`
+  loop never read; the recorder is a sink that sees every frame, so this is not recording loss, only a check that
+  the loop kept up) are zero, the recorder's buffer never refused a frame, the recording is closed, and the recorder's stderr
   holds no `IB-` line. Bounded: the recorder's buffer peak (new `peak_pending_bytes` field of the
   `recording.stop` ledger record) stays under 16 MiB (cap 256 MiB) and the process's RSS growth under 96 MiB
   (`/proc` `VmHWM`). The CPU share is the recorder's CPU between the first datagram and the blaster's end over
@@ -3745,7 +3762,8 @@ Built (all items below are done; the differences from the first design are state
   absolutely, not tracked. `IRONBIRD_BENCH_RESULTS=<file>` collects each run's numbers as JSON. Measured on
   the development host (4 vCPU Xeon 2.1 GHz, loopback, tmpfs-class disk): floor 15,000/15,000, 10% of a core;
   target 600,000/600,000 in 60.0 s on three runs, 48-51% of a core (48-51 us per frame), RSS 31 -> 32 MiB,
-  buffer peak 0.26-1.4 MiB, zero kernel and queue drops, 141 MiB written (8.3 GiB/h).
+  buffer peak 0.26-1.4 MiB, zero kernel drops and zero frames left unread by the `--count` loop, 141 MiB
+  written (8.3 GiB/h).
 - Benchmarks collected: `tests/test_benchmarks.py` already measured every item the plan lists, so none had to
   be added there; `tests/bench/test_collected.py` fails if one of them is renamed or deleted. Development host,
   `pytest tests/test_benchmarks.py -n0 -s`: ingest 243k frames/s per frame cost (73,983 packets/s saturated
@@ -3760,9 +3778,16 @@ Built (all items below are done; the differences from the first design are state
   600,000-row recording (44 MiB) with the real command at 36,500 rows/s, no slower per row than a tenth of it
   (32,300 rows/s), so a one-hour recording takes about 99 s at the 1k floor (3.6 M rows) and about 987 s at
   the 10k target (36 M rows). The trigger is met. The pool is not built in 2l: at four cores even a perfect
-  split cannot bring the target hour under 60 s, and the floor hour is within 2x of it. OPEN for the user's
-  decision: build the pool (and what a one-hour export is to cost), or accept the single pass and state the
-  cost in the README (done: the README gives the measured figures).
+  split cannot bring the target hour under 60 s, and the floor hour is within 2x of it. Caveat: the benchmark
+  exports `hk_frames` (the small housekeeping message, about 75-byte frames), while the 10k target's packets are
+  200 bytes with more fields per row, so the per-row rate measured here is probably optimistic for the target
+  and the 987 s figure is a lower bound; re-measure with 200-byte frames before relying on it. OPEN for the
+  user's decision: build the pool (and what a one-hour export is to cost), or accept the single pass and state
+  the cost in the README (done: the README gives the measured figures).
+- `[recording] max_buffer_bytes` and `min_free_bytes` take the size grammar of `[ledger]` and `[retention]` (an
+  integer of bytes or a string such as `"64MiB"`), with the same range checks and `IB-CFG-003` errors (found
+  in review: the README showed strings the loader refused). `min_free_bytes = 0` is the integer 0 (the string
+  grammar has no zero). The README Commands table was checked against `--help` for every command and option.
 - Not done: the throughput gate for serial at line rates above a pty's needs a real UART (D7). The pty is
   not rate limited, so the serial floor (4 s at 1k/s, 2k) stays the serial gate.
 - README: a Commands table (every command, with the section that describes it), the configuration reference

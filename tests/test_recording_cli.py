@@ -514,9 +514,26 @@ def test_rec_commands_work_without_any_config(tmp_path: Path, mock_codec: Codec)
         "fsync = 1",
         "max_buffer_bytes = 100",
         "max_buffer_bytes = true",
-        'max_buffer_bytes = "256MiB"',
+        "max_buffer_bytes = 1.5",
+        'max_buffer_bytes = "1023KiB"',
+        'max_buffer_bytes = "65GiB"',
+        'max_buffer_bytes = "unlimited"',
+        'max_buffer_bytes = "256 MiB"',
+        'max_buffer_bytes = "256mib"',
+        'max_buffer_bytes = "0256MiB"',
+        'max_buffer_bytes = "-256MiB"',
+        'max_buffer_bytes = "256"',
+        'max_buffer_bytes = "MiB"',
+        'max_buffer_bytes = ""',
+        "max_buffer_bytes = [1]",
         "min_free_bytes = -1",
         "min_free_bytes = 1.5",
+        'min_free_bytes = "0B"',
+        'min_free_bytes = "1.5GiB"',
+        'min_free_bytes = "2000000TiB"',
+        'min_free_bytes = "1GB"',
+        'min_free_bytes = "unlimited"',
+        "min_free_bytes = false",
         'embed_definitions = "yes"',
         "dir = ''",
         "unknown_key = 1",
@@ -539,6 +556,16 @@ def test_recording_config_values(tmp_path: Path) -> None:
     cfg = load_config(path).recording
     assert cfg.dir == tmp_path / "out" and cfg.fsync == "always"
     assert (cfg.max_buffer_bytes, cfg.min_free_bytes, cfg.embed_definitions) == (2097152, 0, False)
+
+
+def test_recording_sizes_accept_the_unit_grammar(tmp_path: Path) -> None:
+    path, _, _ = write_config(
+        tmp_path, '[recording]\nmax_buffer_bytes = "64MiB"\nmin_free_bytes = "2GiB"\n'
+    )
+    cfg = load_config(path).recording
+    assert (cfg.max_buffer_bytes, cfg.min_free_bytes) == (64 << 20, 2 << 30)
+    path, _, _ = write_config(tmp_path, '[recording]\nmax_buffer_bytes = "1MiB"\n')
+    assert load_config(path).recording.max_buffer_bytes == 1 << 20
 
 
 def test_embed_definitions_false_records_hashes_only(tmp_path: Path, mock_codec: Codec) -> None:

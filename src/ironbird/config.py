@@ -472,21 +472,24 @@ def _parse_recording(ctx: _Ctx, raw: object) -> RecordingConfig:
     embed = raw.get("embed_definitions", defaults.embed_definitions)
     if not isinstance(embed, bool):
         raise ctx.fail("recording.embed_definitions", "must be true or false")
+    max_buffer = _config_size(
+        ctx,
+        raw,
+        "max_buffer_bytes",
+        "recording",
+        MIN_BUFFER_BYTES,
+        MAX_BUFFER_BYTES,
+        defaults.max_buffer_bytes,
+    )
+    min_free = _config_size(
+        ctx, raw, "min_free_bytes", "recording", 0, MAX_FREE_BYTES, defaults.min_free_bytes
+    )
+    assert max_buffer is not None and min_free is not None
     return RecordingConfig(
         dir=ctx.file(raw, "dir", "recording"),
         fsync=fsync,
-        max_buffer_bytes=(
-            _config_int(
-                ctx, raw, "max_buffer_bytes", "recording", MIN_BUFFER_BYTES, MAX_BUFFER_BYTES
-            )
-            if "max_buffer_bytes" in raw
-            else defaults.max_buffer_bytes
-        ),
-        min_free_bytes=(
-            _config_int(ctx, raw, "min_free_bytes", "recording", 0, MAX_FREE_BYTES)
-            if "min_free_bytes" in raw
-            else defaults.min_free_bytes
-        ),
+        max_buffer_bytes=max_buffer,
+        min_free_bytes=min_free,
         embed_definitions=embed,
     )
 

@@ -46,11 +46,13 @@ static void IB_TEST_PublishVar(void)
 
 /* -- throughput generator ------------------------------------------------------------------- */
 
+/* The PSP's time source: the platform timebase, which on the Linux PSP is CLOCK_MONOTONIC. A
+ * run's schedule must not move when the wall clock is stepped. */
 static int64 IB_TEST_NowNs(void)
 {
     OS_time_t now = OS_TIME_ZERO;
 
-    OS_GetLocalTime(&now);
+    CFE_PSP_GetTime(&now);
     return OS_TimeGetTotalNanoseconds(now);
 }
 
@@ -62,7 +64,7 @@ static void IB_TEST_GenPublishStatusLocked(void)
     gen->StatusTlm.Payload.Run      = gen->Run;
     gen->StatusTlm.Payload.Rate     = gen->Rate;
     gen->StatusTlm.Payload.Target   = gen->Target;
-    gen->StatusTlm.Payload.Sent     = gen->Sent;
+    gen->StatusTlm.Payload.Sent     = (uint32)gen->Sent; /* wraps at 2^32 by design */
     gen->StatusTlm.Payload.State    = gen->State;
     gen->StatusTlm.Payload.Spare    = 0;
     gen->StatusTlm.Payload.MaxBurst = gen->MaxBurst;
@@ -70,22 +72,41 @@ static void IB_TEST_GenPublishStatusLocked(void)
     CFE_SB_TransmitMsg(CFE_MSG_PTR(gen->StatusTlm.TelemetryHeader), true);
 }
 
-/* Publish one generator packet: the next Serial of the run, and the fill derived from it. The
- * caller holds Gen.Lock. */
+/* Publish one generator packet: the next Serial of the run, and the fill derived from it. Serial
+ * is the low 32 bits of the run's packet count, so a run of 2^32 packets or more (Count = 0 at
+ * 10k packets/s passes it after about 5 days) wraps to 0. The caller holds Gen.Lock. */
 static void IB_TEST_GenPublishOneLocked(void)
 {
-    IB_TEST_Gen_t *gen = &IB_TEST_Data.Gen;
+    IB_TEST_Gen_t *gen    = &IB_TEST_Data.Gen;
+    const uint32   serial = (uint32)gen->Sent;
     size_t         i;
 
-    gen->Tlm.Payload.Serial = gen->Sent;
+    gen->Tlm.Payload.Serial = serial;
     gen->Tlm.Payload.Run    = gen->Run;
     for (i = 0; i < IB_TEST_GEN_FILL_BYTES; i++)
     {
-        gen->Tlm.Payload.Fill[i] = (uint8)(gen->Sent + i);
+        gen->Tlm.Payload.Fill[i] = (uint8)(serial + i);
     }
     CFE_SB_TimeStampMsg(CFE_MSG_PTR(gen->Tlm.TelemetryHeader));
     CFE_SB_TransmitMsg(CFE_MSG_PTR(gen->Tlm.TelemetryHeader), true);
     gen->Sent++;
+}
+
+/* The packets due after "elapsed_ns" of a run at "rate" packets/s: the first at time zero, then
+ * one per 1/rate. Whole seconds and the remainder are multiplied separately, so no elapsed time
+ * a signed 64-bit nanosecond count can hold overflows the 64-bit product. */
+static uint64 IB_TEST_GenDue(int64 elapsed_ns, uint32 rate)
+{
+    uint64 due = 1;
+
+    if (elapsed_ns > 0)
+    {
+        const uint64 whole     = (uint64)elapsed_ns / IB_TEST_NS_PER_SEC;
+        const uint64 remainder = (uint64)elapsed_ns % IB_TEST_NS_PER_SEC;
+
+        due += whole * rate + (remainder * rate) / IB_TEST_NS_PER_SEC;
+    }
+    return due;
 }
 
 /* One tick of a running generator: the packets due since the run began, at most one burst. The
@@ -93,20 +114,15 @@ static void IB_TEST_GenPublishOneLocked(void)
  * instead of shifting the rate. The caller holds Gen.Lock. */
 static void IB_TEST_GenTickLocked(void)
 {
-    IB_TEST_Gen_t *gen     = &IB_TEST_Data.Gen;
-    int64          elapsed = IB_TEST_NowNs() - gen->StartNs;
-    uint64         due     = 1;
-    uint32         burst   = 0;
+    IB_TEST_Gen_t *gen   = &IB_TEST_Data.Gen;
+    uint64         due   = IB_TEST_GenDue(IB_TEST_NowNs() - gen->StartNs, gen->Rate);
+    uint32         burst = 0;
 
-    if (elapsed > 0)
-    {
-        due += ((uint64)elapsed * gen->Rate) / 1000000000ULL;
-    }
     if (gen->Target != 0 && due > gen->Target)
     {
         due = gen->Target;
     }
-    while (gen->Sent + burst < due && burst < IB_TEST_GEN_MAX_BURST)
+    while (gen->Sent < due && burst < IB_TEST_GEN_MAX_BURST)
     {
         IB_TEST_GenPublishOneLocked();
         burst++;
@@ -432,11 +448,14 @@ static CFE_Status_t IB_TEST_Init(void)
     status = CFE_SB_CreatePipe(&IB_TEST_Data.CommandPipe, IB_TEST_PIPE_DEPTH, IB_TEST_PIPE_NAME);
     if (status == CFE_SUCCESS)
     {
-        status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(IB_TEST_SEND_HK_MID), IB_TEST_Data.CommandPipe);
+        status = CFE_SB_SubscribeEx(CFE_SB_ValueToMsgId(IB_TEST_SEND_HK_MID),
+                                    IB_TEST_Data.CommandPipe, CFE_SB_DEFAULT_QOS,
+                                    IB_TEST_PIPE_MSG_LIMIT);
     }
     if (status == CFE_SUCCESS)
     {
-        status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(IB_TEST_CMD_MID), IB_TEST_Data.CommandPipe);
+        status = CFE_SB_SubscribeEx(CFE_SB_ValueToMsgId(IB_TEST_CMD_MID), IB_TEST_Data.CommandPipe,
+                                    CFE_SB_DEFAULT_QOS, IB_TEST_PIPE_MSG_LIMIT);
     }
     if (status != CFE_SUCCESS)
     {

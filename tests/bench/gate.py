@@ -49,7 +49,7 @@ class GateResult:
     in_order: bool
     kernel_gap_lost: int  # datagrams the kernel dropped, as the recording's GAP records say
     udp_socket_drops: int  # the receiving socket's own drop counter (/proc/net/udp)
-    queue_not_shown: int  # frames the capture's queue refused
+    queue_not_shown: int  # frames the --count loop never read (the recorder saw them: not loss)
     queue_peak_bytes: int
     overrun_frames: int  # frames the recorder's buffer refused
     gap_records: int
