@@ -46,7 +46,7 @@ import serial
 
 from ironbird.config import DATA_BITS, PARITIES, STOP_BITS, FramingSpec, SerialLinkSpec
 from ironbird.errors import Code, IronbirdError
-from ironbird.ledgergate import start_thread
+from ironbird.sigmask import start_thread
 from ironbird.transport.base import (
     LinkStateHandler,
     Receiver,
@@ -350,6 +350,8 @@ class SerialTransport:
         self._port, self._fd = port, port.fileno()
         self._register_device(port)
         try:
+            os.set_blocking(self._fd, False)  # the loop's reads and writes never wait
+            assert not os.get_blocking(self._fd)
             if self._receiver is not None:
                 loop.add_reader(self._fd, self._on_readable)
         except OSError as exc:

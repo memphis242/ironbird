@@ -3657,7 +3657,10 @@ As built (where the build differs from, or settles, the text above)
   catch the reply; RS-485 direction control; `2l`'s throughput gate for serial at line rates above a pty's.
 - Deferred (review 2k, L1): a send-only close before the capture loop loses replies during the reopen and
   drops DTR; better to attach a receiver to the transport that is already open.
-- Deferred (review 2k, L2, with D7): a real UART close can block the event loop up to `closing_wait`.
+- Deferred (review 2k, L2, with D7): a real UART close can block the event loop up to `closing_wait`. On
+  Ctrl-C in the middle of a drain on a real UART with RTS/CTS stalled, the final close can wait up to the
+  driver's `closing_wait` (30 s by default); a second signal interrupts it. Candidate fix: `tcflush(TCOFLUSH)`
+  on cancellation and before the close.
 - Deferred (review 2k, L3): a guard against a descriptor that reads as readable with 0 bytes and no hang-up
   (it spins the loop).
 - Deferred (review 2k, L5, with D7): an FTDI's 16 ms latency timer against the idle floor.
