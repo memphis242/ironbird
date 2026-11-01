@@ -56,6 +56,10 @@ jobs:
       # by a serial run.
       - name: Benchmarks (serial, so the performance ceilings are enforced)
         run: pytest tests/test_benchmarks.py -n0
+      # 15 s of 200-byte telemetry at the 1k packets/s floor into `ib record`: zero loss, or fail.
+      # The 10k packets/s target (60 s) is the development host's: IRONBIRD_BENCH_10K=1.
+      - name: Throughput gate (serial, 1k packets/s floor)
+        run: pytest tests/bench -n0 -s
 
   cfs:
     name: real cFS acceptance
@@ -198,6 +202,11 @@ jobs:
         run: |
           test "$(id -u)" -ne 0
           pytest tests/test_benchmarks.py -n0
+      - name: Throughput gate (serial, 1k packets/s floor)
+        if: steps.setup.outputs.ready == 'true'
+        run: |
+          test "$(id -u)" -ne 0
+          pytest tests/bench -n0 -s
       - name: Hand the workspace back to root (root)
         if: always()
         shell: bash

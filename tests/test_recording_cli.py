@@ -85,6 +85,11 @@ def test_record_count_writes_a_closed_recording_and_the_ledger_notes_it(
     start = next(e for e in events if e["event"] == "recording.start")
     stop = next(e for e in events if e["event"] == "recording.stop")
     assert start["path"] == str(out) and stop["frames"] == 5 and stop["failed"] is None
+    # the numbers the throughput gate reads from the ledger: the recorder's buffer peak (bounded
+    # by its cap) and the capture queue's counts
+    assert 0 < stop["peak_pending_bytes"] <= start["max_buffer_bytes"]
+    capture = next(e for e in events if e["event"] == "record.capture")
+    assert capture["queue_not_shown"] == 0 and capture["offered"] == 5 and capture["unread"] == 0
 
 
 def test_record_duration_is_a_normal_end_and_status_lines_appear(

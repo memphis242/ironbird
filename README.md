@@ -1,7 +1,8 @@
 # ironbird
 
-Terminal integrated/system test tool for cFS flight software vehicles. Stage 1: CLI send and
-receive over UDP. See `docs/plan.md` for the design and `CLAUDE.md` for project rules.
+Terminal integrated/system test tool for cFS flight software vehicles. The CLI sends commands and
+listens, records, replays, filters and exports telemetry over UDP and serial links; the TUI is a
+later stage. See `docs/plan.md` for the design and `CLAUDE.md` for project rules.
 
 ## Setup
 
@@ -70,6 +71,25 @@ but capture is not guaranteed when the queue is full. A `[ledger n=N]` pointer n
 queued for the latest occurrence; it is written unless the ledger is still stalled at exit
 (`IB-LED-001`) or the process is killed first. After the ledger rotates into a second part the
 pointer names the part too: `[ledger n=1234 file=<stamp>-<session>.p0003]`.
+
+## Commands
+
+`ib` is `ironbird`. Global options: `--config/-c PATH` (or `$IRONBIRD_CONFIG`), `--as NODE`,
+`--verbose/-v`. `--help` on any command lists its options.
+
+| Command | What it does | Section |
+|---------|--------------|---------|
+| `ib nodes` | List nodes, aliases and links, and check every definition file | below |
+| `ib find TEXT` | Search commands and telemetry by name, MID or description | below |
+| `ib send NODE CMD [name=value ...]` | Encode and send one command | below |
+| `ib listen [NODE] [--where EXPR] [--record PATH]` | Decode and print incoming packets | Filtering |
+| `ib events [--min-type T] [--where EXPR]` | Print only cFS events from every telemetry link | below |
+| `ib respond --as NODE` | Act as a flight node: answer commands with configured telemetry | below |
+| `ib record [NODE ...] [--duration S] [--count N] [--split S]` | Capture every frame into a recording | Recording |
+| `ib rec info\|check\|repair FILE` | Summarise, verify, or copy the valid prefix of a recording | Recording |
+| `ib rec prune`, `ib ledger prune` | Delete old recordings or ledger sessions after confirmation | The ledger under load |
+| `ib replay FILE [--where EXPR] [--from T] [--to T] [--follow]` | Play a recording back as `listen` shows it | Replay |
+| `ib export FILE -o OUT [--format csv\|text\|jsonl]` | Export a recording to tables, text or JSON Lines | Export |
 
 ## The ledger under load, a full disk, and retention
 
@@ -342,8 +362,8 @@ ib export run1.ibrec --format text --from +90s --to +2m -o minute.txt
 
 | Code | Meaning |
 |------|---------|
-| 0 | Normal end: done, `--count` reached, `--timeout` elapsed without `--count`, or the reader of stdout went away (`\| head -1`) |
-| 1 | Runtime error (`error IB-...`), `find` with no match; `ib rec check` found damage; a recording failed to write (`IB-REC-002`) |
+| 0 | Normal end: done, `--count` reached, `--timeout` elapsed without `--count` (`ib record --duration` elapsed), or the reader of stdout went away (`\| head -1`); `ib rec check` of a recording that is clean, or only torn at its tail |
+| 1 | Runtime error (`error IB-...`), `find` with no match; `ib rec check` found mid-file damage (or, with `--strict`, a recording not closed cleanly); a recording failed to write (`IB-REC-002`) |
 | 2 | Usage, configuration, CCDD or header-profile error |
 | 3 | `listen`, `events` or `respond` had `--count N` and `--timeout` elapsed first |
 | 5 | The output was produced, but the input recording was damaged mid-file: `ib rec repair` left valid frames after the damage out of the copy; `ib replay` or `ib export` stopped at the damage (or, with `--skip-damage`, went past it) or a part of a split recording is missing |
@@ -565,6 +585,36 @@ field path; a span that does not fit one particular packet is `IB-ENC-004` for a
 
 ## Configuration
 
+One TOML file (`--config`, `$IRONBIRD_CONFIG`). Unknown keys are refused by name (`IB-CFG-*`, exit 2).
+Sizes are bytes or `"64MiB"`, durations `"10min"`. Defaults are in the second column.
+
+| Table | Key | Default / values |
+|-------|-----|------------------|
+| `[ironbird]` | `acts_as` | the node this process plays (`--as` overrides) |
+| | `max_packet_bytes` | 2048 (64..65535): longer datagrams are cut and reported |
+| `[nodes.NAME]` | `alias`, `description` | alias defaults to the name |
+| | `ccdd`, `ccdd_adapter` | CCDD file, `"json"` |
+| | `command_header`, `telemetry_header` | header profile files (`examples/headers`) |
+| `[[nodes.NAME.responses]]` | `on`, `reply`, `fields`, `echo`, `accepted_counter`, `rejected_counter` | what `respond` answers |
+| `[[links]]` | `name`, `from`, `to`, `transport` | `transport` is `"udp"` (default) or `"serial"` |
+| (udp) | `command_endpoint`, `telemetry_endpoint` | `"host:port"` |
+| (serial) | `[links.serial]`, `[links.framing]` | see Serial links |
+| `[recording]` | `dir` | `$IRONBIRD_RECORD_DIR`, else the XDG data directory |
+| | `fsync` | `"chunk"`, `"always"` or `"never"` |
+| | `max_buffer_bytes` | 256MiB |
+| | `min_free_bytes` | 1GiB |
+| | `embed_definitions` | `true` |
+| `[ledger]` | `event_bytes_per_hour`, `evidence_bytes_per_hour` | 160MiB, 32MiB, or `"unlimited"` |
+| | `evidence_raw_bytes_per_second`, `essential_reserve_bytes`, `max_file_bytes` | 256KiB, 32MiB, 32MiB |
+| | `on_full` | `"continue"` or `"refuse_commands"` |
+| `[retention]` | `max_age`, `max_total_bytes` | 7d, 8GiB, or `"unlimited"` (warnings only) |
+| | `keep_recent`, `warn_interval`, `scan_interval` | 10, 24h, 10min |
+
+Environment: `IRONBIRD_CONFIG`, `IRONBIRD_STATE_DIR` (ledger; absolute), `IRONBIRD_RECORD_DIR`
+(recordings), `XDG_STATE_HOME`, `XDG_DATA_HOME`.
+
+Shipped files:
+
 - `examples/ironbird.toml` - ground plus a real cFS flight computer (CI_LAB 1234, TO_LAB 2234), telemetry header time in the cFE epoch.
 - `examples/mock.toml` - ironbird-vs-ironbird on distinct ports, with response rules, telemetry header time in Unix seconds.
 - `examples/cfs-serial.toml` - ground plus a real cFS over a serial link, through `tools/cfs/serial_bridge.py` (a pty joined to CI_LAB / TO_LAB).
@@ -589,7 +639,11 @@ IRONBIRD_CFS=1 pytest tests/cfs -n0      # or: pytest tests/cfs -m cfs -n0
 ```
 
 A plain `pytest` skips them. They start and stop cFS themselves and need UDP 1234 and 2234
-and `/dev/shm/osal:RAM` free (one instance per host).
+and `/dev/shm/osal:RAM` free (one instance per host). `tests/cfs/test_stage2_acceptance.py` is the
+Stage 2 scenario (a 60 s recording of a live session, replay, export, and a recorder killed with
+SIGKILL then repaired); `tests/cfs/test_cfs_generator.py` drives the `ib_test` throughput source. CI
+runs all of `tests/cfs` in the `cfs` and `el8-cfs` jobs, and the throughput gate (`pytest tests/bench
+-n0`) serially next to the benchmarks.
 
 Test corpus of malformed inputs: `tests/corpus/malformed/`. Add a file there for every parser bug.
 
@@ -600,3 +654,25 @@ a captured frame. Malformed and unknown frames are consumers' frames too; they a
 coalesced, at ingest. `Session.capture()` gives the raw frames, `Session.decoder()` decodes them.
 Throughput guards: `pytest tests/test_benchmarks.py -n0 -s` prints the loopback ingest-only rate
 (receive side alone) and the end-to-end `ib listen` result at 10k packets/s.
+
+## Throughput
+
+Design target 10k packets/s (200-byte packets) with zero capture loss; hard floor 1k packets/s.
+`tests/bench/` holds the gate: a separate loopback process sends valid telemetry at a fixed rate into an
+`ib record` subprocess, and the run must record every datagram, in order, with no kernel, queue or buffer
+drop, a bounded buffer peak and RSS, and a reported CPU share.
+
+```bash
+pytest tests/bench -n0 -s                                  # the 1k floor for 15 s: what CI runs
+IRONBIRD_BENCH_10K=1 pytest tests/bench -n0 -s             # the 10k target for 60 s, on the dev host
+IRONBIRD_BENCH_10K=1 IRONBIRD_BENCH_UPDATE=1 pytest tests/bench -n0 -k target   # new baseline
+IRONBIRD_BENCH_EXPORT=1 pytest tests/bench/test_export_hour.py -n0 -s           # the export cost
+```
+
+The 10k run is compared with `tests/bench/baseline.json` (CPU per frame, peak RSS); more than 20% above it
+fails. Measured on the development host (4 vCPU Xeon 2.1 GHz): at 10k packets/s `ib record` uses about half
+a core (48-51 us per frame), RSS stays near 32 MiB, the buffer peaks under 1.5 MiB of its 256 MiB, and
+141 MiB are written per minute (8.3 GiB per hour). `ib export` runs at about 36,000 rows/s as CSV: a
+one-hour recording takes about 100 s at 1k packets/s and 16 minutes at 10k packets/s. The ironbird side
+never loses a datagram it was handed; the cFS side of a 10k packets/s source is limited by TO_LAB's
+software-bus pipe (`tools/cfs/NOTES.md`, section 8).

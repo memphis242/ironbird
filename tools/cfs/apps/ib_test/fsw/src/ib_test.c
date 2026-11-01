@@ -44,6 +44,142 @@ static void IB_TEST_PublishVar(void)
     CFE_SB_TransmitMsg(CFE_MSG_PTR(IB_TEST_Data.VarTlm.TelemetryHeader), true);
 }
 
+/* -- throughput generator ------------------------------------------------------------------- */
+
+static int64 IB_TEST_NowNs(void)
+{
+    OS_time_t now = OS_TIME_ZERO;
+
+    OS_GetLocalTime(&now);
+    return OS_TimeGetTotalNanoseconds(now);
+}
+
+/* Publish the status packet. The caller holds Gen.Lock. */
+static void IB_TEST_GenPublishStatusLocked(void)
+{
+    IB_TEST_Gen_t *gen = &IB_TEST_Data.Gen;
+
+    gen->StatusTlm.Payload.Run      = gen->Run;
+    gen->StatusTlm.Payload.Rate     = gen->Rate;
+    gen->StatusTlm.Payload.Target   = gen->Target;
+    gen->StatusTlm.Payload.Sent     = gen->Sent;
+    gen->StatusTlm.Payload.State    = gen->State;
+    gen->StatusTlm.Payload.Spare    = 0;
+    gen->StatusTlm.Payload.MaxBurst = gen->MaxBurst;
+    CFE_SB_TimeStampMsg(CFE_MSG_PTR(gen->StatusTlm.TelemetryHeader));
+    CFE_SB_TransmitMsg(CFE_MSG_PTR(gen->StatusTlm.TelemetryHeader), true);
+}
+
+/* Publish one generator packet: the next Serial of the run, and the fill derived from it. The
+ * caller holds Gen.Lock. */
+static void IB_TEST_GenPublishOneLocked(void)
+{
+    IB_TEST_Gen_t *gen = &IB_TEST_Data.Gen;
+    size_t         i;
+
+    gen->Tlm.Payload.Serial = gen->Sent;
+    gen->Tlm.Payload.Run    = gen->Run;
+    for (i = 0; i < IB_TEST_GEN_FILL_BYTES; i++)
+    {
+        gen->Tlm.Payload.Fill[i] = (uint8)(gen->Sent + i);
+    }
+    CFE_SB_TimeStampMsg(CFE_MSG_PTR(gen->Tlm.TelemetryHeader));
+    CFE_SB_TransmitMsg(CFE_MSG_PTR(gen->Tlm.TelemetryHeader), true);
+    gen->Sent++;
+}
+
+/* One tick of a running generator: the packets due since the run began, at most one burst. The
+ * schedule is the run's start time and its Rate, so a late tick catches up on the next ones
+ * instead of shifting the rate. The caller holds Gen.Lock. */
+static void IB_TEST_GenTickLocked(void)
+{
+    IB_TEST_Gen_t *gen     = &IB_TEST_Data.Gen;
+    int64          elapsed = IB_TEST_NowNs() - gen->StartNs;
+    uint64         due     = 1;
+    uint32         burst   = 0;
+
+    if (elapsed > 0)
+    {
+        due += ((uint64)elapsed * gen->Rate) / 1000000000ULL;
+    }
+    if (gen->Target != 0 && due > gen->Target)
+    {
+        due = gen->Target;
+    }
+    while (gen->Sent + burst < due && burst < IB_TEST_GEN_MAX_BURST)
+    {
+        IB_TEST_GenPublishOneLocked();
+        burst++;
+    }
+    if (burst > gen->MaxBurst)
+    {
+        gen->MaxBurst = (uint16)burst;
+    }
+    if (gen->Target != 0 && gen->Sent >= gen->Target)
+    {
+        gen->State = IB_TEST_GEN_STATE_FINISHED;
+        CFE_EVS_SendEvent(IB_TEST_GEN_DONE_EID, CFE_EVS_EventType_INFORMATION,
+                          "IB_TEST: GEN run %u done, %u packets", (unsigned int)gen->Run,
+                          (unsigned int)gen->Sent);
+        IB_TEST_GenPublishStatusLocked();
+    }
+}
+
+/* The generator task: ticks every IB_TEST_GEN_TICK_MS while a run is on, else waits for GEN_START. */
+static void IB_TEST_GenTaskMain(void)
+{
+    IB_TEST_Gen_t *gen = &IB_TEST_Data.Gen;
+
+    while (IB_TEST_Data.RunStatus == CFE_ES_RunStatus_APP_RUN)
+    {
+        bool running;
+
+        OS_MutSemTake(gen->Lock);
+        running = (gen->State == IB_TEST_GEN_STATE_RUNNING);
+        if (running)
+        {
+            IB_TEST_GenTickLocked();
+        }
+        OS_MutSemGive(gen->Lock);
+
+        if (running)
+        {
+            OS_TaskDelay(IB_TEST_GEN_TICK_MS);
+        }
+        else
+        {
+            OS_BinSemTimedWait(gen->Wake, IB_TEST_GEN_IDLE_WAIT_MS);
+        }
+    }
+    CFE_ES_ExitChildTask();
+}
+
+static CFE_Status_t IB_TEST_GenInit(void)
+{
+    IB_TEST_Gen_t *gen = &IB_TEST_Data.Gen;
+    int32          os  = OS_MutSemCreate(&gen->Lock, "IB_TEST_GEN_LOCK", 0);
+
+    if (os == OS_SUCCESS)
+    {
+        os = OS_BinSemCreate(&gen->Wake, "IB_TEST_GEN_WAKE", 0, 0);
+    }
+    if (os != OS_SUCCESS)
+    {
+        CFE_ES_WriteToSysLog("IB_TEST: error creating the generator semaphores, RC = %d\n", (int)os);
+        return CFE_STATUS_EXTERNAL_RESOURCE_FAIL;
+    }
+    gen->State = IB_TEST_GEN_STATE_IDLE;
+
+    CFE_MSG_Init(CFE_MSG_PTR(gen->Tlm.TelemetryHeader), CFE_SB_ValueToMsgId(IB_TEST_GEN_TLM_MID),
+                 sizeof(gen->Tlm));
+    CFE_MSG_Init(CFE_MSG_PTR(gen->StatusTlm.TelemetryHeader),
+                 CFE_SB_ValueToMsgId(IB_TEST_GEN_STATUS_TLM_MID), sizeof(gen->StatusTlm));
+
+    return CFE_ES_CreateChildTask(&gen->Task, IB_TEST_GEN_TASK_NAME, IB_TEST_GenTaskMain,
+                                  CFE_ES_TASK_STACK_ALLOCATE, IB_TEST_GEN_TASK_STACK,
+                                  IB_TEST_GEN_TASK_PRIORITY, 0);
+}
+
 /* A command refused: "what" says which check failed, "got" is the offending value and "limit" the
  * value it was held to (the exact packet size, or the bound it had to stay within). */
 static void IB_TEST_Reject(const char *what, CFE_MSG_FcnCode_t cc, size_t got, size_t limit)
@@ -113,6 +249,87 @@ static void IB_TEST_SetData(const CFE_SB_Buffer_t *buf, CFE_MSG_FcnCode_t cc)
     IB_TEST_PublishVar();
 }
 
+/* GEN_START: Rate and Count, validated here; refused while a run is on. */
+static void IB_TEST_GenStart(const CFE_SB_Buffer_t *buf, CFE_MSG_FcnCode_t cc)
+{
+    IB_TEST_Gen_t               *gen = &IB_TEST_Data.Gen;
+    const IB_TEST_GenStartCmd_t *cmd = (const IB_TEST_GenStartCmd_t *)buf;
+
+    if (!IB_TEST_HasSize(&buf->Msg, cc, "GEN_START size", sizeof(IB_TEST_GenStartCmd_t)))
+    {
+        return;
+    }
+    if (cmd->Rate < 1 || cmd->Rate > IB_TEST_GEN_MAX_RATE)
+    {
+        IB_TEST_Reject("GEN_START rate outside 1..maximum", cc, cmd->Rate, IB_TEST_GEN_MAX_RATE);
+        return;
+    }
+    OS_MutSemTake(gen->Lock);
+    if (gen->State == IB_TEST_GEN_STATE_RUNNING)
+    {
+        const uint32 run = gen->Run;
+
+        OS_MutSemGive(gen->Lock);
+        IB_TEST_Reject("GEN_START while a run is on", cc, run, 0);
+        return;
+    }
+    gen->Run++;
+    gen->Rate     = cmd->Rate;
+    gen->Target   = cmd->Count;
+    gen->Sent     = 0;
+    gen->MaxBurst = 0;
+    gen->StartNs  = IB_TEST_NowNs();
+    gen->State    = IB_TEST_GEN_STATE_RUNNING;
+    OS_MutSemGive(gen->Lock);
+    OS_BinSemGive(gen->Wake);
+
+    IB_TEST_Data.CmdCounter++;
+    CFE_EVS_SendEvent(IB_TEST_GEN_START_EID, CFE_EVS_EventType_INFORMATION,
+                      "IB_TEST: GEN_START rate %u count %u", (unsigned int)cmd->Rate,
+                      (unsigned int)cmd->Count);
+}
+
+/* GEN_STOP: ends a run that is on and publishes its status; no run on is an error. */
+static void IB_TEST_GenStop(const CFE_SB_Buffer_t *buf, CFE_MSG_FcnCode_t cc)
+{
+    IB_TEST_Gen_t *gen = &IB_TEST_Data.Gen;
+
+    if (!IB_TEST_HasSize(&buf->Msg, cc, "GEN_STOP size", sizeof(IB_TEST_NoArgsCmd_t)))
+    {
+        return;
+    }
+    OS_MutSemTake(gen->Lock);
+    if (gen->State != IB_TEST_GEN_STATE_RUNNING)
+    {
+        const uint32 state = gen->State;
+
+        OS_MutSemGive(gen->Lock);
+        IB_TEST_Reject("GEN_STOP with no run on", cc, state, IB_TEST_GEN_STATE_RUNNING);
+        return;
+    }
+    gen->State = IB_TEST_GEN_STATE_STOPPED;
+    CFE_EVS_SendEvent(IB_TEST_GEN_STOP_EID, CFE_EVS_EventType_INFORMATION,
+                      "IB_TEST: GEN run %u stopped, %u packets", (unsigned int)gen->Run,
+                      (unsigned int)gen->Sent);
+    IB_TEST_GenPublishStatusLocked();
+    OS_MutSemGive(gen->Lock);
+    IB_TEST_Data.CmdCounter++;
+}
+
+static void IB_TEST_GenSendStatus(const CFE_SB_Buffer_t *buf, CFE_MSG_FcnCode_t cc)
+{
+    IB_TEST_Gen_t *gen = &IB_TEST_Data.Gen;
+
+    if (!IB_TEST_HasSize(&buf->Msg, cc, "GEN_SEND_STATUS size", sizeof(IB_TEST_NoArgsCmd_t)))
+    {
+        return;
+    }
+    OS_MutSemTake(gen->Lock);
+    IB_TEST_GenPublishStatusLocked();
+    OS_MutSemGive(gen->Lock);
+    IB_TEST_Data.CmdCounter++;
+}
+
 static void IB_TEST_ProcessGroundCommand(const CFE_SB_Buffer_t *buf)
 {
     CFE_MSG_FcnCode_t cc = 0;
@@ -145,6 +362,15 @@ static void IB_TEST_ProcessGroundCommand(const CFE_SB_Buffer_t *buf)
                 IB_TEST_Data.CmdCounter++;
                 IB_TEST_PublishVar();
             }
+            break;
+        case IB_TEST_GEN_START_CC:
+            IB_TEST_GenStart(buf, cc);
+            break;
+        case IB_TEST_GEN_STOP_CC:
+            IB_TEST_GenStop(buf, cc);
+            break;
+        case IB_TEST_GEN_SEND_STATUS_CC:
+            IB_TEST_GenSendStatus(buf, cc);
             break;
         default:
             IB_TEST_Data.ErrCounter++;
@@ -193,6 +419,15 @@ static CFE_Status_t IB_TEST_Init(void)
                  sizeof(IB_TEST_Data.HkTlm));
     CFE_MSG_Init(CFE_MSG_PTR(IB_TEST_Data.VarTlm.TelemetryHeader),
                  CFE_SB_ValueToMsgId(IB_TEST_VAR_TLM_MID), sizeof(IB_TEST_Data.VarTlm));
+
+    status = IB_TEST_GenInit();
+    if (status != CFE_SUCCESS)
+    {
+        CFE_EVS_SendEvent(IB_TEST_INIT_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "IB_TEST: generator initialization failed, RC = 0x%08lX",
+                          (unsigned long)status);
+        return status;
+    }
 
     status = CFE_SB_CreatePipe(&IB_TEST_Data.CommandPipe, IB_TEST_PIPE_DEPTH, IB_TEST_PIPE_NAME);
     if (status == CFE_SUCCESS)

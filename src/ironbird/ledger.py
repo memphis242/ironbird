@@ -180,6 +180,7 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "recording.failed": Tier.ESSENTIAL,
         "recording.part": Tier.ESSENTIAL,
         "recording.stop": Tier.ESSENTIAL,
+        "record.capture": Tier.ESSENTIAL,
         "ledger.open": Tier.ESSENTIAL,
         "ledger.part": Tier.ESSENTIAL,
         "ledger.reserve": Tier.ESSENTIAL,

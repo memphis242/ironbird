@@ -1230,6 +1230,7 @@ class Recorder:
                 lost_frames=stats.lost_frames,
                 gaps=stats.gaps,
                 chunks=stats.chunks,
+                peak_pending_bytes=stats.peak_pending_bytes,
                 failed=self._failed.code.value if self._failed else None,
             )
         return stats

@@ -2664,7 +2664,8 @@ Deliverables
   errors are `IB-EXP-001` and remove the temporary file (or the files this process
   created in the temporary directory, then the directory) through the failure helper.
 - Single process, streaming, constant memory. The decode worker pool stays unbuilt
-  until a 2l benchmark shows a one-hour recording exports in over 60 s.
+  until a 2l benchmark shows a one-hour recording exports in over 60 s (2l measured 99 s at the
+  1k packets/s floor and 987 s at the 10k target: the trigger is met, the decision is open; see 2l).
 
 Untrusted input: string cells sanitized (control characters escaped) and formula-leading
 cells (`=`, `+`, `-`, `@`, their fullwidth forms, tab, CR, LF, behind any leading whitespace)
@@ -3130,7 +3131,7 @@ As built (where the build differs from, or settles, the text above)
   verification set have no variable-length packet, but the bundle's MD app does (the dwell packet:
   `ByteCount`, then that many bytes), so the claim "stock cFS has none" holds only for the verification
   set. MD needs a dwell table and `CFS_APPS=ALL`; a case against it is deferred. The throughput
-  generator is 2l's.
+  generator is 2l's (built: see 2l).
 - Shipped examples. `examples/ccdd/mock.json` and `cfs.json` are `/1` and gain a variable-length command
   and reply (`MOCK_LOAD_DATA` / `MOCK_DATA`, with a response rule in `examples/mock.toml` that echoes the
   array and the string) and the `ib_test` messages. `tests/golden_2i.py` limits its model to the
@@ -3665,7 +3666,7 @@ As built (where the build differs from, or settles, the text above)
 - Deferred: real UART hardware and an FTDI latency check (D7); kernel serial overrun counters
   (`TIOCGICOUNT`); a session that sends and listens on one device at once (needs a long-lived process: the
   TUI); `sync` bytes are not kept in the recording; a serial `--follow`-style `ib send` that stays up to
-  catch the reply; RS-485 direction control; `2l`'s throughput gate for serial at line rates above a pty's.
+  catch the reply; RS-485 direction control; a throughput gate for serial at line rates above a pty's (2l has none: it needs a UART, D7).
 - Deferred (review 2k, L1): a send-only close before the capture loop loses replies during the reopen and
   drops DTR; better to attach a receiver to the transport that is already open.
 - Deferred (review 2k, L2, with D7): a real UART close can block the event loop up to `closing_wait`. On
@@ -3678,26 +3679,98 @@ As built (where the build differs from, or settles, the text above)
 
 ### 2l - Stage 2 acceptance, throughput gate, docs
 
-- `tests/cfs/test_stage2_acceptance.py` (marker `cfs`), one scenario: start cFS;
-  `ib record` 60 s; TO_LAB enable; K SAMPLE_APP NOOPs, then RESET_COUNTERS, then K more;
-  TIME commands. Then: `ib rec info` clean, seq contiguous, per-MID counts match SCH_LAB
-  periods; `ib replay --where` finds exactly 2K NOOP events; `ib export` of
-  `SAMPLE_APP_HK` shows the counter rising by K, resetting, rising by K; row counts equal
-  `rec info` counts. A second run is killed with SIGKILL mid-capture: torn tail
-  reported, replay plays to it, `ib rec repair` output equals the readable prefix.
-- `ib_test` throughput source (D6): the app built in 2j gains a command-enabled generator
-  of up to 10k pkt/s of fixed-size telemetry (2j owns the app and its variable-length
-  packet; 2l owns the generator).
-- Throughput gate (`tests/bench/`): a loopback blaster sends 200-byte valid telemetry at
-  10k pkt/s for 60 s into `ib record` (subprocess): recorded frames equal sent, kernel
-  and queue drops zero, recorder buffer peak and RSS bounded, CPU share reported. CI
-  asserts the 1k pkt/s floor with zero loss on any runner; the 10k target is asserted on
-  the development host and tracked as a benchmark (regressions over 20% fail).
-- Benchmarks collected across 2b-2k: ingest frames/s, `Recorder.append` cost, writer
-  MB/s, reader frames/s, filter evaluations/s, framer MB/s (clean and adversarial),
-  variable-length decode/s, export rows/s.
-- README: new commands, config tables, exit codes; this plan updated where the build
-  differed.
+Built (all items below are done; the differences from the first design are stated where they occur).
+
+- `tests/cfs/test_stage2_acceptance.py` (marker `cfs`), two scenarios against a cFS power-on that also
+  runs `ib_test`.
+  `test_the_whole_stage2_scenario`: `ib record --duration 60` runs while TO_LAB output is enabled, K = 3
+  SAMPLE_APP NOOPs, a RESET_COUNTERS and 3 more go out (after each, the SAMPLE_APP housekeeping request is
+  repeated until the live recording holds the expected counter), then TIME_NOOP and TIME_SET_STCF. Then:
+  `rec check --strict` and `rec info` clean (closed, from the index, no gap, no hole, no damage), the frame
+  sequence in the file exactly `first_seq..last_seq`, the count of each of the eight periodic housekeeping
+  MIDs within 2 of (window / SCH_LAB period) (the housekeeping the test asked for itself is subtracted; the
+  window runs from the first frame to the STOP mark), `ib replay --where` finds exactly 2K NOOP events (and
+  the ledger holds 2K `SAMPLE_APP_NOOP` transmissions), `ib export` of `SAMPLE_APP_HK` shows the counter runs
+  `0..K, 0..K` (rising by K, resetting, rising by K), its row count equals `rec info`'s count for the MID,
+  `TIME_HK.csv` shows the commanded STCF, and every frame of the recording is in exactly one table. The
+  steps take about 10 s of the 60 s recording on the development host; the test fails (it does not hang) if
+  they ever outlast the recording.
+  `test_a_recorder_killed_mid_capture_leaves_a_recording_that_replays_and_repairs`: a second recorder, fed by
+  the `ib_test` generator at 1000 packets/s, is sent SIGKILL once 2500 frames are readable. Then: the status
+  is `unclosed` or `torn`, `rec check` exits 0 with `IB-REC-007` in stderr and `rec check --strict` exits 1,
+  `ib replay` plays exactly the frames `rec info` counts and reports the tail, and `ib rec repair` writes a
+  closed file whose frames (and whose `replay --format hex` output) equal the readable prefix of the original,
+  which is left byte-identical. Differs from the first design: SIGKILL stops the process between two writes,
+  so the file ends on a record boundary (`unclosed`: no trailer, nothing cut), never inside a record; the
+  same checks run on a copy with its last 100 bytes removed (`torn`: a cut inside the last record, as a power
+  loss leaves it), whose prefix is one frame shorter.
+- `ib_test` throughput source (D6): `GEN_START` (fc 4, `Rate` 1..10000 packets/s, `Count`, 0 = until
+  stopped), `GEN_STOP` (fc 5) and `GEN_SEND_STATUS` (fc 6) drive a child task that publishes `IB_TEST_GEN`
+  (MID `0x08E2`, 200 bytes: `Serial`, `Run`, `Fill[176]` with `Fill[i] = Serial + i`) on a 1 ms tick from the
+  run's start time and rate (a late tick catches up, at most 16 packets per tick) and `IB_TEST_GEN_STATUS`
+  (`0x08E3`: run, rate, target, sent, state, largest burst) when a run ends. A run is refused while another is
+  on; the rate, the sizes and the state are checked like every other command, with the app's rejection event
+  (`got N, limit M`). Packets go out with the generator's mutex held, so a command sees whole bursts and the
+  `Sent` it reports is exact. `ib_test.h` asserts the layout at compile time (sizes, offsets, burst against the
+  pipe depth, rate against the tick), and `tests/test_ib_test_layout.py` checks the header's topic IDs,
+  function codes and sizes against `examples/ccdd/cfs.json` without building cFS. The messages were added to
+  `examples/ccdd/cfs.json`, which stands in for the CCDD (this repository has no CSV sources or generator for
+  it; the JSON is the maintained file). `tests/cfs/test_cfs_generator.py`: 3000 packets at 1k/s reach the
+  recording exactly (all serials, in order, fills right, sequence counts consecutive, zero SB overflow); the
+  commands are validated; 30,000 packets at 10k/s are not lost by ironbird (recorder, queue and kernel
+  counters zero, none repeated or out of order). Measured finding: the stock TO_LAB forwards through a
+  telemetry pipe of depth 50 (`OS_QUEUE_MAX_DEPTH`, subscription limit at most 49), and at 10k packets/s the
+  software bus overflows it when TO_LAB's task is off-CPU for a few milliseconds (28,886 of 30,000 recorded on
+  the development host); every missing packet is counted by SB housekeeping (`PipeOverflowErrorCounter`
+  grew by 1,121 for the 1,114 missing), which the test uses to tell cFS's loss from ironbird's. A cFS source
+  that is lossless at 10k packets/s needs a deeper pipe (`OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's
+  `TLM_PIPE_DEPTH`), a platform configuration change that is not made here (deferred).
+- Throughput gate (`tests/bench/`, `gate.py`, `blaster.py`, `test_throughput_gate.py`). The blaster is a
+  separate process that sends 200-byte valid telemetry (`GATE_TLM`: `uint32 serial` plus a string) to the
+  recorder's UDP port on an absolute schedule (a late slot is followed by a catch-up burst); `ib record
+  --count N` (a subprocess) records it. The checks are exact: frames recorded equal datagrams sent, the
+  `serial` of every frame is the next one in order, no GAP record, the kernel's own drop counter for the
+  socket (`/proc/net/udp`) and the capture queue's refused frames (new ledger record `record.capture`) are
+  zero, the recorder's buffer never refused a frame, the recording is closed, and the recorder's stderr
+  holds no `IB-` line. Bounded: the recorder's buffer peak (new `peak_pending_bytes` field of the
+  `recording.stop` ledger record) stays under 16 MiB (cap 256 MiB) and the process's RSS growth under 96 MiB
+  (`/proc` `VmHWM`). The CPU share is the recorder's CPU between the first datagram and the blaster's end over
+  the blast time (`/proc/<pid>/stat`), reported with a per-frame cost. CI runs the 1k packets/s floor for 15 s
+  on any runner (new serial step `pytest tests/bench -n0 -s` in `checks` and in both EL8 jobs; the gate skips
+  under xdist like the other host-timing guards, and a test fails if a parallel CI job lacks the serial step).
+  The 10k target for 60 s (600,000 datagrams) runs with `IRONBIRD_BENCH_10K=1` on the development host and
+  is compared with `tests/bench/baseline.json` (CPU per frame and peak RSS; more than 20% above fails; the
+  comparison is skipped on a host whose CPU count and model differ from the baseline's; `IRONBIRD_BENCH_UPDATE=1`
+  rewrites it). The buffer peak varies from run to run with disk flushes (0.26 to 1.4 MiB), so it is bounded
+  absolutely, not tracked. `IRONBIRD_BENCH_RESULTS=<file>` collects each run's numbers as JSON. Measured on
+  the development host (4 vCPU Xeon 2.1 GHz, loopback, tmpfs-class disk): floor 15,000/15,000, 10% of a core;
+  target 600,000/600,000 in 60.0 s on three runs, 48-51% of a core (48-51 us per frame), RSS 31 -> 32 MiB,
+  buffer peak 0.26-1.4 MiB, zero kernel and queue drops, 141 MiB written (8.3 GiB/h).
+- Benchmarks collected: `tests/test_benchmarks.py` already measured every item the plan lists, so none had to
+  be added there; `tests/bench/test_collected.py` fails if one of them is renamed or deleted. Development host,
+  `pytest tests/test_benchmarks.py -n0 -s`: ingest 243k frames/s per frame cost (73,983 packets/s saturated
+  on loopback, 10k/s paced with no loss); `Recorder.append` 2.1 us (425k frames/s); writer 375k frames/s,
+  93 MB/s to a closed file; reader 176k frames/s (44 MB/s); filter evaluations 0.37-1.8 M/s for frame, model
+  and check predicates and 155k/s with a decode (6.5 us); framer 225k packets/s and 45 MB/s clean, 1.4 MB/s
+  with line noise and with a hostile stream (inside its work budget); variable-length decode and check 76k/s;
+  export 38k rows/s as CSV, 26k as JSON Lines, 19k as text (the command: 31k rows/s); `ib record` at 10k pkt/s
+  36 us per frame; `ib record` over a pty at the 1k floor 95 us per packet.
+- The export question of 2h ("the decode worker pool stays unbuilt until a 2l benchmark shows a one-hour
+  recording exports in over 60 s"): `tests/bench/test_export_hour.py` (`IRONBIRD_BENCH_EXPORT=1`) exports a
+  600,000-row recording (44 MiB) with the real command at 36,500 rows/s, no slower per row than a tenth of it
+  (32,300 rows/s), so a one-hour recording takes about 99 s at the 1k floor (3.6 M rows) and about 987 s at
+  the 10k target (36 M rows). The trigger is met. The pool is not built in 2l: at four cores even a perfect
+  split cannot bring the target hour under 60 s, and the floor hour is within 2x of it. OPEN for the user's
+  decision: build the pool (and what a one-hour export is to cost), or accept the single pass and state the
+  cost in the README (done: the README gives the measured figures).
+- Not done: the throughput gate for serial at line rates above a pty's needs a real UART (D7). The pty is
+  not rate limited, so the serial floor (4 s at 1k/s, 2k) stays the serial gate.
+- README: a Commands table (every command, with the section that describes it), the configuration reference
+  table (`[ironbird]`, nodes, links, `[recording]`, `[ledger]`, `[retention]`, environment variables; serial
+  keys stay in Serial links), the exit-code table brought up to date (`--duration`, `rec check --strict`), a
+  Throughput section (the gate commands, the measured figures, the export cost) and the Stage 2 cFS tests in
+  Development; the stale "Stage 1" intro is replaced. `tools/cfs/README.md` and `NOTES.md` section 8 describe
+  the generator and the TO_LAB limit.
 
 ### Error codes added in Stage 2
 
@@ -3840,7 +3913,7 @@ Decided by the user (2026-10-30):
 - **D6 Variable-length and throughput on real cFS: add an `ib_test` cFS app** under
   `tools/cfs`, built with the pinned bundle, that emits a counted-array packet and can
   generate up to 10k pkt/s of telemetry. Used only for acceptance and the throughput gate.
-  Owners: 2j builds the app with the variable-length packet, 2l adds the throughput source.
+  Owners: 2j builds the app with the variable-length packet, 2l adds the throughput source (done).
 - **D7 Serial hardware: none yet.** The pty bridge (mock E2E and pty-to-cFS-UDP) is the
   gate; a real-UART run is added when hardware is available.
 

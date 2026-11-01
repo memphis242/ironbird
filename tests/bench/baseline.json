@@ -1,0 +1,11 @@
+{
+  "host": {
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cpus": 4,
+    "machine": "x86_64"
+  },
+  "target": {
+    "cpu_us_per_frame": 48.4,
+    "rss_peak_kib": 32148.0
+  }
+}
