@@ -4,6 +4,7 @@
 # deliberately (re-run ruff, pyright and the tests, fix what moved) instead of letting a new
 # release break an unrelated change. Transitive packages are left free.
 typer==0.27.3
+pyserial==3.5
 pytest==8.4.2
 pytest-xdist==3.8.0
 pytest-benchmark==5.3.0

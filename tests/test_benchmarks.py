@@ -1056,6 +1056,129 @@ def test_export_cli_writes_a_csv_directory_at_the_target_rate(
     assert rows == REPLAY_FRAMES and rows / took >= TARGET_PPS
 
 
+# -- serial framing and the serial link --
+
+FRAMER_PACKETS = 2000
+FRAMER_NOISE_BYTES = 64 * 1024
+SERIAL_FLOOR_SECONDS = 4  # how long the floor test sends at FLOOR_PPS
+
+
+def _framer_inputs() -> tuple[Any, bytes, bytes, bytes]:
+    """A framer over the PEC profile and three streams: clean 200-byte packets, line noise, and
+    hostile input (a plausible header claiming a long packet at every offset)."""
+    import random
+
+    from ironbird import header
+    from ironbird.transport.framing import HeaderLengthFramer
+
+    profile = header.load_profile(EXAMPLES / "headers" / "ccsds_pec_tlm.toml")
+    packet = header.pack(profile, bytes(range(PACKET_BYTES - 8)), mid=0x100)
+    assert len(packet) == PACKET_BYTES  # header 6 + payload 192 + PEC 2
+    clean = packet * FRAMER_PACKETS
+    rng = random.Random(7)
+    noise = bytes(rng.randrange(256) for _ in range(FRAMER_NOISE_BYTES))
+    hostile = bytes([0x01, 0x00, 0xC0, 0x00, 0x03, 0xE8]) * (FRAMER_NOISE_BYTES // 6)
+
+    def make() -> Any:
+        return HeaderLengthFramer(profile, max_packet_bytes=1024, payload_bounds=None)
+
+    return make, clean, noise, hostile
+
+
+def _feed_all(make: Any, stream: bytes) -> Any:
+    framer = make()
+    for start in range(0, len(stream), 4096):
+        framer.feed(stream[start : start + 4096], 0, 0)
+    framer.flush(0)
+    return framer
+
+
+def test_framer_clean_stream_rate(benchmark: Any) -> None:
+    """Back-to-back 200-byte checksummed packets through the stream framer: each costs a header
+    judgement and one CRC pass."""
+    make, clean, _, _ = _framer_inputs()
+    framer = benchmark(_feed_all, make, clean)
+    assert framer.stats().packets == FRAMER_PACKETS and framer.stats().work_exhausted == 0
+    if getattr(benchmark, "stats", None) is not None:
+        mean = benchmark.stats.stats.mean
+        benchmark.extra_info["MB_per_s"] = round(len(clean) / mean / 1e6, 1)
+        benchmark.extra_info["packets_per_s"] = round(FRAMER_PACKETS / mean)
+    _check_ceiling(benchmark, FRAMER_PACKETS * DECODE_CEILING_S)
+
+
+def test_framer_line_noise_rate(benchmark: Any) -> None:
+    """Random bytes: a header is looked at, and refused, at every offset."""
+    make, _, noise, _ = _framer_inputs()
+    framer = benchmark(_feed_all, make, noise)
+    assert framer.stats().work_exhausted == 0
+    if getattr(benchmark, "stats", None) is not None:
+        benchmark.extra_info["MB_per_s"] = round(len(noise) / benchmark.stats.stats.mean / 1e6, 2)
+    _check_ceiling(benchmark, FRAMER_NOISE_BYTES * 10e-6)  # at least 0.1 MB/s
+
+
+def test_framer_hostile_stream_stays_within_its_work_budget(benchmark: Any) -> None:
+    """A plausible header claiming a long packet at every offset: the work budget turns what it
+    cannot afford to examine into garbage, so the cost per byte stays bounded."""
+    make, _, _, hostile = _framer_inputs()
+    framer = benchmark(_feed_all, make, hostile)
+    stats = framer.stats()
+    assert stats.work_exhausted > 0
+    assert stats.work_spent <= stats.work_earned + 4096
+    if getattr(benchmark, "stats", None) is not None:
+        benchmark.extra_info["MB_per_s"] = round(len(hostile) / benchmark.stats.stats.mean / 1e6, 2)
+    _check_ceiling(benchmark, len(hostile) * 10e-6)
+
+
+@needs_a_quiet_host
+def test_ib_record_over_a_pty_at_the_floor_rate_loses_nothing(tmp_path: Path) -> None:
+    """END TO END: ``ib record`` on a serial link (a pty has no baud limit) while a sender writes
+    200-byte telemetry packets at the plan's 1k packets/s floor: every packet is in the recording,
+    no frame is garbage, nothing is a gap, and the sender is never held back by the receiver."""
+    import resource
+
+    import serialutil
+    from ironbird.recording import inspect as rec_inspect
+    from recutil import Proc
+    from support.ptybridge import PtyDevice
+
+    total = FLOOR_PPS * SERIAL_FLOOR_SECONDS
+    codec = serialutil.CODEC
+    packet = codec.encode_telemetry("MOCK_DATA", {"Entries": list(range(46)), "Text": "x" * 4}).data
+    assert 190 <= len(packet) <= 210
+    device = PtyDevice(tmp_path / "tty")
+    config = serialutil.serial_config(tmp_path, "ib.toml", device.path, "ground")
+    out = tmp_path / "floor.ibrec"
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    recorder = Proc(
+        tmp_path, "rec", ["-c", str(config), "record", "-o", str(out), "--count", str(total)],
+        dict(os.environ),
+    )  # fmt: skip
+    try:
+        recorder.wait_for("recording: listening on")
+        batch = FLOOR_PPS // 100  # one write per 10 ms
+        start = time.perf_counter()
+        for n in range(total // batch):
+            device.write(packet * batch)
+            lag = start + (n + 1) * 0.01 - time.perf_counter()
+            if lag > 0:
+                time.sleep(lag)
+        sending = time.perf_counter() - start
+        assert recorder.finish(timeout=60) == 0, recorder.stderr
+    finally:
+        recorder.kill()
+        device.close()
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
+    report = rec_inspect.scan(out)
+    print(
+        f"\nib record over a pty at {FLOOR_PPS:,} pkt/s: {report.frames}/{total} recorded, "
+        f"sent in {sending:.2f} s, {cpu:.2f} s CPU ({cpu / total * 1e6:.0f} us per packet)"
+    )
+    assert report.status == "closed" and not report.holes and not report.findings
+    assert report.frames == total and report.gap_total == 0
+    assert sending < SERIAL_FLOOR_SECONDS * 1.25, "the receiver held the sender back"
+
+
 # -- the serial run that enforces the guards above --
 
 WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"

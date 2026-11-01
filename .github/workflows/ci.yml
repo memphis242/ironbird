@@ -318,7 +318,7 @@ jobs:
     # Scheduled only: coverage-guided fuzzing is too slow for every push.
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -343,6 +343,10 @@ jobs:
       - name: Fuzz replay and the definitions a recording embeds
         run: |
           python tools/fuzz/fuzz_replay.py -max_total_time=600 \
+            -artifact_prefix="$RUNNER_TEMP/fuzz-crashes/"
+      - name: Fuzz the serial stream framer
+        run: |
+          python tools/fuzz/fuzz_framer.py -max_total_time=600 \
             -artifact_prefix="$RUNNER_TEMP/fuzz-crashes/"
       - name: Keep crash inputs
         if: failure()

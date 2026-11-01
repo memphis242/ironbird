@@ -51,7 +51,7 @@ def test_example_configs_load() -> None:
             "port must be",
         ),
         (
-            lambda d: d["links"][0].update(transport="serial"),
+            lambda d: d["links"][0].update(transport="tcp"),
             Code.CFG_SCHEMA,
             "unsupported transport",
         ),

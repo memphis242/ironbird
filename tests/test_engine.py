@@ -431,11 +431,11 @@ def test_a_link_holds_exactly_the_spec_its_transport_names(mock_config_path: Pat
     assert isinstance(link.udp, UdpLinkSpec)
 
 
-def test_a_serial_link_is_still_refused_by_the_config(
+def test_a_transport_the_config_does_not_know_is_refused(
     mock_config_path: Path, tmp_path: Path
 ) -> None:
-    text = mock_config_path.read_text().replace('transport = "udp"', 'transport = "serial"')
-    path = tmp_path / "serial.toml"
+    text = mock_config_path.read_text().replace('transport = "udp"', 'transport = "tcp"')
+    path = tmp_path / "tcp.toml"
     path.write_text(text)
     with pytest.raises(IronbirdError) as info:
         load_config(path)

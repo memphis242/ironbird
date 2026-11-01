@@ -11,6 +11,7 @@ requires-python = ">=3.11,<3.12"
 license = { file = "LICENSE" }
 dependencies = [
     "typer>=0.12,<1",
+    "pyserial>=3.5,<4",  # opens and configures serial devices; the loop drives the descriptor
 ]
 
 [project.optional-dependencies]

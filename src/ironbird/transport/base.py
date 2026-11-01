@@ -55,6 +55,7 @@ class TransportStats:
     kernel_dropped: int = 0  # lost to the OS before the transport saw them (buffer overflow)
     unread_at_close: int = 0  # still in the OS buffer when the transport closed, discarded
     rx_errors: int = 0  # reads that failed with an error (see ``IB-TX-003``)
+    ccdd_mismatched: int = 0  # frames whose MID or size the CCDD does not define (serial framer)
 
 
 # What a factory may call to surface a problem found away from any caller (e.g. at open time).
@@ -62,6 +63,11 @@ ErrorReporter = Callable[[IronbirdError], None]
 
 # Called once when a transport can no longer receive (``IB-TX-003``): its consumers end with it.
 FailureHandler = Callable[[IronbirdError], None]
+
+# Called on the event-loop thread when a link that was up goes down or comes back, as
+# ``(up, time_ns, error)``: ``error`` is the ``IB-TX-008`` that says why it went down (``None``
+# when it came back). Only a transport that reopens its device has such events (serial).
+LinkStateHandler = Callable[[bool, int, IronbirdError | None], None]
 
 
 class Transport(Protocol):

@@ -1,0 +1,10 @@
+[nodes.a]
+[nodes.b]
+ccdd="c.json"
+command_header="c.toml"
+telemetry_header="t.toml"
+[[links]]
+from="a"
+to="b"
+transport="serial"
+serial = { device = "ttyUSB0", baud = 115200 }

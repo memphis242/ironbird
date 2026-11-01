@@ -1,0 +1,11 @@
+[nodes.a]
+[nodes.b]
+ccdd="c.json"
+command_header="c.toml"
+telemetry_header="t.toml"
+[[links]]
+from="a"
+to="b"
+transport="serial"
+serial = { device = "/dev/ttyS0", baud = 9600 }
+framing = { kind = "slip" }
