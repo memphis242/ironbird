@@ -3760,12 +3760,13 @@ Built (all items below are done; the differences from the first design are state
   recorder-buffer or capture-queue loss, and every missing packet is accounted for by cFS's SB overflow counter or
   by a `kernel_drop` GAP record in the recording; the exact zero-kernel-drop check on an otherwise idle host is the
   throughput gate's, since a loaded CI runner can drop datagrams in the kernel). Measured finding: the stock TO_LAB asks for a
-  telemetry pipe of depth 50 (`OS_QUEUE_MAX_DEPTH`, subscription limit at most 49), and at 10k packets/s the
-  software bus overflows it when TO_LAB's task is off-CPU for a few milliseconds (28,886 of 30,000 recorded on
-  the development host); every missing packet is counted by SB housekeeping (`PipeOverflowErrorCounter`
-  grew by 1,121 for the 1,114 missing), which the test uses to tell cFS's loss from ironbird's. A cFS source
-  that is lossless at 10k packets/s needs a deeper pipe (`OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's
-  `TLM_PIPE_DEPTH`), a platform configuration change that is not made here (deferred).
+  telemetry pipe of depth 50 (`OS_QUEUE_MAX_DEPTH`, subscription limit at most 49), but the pipe it gets is
+  truncated (below), and at 10k packets/s the software bus overflows a 10-deep pipe when TO_LAB's task is off-CPU
+  for a millisecond or so (28,886 of 30,000 recorded on the development host); every missing packet is counted by
+  SB housekeeping (`PipeOverflowErrorCounter` grew by 1,121 for the 1,114 missing), which the test uses to tell
+  cFS's loss from ironbird's. With `fs.mqueue.msg_max` raised to at least 50 (`unshare --ipc`, `msg_max` 64) the
+  stock 50-deep pipe is lossless at 10k packets/s (0 of 30,000 missing, 3 of 3 runs): no cFS configuration change
+  is needed, only that host setting.
   Found later (a 1k/s run that lost 25 and one that lost 3 on a loaded 4-core host): the pipe is not
   50 deep on the native target. OSAL in permissive mode truncates every queue a non-root cFS creates to
   `/proc/sys/fs/mqueue/msg_max`, 10 by default on Linux (a fresh IPC namespace, such as a container's,
@@ -3779,13 +3780,16 @@ Built (all items below are done; the differences from the first design are state
   fits the shallowest pipe it is designed for (`IB_TEST_GEN_MIN_PIPE_DEPTH` 10, less
   `IB_TEST_GEN_PIPE_RESERVE` 2 for the other telemetry), asserted at compile time and in the host harness;
   the same generator stall then loses nothing (largest burst 2). The 1k test checks the pipe's depth
-  from that console line and fails, with what to raise, below 10. TO_LAB itself off-CPU for longer than
+  from that console line and fails, with what to raise, below 10 (or, naming the missing line, when the cFS build prints none). TO_LAB itself off-CPU for longer than
   its pipe covers is a host-scheduling loss inside cFS that ironbird cannot prevent; the test requires
   every such packet to be counted by SB (`PipeOverflowErrorCounter`) and keeps ironbird's side exact.
-  Deferred: a cFS source lossless at 1k/s under any host load needs TO_LAB's pipe deeper than
-  `msg_max` allows an unprivileged user (a raised `fs.mqueue.msg_max`, which is a host setting, or a
-  user+IPC namespace whose own `msg_max` is raised, which works unprivileged on recent kernels but not
-  under Ubuntu's user-namespace restriction, Docker's default seccomp profile or an EL8 kernel).
+  Remedy for a source lossless under host load (1k/s with a stalled TO_LAB, and 10k/s): raise
+  `fs.mqueue.msg_max` to at least 50 on the host, so the 50-deep pipe cFE asks for is kept (a host setting;
+  alternatively a user+IPC namespace whose own `msg_max` is raised, which works unprivileged on recent kernels
+  but not under Ubuntu's user-namespace restriction, Docker's default seccomp profile or an EL8 kernel).
+  No cFS configuration change is needed; the 10k test accounts for any loss on a default host through the SB
+  counter. Deferred: a pipe deeper than 50 (`OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's `TLM_PIPE_DEPTH`), which
+  nothing measured needs.
 - Throughput gate (`tests/bench/`, `gate.py`, `blaster.py`, `test_throughput_gate.py`). The blaster is a
   separate process that sends 200-byte valid telemetry (`GATE_TLM`: `uint32 serial` plus a string) to the
   recorder's UDP port on an absolute schedule (a late slot is followed by catch-up bursts of at most 64

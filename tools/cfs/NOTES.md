@@ -543,7 +543,8 @@ what fits beside 2 slots left for other telemetry (`IB_TEST_GEN_MIN_PIPE_DEPTH` 
 overflowed the pipe while TO_LAB ran. What remains at 1k packets/s is TO_LAB itself off-CPU for longer than
 the pipe covers, on a loaded host; the software bus drops those packets and `CFE_SB_HousekeepingTlm`
 `PipeOverflowErrorCounter` (`SB_HK`) counts them (it also counts other telemetry dropped meanwhile). At 10k
-packets/s that pipe overflows whenever TO_LAB's forwarding task is off-CPU for a millisecond or so (about 4% of
-30,000 packets in one run), every drop counted the same way. A source lossless under host load needs a deeper
-pipe: a raised `fs.mqueue.msg_max` (a host setting) and, past 50, `OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's
-`TLM_PIPE_DEPTH`; not made here.
+packets/s a 10-deep pipe overflows whenever TO_LAB's forwarding task is off-CPU for a millisecond or so (about 4% of
+30,000 packets in one run), every drop counted the same way. With `fs.mqueue.msg_max` raised to at least 50
+(`unshare --ipc`, `msg_max` 64) the stock 50-deep pipe is lossless at 10k packets/s (0 of 30,000, 3 of 3 runs). A
+source lossless under host load therefore needs that host setting and no cFS configuration change; a pipe deeper
+than 50 would need `OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's `TLM_PIPE_DEPTH`, which nothing measured needs.

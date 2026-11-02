@@ -16,8 +16,9 @@ validated) and what ironbird makes of the stream:
   housekeeping counts (``PipeOverflowErrorCounter``), and the test requires that count to cover it;
 * at 10k packets/s ``ib record`` loses nothing silently: no duplicate, nothing out of order, no
   recorder-buffer or capture-queue loss, and every packet missing from the recording is accounted
-  for, either by cFS (its software bus can overflow TO_LAB's pipe when the forwarding task is
-  descheduled for a few milliseconds; SB housekeeping counts those drops in
+  for, either by cFS (with the default ``fs.mqueue.msg_max`` of 10 its software bus overflows
+  TO_LAB's pipe when the forwarding task is descheduled for a millisecond or so, which a
+  ``msg_max`` of at least 50 avoids; SB housekeeping counts those drops in
   ``PipeOverflowErrorCounter``) or by a ``kernel_drop`` GAP record in the recording itself, which
   a loaded CI runner can produce. A run with zero kernel drops is enforced by the throughput gate
   (``tests/bench``), whose blaster is not subject to cFS's pipe.
@@ -55,12 +56,14 @@ from test_stage2_acceptance import (
     _wait_listening,
 )
 
-from conftest import REPO
+from conftest import CFS_BUILD_DIR, REPO
 from ironbird.recording.reader import RecordingReader
 
 pytestmark = pytest.mark.cfs
 
-IB_TEST_HEADER = REPO / "tools" / "cfs" / "apps" / "ib_test" / "fsw" / "src" / "ib_test.h"
+IB_TEST_HEADER_IN_REPO = REPO / "tools" / "cfs" / "apps" / "ib_test" / "fsw" / "src" / "ib_test.h"
+# The source cFS was built from (staged into the build tree), when the build tree has it
+IB_TEST_HEADER_IN_BUILD = CFS_BUILD_DIR / "src" / "apps" / "ib_test" / "fsw" / "src" / "ib_test.h"
 # What the OSAL BSP prints when it truncates every queue to fs.mqueue.msg_max (a non-root cFS)
 QUEUE_DEPTH_LINE = re.compile(rb"Maximum user msg queue depth = (\d+)")
 
@@ -134,18 +137,36 @@ def _generated(g: Ground, tmp_path: Path, name: str, rate: int, count: int) -> d
 
 @functools.cache
 def _generator_define(name: str) -> int:
-    """A numeric ``#define`` of the generator's header (the value cFS was built with)."""
-    match = re.search(rf"^#define\s+{name}\s+(\d+)\b", IB_TEST_HEADER.read_text(), re.M)
-    assert match is not None, f"{name} not defined in {IB_TEST_HEADER}"
+    """A numeric ``#define`` of the generator's header: the copy in the cFS build tree (the source
+    cFS was built from) when it exists, else the repository's."""
+    header = (
+        IB_TEST_HEADER_IN_BUILD if IB_TEST_HEADER_IN_BUILD.is_file() else IB_TEST_HEADER_IN_REPO
+    )
+    match = re.search(rf"^#define\s+{name}\s+(\d+)\b", header.read_text(), re.M)
+    assert match is not None, f"{name} not defined in {header}"
     return int(match.group(1))
 
 
-def _queue_depth_limit(console: Path) -> int | None:
+def _burst_limit(rate: int) -> int:
+    """``IB_TEST_GEN_BURST_LIMIT(rate)``: the most packets one tick publishes at ``rate``."""
+    share = -(-rate * _generator_define("IB_TEST_GEN_TICK_MS") // 1000)  # rounded up
+    return min(
+        _generator_define("IB_TEST_GEN_CATCHUP_TICKS") * share,
+        _generator_define("IB_TEST_GEN_MAX_BURST"),
+    )
+
+
+def _queue_depth_limit(console: Path) -> int:
     """The depth this cFS truncated every queue to (``fs.mqueue.msg_max``, as its OSAL BSP read
-    it), or None when it did not truncate (cFS running as root: every pipe has its full depth)."""
+    it). cFS runs non-root here, so OSAL always prints it (needs a build with ``DEBUG_PRINTF``);
+    without the line the pipe depth is unknown and truncation may still apply."""
     found = QUEUE_DEPTH_LINE.findall(console.read_bytes())
-    assert len(found) <= 1, found  # printed once, at start-up
-    return int(found[0]) if found else None
+    assert len(found) == 1, (
+        f"the cFS console has no 'Maximum user msg queue depth' line ({len(found)} found in "
+        f"{console}): the pipe depth is unknown (a cFS built without DEBUG_PRINTF does not print "
+        "it, and OSAL may still truncate every queue to fs.mqueue.msg_max)"
+    )
+    return int(found[0])
 
 
 def _counter(fields: dict[str, object], name: str) -> int:
@@ -183,11 +204,10 @@ def test_one_thousand_packets_a_second_reach_the_recording_unless_cfs_counts_the
 ) -> None:
     rate, count = _generator_define("IB_TEST_GEN_FLOOR_RATE"), 3000
     min_depth = _generator_define("IB_TEST_GEN_MIN_PIPE_DEPTH")
-    room = min_depth - _generator_define("IB_TEST_GEN_PIPE_RESERVE")
     limit = _queue_depth_limit(cfs)
     # the pipe is at least as deep as the generator is designed for (a host whose msg_max is below
     # the Linux default would make every pipe shallower than that)
-    assert limit is None or limit >= min_depth, (
+    assert limit >= min_depth, (
         f"cFS truncated its queues to fs.mqueue.msg_max = {limit}, below the {min_depth} the "
         "ib_test generator is designed for; raise fs.mqueue.msg_max on this host"
     )
@@ -215,9 +235,10 @@ def test_one_thousand_packets_a_second_reach_the_recording_unless_cfs_counts_the
     assert all(
         (b[0] - a[0]) % 16384 == (b[1] - a[1]) % 16384 for a, b in itertools.pairwise(found)
     ), summary
-    # the generator never published more in one tick than the pipe holds beside its reserve, so
-    # it cannot have overflowed the pipe by itself
-    assert 1 <= status["MaxBurst"] <= room, summary
+    # the generator never published more in one tick than its burst limit at this rate, which fits
+    # the pipe beside its reserve (asserted at compile time), so it cannot have overflowed the pipe
+    # by itself
+    assert 1 <= status["MaxBurst"] <= _burst_limit(rate), summary
     # what is missing, cFS's software bus dropped and counted (TO_LAB's task was off-CPU for longer
     # than its pipe covers; the counter also counts other telemetry, so it can exceed the loss)
     assert 0 <= lost <= result["sb_overflow"], summary
