@@ -954,6 +954,43 @@ def test_evs_housekeeping_decodes_and_counts_its_noop(ground: Ground) -> None:
 
 RECORD_SECONDS = 10.0
 ES_HK_PERIOD_S = 4.0  # SCH_LAB publishes ES housekeeping every 4.0 s (tools/cfs/NOTES.md)
+# Ledger records of the recorder that say where frames went missing (see _losses).
+LOSS_EVENTS = frozenset(
+    {
+        "rx.kernel_drops",
+        "rx.unread_at_close",
+        "rx.queue_drops",
+        "rx.failed",
+        "link.down",
+        "link.up",
+        "link.down_at_close",
+        "recording.overrun",
+        "recording.overrun_end",
+        "recording.failed",
+        "record.capture",
+        "recording.stop",
+    }
+)
+
+
+def _losses(report: dict[str, Any], state_dir: Path) -> str:
+    """Why a recording is not gap-free, as one message: its GAP records (reason, count, span),
+    its sequence holes no GAP explains, and what the recorder's own ledger says about loss."""
+    session = report["meta"].get("session")
+    ledgered = [
+        e
+        for e in _ledger_events(state_dir)
+        if e.get("session") == session and e["event"] in LOSS_EVENTS
+    ]
+    return json.dumps(
+        {
+            "gaps": report["gaps"],
+            "missing_frames": report["missing_frames"],
+            "holes": report["holes"],
+            "recorder_ledger": ledgered,
+        },
+        indent=1,
+    )
 
 
 def test_a_live_session_records_to_a_clean_recording_with_the_periodic_housekeeping(
@@ -999,7 +1036,11 @@ def test_a_live_session_records_to_a_clean_recording_with_the_periodic_housekeep
     assert info.returncode == 0, info.stderr
     report = json.loads(info.stdout)
     assert report["status"] == "closed" and report["frames"] > 0
-    assert report["gaps"]["total"] == 0 and report["missing_frames"] == 0  # seq contiguous
+    # Nothing lost and the sequence contiguous: at this rate (a few packets a second) the kernel
+    # drops nothing, and stopping the recorder loses nothing it had received.
+    assert report["gaps"]["total"] == 0 and report["missing_frames"] == 0, _losses(
+        report, Path(env["IRONBIRD_STATE_DIR"])
+    )
     by_mid = {m["mid"]: m["count"] for m in report["mids"]}
     span = report["duration_s"]
     es_hk = by_mid[0x0800]

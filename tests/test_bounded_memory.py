@@ -607,6 +607,15 @@ def test_frames_a_failed_captures_other_link_end_still_receives_are_not_counted_
             ground.flush_notices()
             assert capture.stats().not_shown == 0 and not other.lossy
             assert all(sub.dropped == 0 for sub in other.subs)
+            assert capture.stats().after_close == 2  # counted, not silent
+            ledger = ground.ledger
+            ledger.flush()
+            closed = [
+                json.loads(line)
+                for line in ledger.path.read_text().splitlines()
+                if '"rx.closed_drops"' in line
+            ]
+            assert sum(rec["delta"] for rec in closed) == 2, closed
             await capture.close()
 
     _run(main())

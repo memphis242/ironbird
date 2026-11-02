@@ -624,20 +624,30 @@ class UdpTransport:
             sock.close()
 
     async def close(self) -> None:
+        """Stop receiving at one instant, then release the sockets.
+
+        The stop is synchronous: the receiver is handed what the socket already holds (one
+        batch, as a wakeup would), the reader is detached, and what is still buffered after that
+        batch is read, discarded and counted (``unread_at_close``). Only then is the kernel's
+        drop counter read, off the loop. A datagram that reaches the socket during that read
+        arrived after the stop: the socket discards it at close, and it is neither delivered nor
+        counted.
+        """
         if self._closed:
             return
         self._closed = True
         rx, loop = self._rx, self._loop
         try:
             if rx is not None:
+                self._on_readable()  # what arrived since the loop last read the socket
                 self._receiver = None  # nothing more is delivered
                 if loop is not None:
                     with contextlib.suppress(ValueError, OSError):
                         loop.remove_reader(rx.fileno())
+                self._unread_at_close = self._count_unread(rx)
                 # The socket's counter goes away with it; this also catches the tail of a
                 # burst that no datagram reported.
                 await scan_kernel_drops((self,))
-                self._unread_at_close = self._count_unread(rx)
         finally:
             self._release()
 

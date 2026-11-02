@@ -131,6 +131,7 @@ class CaptureStats:
     queued_bytes: int = 0  # charged to the queue now: unread frames plus a batch still held
     peak_bytes: int = 0  # most the queue ever counted as held (never below what it held)
     not_shown_bytes: int = 0  # data bytes of the frames in ``not_shown``
+    after_close: int = 0  # arrived at a link end after this capture's queue was closed
 
 
 class _Closing(Exception):
@@ -298,6 +299,8 @@ class _Subscription:
     dropped: int = 0  # frames the queue refused
     dropped_to_sinks: int = 0  # of those, frames a sink had already received
     reported: int = 0
+    refused_closed: int = 0  # frames that arrived after the queue was closed (not a lag)
+    reported_closed: int = 0
 
 
 @dataclass(slots=True, eq=False)
@@ -440,6 +443,7 @@ class Capture:
             queue.queued_bytes,
             queue.peak_bytes,
             queue.dropped_bytes,
+            sum(sub.refused_closed for sub in self._subs),
         )
 
     async def close(self) -> None:
@@ -860,24 +864,34 @@ class Engine:
             else:
                 io.subs.append(sub)
 
-    async def _stop_if_idle(self, io: _LinkIO) -> None:
-        """Close the receiving transport of ``io`` unless a capture subscribed in the meantime.
+    async def _leave(self, sub: _Subscription) -> None:
+        """Detach ``sub`` from its link end, closing the end's receiving transport unless another
+        capture subscribes to it.
 
-        The decision and the close happen under the link end's lock, and the end's state changes
-        only once the transport is closed, so an open of the same end waits for the port to be
-        free instead of racing the close for it.
+        The subscription stays attached until that transport is closed, so what the close still
+        hands over (the datagrams already in a UDP socket) reaches this consumer and the sinks
+        and is counted with the rest of its frames. The decision and the close happen under the
+        link end's lock, and the end's state changes only once the transport is closed, so an
+        open of the same end waits for the port to be free instead of racing the close for it.
         """
-        async with io.lock:
-            transport = io.transport
-            if io.subs or not io.receiving or transport is None:
-                return
-            try:
-                await transport.close()
-            finally:  # drops counted while closing are part of the final report
-                self._poll_kernel(io, transport)
-                self._note_unread(io, transport)
-                self._close_down_link(io)
-                io.transport, io.receiving, io.failure = None, False, None
+        io = sub.io
+        try:
+            async with io.lock:
+                transport = io.transport
+                needed = any(other is not sub for other in io.subs)
+                if needed or not io.receiving or transport is None:
+                    return
+                try:
+                    await transport.close()
+                finally:  # drops counted while closing are part of the final report
+                    self._poll_kernel(io, transport)
+                    self._note_unread(io, transport)
+                    self._close_down_link(io)
+                    io.transport, io.receiving, io.failure = None, False, None
+        finally:
+            if sub in io.subs:
+                io.subs.remove(sub)
+            self._poll_sub(sub)
 
     async def open_capture(
         self,
@@ -920,19 +934,19 @@ class Engine:
 
     async def _release_capture(self, capture: Capture) -> None:
         failure: BaseException | None = None
+        assert len({id(sub.io) for sub in capture._subs}) == len(capture._subs), (
+            "a capture subscribes to a link end once"
+        )
         try:
-            ios: dict[int, _LinkIO] = {}
             for sub in capture._subs:
-                self._poll_sub(sub)
-                if sub in sub.io.subs:
-                    sub.io.subs.remove(sub)
-                ios[id(sub.io)] = sub.io
-            for io in ios.values():
                 try:
-                    await self._stop_if_idle(io)
+                    await self._leave(sub)
                 except BaseException as exc:  # the other link ends are still released
                     failure = failure or exc
         finally:
+            for sub in capture._subs:  # a release cut short leaves no subscription behind
+                if sub in sub.io.subs:
+                    sub.io.subs.remove(sub)
             for sink in capture._sinks:
                 self.remove_sink(sink)
         if failure is not None:
@@ -1002,31 +1016,39 @@ class Engine:
 
     async def close(self) -> None:
         """Close every transport still open (a capture its owner never closed, a send-only one)
-        and end every capture's iteration, so a consumer still waiting does not wait forever."""
+        and end every capture's iteration, so a consumer still waiting does not wait forever.
+
+        Every link end's transport is closed (or fails to close) before any capture is ended: a
+        capture's queue is shared by all its link ends, so ending it after the first end would
+        refuse what the next end's close still hands over (the datagrams already in a UDP
+        socket). Captures ended after all of them receive and count every frame the closes hand
+        over."""
         self._closed = True
         failure: BaseException | None = None
         ios = list(self._ios.values())
         for io in ios:
             if io.opening is not None:  # an open in progress must not hold the lock for its timeout
                 io.opening.cancel()
-            self._end_subscriptions(io)
-        for io in ios:
-            try:
-                async with io.lock:
-                    self._end_subscriptions(io)  # a capture that joined while the lock was held
-                    transport = io.transport
-                    if transport is None:
-                        continue
-                    try:
-                        await transport.close()
-                    finally:
-                        if io.receiving:
-                            self._poll_kernel(io, transport)
-                        self._note_unread(io, transport)
-                        self._close_down_link(io)
-                        io.transport, io.receiving = None, False
-            except BaseException as exc:  # the other link ends are still closed
-                failure = failure or exc
+        try:
+            for io in ios:
+                try:
+                    async with io.lock:
+                        transport = io.transport
+                        if transport is None:
+                            continue
+                        try:
+                            await transport.close()
+                        finally:
+                            if io.receiving:
+                                self._poll_kernel(io, transport)
+                            self._note_unread(io, transport)
+                            self._close_down_link(io)
+                            io.transport, io.receiving = None, False
+                except BaseException as exc:  # the other link ends are still closed
+                    failure = failure or exc
+        finally:
+            for io in ios:
+                self._end_subscriptions(io)
         if failure is not None:
             raise failure
 
@@ -1141,6 +1163,7 @@ class Engine:
             queue = sub.queue
             if not queue.put(frame):
                 if queue.closed:  # ended (a failed link end of the same capture): not a lag
+                    sub.refused_closed += 1  # counted; ledgered, coalesced, by ``_poll_sub``
                     continue
                 io.lossy = True
                 sub.dropped += 1
@@ -1185,6 +1208,19 @@ class Engine:
 
     def _poll_sub(self, sub: _Subscription) -> None:
         """Report frames this consumer's queue refused since the last poll (coalesced, ledgered)."""
+        closed_total = sub.refused_closed
+        if closed_total != sub.reported_closed:
+            # Frames that reached a link end whose capture queue had already been closed: they
+            # went to the sinks but not to the consumer. Ledger only, since the closure itself
+            # (a failed link end, IB-TX-003) is what the user is told.
+            self._ledger.record(
+                "state",
+                "rx.closed_drops",
+                label=sub.io.description,
+                delta=closed_total - sub.reported_closed,
+                total=closed_total,
+            )
+            sub.reported_closed = closed_total
         total = sub.dropped
         if total == sub.reported:
             return
@@ -1213,9 +1249,10 @@ class Engine:
 
     def _note_unread(self, io: _LinkIO, transport: Transport) -> None:
         """Ledger the packets a framing transport emitted although the CCDD disagrees with them,
-        and account for datagrams still in the socket buffer when ``transport`` closed (they are
-        discarded unread). Always ledgered; reported only on a link end that was already losing
-        frames, where the count completes the picture rather than adding noise."""
+        and account for datagrams still in the socket buffer when ``transport`` stopped, beyond
+        the batch its close handed over (they are discarded unread). Always ledgered; reported
+        only on a link end that was already losing frames, where the count completes the picture
+        rather than adding noise."""
         stats = transport.stats()
         label = io.description
         if stats.ccdd_mismatched:  # the decode reports each one; this is the total for the ledger

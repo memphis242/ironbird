@@ -867,11 +867,28 @@ As built (where the build differs from, or settles, the text above)
   reported and ledgered once (`sink.detached`), never once per frame; its holders stay counted,
   so asking for it again re-attaches it and an old holder's release cannot detach it from a
   newer one.
-- Datagrams still in a UDP receive buffer when its transport closes are read, discarded and
-  counted (`TransportStats.unread_at_close`, ledger `rx.unread_at_close`); on a link end that
-  was already losing frames the count is reported (`IB-TX-004`), and `Listener.close` reports the
-  frames left unread in the queue, so a SIGTERM under overload accounts for every frame:
-  `sent == shown + kernel drops + unread in the socket + unread in the queue`.
+- A UDP receiving transport stops at one synchronous instant: its close hands the receiver what
+  the socket already holds (one read batch, as a wakeup would), stops reading, and reads,
+  discards and counts what is still buffered (`TransportStats.unread_at_close`, ledger
+  `rx.unread_at_close`, a `kernel_drop` GAP for a recorder). Only then does it read the kernel's
+  drop counter, off the loop; a datagram arriving during that read came after the stop and is
+  neither delivered nor counted. A capture stays subscribed until its link end's transport is
+  closed (by `Capture.close` or `Engine.close`), so what the close hands over is queued for it
+  and reaches the sinks: a recorder stopped under ordinary traffic records a clean tail. On a
+  link end that was already losing frames the unread count is reported (`IB-TX-004`), and
+  `Listener.close` reports the frames left unread in the queue, so a SIGTERM under overload
+  accounts for every frame: `sent == shown + kernel drops + unread in the socket + unread in the
+  queue`. Deferred: under overload, a kernel drop that happens during that final drop-counter
+  read (after the stop) is still counted, which needs the just-emptied receive buffer to refill
+  within milliseconds. `Engine.close` closes every link end's transport first and only then ends
+  the captures, because a multi-end capture shares one queue and ending it after the first end
+  would refuse what the next end's close hands over. Consumers therefore end after all link ends'
+  transports have closed, so a hung transport close delays them (a signal still ends the
+  process). A frame that does reach a link end whose capture queue is already closed (the other
+  end of a capture that failed) is counted per subscription (`CaptureStats.after_close`) and
+  ledgered, coalesced per poll, as `rx.closed_drops`; it still reaches the sinks. Frames a serial
+  close flushes (a partial packet cut by the close) now reach the consumer queue as well as the
+  sinks.
 - Per-MID statistics count only frames that pass `Codec.check`.
 - A link end's transport is opened, joined and closed under the end's lock: a capture subscribes
   inside the lock, the closer re-checks the subscribers inside it, and the end's state changes
@@ -2029,8 +2046,8 @@ As built (where the build differs from, or settles, the text above)
 - **Tier table.** `ledger.RECORD_TIERS` lists every record name `src/` writes; a test parses `src/`
   and fails on a name that is missing. Errors take their tier from the code (`IB-DEC-*`,
   `IB-RSP-*`, `IB-TX-003/004`, `IB-ENG-001` are evidence). `rx.unread_at_close` and `rx.failed` are
-  essential (once per close or failure); `rx.first`, `rx.queue_drops`, `rx.kernel_drops` are
-  evidence. The queue slices are 100 000 evidence and 50 000 event records (32 and 16 MiB) of
+  essential (once per close or failure); `rx.first`, `rx.queue_drops`, `rx.closed_drops`, `rx.kernel_drops`
+  are evidence. The queue slices are 100 000 evidence and 50 000 event records (32 and 16 MiB) of
   200 000 (64 MiB).
 - **Sampling keys.** `rx.malformed` records and their error records sample under separate keys
   (`CODE:MID:stream` and the same with `|error`), the responder's received commands under
