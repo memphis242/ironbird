@@ -19,8 +19,7 @@ from types import ModuleType
 
 import pytest
 
-from conftest import REPO
-from recutil import high_ports
+from conftest import REPO, free_udp_ports
 
 BRIDGE = REPO / "tools" / "cfs" / "serial_bridge.py"
 
@@ -72,7 +71,7 @@ def test_a_length_above_the_maximum_is_skipped_a_byte_at_a_time_until_a_header_f
 class Running:
     def __init__(self, tmp_path: Path, *extra: str) -> None:
         self.link = tmp_path / "uart"
-        self.ci_port, self.to_port = high_ports(2)
+        self.ci_port, self.to_port = free_udp_ports(2)
         self.ci = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.ci.bind(("127.0.0.1", self.ci_port))
         self.ci.settimeout(10)
