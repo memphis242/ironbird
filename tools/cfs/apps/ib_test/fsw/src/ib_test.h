@@ -44,14 +44,42 @@
 #define IB_TEST_MAX_TEXT    122
 #define IB_TEST_VAR_MAX_PAYLOAD (2 + 4 * IB_TEST_MAX_ENTRIES + IB_TEST_MAX_TEXT)
 
-/* Generator limits. The burst cap keeps one tick's packets within what TO_LAB's telemetry pipe
- * (depth 50, subscription limit below that) holds when the task has fallen behind its schedule. */
+/* Generator limits. */
 #define IB_TEST_NS_PER_SEC        1000000000ULL
 #define IB_TEST_GEN_MAX_RATE      10000
 #define IB_TEST_GEN_FILL_BYTES    176
 #define IB_TEST_GEN_PACKET_BYTES  200
-#define IB_TEST_GEN_MAX_BURST     16
 #define IB_TEST_GEN_TICK_MS       1
+
+/*
+ * What one tick may publish. The packets go to TO_LAB's telemetry pipe, and its depth on the
+ * native target is not the OS_QUEUE_MAX_DEPTH (50) cFE asks for: OSAL in permissive mode (every
+ * native build) silently truncates each queue a non-root cFS creates to
+ * /proc/sys/fs/mqueue/msg_max, which is 10 on a default Linux host (the cFS console says
+ * "Maximum user msg queue depth = 10"). A tick's packets go out back to back, faster than TO_LAB
+ * forwards them, so a tick that publishes more than the pipe has room for overflows it even while
+ * TO_LAB runs.
+ *
+ * IB_TEST_GEN_MIN_PIPE_DEPTH is the shallowest pipe the generator is designed for, and
+ * IB_TEST_GEN_PIPE_RESERVE the slots it leaves to the other telemetry TO_LAB forwards through the
+ * same pipe (housekeeping, events). A tick publishes at most IB_TEST_GEN_CATCHUP_TICKS ticks' share
+ * of the rate (IB_TEST_GEN_BURST_LIMIT), so a late generator catches up at that multiple of its
+ * rate instead of in one burst, and never more than IB_TEST_GEN_MAX_BURST. At
+ * IB_TEST_GEN_FLOOR_RATE (ironbird's 1k packets/s floor) the limit fits the pipe beside the
+ * reserve, so the generator cannot overrun the pipe by itself; what remains is TO_LAB's own task
+ * being off-CPU for longer than the pipe covers, which the software bus counts
+ * (PipeOverflowErrorCounter).
+ */
+#define IB_TEST_GEN_MIN_PIPE_DEPTH 10
+#define IB_TEST_GEN_PIPE_RESERVE   2
+#define IB_TEST_GEN_CATCHUP_TICKS  2
+#define IB_TEST_GEN_MAX_BURST      16
+#define IB_TEST_GEN_FLOOR_RATE     1000
+#define IB_TEST_GEN_TICK_SHARE(rate) ((((rate) * IB_TEST_GEN_TICK_MS) + 999) / 1000)
+#define IB_TEST_GEN_BURST_LIMIT(rate)                                                    \
+    ((IB_TEST_GEN_CATCHUP_TICKS * IB_TEST_GEN_TICK_SHARE(rate)) < IB_TEST_GEN_MAX_BURST     \
+         ? (IB_TEST_GEN_CATCHUP_TICKS * IB_TEST_GEN_TICK_SHARE(rate))                      \
+         : IB_TEST_GEN_MAX_BURST)
 #define IB_TEST_GEN_IDLE_WAIT_MS  500
 #define IB_TEST_GEN_TASK_NAME     "IB_TEST_GEN"
 #define IB_TEST_GEN_TASK_PRIORITY 70
@@ -242,8 +270,28 @@ IB_TEST_ASSERT_SIZE(GenStatusTlm, sizeof(IB_TEST_GenStatusTlm_t) == 16 + 20);
 IB_TEST_ASSERT_SIZE(PipeLimitIsDepth, IB_TEST_PIPE_MSG_LIMIT == IB_TEST_PIPE_DEPTH);
 IB_TEST_ASSERT_SIZE(PipeDepthFitsU16, IB_TEST_PIPE_DEPTH >= 1 && IB_TEST_PIPE_DEPTH <= 0xFFFF);
 IB_TEST_ASSERT_SIZE(PipeDepthFitsOsal, IB_TEST_PIPE_DEPTH <= OS_QUEUE_MAX_DEPTH);
-IB_TEST_ASSERT_SIZE(GenBurstFitsPipe, IB_TEST_GEN_MAX_BURST < 50);
+IB_TEST_ASSERT_SIZE(GenBurstFitsPipe, IB_TEST_GEN_MAX_BURST < OS_QUEUE_MAX_DEPTH);
 IB_TEST_ASSERT_SIZE(GenRateFitsTicks, IB_TEST_GEN_MAX_RATE <= 1000 * IB_TEST_GEN_MAX_BURST * IB_TEST_GEN_TICK_MS);
+
+/* The pipe model: the shallowest pipe the generator is designed for is one cFE can ask for, and
+ * leaves the generator room beside the reserve. */
+IB_TEST_ASSERT_SIZE(GenMinPipeFitsOsal, IB_TEST_GEN_MIN_PIPE_DEPTH <= OS_QUEUE_MAX_DEPTH);
+IB_TEST_ASSERT_SIZE(GenReserveLeavesRoom, IB_TEST_GEN_PIPE_RESERVE < IB_TEST_GEN_MIN_PIPE_DEPTH);
+/* At the floor rate a tick never publishes more than that room, so a late generator does not
+ * overflow the pipe by itself. */
+IB_TEST_ASSERT_SIZE(GenFloorWithinRates,
+                    IB_TEST_GEN_FLOOR_RATE >= 1 && IB_TEST_GEN_FLOOR_RATE <= IB_TEST_GEN_MAX_RATE);
+IB_TEST_ASSERT_SIZE(GenFloorBurstFitsPipe, IB_TEST_GEN_BURST_LIMIT(IB_TEST_GEN_FLOOR_RATE) <=
+                                               IB_TEST_GEN_MIN_PIPE_DEPTH - IB_TEST_GEN_PIPE_RESERVE);
+/* A late generator catches up at every rate: a tick may publish more than its share (a real tick
+ * is never shorter than IB_TEST_GEN_TICK_MS, so a limit of one share could never recover). */
+IB_TEST_ASSERT_SIZE(GenCatchUpExists, IB_TEST_GEN_CATCHUP_TICKS >= 2);
+IB_TEST_ASSERT_SIZE(GenMinRateCatchesUp, IB_TEST_GEN_BURST_LIMIT(1) > IB_TEST_GEN_TICK_SHARE(1));
+IB_TEST_ASSERT_SIZE(GenMaxRateCatchesUp,
+                    IB_TEST_GEN_BURST_LIMIT(IB_TEST_GEN_MAX_RATE) > IB_TEST_GEN_TICK_SHARE(IB_TEST_GEN_MAX_RATE));
+/* MaxBurst (uint16) holds every limit, and the share arithmetic stays within uint32. */
+IB_TEST_ASSERT_SIZE(GenBurstFitsU16, IB_TEST_GEN_MAX_BURST <= 0xFFFF);
+IB_TEST_ASSERT_SIZE(GenShareFitsU32, IB_TEST_GEN_MAX_RATE <= (0xFFFFFFFFUL - 999) / IB_TEST_GEN_TICK_MS);
 
 /* The schedule arithmetic is 64-bit for every elapsed time an int64 nanosecond count holds: the
  * product of the remainder of a second and the rate, and of whole seconds and the rate, fit. */

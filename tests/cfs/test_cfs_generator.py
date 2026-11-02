@@ -5,7 +5,15 @@ The app's generator (``IB_TEST_GEN_START``) publishes fixed-size 200-byte teleme
 consecutive serials, a filler derived from the serial, and a status packet; its commands are
 validated) and what ironbird makes of the stream:
 
-* at 1k packets/s nothing is lost anywhere between the app and the recording;
+* at 1k packets/s ironbird loses nothing (no GAP of any reason, kernel drops included, nothing out
+  of order) and the generator never overruns TO_LAB's telemetry pipe by itself. That pipe is
+  ``fs.mqueue.msg_max`` deep (10 on a default Linux host: OSAL truncates every queue a non-root
+  cFS creates to it), not the 50 cFE asks for, so it covers 10 ms of TO_LAB's task being off-CPU at
+  1k packets/s. The generator's catch-up after its own stall is limited to what fits in the pipe
+  (``IB_TEST_GEN_BURST_LIMIT``, asserted at compile time in ``ib_test.h``, and here through the
+  run's ``MaxBurst``); a packet still missing was dropped by cFS's software bus while TO_LAB was
+  off-CPU for longer than the pipe covers, a host-scheduling loss outside ironbird that SB
+  housekeeping counts (``PipeOverflowErrorCounter``), and the test requires that count to cover it;
 * at 10k packets/s ``ib record`` loses nothing silently: no duplicate, nothing out of order, no
   recorder-buffer or capture-queue loss, and every packet missing from the recording is accounted
   for, either by cFS (its software bus can overflow TO_LAB's pipe when the forwarding task is
@@ -20,7 +28,9 @@ alone, is ``tests/bench``.
 
 from __future__ import annotations
 
+import functools
 import itertools
+import re
 import signal
 import struct
 import subprocess
@@ -45,9 +55,14 @@ from test_stage2_acceptance import (
     _wait_listening,
 )
 
+from conftest import REPO
 from ironbird.recording.reader import RecordingReader
 
 pytestmark = pytest.mark.cfs
+
+IB_TEST_HEADER = REPO / "tools" / "cfs" / "apps" / "ib_test" / "fsw" / "src" / "ib_test.h"
+# What the OSAL BSP prints when it truncates every queue to fs.mqueue.msg_max (a non-root cFS)
+QUEUE_DEPTH_LINE = re.compile(rb"Maximum user msg queue depth = (\d+)")
 
 SHARED_FIXTURES = (_artifact_safe_paths, cfs, ground, ground_session)
 
@@ -117,6 +132,22 @@ def _generated(g: Ground, tmp_path: Path, name: str, rate: int, count: int) -> d
     return {"out": out, "env": env, "status": done["fields"], "sb_overflow": overflow}
 
 
+@functools.cache
+def _generator_define(name: str) -> int:
+    """A numeric ``#define`` of the generator's header (the value cFS was built with)."""
+    match = re.search(rf"^#define\s+{name}\s+(\d+)\b", IB_TEST_HEADER.read_text(), re.M)
+    assert match is not None, f"{name} not defined in {IB_TEST_HEADER}"
+    return int(match.group(1))
+
+
+def _queue_depth_limit(console: Path) -> int | None:
+    """The depth this cFS truncated every queue to (``fs.mqueue.msg_max``, as its OSAL BSP read
+    it), or None when it did not truncate (cFS running as root: every pipe has its full depth)."""
+    found = QUEUE_DEPTH_LINE.findall(console.read_bytes())
+    assert len(found) <= 1, found  # printed once, at start-up
+    return int(found[0]) if found else None
+
+
 def _counter(fields: dict[str, object], name: str) -> int:
     value = fields[name]
     assert isinstance(value, int)
@@ -147,35 +178,53 @@ def _assert_intact(found: list[tuple[int, int, int, bytes]], run: int) -> None:
         assert fill == bytes((serial + i) & 0xFF for i in range(FILL_BYTES)), serial
 
 
-def test_one_thousand_packets_a_second_reach_the_recording_exactly(
-    generator_output: Ground, tmp_path: Path
+def test_one_thousand_packets_a_second_reach_the_recording_unless_cfs_counts_them_lost(
+    cfs: Path, generator_output: Ground, tmp_path: Path
 ) -> None:
-    count = 3000
-    result = _generated(generator_output, tmp_path, "floor", 1000, count)
+    rate, count = _generator_define("IB_TEST_GEN_FLOOR_RATE"), 3000
+    min_depth = _generator_define("IB_TEST_GEN_MIN_PIPE_DEPTH")
+    room = min_depth - _generator_define("IB_TEST_GEN_PIPE_RESERVE")
+    limit = _queue_depth_limit(cfs)
+    # the pipe is at least as deep as the generator is designed for (a host whose msg_max is below
+    # the Linux default would make every pipe shallower than that)
+    assert limit is None or limit >= min_depth, (
+        f"cFS truncated its queues to fs.mqueue.msg_max = {limit}, below the {min_depth} the "
+        "ib_test generator is designed for; raise fs.mqueue.msg_max on this host"
+    )
+    result = _generated(generator_output, tmp_path, "floor", rate, count)
     found = _packets(result["out"])
     status = result["status"]
-    assert (status["Run"], status["Rate"], status["Target"], status["Sent"]) == (
-        status["Run"],
-        1000,
-        count,
-        count,
-    )
+    assert (status["Rate"], status["Target"], status["Sent"]) == (rate, count, count)
     assert status["State"] == STATE_FINISHED
-    serials = [serial for _, serial, _, _ in found]
-    # all of them, in order; if not, say who lost them (cFS's software bus, or the kernel's socket)
-    assert serials == list(range(count)), (
-        f"{count - len(found)} of {count} packets missing; SB pipe overflows "
-        f"{result['sb_overflow']}, ironbird gaps {_info(result['env'], result['out'])['gaps']}"
-    )
-    _assert_intact(found, int(status["Run"]))
-    counts = [seq for seq, _, _, _ in found]
-    assert all((b - a) % 16384 == 1 for a, b in itertools.pairwise(counts))
-    assert result["sb_overflow"] == 0, "cFS dropped packets at 1k/s"
     report = _info(result["env"], result["out"])
-    assert report["status"] == "closed" and report["gaps"]["total"] == 0
-    one = _replayed(IB, result["out"], result["env"], "msg == IB_TEST_GEN and Serial == 17")
+    lost = count - len(found)
+    summary = (
+        f"{lost} of {count} packets missing; SB pipe overflows {result['sb_overflow']}, "
+        f"largest burst {status['MaxBurst']}, queue depth limit {limit}, "
+        f"ironbird gaps {report['gaps']}"
+    )
+    print(f"\ncFS generator at {rate}/s: {summary}")
+    # ironbird loses nothing: no GAP of any reason and none missing without one
+    assert report["status"] == "closed" and report["gaps"]["total"] == 0, summary
+    assert report["missing_frames"] == 0, summary
+    assert found, summary
+    # each recorded packet is the one its serial says, once, in order, and the sequence counts
+    # advance by exactly the serials that are missing between two packets
+    _assert_intact(found, int(status["Run"]))
+    assert all(0 <= serial < count for _, serial, _, _ in found)
+    assert all(
+        (b[0] - a[0]) % 16384 == (b[1] - a[1]) % 16384 for a, b in itertools.pairwise(found)
+    ), summary
+    # the generator never published more in one tick than the pipe holds beside its reserve, so
+    # it cannot have overflowed the pipe by itself
+    assert 1 <= status["MaxBurst"] <= room, summary
+    # what is missing, cFS's software bus dropped and counted (TO_LAB's task was off-CPU for longer
+    # than its pipe covers; the counter also counts other telemetry, so it can exceed the loss)
+    assert 0 <= lost <= result["sb_overflow"], summary
+    serial = found[len(found) // 2][1]
+    one = _replayed(IB, result["out"], result["env"], f"msg == IB_TEST_GEN and Serial == {serial}")
     assert len(one) == 1  # the codec decodes the packet the raw bytes describe
-    assert one[0]["fields"]["Serial"] == 17 and one[0]["fields"]["Run"] == status["Run"]
+    assert one[0]["fields"]["Serial"] == serial and one[0]["fields"]["Run"] == status["Run"]
 
 
 def test_ten_thousand_packets_a_second_are_not_lost_silently_by_ironbird(

@@ -519,8 +519,9 @@ forward the telemetry MIDs by default; add them with `TO_LAB_ADD_PKT Stream=0x8E
 `0x8E3`). Everything is little-endian, as everywhere else on this target.
 
 Throughput generator (stage 2l). `IB_TEST_GEN_START` starts a run in a child task (`IB_TEST_GEN`): every
-1 ms it publishes the packets due since the run's start at `Rate` (at most 16 per tick, so a late tick
-catches up on the next ones; the clock is `CFE_PSP_GetTime`, the platform timebase, which on the Linux PSP
+1 ms it publishes the packets due since the run's start at `Rate` (at most two ticks' share of the rate per
+tick and never more than 16, so a late tick catches up on the next ones at up to twice the rate; 2 per tick at
+1k/s; the clock is `CFE_PSP_GetTime`, the platform timebase, which on the Linux PSP
 is `CLOCK_MONOTONIC`, so a wall-clock step does not move the schedule) until `Count` packets are out (state finished, one event, one status packet),
 or `IB_TEST_GEN_STOP` (state stopped). A START while a run is on, a rate outside 1..10000 or a STOP with no run
 bumps `ErrCounter`. Its state is guarded by one mutex held across a burst, so the `Sent` a status packet
@@ -531,10 +532,18 @@ command pipe holds 32 messages and each subscription may queue that many (`CFE_S
 default is 4). The layout and these limits are asserted at compile time in `ib_test.h`;
 `tests/cfs/test_generator_schedule.py` runs the tick against a fake clock across both wraps.
 
-Measured limit (development host, 4 vCPU): the stock TO_LAB forwards through a telemetry pipe of depth 50
+Measured limit (development host, 4 vCPU): the stock TO_LAB asks for a telemetry pipe of depth 50
 (`OS_QUEUE_MAX_DEPTH` in `build-native_std/osal_public_api/osconfig.gen`; `TO_LAB_ADD_PKT BufLimit` must be
-below it). At 1k packets/s nothing is lost. At 10k packets/s the software bus overflows that pipe whenever
-TO_LAB's forwarding task is off-CPU for a few milliseconds (about 4% of 30,000 packets in one run);
-`CFE_SB_HousekeepingTlm` `PipeOverflowErrorCounter` (`SB_HK`) counts exactly those drops. A lossless 10k
-packets/s source needs a deeper pipe (`OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's `TLM_PIPE_DEPTH`), a platform
-configuration change not made here.
+below it), but the pipe it gets is `/proc/sys/fs/mqueue/msg_max` deep, 10 by default: OSAL truncates every
+queue a non-root cFS creates to it (section 6; the console's first lines say
+`Maximum user msg queue depth = 10`). At 1k packets/s that covers 10 ms of TO_LAB's task being off-CPU. A
+tick's packets go out back to back, faster than TO_LAB forwards them, so the generator limits each tick to
+what fits beside 2 slots left for other telemetry (`IB_TEST_GEN_MIN_PIPE_DEPTH` 10, `IB_TEST_GEN_PIPE_RESERVE`,
+`IB_TEST_GEN_BURST_LIMIT` in `ib_test.h`): with its 16-packet cap, a 15 ms stall of the generator's own thread
+overflowed the pipe while TO_LAB ran. What remains at 1k packets/s is TO_LAB itself off-CPU for longer than
+the pipe covers, on a loaded host; the software bus drops those packets and `CFE_SB_HousekeepingTlm`
+`PipeOverflowErrorCounter` (`SB_HK`) counts them (it also counts other telemetry dropped meanwhile). At 10k
+packets/s that pipe overflows whenever TO_LAB's forwarding task is off-CPU for a millisecond or so (about 4% of
+30,000 packets in one run), every drop counted the same way. A source lossless under host load needs a deeper
+pipe: a raised `fs.mqueue.msg_max` (a host setting) and, past 50, `OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's
+`TLM_PIPE_DEPTH`; not made here.
