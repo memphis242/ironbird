@@ -4302,7 +4302,15 @@ Decided by the user (2026-10-30, later):
    **Pass 1 decisions so far:** Bench (variant A) colors; Cockpit (variant B) layout, the
    packet list on the left and fields above bytes on the right; Bench's top and bottom
    status bars; a quiet list with no latest-values summary column by default (it can be
-   enabled in configuration).
+   enabled in configuration). **Pass 1 signed off (2026-11-02): round 2, variant V1
+   "Gutter".** The list is sized to its columns and the freed width goes to the fields
+   pane; a change shows as a half-cell teal mark in a one-column gutter at the row's left
+   edge, in three fade steps, so change and selection never share a cell; at 80x24 one
+   pane shows at a time (Enter opens a packet's detail with a breadcrumb, Esc returns);
+   event rows show their severity word (the text is in the fields pane and on the Events
+   page); the retuned pulse colors (step 2 `#1b9885` with dark text, step 3 `#0b6558`;
+   256-color stand-ins selection 26, unfocused selection 17, step 2 30, step 3 23). The
+   mockups are the reference until the TUI exists.
 4. TUI command composer with tiered search and argument entry.
 5. Send modes: scheduled at T, repeat N, every M ms/s until T or for duration.
 6. xlsx export, optional semantic search (local sentence-transformer as an extra),
