@@ -7,14 +7,13 @@ import asyncio
 import hashlib
 import json
 import os
-import socket
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from conftest import EXAMPLES
+from conftest import EXAMPLES, free_udp_ports
 from ironbird.ccdd.loader import load_ccdd
 from ironbird.codec import Codec
 from ironbird.errors import IronbirdError
@@ -281,32 +280,9 @@ def records(lines: Iterable[str]) -> list[dict[str, Any]]:
     return [json.loads(line) for line in lines]
 
 
-# -- ports 58000-58999 --
-
-
-def ports_58k(count: int) -> list[int]:
-    import random
-
-    found: list[int] = []
-    candidates = list(range(58000, 59000))
-    random.shuffle(candidates)
-    for port in candidates:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.bind(("127.0.0.1", port))
-        except OSError:
-            continue
-        finally:
-            sock.close()
-        found.append(port)
-        if len(found) == count:
-            return found
-    raise AssertionError("no free port in 58000-58999")
-
-
 def write_config_58k(directory: Path, extra: str = "") -> tuple[Path, int, int]:
-    """examples/mock.toml with absolute paths and ports in 58000-58999."""
-    command_port, telemetry_port = ports_58k(2)
+    """examples/mock.toml with absolute paths and free ports."""
+    command_port, telemetry_port = free_udp_ports(2)
     text = (EXAMPLES / "mock.toml").read_text()
     text = text.replace('"ccdd/', f'"{EXAMPLES}/ccdd/').replace(
         '"headers/', f'"{EXAMPLES}/headers/'

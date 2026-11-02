@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import random
 import socket
 import subprocess
 import sys
@@ -15,7 +14,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from conftest import EXAMPLES, without_host_warnings
+from conftest import EXAMPLES, free_udp_ports, without_host_warnings
 from ironbird.ccdd.model import EventSeverity
 from ironbird.cli.main import app
 from ironbird.config import SystemConfig, load_config
@@ -26,31 +25,11 @@ from ironbird.fsops import FileSystem
 from ironbird.ledger import Ledger
 from ironbird.session import Responder, Session
 
-PORT_RANGE = (53000, 53999)  # the range mock tests use, away from cFS's fixed ports
-
-
-def mock_ports(count: int) -> list[int]:
-    """Distinct free UDP ports on loopback from :data:`PORT_RANGE` (closed again on return)."""
-    found: list[int] = []
-    candidates = random.Random().sample(range(PORT_RANGE[0], PORT_RANGE[1] + 1), 200)
-    for port in candidates:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.bind(("127.0.0.1", port))
-        except OSError:
-            continue
-        finally:
-            sock.close()
-        found.append(port)
-        if len(found) == count:
-            return found
-    raise AssertionError("no free port in the mock range")
-
 
 @pytest.fixture
 def config_path(tmp_path: Path) -> Path:
-    """examples/mock.toml with absolute paths and ports from the mock range."""
-    command_port, telemetry_port = mock_ports(2)
+    """examples/mock.toml with absolute paths and free ports."""
+    command_port, telemetry_port = free_udp_ports(2)
     text = (EXAMPLES / "mock.toml").read_text()
     text = text.replace('"ccdd/', f'"{EXAMPLES}/ccdd/').replace(
         '"headers/', f'"{EXAMPLES}/headers/'

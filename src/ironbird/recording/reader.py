@@ -181,6 +181,7 @@ class RecordingReader:
         self.locked = False
         self._state = _State()
         self._work = 0  # bytes read and CRC-checked this pass, charged against the budget
+        self._scanned = 0  # bytes the resync scans have read, never reset
         self.position = 0  # where :meth:`items` last was: the offset of the next record to read
         self.reached_stop = False  # :meth:`items` ended because the record at ``stop`` was due
         self._definitions: list[tuple[Any, ...]] | None = None
@@ -304,6 +305,13 @@ class RecordingReader:
     def work(self) -> int:
         """Bytes read and CRC-checked so far this pass, charged against the resync budget."""
         return self._work
+
+    @property
+    def scanned(self) -> int:
+        """Bytes the resync scans (:meth:`find_boundary`, and the search after damage) have read
+        since the reader was opened. Unlike :attr:`work` it is never reset or seeded, and a stretch
+        with no candidate in it counts too."""
+        return self._scanned
 
     def seed_state(
         self,
@@ -644,6 +652,7 @@ class RecordingReader:
                     f"cannot read {_shown(self.path)}: {exc.strerror or exc}",
                     cause=exc,
                 ) from exc
+            self._scanned += min(len(block), want)
             if len(block) < fmt.ENVELOPE_SIZE:
                 return None, False
             for match in _CANDIDATE.finditer(block, 4, want + 7):
