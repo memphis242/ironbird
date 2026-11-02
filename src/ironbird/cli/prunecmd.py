@@ -137,7 +137,6 @@ def work(
     kind: str,
     flags: PruneFlags,
     config: SystemConfig | None,
-    config_error: IronbirdError | None,
     ledger: Ledger,
     console: Console,
     *,
@@ -148,9 +147,6 @@ def work(
     """Run one prune; returns the exit code (0, 1 for a failure or an unreachable target, 2
     for a usage error)."""
     assert kind in ("ledger", "recording")
-    if config_error is not None:
-        console.err(term(config_error.user_line(), 1000, err=True))
-        return config_error.exit_code
     retention: RetentionConfig = config.retention if config is not None else RetentionConfig()
     try:
         directory = _directory(kind, config)

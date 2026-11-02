@@ -228,7 +228,7 @@ def test_led002_message_names_what_it_counts(
     console = Console(out, err)
     ledger = Ledger(tmp_path / "off", session_id="a" * 12, enabled=False)
     flags = prunecmd.PruneFlags(86400, None, 0, True, False, True)
-    prunecmd.work("ledger", flags, None, None, ledger, console, verbose=False)
+    prunecmd.work("ledger", flags, None, ledger, console, verbose=False)
     console.close()
     assert "IB-LED-002" in err.getvalue()
     assert "set-aside original(s)" in err.getvalue()

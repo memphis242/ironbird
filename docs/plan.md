@@ -154,11 +154,13 @@ Processes:
      decode only candidates. **Hold** = UI stops advancing its view (it keeps reading
      into its scroll-back, engine continues); **pause** = engine stops recording;
      **stop** = engine closes the session.
-3. **Decode workers** (`ProcessPoolExecutor`) only for bulk jobs: replay with field
+3. **Decode workers** (spawned processes, one pipe each; see 2m) only for bulk jobs: replay with field
    filters, exports, search over large recordings. Jobs are chunked by file offset;
    workers read the recording themselves, so only offsets go in and compact results
    come out. At these rates most recordings decode fast enough in one process, so the
-   pool is created lazily and only for jobs over a size threshold.
+   pool is created lazily and only for jobs over a size threshold. Built for `ib export`
+   in step 2m (below); replay with field filters and search over large recordings reuse
+   the same ranges later.
 
 **How processes are launched.** Everything is started by ironbird itself as the
 invoking user: no daemons installed, no services, no root, no setuid.
@@ -260,8 +262,11 @@ Practices (enforced in review and by tests):
 - **Preserve the evidence.** Malformed packets are recorded raw and shown as hex with
   the failing offset highlighted; they are never silently dropped or "repaired".
 - **No code from data.** No `pickle`, `eval`, `exec`, or YAML object loading on
-  anything read from files, the wire, or shared memory. The ring and worker pool move
-  raw bytes and offsets only. The header-profile `python:` escape hatch is trusted
+  anything read from files, the wire, or shared memory. The ring moves raw bytes and
+  offsets only. The export worker pool (2m) pickles jobs and results between the parent and
+  its own spawned workers over a private socketpair; the types are fixed by ironbird's code,
+  recording bytes only ever become string or number contents inside them, and nothing read
+  from a file is unpickled. The header-profile `python:` escape hatch is trusted
   local configuration and is documented as such.
 - **Bounded resources.** Caps on per-MID caches, scroll-back, unknown-MID tables, and
   ledger queue; a flood of unique garbage MIDs cannot exhaust memory.
@@ -363,7 +368,7 @@ interface, later sub-steps build on it unchanged.
 | 2j | Variable-length payloads | 2i (codec overlap), 2h | counted and tail arrays in CCDD, encode and decode |
 | 2k | Serial transport | 2b, 2c, 2i | `transport = "serial"` links with resync and reconnect |
 | 2l | Stage 2 acceptance, throughput gate, docs | all | end-to-end cFS scenario, 10k pkt/s gate |
-| 2m | Parallel export decode | export | worker pool by file offset; one-hour export re-measured with 200-byte frames |
+| 2m | Parallel export decode | export | worker pool by file offset (built); one-hour export re-measured with 200-byte frames: 199-217 s -> 55-70 s at the floor |
 
 Parallel lanes once 2b is merged: {2c -> 2d}, {2e}, {2f}, {2i}; then 2g, 2h, 2j, 2k.
 
@@ -2286,8 +2291,8 @@ As built (where the build differs from, or settles, the text above)
   is a warning unless `--strict`), `ib rec repair IN OUT [--force]` (exit 5 when valid frames
   after mid-file damage were left out; the synthesised closing chunk has no monotonic times; a clean
   recording repairs to identical bytes). `info` answers from the index and chunk summaries, so it
-  does not notice a damaged frame; `check` does. The CLI gained an `offline` runner (no config,
-  no session) for the `rec` commands, and `Session.record_routes`, `event_routes`, `respond_route`
+  does not notice a damaged frame; `check` does. The CLI gained an `offline` runner (no session; a
+  configuration only if one is found, see 2m) for the `rec` commands, and `Session.record_routes`, `event_routes`, `respond_route`
   and `streams_for`.
 - Config `[recording]`: `dir`, `fsync`, `max_buffer_bytes` (1 MiB to 64 GiB), `min_free_bytes`,
   `embed_definitions`; definition files above 8 MiB (64 KiB for profiles) refuse the recording
@@ -2664,9 +2669,10 @@ Deliverables
   would later delete an export as if it were a ledger part or a recording. Write
   errors are `IB-EXP-001` and remove the temporary file (or the files this process
   created in the temporary directory, then the directory) through the failure helper.
-- Single process, streaming, constant memory. The decode worker pool stays unbuilt
-  until a 2l benchmark shows a one-hour recording exports in over 60 s (2l measured 99 s at the
-  1k packets/s floor and 987 s at the 10k target: the trigger is met, the decision is open; see 2l).
+- Single process, streaming, constant memory. The decode worker pool stayed unbuilt until a 2l
+  benchmark showed a one-hour recording exporting in over 60 s (2l measured 99 s at the 1k packets/s
+  floor and 987 s at the 10k target); it was built in 2m, and a recording under 8 MiB is still
+  exported in this one process.
 
 Untrusted input: string cells sanitized (control characters escaped) and formula-leading
 cells (`=`, `+`, `-`, `@`, their fullwidth forms, tab, CR, LF, behind any leading whitespace)
@@ -3784,7 +3790,7 @@ Built (all items below are done; the differences from the first design are state
   200 bytes with more fields per row, so the per-row rate measured here is probably optimistic for the target
   and the 987 s figure is a lower bound; re-measure with 200-byte frames before relying on it. Decided by
   the user: build the pool, in step 2m (below), before Stage 3 feature work; performance ranks right after
-  correctness (CLAUDE.md).
+  correctness (CLAUDE.md). Built; the 200-byte re-measurement is in 2m.
 - `[recording] max_buffer_bytes` and `min_free_bytes` take the size grammar of `[ledger]` and `[retention]` (an
   integer of bytes or a string such as `"64MiB"`), with the same range checks and `IB-CFG-003` errors (found
   in review: the README showed strings the loader refused). `min_free_bytes = 0` is the integer 0 (the string
@@ -3797,6 +3803,236 @@ Built (all items below are done; the differences from the first design are state
   Throughput section (the gate commands, the measured figures, the export cost) and the Stage 2 cFS tests in
   Development; the stale "Stage 1" intro is replaced. `tools/cfs/README.md` and `NOTES.md` section 8 describe
   the generator and the TO_LAB limit.
+
+### 2m - Parallel export decode
+
+Built. `ib export` decodes a large recording in a pool of worker processes and writes the same bytes
+the single process writes (priority order of CLAUDE.md: correctness, then performance, then error
+handling and code quality). Code: `src/ironbird/recording/pexport.py` (the pool and the proof of
+equality), with `RecordingReader.items(start=, stop=)` and its seeding in `reader.py`, the part-level
+methods of `Replay` in `replay.py`, `make_pipeline` in `export.py` (the one place a frame becomes a
+row, used by the single process and by every worker), `[export]` in `config.py`, `ib export --jobs`.
+
+- **Ranges.** A part is cut into byte ranges of `[export] range_bytes` (4 MiB; the measured time is flat
+  from 512 KiB to 8 MiB, and 16 MiB is 25% slower from tail imbalance). A range is shorter when its
+  rows are so wide that 4 MiB of file would make more than a worker's share of the text budget
+  (`PENDING_TEXT_BUDGET / (2 x workers)`, and under three quarters of `RESULT_TEXT_CAP`): ranges are
+  planned one at a time, and the length of the next follows the largest text-per-byte ratio seen
+  recently (down to 4 KiB, and to 256 KiB of text), so a result stays under the cap, the ranges
+  running together and waiting fit the budget, and the pool stays parallel on wide rows. The first
+  ranges, planned before any result has shown the width, are 1/32 of `range_bytes`. Job 0
+  begins at the first record after META. Every other range begins at a *guess*: the first record
+  boundary at or after its byte offset and before the end of its range, found with the reader's own
+  resynchronisation (`RecordingReader.find_boundary(offset, limit)`: a record that passes every rule
+  and is followed by a second valid record, the scan `items()` uses after damage; never a second
+  parser; the scan reads no further than the end of the range, so a stretch of zeros costs its own
+  length once and not the rest of the file for every range in it; a record that begins at the end of the range
+  belongs to the next range, and an offset that is not aligned is rounded up, never down). A worker reads its range itself (`pread` through the same
+  reader, so every length is validated before it is unpacked, and a malformed record is damage, never
+  an exception) and returns the text of its rows (no header row), the tally, the damage, the
+  definitions it made, which seeded entries it relied on, its first and last sequence numbers and
+  where it stopped. Only offsets and a seed (the streams, sources, last sequence number) go in.
+- **Why the result is the single process's result.** The walk through a part is deterministic: the
+  record at an offset has a length, the next record is there, and what a record means depends on the
+  streams and sources defined, the last sequence number and (for a resync) the work spent so far. The
+  parent takes results strictly in file order and accepts a range read from a guess only if the range
+  is clean (no damage, no reader error, no worker fault), began exactly where the previous range
+  ended, relied on seeded definitions that are in force at that point as they were in the seed (the
+  reader records which stream and source ids a frame or GAP found in the seed and had not defined
+  itself, `Lookups`), defined nothing the walk has defined differently, and has a first sequence number
+  above the last one before it. A range in which no record begins (it lies inside a longer record, or
+  in zeros) holds nothing and is accepted when the walk is already past its end. A range without
+  frames never changes the sequence the walk checks against. A guess meets damage and stops there
+  (`items(halt_on_damage=True)`: it will be read again, so it does not scan for what follows). Anything
+  else is read again as an *exact* job (start and state from the walk, and the resync work the single
+  process had done at that point, META and the index included) whose result stands whatever it
+  holds. So damage, a torn tail, a record of an unknown critical
+  type, a sequence number that goes back, a stream defined late or twice, and a boundary found in the
+  middle of a frame (a recording forged to hold a valid chain inside a payload) all end up decided by
+  the exact state; a range that ends the walk early discards every range after it. The cost of
+  damage is that the damaged ranges are read twice.
+- **Tables and order.** CSV tables are keyed by (message name, columns). A worker opens tables in its
+  own order; the parent attaches each block to its table (`Layouts.table_for`) in file order, so the
+  files, stems (`<name>.2`), header rows and first-appearance order are the single process's. A single
+  table that would need a second layout is `IB-CLI-001` from the parent at the same row.
+- **Memory.** A result carries at most `RESULT_TEXT_CAP` (8 MiB) characters of rows and
+  `MAX_RANGE_EVENTS` (1000) damage and gap notes: a worker that reaches either stops at a record
+  boundary (after a frame, a gap, or damage it resumed past) and the parent submits an exact job from
+  there for the rest of the range (`continued` in the report), with the state the walk has after the
+  part it took. At most `2 x workers` ranges are submitted and not yet written, so the rows held (in the
+  parent and in the workers, whose finished results wait in their pipes until the parent takes them)
+  never pass `2 x workers x RESULT_TEXT_CAP` (64 MiB with four workers, 1 GiB at the 64-worker
+  maximum). A range is submitted beyond the first one per worker only while the rows waiting plus the
+  largest recent result for each range still running fit in `PENDING_TEXT_BUDGET` (32 MiB); that
+  estimate follows what has come back, so the budget holds in steady state, and after a stretch of narrow rows
+  followed by wide ones the ranges already submitted can all be wide and the held rows come to the
+  `2 x workers x RESULT_TEXT_CAP` figure until the first wide results are seen and the next ranges
+  are planned shorter. Results are written in order and dropped. The report (`export.pool` in the ledger: `max_pending`, `max_text_bytes`, `continued`)
+  shows it. The parent's peak RSS is that of one process plus a small constant whatever the width of
+  the rows: on the wide-row recording of the review (1000 enum fields of 64 characters, 70 KiB of text
+  per 1 KiB frame, 4 MiB, 266 MiB of text, ranges of 1 MiB configured) one process peaks at 36 MiB
+  in 57.7 s and four workers at 62 MiB in 17.1 s (71 ranges, none cut, 12.6 MB of text waiting at
+  most); before the bounds the same export peaked at 378 MiB (144 MB waiting) in 17.6 s, and grew with
+  the width of the rows and the size of the ranges. The bounds without the shorter ranges (cut and
+  continued serially) kept the memory but not the speed: 56 s.
+- **Output closing and failing.** A worker records the kind of each row it makes (one byte per row; for
+  CSV, which table each line went to) and how many rows came before each damage and each GAP record. A
+  range that holds damage or gaps, and every range for a destination that takes one line at a time and
+  may refuse (stdout), is written row by row with the damage and gaps noted between the rows where
+  they came and the tally counted as far as the output takes them (a table is opened by its first row).
+  The single process stops reading at the row an output refuses and at the row whose line made a file
+  flush fail (a full disk); so the damage reported, the gaps counted and the exit code and messages
+  under `| head` or after `IB-EXP-001` are the single process's (found in review: the damage and gaps of
+  a range were noted before its rows were written, so a failing write reported the damage that came
+  after the row it failed at). A range without damage or gaps goes to a file destination in blocks, and
+  the file destination flushes after the line that fills its buffer wherever in a block that line is,
+  so the flush that fails is at the same row as in one process (`FileDestination.write`). What is read
+  ahead of a refusal is not the single process's: `rejected`, `skipped_no_definitions`,
+  `not_written` and `frames_read` cover the range being decoded.
+- **The file read is the file opened.** The parent holds each part open and gives every job its
+  identity (device, inode). A worker opens by name and reads nothing if the name leads elsewhere or
+  nowhere (`Outcome.moved`); the parent then reads that range, and all the rest of the part, itself
+  on the descriptor it holds (`report.local`), so a recording renamed, replaced or deleted during an
+  export (retention, a user) is exported as the single process exports it.
+- **Processes.** `spawn`, never `fork`. The pool is owned (`WorkerPool`, which a caller may keep for many
+  exports; started lazily by the export that needs it, a worker at a time as jobs are submitted): one
+  `multiprocessing.Process` and one duplex `multiprocessing.Pipe` per worker, the parent's copy of the
+  worker's end closed after the start so that a worker that dies is an end of file on its pipe; jobs and
+  results are pickled messages over that pipe (the tool's own typed data between a process and its own
+  child on a private socket pair; nothing read from a recording is ever unpickled as code), each worker
+  has up to two jobs sent (one running, one ready; a job message over 16 KiB goes only to an idle worker so a
+  send never waits on a busy one), and the parent reads on the calling thread with
+  `multiprocessing.connection.wait` in 50 ms slices. There is no manager thread and no queue shared
+  between workers. (Found in review: the executor this replaced had a manager thread that read the
+  results; after the export terminated its workers part way through sending a result, that thread
+  blocked reading a message that was never completed and the interpreter waited for it at exit, forever;
+  about one run in ten with the output closing at a random row. `tests/test_export_pool_exit.py` runs
+  that in a fresh process 16 times per mode and the CLI at four stops, and fails on the executor.) The
+  processes and the resource tracker the first of them starts are created under `sigmask.masked()`, so
+  none of them takes a shutdown signal (a hangup sent to the process group reaches the parent alone: 129 and the one
+  `interrupted` line, no flood of tracker warnings). Workers set SIGINT and SIGHUP to be ignored (Ctrl-C reaches the whole
+  process group, and only the parent acts on it) and SIGTERM to its default (so the parent can
+  terminate them) while the mask they inherit still holds, then lift it, so a signal that came while
+  a worker started is dropped, not raised in its setup (the tracker and each process are started in
+  separate masked scopes, since starting the resource tracker unblocks SIGINT and SIGTERM in the thread that
+  does it); a thread in each worker exits the process if the parent is
+  gone (a SIGKILLed export leaves no worker behind within a second). The parent waits for results in
+  50 ms slices with `checkpoint()` between, so a signal ends the export with 130/143/129 as it does
+  in one process; the temporary output is removed by the same cleanup, and the workers are terminated
+  (killed after 5 s) on any abnormal end; a finished export tells idle workers to go by closing their
+  pipes and terminates one still holding a job nobody wants. A worker that dies, a result that cannot
+  be pickled or read back, a pool that cannot start (a process or file limit) and a worker fault are `IB-EXP-003` (one line: what failed and to run again or with
+  `--jobs 1`; the traceback or the cause is in the ledger record). Definitions are rebuilt in each
+  worker from the bytes the parent built from (`--defs recording`: the embedded blobs) or, for
+  `--defs config`, from the configuration with a digest of the definition files that a worker checks
+  before it decodes (a file edited during the export is `IB-EXP-003`, not a different decode). The
+  parent reads a range itself (the file moved from under its name) with the codecs it decodes with,
+  not codecs rebuilt from the configuration.
+- **When the pool is used.** `--jobs N` (1..64) beats `[export] jobs`, which beats the default of one
+  worker per core the process may run on (its CPU affinity and the `cpu.max` quota of its cgroup v2
+  group and the groups above it, rounded up; a group that cannot be examined, such as `EACCES`, is no
+  limit; the membership file is read up to 64 KiB), at most 64; 1 never uses workers. A recording whose parts together are
+  under `[export] pool_min_bytes` (8 MiB, the least that is two ranges) is exported in the calling
+  process, and so is each part with fewer than two ranges, a part being written (its writer holds the
+  lock), a followed recording, a range that selects nothing, and a part read through the index with
+  chunks skipped (`--from`/`--to`, or a `--where`/`--message` MID set that rules chunks out). The pool
+  starts about a quarter of a second after the first range is submitted.
+- **Configuration errors of offline commands** (since 2e, found in the second review of 2m). The
+  configuration is read before the ledger opens, since its `[ledger]` table sets the ledger's allowances;
+  an offline command (`export`, `replay`, `rec info|check|repair|prune`, `ledger prune`) kept the error and
+  ran on defaults, so an `[export]` or `[retention]` table that did not load was ignored without a word.
+  Now finding no configuration file in the search (`./ironbird.toml`, the XDG directory) is still not
+  an error for these tools; a file named by `-c` or `$IRONBIRD_CONFIG` that does not exist is
+  `IB-CFG-001`, and a file that is found and cannot be loaded ends the command before it does anything: the one-line coded `IB-CFG-001|002|003`
+  error (`--verbose` adds the cause), exit 2, the error in full in the ledger. `tests/test_offline_config_error.py`:
+  a TOML syntax error, a value of the wrong kind, an unknown `[export]` key and an unknown `[ledger]` key,
+  for each of those commands.
+- **Measured** (`tests/bench/test_export_pool_bench.py`, 4 vCPU Xeon 2.1 GHz, a quiet host), packets of the
+  target's shape (200 bytes, one message of 62 fields, `tests/bench/targetshape.py`), CSV:
+
+  | frames | file | one process | four workers | speedup |
+  |--------|------|-------------|--------------|---------|
+  | 40,000 | 9 MiB | 15,400-17,300 rows/s | 31,600-35,600 rows/s | 1.9-2.1 |
+  | 400,000 | 96 MiB | 16,600-20,300 rows/s | 51,400-67,200 rows/s | 3.1-3.6 |
+
+  (Four runs on a shared host; the ranges are the spread. The last two, after the fixes of the review
+  below: 17,474 and 36,744 rows/s at 40,000 frames, 19,198 and 67,213 at 400,000 (x3.50; 188 s ->
+  54 s per floor hour), with no range read again or read in the calling process.) With the owned pool of the second review (a pipe per worker in place of the executor), measured the
+  same way on the same host: 17,157 and 35,482 rows/s at 40,000 frames (x2.07), 19,468 and 69,387 at 400,000
+  (x3.56; 52 s per floor hour), the parent's peak RSS 145 MiB with and without workers. The executor, measured just before on the
+  same host: 19,143 and 36,446 rows/s (x1.90), 20,116 and 69,578 (x3.46): no slower. A one-hour recording of such packets takes
+  178-217 s at the 1k packets/s floor in one process and 55-70 s with four workers (the 60 s bar is met
+  in the better run and missed by 10 s in the other; the floor hour at 200 bytes is within 2x of it, as
+  2l said); at the 10k target 1,777-2,166 s and 554-700 s, so the target hour needs more cores (or the
+  deferred items below) to get under a minute. The 75-byte housekeeping packets of the 2l benchmark
+  export at 101,800 rows/s with four workers (28,100-36,500 in one process): 35 s per floor hour. The 2l figures (36,500
+  rows/s, 99 s and 987 s) were for 75-byte housekeeping packets of 5 fields; 200-byte packets of 62
+  fields cost twice as much per row, as 2l said they would. Crossover (one process / four workers,
+  hk packets and target packets): below 8 MiB nothing is shared (1.0); 9 MiB 1.7; 11.6 MiB 1.9;
+  13.4 MiB 2.3. Four workers use all four cores (the parent is a few percent of one).
+  `test_the_pool_is_faster_and_writes_the_same_file` is the CI-sized check (40,000 frames, ranges of
+  1 MiB): the same bytes, no reruns, at least 1.3x with three or more cores (0.8x with fewer).
+- **Tests.** `tests/test_export_pool.py`: a differential over everything an export leaves (files and
+  bytes, tally, damage reported, the replay's own counts, the error) between one process and the pool
+  in 4 KiB ranges: clean recordings in every format with every option, filters, `--message`s, split
+  sets, a missing part, damage in a part; recordings built record by record (a stream and a source
+  defined late and used rarely, a stream defined again differently, a sequence number that goes back
+  exactly at the start of a range, a record of an unknown critical type, a frame of an undefined
+  stream); 36 random mutations (flips, zeroed and cut and duplicated and swapped stretches, garbage,
+  truncation) with and without `--skip-damage`; damage at the edges of the first ranges; torn tails;
+  the checked-in malformed corpora; the `rec_corpus` damage cases spliced into a large file; an output
+  that closes; the reader's range read; the acceptance rule; workers that cannot start; the
+  `[export]` table. Mutating the acceptance rule (no sequence check, damage counted as clean, no
+  definition check) fails one of them each. `tests/test_export_pool_cli.py`: the CLI with
+  `--jobs 1` and `--jobs 3` writes the same files and the same stderr; `--defs config`; stdout;
+  damage (exit 5); `--jobs`/`[export]` precedence; a bad `--jobs` is usage; SIGINT, SIGTERM, SIGHUP
+  (130/143/129) and a group-wide SIGINT at a point where the workers are up and the temporary output
+  exists leave no output, no temporary file, no worker, no leaked semaphore; a SIGKILLed worker is
+  `IB-EXP-003` and leaves nothing; a SIGKILLed export leaves no worker; the output is published only
+  after the last range.
+  Review findings of the pull request, each a test that fails on the commit reviewed
+  (`tests/test_export_pool_review.py`, `tests/test_export_pool_cli.py`): a range without frames
+  resetting the sequence check; the resync budget of an exact read; the boundary scan reading to the
+  end of the file for every range of a zero tail (a 384 MiB zero tail exports in 3.2 s with four workers and
+  3.1 s with one; it took 9.3 s with workers before; a guess also stops at its first damage); an output closing with damage and gaps further on;
+  results and damage lists without a bound (caps and continuation; a window bounded in bytes as well
+  as in ranges; ranges that follow the width of the rows; the wide-row recording's peak RSS); a recording moved during the export; more than 64 cores and a
+  cgroup quota; a hangup to the process group. `tests/test_export_pool_fuzz.py` is the differential
+  on adversarial recordings (`poolfuzz.py`: forged chains inside skippable records and payloads,
+  sequence resets, runs of marks, definitions that appear and change, raw damage, bad CRCs, torn
+  ends) in every format and option, with an output that closes and tiny caps; 6 seeds of each of
+  three kinds in CI, `IRONBIRD_POOL_FUZZ_SEEDS=N` for N (60 seeds of each kind were run on the final code).
+  Second review (`tests/test_export_pool_exit.py`, `tests/test_export_pool_review2.py`,
+  `tests/test_offline_config_error.py`), each failing on the commit reviewed: the hang at exit described
+  under Processes; a failing write told of the damage and gaps after the row it failed at (a disk that
+  fills at a range of limits, over a damaged recording and a recording with gaps, compared with one
+  process: the error, the bytes that reached the disk, the damage and the gaps); a boundary at the limit
+  of the scan; a control group that cannot be examined; and a configuration that is found and cannot be
+  loaded, which an offline command ignored without a word (see Configuration errors of offline commands). The caps fuzz compares the
+  replay's own counts too whenever the output did not close.
+- **Deferred.** (1) Chunk skipping: a part read with jumps is exported in the calling process (the jumps
+  reset the sequence check and learn definitions from skipped heads; each segment between jumps could
+  be a range). (2) Parts are exported one after another (the pool idles at the end of each part and
+  ramps at the start of the next; one ramp costs about a range per worker). (3) The first ranges are
+  seeded from the head of the file, so a stream or source defined later costs one rerun per range
+  submitted before it is known (at most `2 x workers` per new definition). (4) A recording with
+  damage reads the damaged ranges twice. (5) The workers do not stream a range back before it is
+  complete (a range is at most a few tens of MiB of text). (6) Replay with field filters and
+  search over recordings do not use the pool yet. (7) A reader that never takes stdout (`IB-OUT-*`)
+  behaves as before: the writer blocks the parent. (8) A range cut at its cap is continued serially
+  (the continuation is submitted when the parent reaches it); the length of the ranges follows the
+  rows' width to keep that rare, but the first window of ranges is planned before any width is
+  known (they are 1/32 of `range_bytes`). (9) When the walk leaves the pool because the file moved, the rest of the part is decoded
+  in the calling process. (10) A resync scan over zeros runs at about 80 MB/s in every mode (the
+  single process included); a faster scan would help a crash-extended file. (11) A directory export (several CSV tables, one shared
+  write buffer) whose write fails in a range that holds no damage or gaps fails at the end of a
+  table's block, not at the row where one process would; the damage noted may then differ by what lies
+  between. A range with damage or gaps is exact. (12) Signals while a pool message is mid-transfer
+  (third review): `connection.wait` returns on the first bytes, then `recv_bytes` (or a `send_bytes`
+  of a job larger than the socket buffer to a worker still starting) blocks for the whole message
+  with no checkpoint. A worker stopped mid-send (`kill -STOP`, a debugger) therefore holds the parent
+  past SIGINT and SIGTERM until it resumes. Ctrl-Z of the whole process group is unaffected. Fix: own
+  message framing read and written in polled slices with a checkpoint between.
 
 ### Error codes added in Stage 2
 
@@ -3842,6 +4078,7 @@ Built (all items below are done; the differences from the first design are state
 | `IB-FLT-004` | `FLT_LIMIT` | filter too long, deep or wide | 2f |
 | `IB-EXP-001` | `EXP_WRITE` | cannot write export output | 2h |
 | `IB-EXP-002` | `EXP_EXISTS` | export output exists (pass `--force`), is the input, or is a file retention manages (`--force` does not apply to these two) | 2h |
+| `IB-EXP-003` | `EXP_WORKER` | an export worker process died (killed, out of memory), failed to return a result, or could not be started; the message says to run again or with `--jobs 1`; the cause or traceback is in the ledger | 2m |
 | `IB-DEC-008` | `DEC_COUNT` | variable-length count above the CCDD maximum | 2j |
 | `IB-DEC-009` | `DEC_OVERRUN` | variable-length data runs past the packet end | 2j |
 

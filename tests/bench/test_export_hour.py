@@ -1,5 +1,6 @@
-"""Does a one-hour recording export in under a minute? (docs/plan.md, 2h: the decode worker pool
-stays unbuilt until a 2l benchmark says it does not.)
+"""Does a one-hour recording export in under a minute in one process? (docs/plan.md, 2h: the
+decode worker pool stayed unbuilt until a 2l benchmark said it did not; the pool is 2m, and
+``test_export_pool_bench.py`` measures it on packets of the target's shape.)
 
 ``ib export`` is one streaming pass, so its cost is linear in the rows. This builds a recording
 of ``IRONBIRD_BENCH_EXPORT_FRAMES`` frames (600,000 by default: ten minutes at the 1k packets/s
@@ -45,7 +46,7 @@ def _frames(count: int) -> Iterator[Frame]:
 def _export_rate(recording: Path, out: Path, rows: int, env: dict[str, str]) -> float:
     start = time.perf_counter()
     done = subprocess.run(
-        [sys.executable, "-c", CLI_MAIN, "export", str(recording), "-o", str(out)],
+        [sys.executable, "-c", CLI_MAIN, "export", str(recording), "-o", str(out), "--jobs", "1"],
         capture_output=True,
         text=True,
         env=env,

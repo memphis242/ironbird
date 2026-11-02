@@ -46,6 +46,10 @@ from ironbird.recording.reader import Damage, RecordingReader
 from ironbird.recording.writer import part_path
 from ironbird.sanitize import clean
 
+#: Where to resume after a chunk the range rules out: ``{start of the skipped bytes: (offset of
+#: its CHUNK record, offset to resume at, start of the skipped bytes)}``.
+JumpTable = dict[int, tuple[int, int, int]]
+
 POLL_S: Final = 0.1  # how often a followed file is looked at again
 HEAD_WAIT_POLLS: Final = (
     30  # polls a new part's head is awaited (it is written just after the file)
@@ -516,8 +520,10 @@ class Replay:
             reader.close()
         return None
 
-    def frames(self) -> Generator[Frame, None, None]:
-        """Every frame of the set inside the time range and the MID set, in file order."""
+    def resolve_range(self) -> tuple[int | None, int | None]:
+        """The time range as nanoseconds, ``(start, end)`` (``None``: unbounded), with offsets
+        measured from the first frame; ``IB-CLI-001`` when it is empty. Sets whether the range
+        selects nothing (an offset from a first frame that was not found)."""
         first_ns: int | None = None
         specs = (self._start_spec, self._end_spec)
         if any(spec is not None and spec.offset_ns is not None for spec in specs):
@@ -532,6 +538,25 @@ class Replay:
         self._select_nothing = (self._start_spec is not None and start is None) or (
             self._end_spec is not None and end is None
         )
+        return start, end
+
+    @property
+    def selects_nothing(self) -> bool:
+        """Whether the range names an offset from a first frame that does not exist (valid after
+        :meth:`resolve_range`): every file is read and no frame is in range."""
+        return self._select_nothing
+
+    @property
+    def following(self) -> bool:
+        return self._follow
+
+    @property
+    def skips_damage(self) -> bool:
+        return self._skip_damage
+
+    def frames(self) -> Generator[Frame, None, None]:
+        """Every frame of the set inside the time range and the MID set, in file order."""
+        start, end = self.resolve_range()
         index = 0
         while index < len(self.parts) and not self._stopped:
             path = self.parts[index]
@@ -568,60 +593,96 @@ class Replay:
                 sigmask.sleep(POLL_S)  # a signal is acted on here (not a failure)
         self.parts.append(path)
 
+    def open_part(self, path: Path) -> RecordingReader:
+        """Open one file of the set for reading and note its identity (the caller counts the part
+        in ``stats.parts``). The reader holds the shared lock that tells retention the session is
+        in use until it is closed."""
+        reader = RecordingReader(path, skip_damage=self._skip_damage)
+        self.stats.opened.add(reader.identity)
+        return reader
+
     def _part(
         self, path: Path, start: int | None, end: int | None, *, wait_for_more: bool
     ) -> Generator[Frame, None, int | None]:
         """The frames of one file. Returns (as the generator's value) the part number if the file
         ended at its trailer, else ``None``."""
-        stats = self.stats
-        reader = RecordingReader(path, skip_damage=self._skip_damage)
-        stats.opened.add(reader.identity)
+        reader = self.open_part(path)
         try:
-            skip = None if self._select_nothing else self._chunk_skipper(reader, start, end)
-            wait = (
-                self._follower.waiter(reader.size)
-                if wait_for_more and self._follower is not None
-                else None
-            )
-            damaged = False
-            for item in reader.items(skip=skip, wait=wait):
-                if isinstance(item, Damage):
-                    damaged = True
-                    self._damage(item, reader, path)
-                    continue
-                match item.rtype:
-                    case RecordType.FRAME:
-                        frame: Frame = item.value
-                        stats.frames_read += 1
-                        if self._select_nothing:
-                            continue
-                        if start is not None and frame.time_ns < start:
-                            continue
-                        if end is not None and frame.time_ns >= end:
-                            continue
-                        stats.frames_in_range += 1
-                        yield frame
-                    case RecordType.GAP:
-                        self._count_gap(item.value, start, end)
-                    case _:
-                        pass
-            if reader.trailer is None and not damaged:
-                if reader.writer_active and not self._follow:
-                    stats.live_end = True
-                elif self.follow_ended in ("", "writer gone"):
-                    # The file ends at a record boundary and its writer is not there to close it.
-                    # (A follow that gave up while a writer may be alive says nothing about it.)
-                    stats.unclosed += 1
-            return reader.meta.part if reader.trailer is not None else None
+            jumps = None if self._select_nothing else self.jump_table(reader, start, end)
+            return (yield from self.read_part(reader, path, start, end, jumps, wait_for_more))
         finally:
             reader.close()
 
+    def read_part(
+        self,
+        reader: RecordingReader,
+        path: Path,
+        start: int | None,
+        end: int | None,
+        jumps: JumpTable | None,
+        wait_for_more: bool = False,
+    ) -> Generator[Frame, None, int | None]:
+        """The frames of an opened file (see :meth:`_part`); ``jumps`` is what
+        :meth:`jump_table` made of it."""
+        stats = self.stats
+        skip = self._skipper(reader, jumps, start, end)
+        wait = (
+            self._follower.waiter(reader.size)
+            if wait_for_more and self._follower is not None
+            else None
+        )
+        damaged = False
+        for item in reader.items(skip=skip, wait=wait):
+            if isinstance(item, Damage):
+                damaged = True
+                self._damage(item, reader, path)
+                continue
+            match item.rtype:
+                case RecordType.FRAME:
+                    frame: Frame = item.value
+                    stats.frames_read += 1
+                    if self._select_nothing:
+                        continue
+                    if start is not None and frame.time_ns < start:
+                        continue
+                    if end is not None and frame.time_ns >= end:
+                        continue
+                    stats.frames_in_range += 1
+                    yield frame
+                case RecordType.GAP:
+                    self._count_gap(item.value, start, end)
+                case _:
+                    pass
+        return self.finish_part(reader, damaged=damaged, closed=reader.trailer is not None)
+
+    def finish_part(self, reader: RecordingReader, *, damaged: bool, closed: bool) -> int | None:
+        """The bookkeeping for a part read to its end (``closed``: up to a trailer, ``damaged``:
+        past or into damage): a file that ends without a trailer is live, or was left unclosed.
+        Returns the part number when the file ended at its trailer, else ``None``."""
+        if not closed and not damaged:
+            if reader.writer_active and not self._follow:
+                self.stats.live_end = True
+            elif self.follow_ended in ("", "writer gone"):
+                # The file ends at a record boundary and its writer is not there to close it.
+                # (A follow that gave up while a writer may be alive says nothing about it.)
+                self.stats.unclosed += 1
+        return reader.meta.part if closed else None
+
     def _count_gap(self, gap: fmt.Gap, start: int | None, end: int | None) -> None:
         """Count a GAP record if the frames it says were lost overlap the selected range."""
-        if (start is None or gap.last_ns >= start) and (end is None or gap.first_ns < end):
+        if gap_in_range(gap, start, end):
             self.stats.gaps += 1
             if gap.reason is not GapReason.LINK_DOWN:  # an outage's frames cannot be counted
                 self.stats.gap_frames += gap.lost
+
+    def note_gaps(self, gaps: int, lost: int) -> None:
+        """Add GAP records counted elsewhere (``gaps`` of them, ``lost`` frames among them)."""
+        self.stats.gaps += gaps
+        self.stats.gap_frames += lost
+
+    def note_damage(self, damage: Damage, reader: RecordingReader, path: Path) -> None:
+        """Count and report a stretch of damage met reading ``path`` (through ``reader``)."""
+        self._damage(damage, reader, path)
 
     def _damage(self, damage: Damage, reader: RecordingReader, path: Path) -> None:
         stats = self.stats
@@ -641,12 +702,13 @@ class Replay:
         if self._on_damage is not None:
             self._on_damage(damage, path)
 
-    def _chunk_skipper(
+    def jump_table(
         self, reader: RecordingReader, start: int | None, end: int | None
-    ) -> Callable[[int], int | None] | None:
-        """A ``skip`` for :meth:`RecordingReader.items` that jumps the chunks of a closed file the
-        range and MID set rule out, or ``None`` when nothing is selected or there is no usable
-        index (a recording still being written has none)."""
+    ) -> JumpTable | None:
+        """The chunks of a closed file that the range and MID set rule out, as the jumps over
+        them (empty: nothing to skip), or ``None`` when nothing is selected or there is no usable
+        index (a recording still being written has none). A file whose index cannot be used is
+        noted (``on_note``)."""
         mids = self._mids
         if start is None and end is None and mids is None:
             return None
@@ -663,7 +725,7 @@ class Replay:
                     f"no usable index ({clean(str(exc), 200)}); every record is read instead",
                 )
             return None
-        jumps: dict[int, tuple[int, int, int]] = {}
+        jumps: JumpTable = {}
         for position, (offset, chunk) in enumerate(chunks):
             if _wanted(chunk, start, end, mids):
                 continue
@@ -672,6 +734,19 @@ class Replay:
             here = max(chunk.chunk_start, reader.body_start)
             if resume > here:
                 jumps[here] = (offset, resume, here)
+        return jumps
+
+    def _skipper(
+        self,
+        reader: RecordingReader,
+        jumps: JumpTable | None,
+        start: int | None,
+        end: int | None,
+    ) -> Callable[[int], int | None] | None:
+        """A ``skip`` for :meth:`RecordingReader.items` that makes the jumps of
+        :meth:`jump_table`, or ``None`` when there are none."""
+        if not jumps:
+            return None
         stats = self.stats
 
         def skip(offset: int) -> int | None:
@@ -691,6 +766,11 @@ class Replay:
             self._follower.close()
 
 
+def gap_in_range(gap: fmt.Gap, start: int | None, end: int | None) -> bool:
+    """Whether the frames a GAP record says were lost overlap the half-open range."""
+    return (start is None or gap.last_ns >= start) and (end is None or gap.first_ns < end)
+
+
 def _wanted(
     chunk: fmt.Chunk, start: int | None, end: int | None, mids: frozenset[int] | None
 ) -> bool:
@@ -708,11 +788,13 @@ def _wanted(
 
 __all__ = [
     "Follower",
+    "JumpTable",
     "Pacer",
     "Replay",
     "ReplayStats",
     "TimeSpec",
     "check_range",
     "check_speed",
+    "gap_in_range",
     "parse_time_spec",
 ]

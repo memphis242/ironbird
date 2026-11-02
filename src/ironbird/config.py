@@ -250,6 +250,32 @@ class RetentionConfig:
     scan_interval_s: int = 600
 
 
+#: The most export workers that may be asked for.
+MAX_EXPORT_JOBS: Final = 64
+#: Recordings under this size are exported in one process: two ranges are the least there is to
+#: share, and below them starting the workers (a quarter of a second each, in parallel) costs more
+#: than they save (measured in tests/bench/test_export_pool_bench.py: the speedup is 1.0 at 7.8 MiB
+#: because nothing is shared, 1.7 at 9 MiB, 1.9 at 11.6 MiB).
+DEFAULT_POOL_MIN_BYTES: Final = 8 * MIB
+#: The size of the byte range one export worker is given at a time.
+DEFAULT_RANGE_BYTES: Final = 4 * MIB
+MIN_RANGE_BYTES: Final = 4096
+MAX_RANGE_BYTES: Final = 256 * MIB
+
+
+@dataclass(frozen=True, slots=True)
+class ExportConfig:
+    """The ``[export]`` table: how ``ib export`` decodes large recordings. ``jobs`` is the number
+    of worker processes (``None``: one per core; 1: never use workers); ``pool_min_bytes``, the
+    size of the recording (all its parts) from which workers are used; ``range_bytes``, how much
+    of the file a worker takes at a time (smaller ranges balance better and use less memory,
+    larger ones hand off less often)."""
+
+    jobs: int | None = None
+    pool_min_bytes: int = DEFAULT_POOL_MIN_BYTES
+    range_bytes: int = DEFAULT_RANGE_BYTES
+
+
 @dataclass(frozen=True, slots=True)
 class SystemConfig:
     path: Path
@@ -260,6 +286,7 @@ class SystemConfig:
     recording: RecordingConfig = RecordingConfig()
     ledger: LedgerConfig = LedgerConfig()
     retention: RetentionConfig = RetentionConfig()
+    export: ExportConfig = ExportConfig()
     sha256: str | None = None  # of the bytes load_config parsed; None for a config built elsewhere
 
     def resolve(self, name_or_alias: str) -> Node:
@@ -649,6 +676,27 @@ def _parse_retention(ctx: _Ctx, raw: object) -> RetentionConfig:
     )
 
 
+def _parse_export(ctx: _Ctx, raw: object) -> ExportConfig:
+    if not isinstance(raw, dict):
+        raise ctx.fail("export", "must be a table")
+    ctx.keys(raw, "export", {"jobs", "pool_min_bytes", "range_bytes"}, set())
+    defaults = ExportConfig()
+    pool_min = _config_size(
+        ctx, raw, "pool_min_bytes", "export", 0, 1024 * TIB, defaults.pool_min_bytes
+    )
+    span = _config_size(
+        ctx, raw, "range_bytes", "export", MIN_RANGE_BYTES, MAX_RANGE_BYTES, defaults.range_bytes
+    )
+    assert pool_min is not None and span is not None
+    if span % 8:
+        raise ctx.fail("export.range_bytes", "must be a multiple of 8 bytes")
+    return ExportConfig(
+        jobs=_config_int(ctx, raw, "jobs", "export", 1, MAX_EXPORT_JOBS) if "jobs" in raw else None,
+        pool_min_bytes=pool_min,
+        range_bytes=span,
+    )
+
+
 def _device_key(device: str) -> str:
     """The device path with ``//``, ``/./`` and a trailing ``/`` removed, so two spellings of
     one path are one device. Symlinks are not followed: the transport compares the device
@@ -795,7 +843,10 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
     """Validate a parsed TOML mapping (paths resolve against ``path.parent``)."""
     ctx = _Ctx(path)
     ctx.keys(
-        data, "", {"ironbird", "nodes", "links", "recording", "ledger", "retention"}, {"nodes"}
+        data,
+        "",
+        {"ironbird", "nodes", "links", "recording", "ledger", "retention", "export"},
+        {"nodes"},
     )
 
     settings = data.get("ironbird", {})
@@ -905,6 +956,7 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
         retention=_parse_retention(ctx, data["retention"])
         if "retention" in data
         else RetentionConfig(),
+        export=_parse_export(ctx, data["export"]) if "export" in data else ExportConfig(),
     )
 
 

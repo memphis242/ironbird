@@ -89,7 +89,7 @@ pointer names the part too: `[ledger n=1234 file=<stamp>-<session>.p0003]`.
 | `ib rec info\|check FILE`, `ib rec repair IN OUT` | Summarise or verify a recording, or copy its valid prefix to a new file | Recording |
 | `ib rec prune`, `ib ledger prune` | Delete old recordings or ledger sessions after confirmation | The ledger under load |
 | `ib replay FILE... [--where EXPR] [--from T] [--to T] [--follow]` | Play a recording back as `listen` shows it | Replay |
-| `ib export FILE... [-o OUT] [--format csv\|text\|jsonl]` | Export a recording to tables, text or JSON Lines | Export |
+| `ib export FILE... [-o OUT] [--format csv\|text\|jsonl] [--jobs N]` | Export a recording to tables, text or JSON Lines | Export |
 
 ## The ledger under load, a full disk, and retention
 
@@ -288,9 +288,9 @@ ib replay run1.ibrec --follow                                 # a recording stil
 
 `ib export FILE... [-o OUT] [--format csv|text|jsonl] [--message NAME ...] [--where EXPR]
 [--from T] [--to T] [--header-fields] [--raw-enums] [--defs recording|config] [--skip-damage]
-[--force]` writes a recording to files other tools read. It decodes exactly as `ib replay` does
-(same definitions, same `--where`, `--from`/`--to` and `--skip-damage`), needs no configuration
-and sends nothing.
+[--force] [--jobs N]` writes a recording to files other tools read. It decodes exactly as
+`ib replay` does (same definitions, same `--where`, `--from`/`--to` and `--skip-damage`), needs no
+configuration and sends nothing.
 
 ```bash
 ib export run1.ibrec -o run1-csv                               # a directory: one CSV per message
@@ -355,9 +355,38 @@ ib export run1.ibrec --format text --from +90s --to +2m -o minute.txt
   5 when the recording was damaged mid-file (the export ends there, or with `--skip-damage` goes
   past it) or a part of a split recording is missing; the output exists and holds everything read.
   1 for `IB-REC-004..009`, `IB-EXP-*`; 2 for usage and `IB-FLT-*`.
-- **Cost.** One pass over the file in one process, with a few MiB of buffer whatever the size of the
-  recording; about 40,000 rows per second as CSV on the development host. The ledger records the
-  start (options) and the end (counts per table, how it ended).
+- **Cost and workers.** A recording of 8 MiB or more is decoded by a pool of worker processes, one per
+  core by default (the cores this process may run on, as its CPU affinity and control-group quota say,
+  at most 64; `--jobs N`, or `[export] jobs` in the configuration; `--jobs 1` decodes in the calling
+  process, and so does a smaller recording, since starting the workers costs about a quarter of a
+  second). The file is cut into byte ranges (`[export] range_bytes`, 4MiB); each worker reads its
+  range itself through the same reader as every other command, decodes it exactly as the single
+  process does and sends back only the text of the rows, which the export writes in file order.
+  Memory does not grow with the recording or the width of its rows: a result carries at most 8 MiB
+  of row text (a worker that reaches that stops, and the export asks for the rest of the range),
+  ranges are planned shorter when the rows are wide, at most two ranges per worker are in flight, and
+  the rows waiting plus those expected from the ranges still running stay within 32 MiB (each worker
+  always has one range): on rows of 70 KiB from 1 KiB frames the export of four workers peaks at
+  62 MiB where one process peaks at 36 MiB, and runs 3.3 times faster.
+  **The files and standard output are the same bytes in every format and with every option, with one
+  worker or many, and so are the tally, the damage reported and the exit code**, also when the reader
+  of standard output goes away (`| head`), because a range that does not hold up (damage, a
+  definition that appeared late, a sequence number that goes back, a record boundary found in the
+  wrong place) is read again, with the exact state, before it is used. (After a reader went away,
+  the count of frames read differs, since workers read whole ranges.) A recording that is renamed
+  or replaced while it is exported is read to the end from the file the export opened, in the calling
+  process, as with `--jobs 1`. A recording read through the index because `--from`/`--to` or
+  `--where` rule chunks out, one still being written, and a followed one are exported in the calling
+  process. A worker that dies (killed, out of memory) or cannot start is `IB-EXP-003` (the message
+  says to run again or with `--jobs 1`; the cause is in the ledger), and Ctrl-C, SIGTERM or SIGHUP
+  (also one sent to the whole process group) ends the export (130/143/129), terminates the workers
+  and leaves nothing: they ignore SIGINT and SIGHUP, which only the export acts on, and exit by
+  themselves if the export is killed. `[export] pool_min_bytes` (8MiB; `0` for always) moves the
+  size from which workers are used. The ledger records the start (options, workers), the pool
+  (`export.pool`: ranges, ranges read again, ranges cut short or read in the calling process) and the
+  end (counts per table, how it ended). Measured on the development host (4 vCPU): 62-field,
+  200-byte packets as CSV, 18,100 rows/s in one process and 51,000 to 67,000 rows/s with four workers
+  (the host is shared; two runs).
 
 ## Exit codes
 
@@ -610,6 +639,8 @@ Sizes are bytes or `"64MiB"`, durations `"10min"`. Defaults are in the second co
 | | `on_full` | `"continue"` or `"refuse_commands"` |
 | `[retention]` | `max_age`, `max_total_bytes` | 7d, 8GiB, or `"unlimited"` (warnings only) |
 | | `keep_recent`, `warn_interval`, `scan_interval` | 10, 24h, 10min |
+| `[export]` | `jobs` | one per core, 1 to 64 (1: never use workers) |
+| | `pool_min_bytes`, `range_bytes` | 8MiB (0: always use workers), 4MiB (a multiple of 8, 4KiB to 256MiB) |
 
 Environment: `IRONBIRD_CONFIG`, `IRONBIRD_STATE_DIR` (ledger; absolute), `IRONBIRD_RECORD_DIR`
 (recordings), `XDG_STATE_HOME`, `XDG_DATA_HOME`.
@@ -672,13 +703,16 @@ pytest tests/bench -n0 -s                                  # the 1k floor for 15
 IRONBIRD_BENCH_10K=1 pytest tests/bench -n0 -s             # the 10k target for 60 s, on the dev host
 IRONBIRD_BENCH_10K=1 IRONBIRD_BENCH_UPDATE=1 pytest tests/bench -n0 -k target   # new baseline
 IRONBIRD_BENCH_EXPORT=1 pytest tests/bench/test_export_hour.py -n0 -s           # the export cost
+IRONBIRD_BENCH_EXPORT=1 pytest tests/bench/test_export_pool_bench.py -n0 -s           # ... with workers
 ```
 
 The 10k run is compared with `tests/bench/baseline.json` (CPU per frame, peak RSS); more than 20% above it
 fails. Measured on the development host (4 vCPU Xeon 2.1 GHz): at 10k packets/s `ib record` uses about half
 a core (48-51 us per frame), RSS stays near 32 MiB, the buffer peaks under 1.5 MiB of its 256 MiB, and
-141 MiB are written per minute (8.3 GiB per hour). `ib export` runs at about 36,000 rows/s as CSV: a
-one-hour recording takes about 100 s at 1k packets/s and 16 minutes at 10k packets/s (measured on
-about 75-byte frames; the 200-byte packets of the 10k target have more fields per row, so expect more). The ironbird side
+141 MiB are written per minute (8.3 GiB per hour). `ib export` runs at about 36,000 rows/s as CSV on the
+75-byte housekeeping packet and 18,100 rows/s on the 200-byte, 62-field packet of the 10k target; with four
+workers (the default on four cores) the 200-byte export runs at 51,000 to 67,000 rows/s (x3.1 to x3.6), so a
+one-hour recording takes about 200-220 s at 1k packets/s in one process and 54-70 s with workers, and 33-36
+minutes at 10k packets/s in one process and 9-12 minutes with workers. The ironbird side
 never loses a datagram it was handed; the cFS side of a 10k packets/s source is limited by TO_LAB's
 software-bus pipe (`tools/cfs/NOTES.md`, section 8).

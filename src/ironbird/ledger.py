@@ -169,6 +169,7 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "replay.defs_differ": Tier.ESSENTIAL,
         "export.start": Tier.ESSENTIAL,
         "export.stop": Tier.ESSENTIAL,
+        "export.pool": Tier.ESSENTIAL,
         "export.note": Tier.ESSENTIAL,
         "export.no_definitions": Tier.ESSENTIAL,
         "export.defs_compare_skipped": Tier.ESSENTIAL,

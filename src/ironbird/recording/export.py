@@ -248,6 +248,9 @@ class Destination(Protocol):
 class StdoutDestination:
     """Lines to the console's stdout, one at a time (the writer adds the line end)."""
 
+    #: Takes one line per call and may refuse any of them.
+    per_line = True
+
     def __init__(self, out: Callable[[str], bool]) -> None:
         self._out = out
 
@@ -277,6 +280,19 @@ class FileDestination:
         return 0
 
     def write(self, handle: int, text: str) -> bool:
+        """Queue ``text``. The buffer is flushed after the line that brings it to
+        :data:`FILE_BUFFER_BYTES`, wherever in ``text`` that line is, so a block of lines reaches
+        the file in the same pieces as the same lines written one at a time."""
+        room = FILE_BUFFER_BYTES - self._size
+        while len(text) >= room:
+            cut = text.find("\n", room - 1) + 1
+            if cut == 0 or cut >= len(text):
+                break
+            self._buffer.append(text[:cut])
+            self._size += cut
+            self.flush()
+            text = text[cut:]
+            room = FILE_BUFFER_BYTES
         self._buffer.append(text)
         self._size += len(text)
         if self._size >= FILE_BUFFER_BYTES:
@@ -334,24 +350,30 @@ class DirDestination:
 # -- the tables -------------------------------------------------------------------------------
 
 
+#: What identifies a table of a CSV export: the message's name and its columns (two nodes may
+#: define one message differently).
+TableKey = tuple[str, tuple[str, ...]]
+
+
 @dataclass(slots=True)
 class _Plan:
     """How the packets of one message become rows."""
 
     message: Message
-    table: _Table
+    table: Table
     mid_cell: str
     header_names: tuple[str, ...]
     converters: tuple[Callable[[object], object], ...]
 
 
 @dataclass(slots=True)
-class _Table:
+class Table:
     """One output file of a directory (or the single file): its handle and rows so far."""
 
     stem: str
     handle: int
     rows: int = 0
+    key: TableKey | None = None  # (message name, columns); None for the malformed table
 
 
 def payload_columns(message: Message, taken: set[str]) -> list[str]:
@@ -406,6 +428,30 @@ class ExportResult:
     rejected: Counter[str] = field(default_factory=Counter)
     per_table: dict[str, int] = field(default_factory=dict)  # rows by file stem
 
+    def tally(self, kind: int) -> None:
+        """Count one row of the kind ``kind`` (one of the ``CAT_*``, without ``NO_LINE``)."""
+        match kind:
+            case 0:
+                self.decoded += 1
+            case 1:
+                self.malformed += 1
+            case 2:
+                self.unknown += 1
+            case 3:
+                self.garbage += 1
+            case 4:
+                self.undecoded += 1
+            case _:
+                raise AssertionError(kind)
+
+    def absorb_rows(self, other: ExportResult) -> None:
+        """Add the row tallies of ``other`` (a part of the same export)."""
+        self.decoded += other.decoded
+        self.malformed += other.malformed
+        self.unknown += other.unknown
+        self.garbage += other.garbage
+        self.undecoded += other.undecoded
+
 
 class Layouts:
     """The CSV tables of one export: opens a file the first time a message appears and writes
@@ -428,20 +474,42 @@ class Layouts:
         self._raw_enums = raw_enums
         self._single = single
         self._plans: dict[int, _Plan] = {}
-        self._tables: dict[tuple[str, tuple[str, ...]], _Table] = {}
+        self._tables: dict[tuple[str, tuple[str, ...]], Table] = {}
         self._layouts: Counter[str] = Counter()
         self._used_stems: set[str] = set()
-        self.all: list[_Table] = []
-        self.malformed: _Table | None = None
+        self.all: list[Table] = []
+        self.malformed: Table | None = None
         if directory:
             self.malformed = self._open(MALFORMED_STEM, MALFORMED_COLUMNS)
 
-    def _open(self, stem: str, columns: Sequence[str]) -> _Table:
+    def _open(self, stem: str, columns: Sequence[str], key: TableKey | None = None) -> Table:
         assert stem.casefold() not in self._used_stems
         self._used_stems.add(stem.casefold())
-        table = _Table(stem, self._dest.member(f"{stem}.csv"))
+        table = Table(stem, self._dest.member(f"{stem}.csv"), key=key)
         self.all.append(table)
         self._dest.write(table.handle, csv_line([safe_cell(c) for c in columns]))
+        return table
+
+    def table_for(self, name: str, columns: tuple[str, ...]) -> Table:
+        """The table of message ``name`` with ``columns``: opened (its header row written) the
+        first time it is asked for. ``IB-CLI-001`` for a second layout in a single-table
+        destination."""
+        key = (name, columns)
+        table = self._tables.get(key)
+        if table is None:
+            if self._single and self._tables:
+                raise IronbirdError(
+                    Code.CLI_USAGE,
+                    f"{render.term(name, 64)} has more than one layout (different "
+                    "nodes define it differently), which one CSV file cannot hold; narrow the "
+                    "export with --where 'node == NAME' or export to a directory",
+                )
+            variant = self._layouts[name] + 1
+            while stem_for(name, variant).casefold() in self._used_stems:
+                variant += 1
+            self._layouts[name] = variant
+            table = self._open(stem_for(name, variant), columns, key)
+            self._tables[key] = table
         return table
 
     def plan_for(self, message: Message, codec: Codec) -> _Plan:
@@ -449,23 +517,7 @@ class Layouts:
         if plan is not None:
             assert plan.message is message
             return plan
-        columns = table_columns(message, codec, self._header_fields)
-        key = (message.name, columns)
-        table = self._tables.get(key)
-        if table is None:
-            if self._single and self._tables:
-                raise IronbirdError(
-                    Code.CLI_USAGE,
-                    f"{render.term(message.name, 64)} has more than one layout (different "
-                    "nodes define it differently), which one CSV file cannot hold; narrow the "
-                    "export with --where 'node == NAME' or export to a directory",
-                )
-            variant = self._layouts[message.name] + 1
-            while stem_for(message.name, variant).casefold() in self._used_stems:
-                variant += 1
-            self._layouts[message.name] = variant
-            table = self._open(stem_for(message.name, variant), columns)
-            self._tables[key] = table
+        table = self.table_for(message.name, table_columns(message, codec, self._header_fields))
         header = header_names_of(message, codec) if self._header_fields else ()
         plan = _Plan(
             message,
@@ -552,8 +604,58 @@ class _NoDefinitions(Exception):
     """A frame of a node with no codec reached the decoder."""
 
 
-def export(
-    replay: Replay,
+#: The kinds of row a worker reports one byte each for (when the output takes rows one at a time
+#: and may refuse one): which counter of :class:`ExportResult` a row is in.
+CAT_DECODED: Final = 0
+CAT_MALFORMED: Final = 1
+CAT_UNKNOWN: Final = 2
+CAT_GARBAGE: Final = 3
+CAT_UNDECODED: Final = 4
+assert (CAT_DECODED, CAT_MALFORMED, CAT_UNKNOWN, CAT_GARBAGE, CAT_UNDECODED) == (0, 1, 2, 3, 4)
+#: Added to a row's kind when it was counted but has no line (a single-file CSV has no place for a
+#: frame that did not decode).
+NO_LINE: Final = 0x80
+
+
+@dataclass(slots=True)
+class Pipeline:
+    """What turns frames into rows: ``step(frame)`` filters, decodes and writes one frame (``False``
+    when the output refused a row: stop), ``result`` is the tally so far, ``tables`` the CSV
+    tables (``None`` for text and JSON Lines), ``categories`` the kind of each row written when
+    asked for (see :data:`CAT_DECODED`)."""
+
+    step: Callable[[Frame], bool]
+    result: ExportResult
+    tables: Layouts | None
+    categories: bytearray | None
+
+    def finish(self) -> ExportResult:
+        """Fill in the totals that come from the tables. Call once, after the last frame."""
+        result, tables = self.result, self.tables
+        if tables is not None:
+            result.files = len(tables.all)
+            result.per_table = {t.stem: t.rows for t in tables.all}
+            result.rows = sum(t.rows for t in tables.all)
+        else:
+            result.files = 1
+            result.rows = result.decoded + result.malformed + result.unknown
+            result.rows += result.garbage + result.undecoded
+        return result
+
+
+class ParallelRunner(Protocol):
+    """A way to run a replay through a pool of workers (see :mod:`ironbird.recording.pexport`)."""
+
+    def wanted(self, replay: Replay) -> bool:
+        """Whether the pool is used for ``replay``."""
+        ...
+
+    def drive(self, replay: Replay, pipe: Pipeline, dest: Destination) -> Ending:
+        """Run ``replay`` into ``pipe``; how the export ended."""
+        ...
+
+
+def make_pipeline(
     codecs: Mapping[str, Codec],
     dest: Destination,
     fmt: ExportFormat,
@@ -564,14 +666,15 @@ def export(
     raw_enums: bool = False,
     single: bool = False,
     directory: bool = False,
-) -> ExportResult:
-    """Run ``replay`` to its end into ``dest``. ``single``: the CSV destination holds the table
-    of one message (frames that did not decode have no place and are counted in
-    :attr:`ExportResult.not_written`); ``directory``: a ``malformed`` table is opened first for
-    them. Never raises for anything a recording contains; ``IronbirdError`` for a layout that
-    cannot share one file, and whatever the destination raises for a failed write."""
+    categories: bool = False,
+) -> Pipeline:
+    """The :class:`Pipeline` that writes the rows of ``fmt`` to ``dest``. ``single``: the CSV
+    destination holds the table of one message (frames that did not decode have no place and are
+    counted in :attr:`ExportResult.not_written`); ``directory``: a ``malformed`` table is opened
+    first for them. ``IronbirdError`` from ``step`` for a layout that cannot share one file."""
     result = ExportResult()
     assert fmt is ExportFormat.CSV or not (single or directory)
+    kinds = bytearray() if categories else None
 
     def codec_for(node: str) -> Codec:
         codec = codecs.get(node)
@@ -679,55 +782,97 @@ def export(
             table.rows += 1
         return taken
 
+    def step(frame: Frame) -> bool:
+        note = ""
+        decoded: Decoded | DecodeError | None
+        try:
+            if matcher is not None and not matcher(frame):
+                return True
+        except _NoDefinitions:
+            result.skipped_no_definitions += 1  # the filter could not be tested
+            return True
+        try:
+            decoded = matcher.decoded(frame) if matcher is not None else decoder.decode(frame)
+        except _NoDefinitions:
+            decoded, note = None, "no definitions for the node"
+        if isinstance(decoded, Decoded):
+            if selection is not None and decoded.packet.message.name not in selection.names:
+                return True
+            taken = write_decoded(decoded)
+            result.decoded += taken  # a row the output refused is not counted
+            if taken and kinds is not None:
+                kinds.append(CAT_DECODED)
+            return taken
+        if selection is not None and not selection.wants(frame):
+            return True
+        taken = write_undecoded(frame, decoded, note)
+        if taken:
+            if note:
+                result.undecoded += 1
+                category = CAT_UNDECODED
+            elif frame.flags & FrameFlag.GARBAGE:
+                result.garbage += 1
+                category = CAT_GARBAGE
+            elif decoded is not None and decoded.code is Code.DEC_UNKNOWN:
+                result.unknown += 1
+                category = CAT_UNKNOWN
+            else:
+                result.malformed += 1
+                category = CAT_MALFORMED
+            if kinds is not None:
+                placed = tables is None or tables.malformed is not None
+                kinds.append(category if placed else category | NO_LINE)
+        return taken
+
+    return Pipeline(step, result, tables, kinds)
+
+
+def export(
+    replay: Replay,
+    codecs: Mapping[str, Codec],
+    dest: Destination,
+    fmt: ExportFormat,
+    *,
+    where: Filter | None = None,
+    selection: Selection | None = None,
+    header_fields: bool = False,
+    raw_enums: bool = False,
+    single: bool = False,
+    directory: bool = False,
+    parallel: ParallelRunner | None = None,
+) -> ExportResult:
+    """Run ``replay`` to its end into ``dest`` (see :func:`make_pipeline` for the options): in
+    this process, or through a pool of workers when ``parallel`` asks for one and the recording is
+    large enough, with the same output. Never raises for anything a recording contains;
+    ``IronbirdError`` for a layout that cannot share one file, a worker that failed, and whatever
+    the destination raises for a failed write."""
+    pipe = make_pipeline(
+        codecs,
+        dest,
+        fmt,
+        where=where,
+        selection=selection,
+        header_fields=header_fields,
+        raw_enums=raw_enums,
+        single=single,
+        directory=directory,
+    )
+    if parallel is not None and parallel.wanted(replay):
+        pipe.result.ending = parallel.drive(replay, pipe, dest)
+        dest.flush()
+        return pipe.finish()
+    step = pipe.step
     frames = replay.frames()
     with contextlib.closing(frames):
         for frame in frames:
-            note = ""
-            decoded: Decoded | DecodeError | None
-            try:
-                if matcher is not None and not matcher(frame):
-                    continue
-            except _NoDefinitions:
-                result.skipped_no_definitions += 1  # the filter could not be tested
-                continue
-            try:
-                decoded = matcher.decoded(frame) if matcher is not None else decoder.decode(frame)
-            except _NoDefinitions:
-                decoded, note = None, "no definitions for the node"
-            if isinstance(decoded, Decoded):
-                if selection is not None and decoded.packet.message.name not in selection.names:
-                    continue
-                taken = write_decoded(decoded)
-                result.decoded += taken  # a row the output refused is not counted
-            else:
-                if selection is not None and not selection.wants(frame):
-                    continue
-                taken = write_undecoded(frame, decoded, note)
-                if taken:
-                    if note:
-                        result.undecoded += 1
-                    elif frame.flags & FrameFlag.GARBAGE:
-                        result.garbage += 1
-                    elif decoded is not None and decoded.code is Code.DEC_UNKNOWN:
-                        result.unknown += 1
-                    else:
-                        result.malformed += 1
-            if not taken:
-                result.ending = Ending.OUTPUT
+            if not step(frame):
+                pipe.result.ending = Ending.OUTPUT
                 break
         else:
             if replay.ended_by_damage:
-                result.ending = Ending.DAMAGE
+                pipe.result.ending = Ending.DAMAGE
     dest.flush()
-    if tables is not None:
-        result.files = len(tables.all)
-        result.per_table = {t.stem: t.rows for t in tables.all}
-        result.rows = sum(t.rows for t in tables.all)
-    else:
-        result.files = 1
-        result.rows = result.decoded + result.malformed + result.unknown
-        result.rows += result.garbage + result.undecoded
-    return result
+    return pipe.finish()
 
 
 # -- where the output may go ------------------------------------------------------------------
@@ -1100,20 +1245,26 @@ def write_to_directory(
 
 
 __all__ = [
+    "NO_LINE",
     "Destination",
     "DirDestination",
     "ExportFormat",
     "ExportResult",
     "FileDestination",
     "OutputError",
+    "ParallelRunner",
+    "Pipeline",
     "Selection",
     "StdoutDestination",
+    "Table",
+    "TableKey",
     "WriteProgress",
     "check_messages",
     "check_single_layout",
     "csv_line",
     "export",
     "input_guard",
+    "make_pipeline",
     "refuse_unsafe_output",
     "safe_cell",
     "stale_temporaries",
