@@ -53,12 +53,12 @@
 
 /*
  * What one tick may publish. The packets go to TO_LAB's telemetry pipe, and its depth on the
- * native target is not the OS_QUEUE_MAX_DEPTH (50) cFE asks for: OSAL in permissive mode (every
- * native build) silently truncates each queue a non-root cFS creates to
- * /proc/sys/fs/mqueue/msg_max, which is 10 on a default Linux host (the cFS console says
- * "Maximum user msg queue depth = 10"). A tick's packets go out back to back, faster than TO_LAB
- * forwards them, so a tick that publishes more than the pipe has room for overflows it even while
- * TO_LAB runs.
+ * native target is not the depth cFE asks for (TO_LAB_PLATFORM_TLM_PIPE_DEPTH, 1000 in
+ * tools/cfs/sample_defs): OSAL in permissive mode (every native build) silently truncates each
+ * queue a non-root cFS creates to /proc/sys/fs/mqueue/msg_max, which is 10 on a default Linux
+ * host (the cFS console says "Maximum user msg queue depth = 10"). A tick's packets go out back to
+ * back, faster than TO_LAB forwards them, so a tick that publishes more than the pipe has room for
+ * overflows it even while TO_LAB runs.
  *
  * IB_TEST_GEN_MIN_PIPE_DEPTH is the shallowest pipe the generator is designed for, and
  * IB_TEST_GEN_PIPE_RESERVE the slots it leaves to the other telemetry TO_LAB forwards through the

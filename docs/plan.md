@@ -3772,8 +3772,9 @@ Built (all items below are done; the differences from the first design are state
   for a millisecond or so (28,886 of 30,000 recorded on the development host); every missing packet is counted by
   SB housekeeping (`PipeOverflowErrorCounter` grew by 1,121 for the 1,114 missing), which the test uses to tell
   cFS's loss from ironbird's. With `fs.mqueue.msg_max` raised to at least 50 (`unshare --ipc`, `msg_max` 64) the
-  stock 50-deep pipe is lossless at 10k packets/s (0 of 30,000 missing, 3 of 3 runs): no cFS configuration change
-  is needed, only that host setting.
+  stock 50-deep pipe was lossless at 10k packets/s in 3 of 3 runs (0 of 30,000 missing), though more runs
+  later were not (see "Found later"): the stock pipe is too shallow for a strict 10k/s test, so the test build
+  deepens it (below).
   Found later (a 1k/s run that lost 25 and one that lost 3 on a loaded 4-core host): the pipe is not
   50 deep on the native target. OSAL in permissive mode truncates every queue a non-root cFS creates to
   `/proc/sys/fs/mqueue/msg_max`, 10 by default on Linux (a fresh IPC namespace, such as a container's,
@@ -3789,14 +3790,63 @@ Built (all items below are done; the differences from the first design are state
   the same generator stall then loses nothing (largest burst 2). The 1k test checks the pipe's depth
   from that console line and fails, with what to raise, below 10 (or, naming the missing line, when the cFS build prints none). TO_LAB itself off-CPU for longer than
   its pipe covers is a host-scheduling loss inside cFS that ironbird cannot prevent; the test requires
-  every such packet to be counted by SB (`PipeOverflowErrorCounter`) and keeps ironbird's side exact.
+  every such packet to be counted by SB (`PipeOverflowErrorCounter`, plus `MsgLimitErrorCounter` for a packet that
+  hit its subscription's limit before the pipe's depth) and keeps ironbird's side exact.
   Remedy for a source lossless under host load (1k/s with a stalled TO_LAB, and 10k/s): raise
-  `fs.mqueue.msg_max` to at least 50 on the host, so the 50-deep pipe cFE asks for is kept (a host setting;
-  alternatively a user+IPC namespace whose own `msg_max` is raised, which works unprivileged on recent kernels
-  but not under Ubuntu's user-namespace restriction, Docker's default seccomp profile or an EL8 kernel).
-  No cFS configuration change is needed; the 10k test accounts for any loss on a default host through the SB
-  counter. Deferred: a pipe deeper than 50 (`OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's `TLM_PIPE_DEPTH`), which
-  nothing measured needs.
+  `fs.mqueue.msg_max` on the host to at least the depth of the pipe cFE asks for (below), so that pipe is kept
+  (a host setting; alternatively a user+IPC namespace whose own `msg_max` is raised, which works unprivileged on
+  recent kernels but not under Ubuntu's user-namespace restriction, Docker's default seccomp profile or an EL8
+  kernel). CI sets `fs.mqueue.msg_max` to 65536 (the kernel's
+  maximum, `HARD_MSGMAX`; there is no "unlimited") for every real-cFS job
+  (`--sysctl fs.mqueue.msg_max=65536` in the `el8-cfs` container options, an IPC-namespaced sysctl Docker allows
+  unprivileged; a `sudo sysctl -w` step with a read-back in the Ubuntu `cfs` job), and sets
+  `IRONBIRD_CFS_REQUIRE_FULL_DEPTH=1` in both jobs, which makes the generator tests fail, naming
+  `fs.mqueue.msg_max`, instead of running in their lenient mode when the pipe is shallower than TO_LAB asks for
+  (a sysctl that silently did not take effect cannot pass). `tests/test_ci_el8.py` fails if the sysctl, its
+  read-back (which must accept nothing below the pipe depth), the variable, or `-rP` on the cFS test commands (which
+  puts the tests' "mode" line in the CI log) is dropped, or if the sysctl step gains an `if`, `continue-on-error`,
+  `shell` or a `set +...`, or if anything else could soften the result: a container `--sysctl` or `sysctl -w` below the
+  pipe depth (every one is checked, and any other line mentioning `msg_max`), a step-level or inline override of
+  `IRONBIRD_CFS_REQUIRE_FULL_DEPTH` or `PYTEST_ADDOPTS`, a later `-r` option replacing `-rP` (the last one wins in
+  pytest), an `if`, `continue-on-error` or `||` on the cFS test step, or a `defaults.run.shell` (workflow or job)
+  without errexit; each has a mutation test.
+  The build deepens the pipe: `tools/cfs/build.sh` copies `tools/cfs/sample_defs/` into the checkout's
+  `sample_defs/`, the mission directory cFS reads its overrides from (never editing a stock file; it checks every name against the checkout's tracked files before copying any, and
+  removes an earlier run's override that is no longer in `tools/cfs/sample_defs`, tracked in a manifest in the build
+  directory, so a rebuild matches a fresh build; it refuses symlinks, control characters and paths
+  leaving `sample_defs/`, and writes the manifest before copying so an interrupted copy is still
+  cleaned up; deferred: the app copy into `apps/<app>` is not hardened against symlinks the same
+  way). `cpu1_osconfig.cmake` sets `OSAL_CONFIG_QUEUE_MAX_DEPTH` 1000 (OSAL's cap, and so the
+  deepest SB pipe), and `cpu1_to_lab_internal_cfg_values.h` sets `TO_LAB_PLATFORM_TLM_PIPE_DEPTH` 1000, checked
+  against OSAL's cap at compile time. TO_LAB then asks for a pipe that holds 100 ms of 10k packets/s, and the
+  generator tests read that depth from the build tree (not a constant). A subscription's own limit is a
+  separate setting: `TO_LAB_ADD_PKT`'s `BufLimit` is a `uint8`, so 255 at most (25 ms of the generator's stream), which
+  lost 33 of 30,000 packets in 1 of 20 strict 10k/s runs under 8 CPU burners (all `Msg Limit Err, MsgId 0x8e2`).
+  The generator's two messages are therefore subscribed by a TO_LAB subscription table override,
+  `tools/cfs/sample_defs/tables/cpu1_to_lab_sub.c`, with a `uint16` `BufLimit` of 1000, the pipe depth (TO_LAB's
+  table validation accepts it; compile-time checks tie the two), and `cpu1_to_lab_internal_cfg_values.h` keeps
+  `TO_LAB_PLATFORM_MAX_TLM_PKTS` at its stock 50 instead of the 1000 `OS_QUEUE_MAX_DEPTH` would give it, so
+  TO_LAB still checks its command pipe about every 5 ms at 10k packets/s. With the console reporting a queue depth of at
+  least the pipe depth, both generator tests are strict: the 1k test requires zero SB drops and zero missing
+  packets, the 10k test zero SB drops and every missing packet a recorded `kernel_drop` GAP (the exact
+  zero-kernel-drop check stays the throughput gate's). Below it (a developer host at the default 10) both keep the
+  accounting through the SB counters, and print which mode ran. Measured on the development host (4 vCPU,
+  `unshare --net --ipc`, `msg_max` 65536, depth 1000, generator `BufLimit` 1000 from the table): both tests strict,
+  lossless in 10 of 10 idle runs and in 50 of 50 runs under 8 `yes` CPU burners (30,000 of 30,000 at 10k/s each, no SB
+  drop, no kernel drop); the same burners with `BufLimit` 255 lost 33 packets in 1 of 20 runs. Before the deeper pipe (depth 50, `BufLimit`
+  49) the 1k/s test was strict 8 of 8 and the 10k/s test lost 10 to 470 of 30,000 in 6 of 18 runs, every one counted
+  by SB (`PipeOverflowErrorCounter` plus `MsgLimitErrorCounter`; the second counts the drops that hit the
+  subscription's limit first, which the earlier accounting missed).
+  `msg_max` only caps what OSAL truncates to; each queue is still created at the depth cFS requests, so the large
+  value adds no memory, but the deeper TO_LAB pipe does cost kernel message-queue bytes. The per-user
+  `RLIMIT_MSGQUEUE` (819200 bytes by default, across all of a user's queues) must still cover the requested depths.
+  Measured with `prlimit --msgqueue` on `tools/cfs/run.sh` at `msg_max` 65536 (cFS with the apps the tests run):
+  with the 1000-deep pipe, cFE still reaches OPERATIONAL under every limit, but at 125000 bytes and below
+  apps fail to create their pipes (`OS_QueueCreate ... errno = 24`; 2 to 4 errors at 100000 to 125000), and from
+  128000 up it starts clean, so the default has a margin of about 6x. With the stock 50-deep pipe the same
+  measurement was 12000 bytes: CI_LAB, TO_LAB, SAMPLE_APP and IB_TEST fail (errno 24), 20000: 4 errors, 25000: 2,
+  30000 clean (about 27x). The 12000/10000 figures an earlier version of this note gave were taken at `msg_max` 10, where
+  every queue is 10 deep, and do not hold at 65536.
 - Throughput gate (`tests/bench/`, `gate.py`, `blaster.py`, `test_throughput_gate.py`). The blaster is a
   separate process that sends 200-byte valid telemetry (`GATE_TLM`: `uint32 serial` plus a string) to the
   recorder's UDP port on an absolute schedule (a late slot is followed by catch-up bursts of at most 64

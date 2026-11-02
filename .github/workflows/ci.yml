@@ -68,6 +68,9 @@ jobs:
     env:
       # Outside the workspace so the cached tree has one stable absolute path.
       CFS_BUILD_DIR: ${{ github.workspace }}/../cfs-build
+      # The generator tests fail, instead of running their lenient accounting mode, when cFS's
+      # queues are truncated below the depth of TO_LAB's telemetry pipe (see the sysctl step).
+      IRONBIRD_CFS_REQUIRE_FULL_DEPTH: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -87,7 +90,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.CFS_BUILD_DIR }}
-          key: cfs-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ hashFiles('tools/cfs/build.sh', 'tools/cfs/apps/**') }}
+          key: cfs-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ hashFiles('tools/cfs/build.sh', 'tools/cfs/apps/**', 'tools/cfs/sample_defs/**') }}
       - name: Build cFS
         if: steps.cache.outputs.cache-hit != 'true'
         run: tools/cfs/build.sh
@@ -99,11 +102,22 @@ jobs:
           key: ${{ steps.cache.outputs.cache-primary-key }}
       - name: Install ironbird
         run: python -m pip install -c constraints-dev.txt -e '.[dev]'
+      # A non-root cFS has OSAL truncate every queue to fs.mqueue.msg_max (10 by default), which
+      # would cut TO_LAB's 1000-deep telemetry pipe (tools/cfs/sample_defs) to 10; 65536 (the
+      # kernel's maximum) only caps that truncation, so every queue keeps the depth cFS requests.
+      # The runner has passwordless sudo, and the value is read back so a silent no-op fails the
+      # job.
+      - name: Raise fs.mqueue.msg_max so cFS keeps its 1000-deep pipes
+        run: |
+          sudo sysctl -w fs.mqueue.msg_max=65536
+          test "$(cat /proc/sys/fs/mqueue/msg_max)" -ge 1000
+          echo "fs.mqueue.msg_max = $(cat /proc/sys/fs/mqueue/msg_max)"
       - name: Real-cFS acceptance tests
         env:
           IRONBIRD_CFS: "1"
         # One cFS instance owns fixed UDP ports and /dev/shm/osal:RAM: run serially.
-        run: pytest tests/cfs -m cfs -n0 -v --basetemp="$RUNNER_TEMP/pytest"
+        # -rP lists what the passing tests printed, which includes the generator tests' mode line.
+        run: pytest tests/cfs -m cfs -n0 -v -rP --basetemp="$RUNNER_TEMP/pytest"
       - name: Keep cFS console logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -225,12 +239,19 @@ jobs:
     container:
       image: ${{ matrix.image }}
       # EL8 logins get a soft nofile limit of 1024 (PAM); Docker's default is far higher.
-      options: --ulimit nofile=1024:524288
+      # fs.mqueue.msg_max is IPC-namespaced, so Docker sets it for this container alone (a
+      # namespaced sysctl, allowed unprivileged): a non-root cFS has OSAL truncate every queue to
+      # it, and 10 (the default) would cut TO_LAB's 1000-deep telemetry pipe (tools/cfs/sample_defs)
+      # to 10. 65536 is the kernel's maximum (HARD_MSGMAX; there is no "unlimited"); it only caps
+      # that truncation, so each queue keeps the depth cFS requests (the generator tests check the
+      # depth TO_LAB asks for, and fail without it: IRONBIRD_CFS_REQUIRE_FULL_DEPTH below).
+      options: --ulimit nofile=1024:524288 --sysctl fs.mqueue.msg_max=65536
     env:
       LANG: en_US.UTF-8
       # Inside the user's home so the cached tree has one stable absolute path.
       CFS_BUILD_DIR: /home/ci/cfs-build
       IRONBIRD_CFS: "1"
+      IRONBIRD_CFS_REQUIRE_FULL_DEPTH: "1"
     defaults:
       run:
         shell: >-
@@ -275,7 +296,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: /home/ci/cfs-build
-          key: cfs-el8-${{ matrix.name }}-${{ steps.pin.outputs.commit }}-${{ steps.pin.outputs.toolchain }}-${{ hashFiles('tools/cfs/build.sh', 'tools/cfs/apps/**', 'tools/ci/el8-setup.sh', 'tools/ci/cache-key.sh') }}
+          key: cfs-el8-${{ matrix.name }}-${{ steps.pin.outputs.commit }}-${{ steps.pin.outputs.toolchain }}-${{ hashFiles('tools/cfs/build.sh', 'tools/cfs/apps/**', 'tools/cfs/sample_defs/**', 'tools/ci/el8-setup.sh', 'tools/ci/cache-key.sh') }}
       - name: Hand the restored cache to the CI user (root)
         if: steps.setup.outputs.ready == 'true'
         shell: bash
@@ -309,7 +330,7 @@ jobs:
         # network and shm namespaces): run serially.
         run: |
           test "$(id -u)" -ne 0
-          pytest tests/cfs -m cfs -n0 -v --basetemp="$HOME/pytest-cfs"
+          pytest tests/cfs -m cfs -n0 -v -rP --basetemp="$HOME/pytest-cfs"
       - name: Keep cFS console logs on failure
         if: failure() && steps.setup.outputs.ready == 'true'
         uses: actions/upload-artifact@v4

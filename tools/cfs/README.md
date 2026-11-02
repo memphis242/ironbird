@@ -37,9 +37,19 @@ Its commands are `IB_TEST_NOOP`, `IB_TEST_RESET_COUNTERS`, `IB_TEST_SET_DATA` (c
 string, stored and published as `IB_TEST_VAR`), `IB_TEST_SEND_VAR` and `IB_TEST_SEND_HK`, and a throughput generator
 (`IB_TEST_GEN_START Rate=1..10000 Count=N`, `IB_TEST_GEN_STOP`, `IB_TEST_GEN_SEND_STATUS`) that publishes
 fixed-size 200-byte telemetry (`IB_TEST_GEN`, with `IB_TEST_GEN_STATUS` at the end of a run); telemetry MIDs
-0x08E0 (HK), 0x08E1 (VAR), 0x08E2 (GEN) and 0x08E3 (GEN_STATUS) are not in TO_LAB's table, so a test adds them
-with `TO_LAB_ADD_PKT` (`BufLimit` below 50).
+0x08E0 (HK) and 0x08E1 (VAR) are not in TO_LAB's stock table, so a test adds them with `TO_LAB_ADD_PKT`
+(`BufLimit` 0..255, below TO_LAB's telemetry pipe depth, 1000 in this build); 0x08E2 (GEN) and 0x08E3
+(GEN_STATUS) are in the subscription table this build installs (`sample_defs/tables/cpu1_to_lab_sub.c`) with a
+`BufLimit` of the pipe depth, more than `TO_LAB_ADD_PKT` can carry.
 The layouts are in `apps/ib_test/fsw/src/ib_test.h` and `examples/ccdd/cfs.json`.
+
+`sample_defs/` holds ironbird's cFS configuration: `build.sh` copies each file (subdirectories too) into the
+checkout's `sample_defs/` (it refuses the whole install if any name is a stock file, and removes an earlier run's
+file that is no longer here, tracked in `$CFS_BUILD_DIR/IRONBIRD_SAMPLE_DEFS`), where cFS reads mission overrides.
+`cpu1_osconfig.cmake` raises OSAL's maximum queue depth, `cpu1_to_lab_internal_cfg_values.h` sets TO_LAB's telemetry
+pipe to that depth (1000), and `tables/cpu1_to_lab_sub.c` subscribes the generator's messages with a per-message limit
+of that depth, so the 10k packets/s generator test can be strict; see `NOTES.md` section 8 for the numbers and for the
+`fs.mqueue.msg_max` the host needs.
 
 Behind the agent proxy a failed clone is a proxy problem, see `/root/.ccr/README.md`.
 
