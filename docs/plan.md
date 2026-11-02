@@ -3919,6 +3919,20 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   most); before the bounds the same export peaked at 378 MiB (144 MB waiting) in 17.6 s, and grew with
   the width of the rows and the size of the ranges. The bounds without the shorter ranges (cut and
   continued serially) kept the memory but not the speed: 56 s.
+- **Scan work in the report.** `RecordingReader.scanned` counts the bytes the resync scans read
+  (`find_boundary` and the search after damage; one integer add per block, never reset or seeded),
+  and each `Outcome.scanned` is its range's share, the search for its first record included. The
+  report's `scanned` (`export.pool` in the ledger) sums it over the outcomes the walk received
+  (a range cancelled after the walk ended is not in it). It is the deterministic measure that a
+  guessed range's search stops at its own end: `tests/test_export_pool_cli.py` builds a recording
+  with 8 MiB of zeros in the middle, 600 frames on each side, and asserts `scanned` is at least
+  the zeros and under 2.5 times them (about two times is measured: one scan of the zeros by the range
+  that holds their start, and each range inside them scanning its own length); a search that ignores
+  the limit reads 1.1 GB there. `scanned` leaves out the reads that validate a candidate's chain of
+  records. `tests/test_export_pool.py` runs a worker on every guessed range of a zero tail at the end
+  of the file (a case the walk never waits for, so it is not in the report) and asserts that each
+  range scans no more than its own length and that all of them together scan about the tail once. Wall-clock ratios between a pooled and a single run are not a test of this: they
+  failed on a loaded shared runner.
 - **Output closing and failing.** A worker records the kind of each row it makes (one byte per row; for
   CSV, which table each line went to) and how many rows came before each damage and each GAP record. A
   range that holds damage or gaps, and every range for a destination that takes one line at a time and
@@ -4037,8 +4051,10 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   Review findings of the pull request, each a test that fails on the commit reviewed
   (`tests/test_export_pool_review.py`, `tests/test_export_pool_cli.py`): a range without frames
   resetting the sequence check; the resync budget of an exact read; the boundary scan reading to the
-  end of the file for every range of a zero tail (a 384 MiB zero tail exports in 3.2 s with four workers and
-  3.1 s with one; it took 9.3 s with workers before; a guess also stops at its first damage); an output closing with damage and gaps further on;
+  end of the file for every range of a zero tail (`tests/test_export_pool.py`, a worker on every guessed
+  range of a zero tail at the end of the file, each scanning no more than its own length; a 384 MiB
+  zero tail exports in 3.2 s with four workers and 3.1 s with one; it took 9.3 s with workers before;
+  a guess also stops at its first damage); an output closing with damage and gaps further on;
   results and damage lists without a bound (caps and continuation; a window bounded in bytes as well
   as in ranges; ranges that follow the width of the rows; the wide-row recording's peak RSS); a recording moved during the export; more than 64 cores and a
   cgroup quota; a hangup to the process group. `tests/test_export_pool_fuzz.py` is the differential

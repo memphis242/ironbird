@@ -409,6 +409,8 @@ class Outcome:
     used_streams: list[int] = field(default_factory=list)  # ids the range found in its seed
     used_sources: list[int] = field(default_factory=list)
     work: int = 0  # bytes charged to the resync budget by the range
+    # bytes the range's resync scans read, the search for its first record included
+    scanned: int = 0
     trailer: bool = False
     seen: bool = False  # the parent has learned from its size
     partial: bool = False  # cut short at a cap: the range goes on from ``end``
@@ -519,6 +521,7 @@ class _Worker:
         if reader is None:
             out.moved = True
             return out
+        scanned = reader.scanned
         try:
             seed = job.seed
             reader.seed_state(seed.streams, seed.sources, seed.last_seq, seed.work)
@@ -568,6 +571,7 @@ class _Worker:
             self._collect(shape, pipe, dest, out)
             return out
         finally:
+            out.scanned = reader.scanned - scanned
             if local is None:
                 reader.close()
 
@@ -800,6 +804,7 @@ class PoolReport:
     local: int = 0  # ranges the parent read itself because the file moved from under its name
     max_pending: int = 0  # most ranges submitted and not yet written
     max_text_bytes: int = 0  # most characters of rows held at once, results waiting included
+    scanned: int = 0  # bytes the resync scans of the outcomes the walk received read, in all
 
 
 class Ticket:
@@ -1171,6 +1176,19 @@ def _align_up(value: int) -> int:
     return (value + ALIGN - 1) & ~(ALIGN - 1)
 
 
+def head_seed(reader: RecordingReader, size: int) -> Seed:
+    """The streams and sources the head of the file defines: what the first ranges are seeded
+    with, before the walk has shown what is in force."""
+    streams: dict[int, Stream] = {}
+    sources: dict[int, str] = {}
+    for item in reader.head_records(reader.body_start, size):
+        if item.rtype == RecordType.STREAM:
+            streams[item.value.id] = item.value
+        elif item.rtype == RecordType.SOURCE:
+            sources[item.value[0]] = item.value[1]
+    return Seed(streams, sources, 0, 0)
+
+
 class _Runner:
     """Drives the parts of one replay through the pool and the calling process."""
 
@@ -1264,7 +1282,9 @@ class _Runner:
             assert pool.pending(), "a ticket that is waited for is queued or running"
             pool.poll(WAIT_SLICE_S)
             checkpoint()
-        return ticket.result()
+        outcome = ticket.result()
+        self._report.scanned += outcome.scanned
+        return outcome
 
     # -- the parts --
 
@@ -1321,7 +1341,7 @@ class _Runner:
         options, report = self._options, self._report
         body = reader.body_start
         walk = _Walk(end=body, work=reader.work)  # the work of the single process at this point
-        guess_seed = self._head_seed(reader, size)
+        guess_seed = head_seed(reader, size)
         edges = [body]  # edges[k]: where range k begins; the last range has no edge after it
         last = False  # the last range (it reads to the end of the file) is planned
         jobs: dict[int, Job] = {}
@@ -1467,19 +1487,9 @@ class _Runner:
                     Code.EXP_WORKER,
                     f"{exc}; run the export again, or with --jobs 1 to decode in one process",
                 ) from exc
-        return self._local.run(job, reader)
-
-    def _head_seed(self, reader: RecordingReader, size: int) -> Seed:
-        """The streams and sources the head of the file defines: what the first ranges are
-        seeded with, before the walk has shown what is in force."""
-        streams: dict[int, Stream] = {}
-        sources: dict[int, str] = {}
-        for item in reader.head_records(reader.body_start, size):
-            if item.rtype == RecordType.STREAM:
-                streams[item.value.id] = item.value
-            elif item.rtype == RecordType.SOURCE:
-                sources[item.value[0]] = item.value[1]
-        return Seed(streams, sources, 0, 0)
+        outcome = self._local.run(job, reader)
+        self._report.scanned += outcome.scanned
+        return outcome
 
     @staticmethod
     def _accepted(job: Job, outcome: Outcome, walk: _Walk, limit: int) -> bool:

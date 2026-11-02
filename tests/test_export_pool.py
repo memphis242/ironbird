@@ -23,9 +23,19 @@ from conftest import CORPUS
 from ironbird.config import parse_config
 from ironbird.errors import Code
 from ironbird.recording.export import ExportFormat
-from ironbird.recording.pexport import WINDOW_PER_WORKER, ConfigDefinitions, _Changed
+from ironbird.recording.pexport import (
+    ALIGN,
+    WINDOW_PER_WORKER,
+    ConfigDefinitions,
+    EmbeddedDefinitions,
+    Job,
+    Shape,
+    _Changed,
+    _Worker,
+    head_seed,
+)
 from ironbird.recording.reader import Damage, Item, RecordingReader
-from ironbird.recording.replay import TimeSpec
+from ironbird.recording.replay import Replay, TimeSpec
 from ironbird.recording.writer import RecorderOptions
 from poolutil import (
     RANGE,
@@ -534,3 +544,40 @@ def test_workers_that_cannot_start_are_a_coded_error(
     pooled = run_export(clean, jobs=JOBS, pool=False)
     assert pooled.error is not None and pooled.error[0] == Code.EXP_WORKER.value
     assert "--jobs 1" in pooled.error[1] and "Resource temporarily" in pooled.error[1]
+
+
+def test_every_range_of_a_zero_tail_scans_no_more_than_its_own_length(tmp_path: Path) -> None:
+    """A file that ends in zeros: a worker runs every guessed range from the one holding the start
+    of the zeros to the end of the file. Each range's resync scans stop at its own end, so the
+    scans of all of them come to about the zeros once (a search that runs on to the end of the file
+    for each range reads the whole tail once per range)."""
+    path = clean_recording(tmp_path / "tail.ibrec", 400)
+    data_end = path.stat().st_size
+    tail = 4 << 20
+    length = 32768
+    with open(path, "r+b") as handle:
+        handle.truncate(data_end + tail)
+    replay = Replay([path])
+    try:
+        definitions = EmbeddedDefinitions.of(replay, "")
+    finally:
+        replay.close()
+    worker = _Worker(definitions)
+    shape = Shape(ExportFormat.TEXT, None, frozenset(), None, (), False, False, False, True)
+    with RecordingReader(path, skip_damage=True) as reader:
+        size = reader.size()
+        seed = head_seed(reader, size)
+        identity = reader.identity
+    first = (data_end - length // 2) & ~(ALIGN - 1)  # the range that holds the start of the zeros
+    edges = list(range(first, size, length))
+    total = 0
+    for index, guess in enumerate(edges):
+        stop = edges[index + 1] if index + 1 < len(edges) else None
+        job = Job(
+            index + 1, path, guess, stop, False, seed, None, None, shape, identity, 1 << 30, 1000
+        )
+        outcome = worker.run(job)
+        own = (stop if stop is not None else size) - guess
+        assert outcome.scanned <= own, (index, guess, stop, outcome.scanned, own)
+        total += outcome.scanned
+    assert tail // 2 < total <= tail + length, (total, tail)

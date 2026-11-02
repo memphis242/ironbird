@@ -561,25 +561,33 @@ def test_a_marks_only_stretch_then_a_sequence_reset_exports_the_same_through_the
     assert "IB-REC-007" in codes[0][1] and codes[0][2].count(b"\n") == 300
 
 
-def test_a_long_run_of_zeros_at_the_end_does_not_cost_a_scan_per_range(
+def test_a_long_run_of_zeros_does_not_cost_a_scan_per_range(
     tmp_path: Path, env: dict[str, str]
 ) -> None:
-    """A crash can leave a file extended with zeros. Every range that begins in them looks for a
-    first record; each must give up at the end of its own range, not scan to the end of the file:
-    the pool takes about as long as one process, not a scan of the tail per range as long."""
+    """A crash can leave a file extended with zeros, and records may follow them. Every range that
+    begins in the zeros looks for a first record; each must give up at the end of its own range,
+    not scan on to the records past the zeros: the bytes the scans of the pool read come to a few
+    times the zeros, not the zeros once per range. (Zeros at the very end of the file end the walk
+    at the first of them, so the ranges behind it are never waited for, and what they scan is not
+    in the report.)"""
     config, _, _ = write_config(tmp_path, "[export]\npool_min_bytes = 0\nrange_bytes = 32768\n")
-    rec = clean_recording(tmp_path / "tail.ibrec", 3000)
-    with open(rec, "r+b") as handle:
-        handle.truncate(rec.stat().st_size + (384 << 20))
-    took: dict[str, float] = {}
+    builder = builder_recording(600)
+    zeros = 8 << 20
+    builder.out += bytes(zeros)
+    for seq in range(601, 1201):
+        builder.frame(seq, data=hk(seq), stream=0, source=0, mid=0x890, time_ns=T0 + seq * STEP_NS)
+    rec = write_builder(builder, tmp_path / "zeros.ibrec")
+    done: dict[str, subprocess.CompletedProcess[str]] = {}
     for jobs in ("1", "4"):
-        started = time.monotonic()
         args = ["--format", "text", "-o", str(tmp_path / f"o{jobs}"), "--jobs", jobs]
-        done = ib(tmp_path, env, config, str(rec), "--skip-damage", *args)
-        took[jobs] = time.monotonic() - started
-        assert done.returncode == 5, done.stderr
+        done[jobs] = ib(tmp_path, env, config, str(rec), "--skip-damage", *args)
+    assert done["1"].returncode == done["4"].returncode == 5, (done["1"].stderr, done["4"].stderr)
     assert (tmp_path / "o1").read_bytes() == (tmp_path / "o4").read_bytes()
-    assert took["4"] < 1.5 * took["1"] + 1, took
+    pool = [e for e in ledger_events(tmp_path) if e["event"] == "export.pool"]
+    assert len(pool) == 1 and pool[0]["ranges"] > zeros // 32768 // 2, pool
+    # The range holding the start of the zeros finds the next record by one scan of them, and
+    # each range inside them scans its own length: about twice the zeros are scanned.
+    assert zeros <= pool[0]["scanned"] < 2.5 * zeros, (pool[0]["scanned"], zeros)
 
 
 def test_wide_rows_do_not_grow_the_memory_of_the_export(
