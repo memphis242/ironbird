@@ -168,6 +168,64 @@ int main(void)
     CHECK(Tick() == IB_TEST_GEN_MAX_BURST, "burst cap");
     CHECK(gen->MaxBurst == IB_TEST_GEN_MAX_BURST, "MaxBurst %u", (unsigned)gen->MaxBurst);
 
+    /* At the 1k/s floor, a generator descheduled for 15 ms (a stall after which a 16-packet
+     * catch-up burst overflowed TO_LAB's 10-deep pipe) catches up two packets per tick, never more
+     * than the pipe holds beside its reserve, and is on schedule again once the backlog is out. */
+    StartRun(IB_TEST_GEN_FLOOR_RATE, 0, 0, 0);
+    fake_now_ns = 0;
+    CHECK(Tick() == 1, "the floor run's first packet");
+    fake_now_ns += 15 * 1000000LL; /* 15 packets due */
+    {
+        int caught_up = -1;
+
+        for (i = 0; i < 100; i++)
+        {
+            const unsigned long n = Tick();
+
+            CHECK(n <= IB_TEST_GEN_MIN_PIPE_DEPTH - IB_TEST_GEN_PIPE_RESERVE,
+                  "floor tick %d published %lu, above the pipe's room", i, n);
+            CHECK(n <= IB_TEST_GEN_BURST_LIMIT(IB_TEST_GEN_FLOOR_RATE), "floor tick %d published %lu", i,
+                  n);
+            if (caught_up >= 0)
+            {
+                CHECK(n == 1, "on schedule again, floor tick %d published %lu", i, n);
+            }
+            else if (gen->Sent == IB_TEST_GenDue(fake_now_ns, gen->Rate))
+            {
+                caught_up = i;
+            }
+            fake_now_ns += 1000000;
+        }
+        CHECK(caught_up >= 0 && caught_up <= 16, "the 15 ms backlog took %d ticks", caught_up);
+        CHECK(gen->MaxBurst == IB_TEST_GEN_BURST_LIMIT(IB_TEST_GEN_FLOOR_RATE), "floor MaxBurst %u",
+              (unsigned)gen->MaxBurst);
+    }
+
+    /* At every rate a late tick publishes the run's limit: more than one tick's share (so a
+     * backlog shrinks), never above IB_TEST_GEN_MAX_BURST, and within the pipe's room up to the
+     * floor. */
+    {
+        const uint32 rates[] = {1, 7, 999, 1000, 1001, 4000, 5000, 9999, 10000};
+        size_t       r;
+
+        for (r = 0; r < sizeof(rates) / sizeof(rates[0]); r++)
+        {
+            const unsigned long limit = IB_TEST_GEN_BURST_LIMIT(rates[r]);
+            unsigned long       n;
+
+            StartRun(rates[r], 0, 1, 0);
+            fake_now_ns = 1000LL * 1000000LL; /* a second late: rates[r] packets due */
+            n           = Tick();
+            CHECK(n == (limit < rates[r] ? limit : rates[r]), "late tick at %u/s published %lu",
+                  (unsigned)rates[r], n);
+            CHECK(limit > IB_TEST_GEN_TICK_SHARE(rates[r]) && limit <= IB_TEST_GEN_MAX_BURST,
+                  "limit %lu at %u/s", limit, (unsigned)rates[r]);
+            CHECK(rates[r] > IB_TEST_GEN_FLOOR_RATE ||
+                      limit <= IB_TEST_GEN_MIN_PIPE_DEPTH - IB_TEST_GEN_PIPE_RESERVE,
+                  "limit %lu at %u/s is above the pipe's room", limit, (unsigned)rates[r]);
+        }
+    }
+
     /* A counted run publishes exactly Count packets and finishes. */
     StartRun(10000, 25, 0, fake_now_ns);
     for (i = 0; i < 10 && gen->State == IB_TEST_GEN_STATE_RUNNING; i++)

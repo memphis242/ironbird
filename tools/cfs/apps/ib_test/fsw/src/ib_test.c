@@ -7,6 +7,7 @@
  */
 #include "ib_test.h"
 
+#include <assert.h>
 #include <string.h>
 
 IB_TEST_Data_t IB_TEST_Data;
@@ -109,20 +110,28 @@ static uint64 IB_TEST_GenDue(int64 elapsed_ns, uint32 rate)
     return due;
 }
 
-/* One tick of a running generator: the packets due since the run began, at most one burst. The
- * schedule is the run's start time and its Rate, so a late tick catches up on the next ones
- * instead of shifting the rate. The caller holds Gen.Lock. */
+/* One tick of a running generator: the packets due since the run began, at most the run's burst
+ * limit (IB_TEST_GEN_BURST_LIMIT, see ib_test.h: what TO_LAB's pipe holds). The schedule is the
+ * run's start time and its Rate, so a late tick catches up on the next ones instead of shifting the
+ * rate. The caller holds Gen.Lock. */
 static void IB_TEST_GenTickLocked(void)
 {
     IB_TEST_Gen_t *gen   = &IB_TEST_Data.Gen;
-    uint64         due   = IB_TEST_GenDue(IB_TEST_NowNs() - gen->StartNs, gen->Rate);
+    uint64         due   = 0;
+    uint32         limit = 0;
     uint32         burst = 0;
+
+    /* GEN_START admits only rates in 1..IB_TEST_GEN_MAX_RATE */
+    assert(gen->Rate >= 1 && gen->Rate <= IB_TEST_GEN_MAX_RATE);
+    due   = IB_TEST_GenDue(IB_TEST_NowNs() - gen->StartNs, gen->Rate);
+    limit = IB_TEST_GEN_BURST_LIMIT(gen->Rate);
+    assert(limit > IB_TEST_GEN_TICK_SHARE(gen->Rate) && limit <= IB_TEST_GEN_MAX_BURST);
 
     if (gen->Target != 0 && due > gen->Target)
     {
         due = gen->Target;
     }
-    while (gen->Sent < due && burst < IB_TEST_GEN_MAX_BURST)
+    while (gen->Sent < due && burst < limit)
     {
         IB_TEST_GenPublishOneLocked();
         burst++;

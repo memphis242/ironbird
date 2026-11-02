@@ -3732,8 +3732,8 @@ Built (all items below are done; the differences from the first design are state
   stopped), `GEN_STOP` (fc 5) and `GEN_SEND_STATUS` (fc 6) drive a child task that publishes `IB_TEST_GEN`
   (MID `0x08E2`, 200 bytes: `Serial`, `Run`, `Fill[176]` with `Fill[i] = Serial + i`) on a 1 ms tick from the
   run's start time and rate, read from `CFE_PSP_GetTime` (the platform timebase, `CLOCK_MONOTONIC` on the Linux
-  PSP, so a wall-clock step cannot move the schedule; a late tick catches up, at most 16 packets per tick) and
-  `IB_TEST_GEN_STATUS`
+  PSP, so a wall-clock step cannot move the schedule; a late tick catches up, at most two ticks' share of
+  the rate per tick and never more than 16, so at most 2 at the 1k packets/s floor) and `IB_TEST_GEN_STATUS`
   (`0x08E3`: run, rate, target, sent, state, largest burst) when a run ends. A run is refused while another is
   on; the rate, the sizes and the state are checked like every other command, with the app's rejection event
   (`got N, limit M`). Packets go out with the generator's mutex held, so a command sees whole bursts and the
@@ -3743,26 +3743,53 @@ Built (all items below are done; the differences from the first design are state
   21 days, both found in review); `Serial` and the status `Sent` stay `uint32` and wrap to 0 by design.
   The command pipe's subscriptions use `CFE_SB_SubscribeEx` with the message limit equal to the pipe depth (32;
   the software bus default of 4 was overrun by a burst of commands while the pipe had room), asserted at
-  compile time. `ib_test.h` asserts the layout at compile time (sizes, offsets, burst against the
-  pipe depth, rate against the tick, the 64-bit schedule products, the message limit),
+  compile time. `ib_test.h` asserts the layout at compile time (sizes, offsets, the floor's burst against the
+  shallowest pipe it is designed for, catch-up at every rate, rate against the tick, the 64-bit schedule
+  products, the message limit),
   `tests/cfs/test_generator_schedule.py` runs the real tick code on the host against a fake clock across both
   wraps (the harness `ib_test_schedule_harness.c` includes `ib_test.c`; it needs the cFS headers, not cFS
   running), and `tests/test_ib_test_layout.py` checks the header's topic IDs,
   function codes and sizes against `examples/ccdd/cfs.json` without building cFS. The messages were added to
   `examples/ccdd/cfs.json`, which stands in for the CCDD (this repository has no CSV sources or generator for
-  it; the JSON is the maintained file). `tests/cfs/test_cfs_generator.py`: 3000 packets at 1k/s reach the
-  recording exactly (all serials, in order, fills right, sequence counts consecutive, zero SB overflow); the
+  it; the JSON is the maintained file). `tests/cfs/test_cfs_generator.py`: of 3000 packets at 1k/s ironbird
+  loses none (no GAP of any reason, every serial once and in order, fills right, sequence counts advancing by exactly the
+  serials missing), the run's largest burst fits the pipe, and a packet missing is one cFS's
+  software bus dropped and counted (see the finding below); the
   commands are validated, and a GEN_START, GEN_STOP or GEN_SEND_STATUS whose header claims too few bytes is
   rejected, counted and not run; at 10k/s nothing is lost silently by ironbird (none repeated or out of order, no
   recorder-buffer or capture-queue loss, and every missing packet is accounted for by cFS's SB overflow counter or
   by a `kernel_drop` GAP record in the recording; the exact zero-kernel-drop check on an otherwise idle host is the
-  throughput gate's, since a loaded CI runner can drop datagrams in the kernel). Measured finding: the stock TO_LAB forwards through a
-  telemetry pipe of depth 50 (`OS_QUEUE_MAX_DEPTH`, subscription limit at most 49), and at 10k packets/s the
-  software bus overflows it when TO_LAB's task is off-CPU for a few milliseconds (28,886 of 30,000 recorded on
-  the development host); every missing packet is counted by SB housekeeping (`PipeOverflowErrorCounter`
-  grew by 1,121 for the 1,114 missing), which the test uses to tell cFS's loss from ironbird's. A cFS source
-  that is lossless at 10k packets/s needs a deeper pipe (`OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's
-  `TLM_PIPE_DEPTH`), a platform configuration change that is not made here (deferred).
+  throughput gate's, since a loaded CI runner can drop datagrams in the kernel). Measured finding: the stock TO_LAB asks for a
+  telemetry pipe of depth 50 (`OS_QUEUE_MAX_DEPTH`, subscription limit at most 49), but the pipe it gets is
+  truncated (below), and at 10k packets/s the software bus overflows a 10-deep pipe when TO_LAB's task is off-CPU
+  for a millisecond or so (28,886 of 30,000 recorded on the development host); every missing packet is counted by
+  SB housekeeping (`PipeOverflowErrorCounter` grew by 1,121 for the 1,114 missing), which the test uses to tell
+  cFS's loss from ironbird's. With `fs.mqueue.msg_max` raised to at least 50 (`unshare --ipc`, `msg_max` 64) the
+  stock 50-deep pipe is lossless at 10k packets/s (0 of 30,000 missing, 3 of 3 runs): no cFS configuration change
+  is needed, only that host setting.
+  Found later (a 1k/s run that lost 25 and one that lost 3 on a loaded 4-core host): the pipe is not
+  50 deep on the native target. OSAL in permissive mode truncates every queue a non-root cFS creates to
+  `/proc/sys/fs/mqueue/msg_max`, 10 by default on Linux (a fresh IPC namespace, such as a container's,
+  starts there too; the cFS console prints `Maximum user msg queue depth = 10`), so at 1k packets/s
+  TO_LAB's pipe covers 10 ms. Reproduced by descheduling one cFS thread (pinned to a CPU with a `SCHED_FIFO` busy loop, 15 ms
+  every 200 ms): with the generator's thread stalled, its 16-packet catch-up burst overflowed the pipe
+  while TO_LAB ran (68-70 of 3000 lost per run, `Pipe Overflow,MsgId 0x8e2,pipe TO_LAB_TLM_PIPE`, every
+  one counted by SB, none lost by ironbird); with TO_LAB's thread stalled, the 15 packets due overran
+  the 10 slots (67-69 lost, likewise counted). Fixed for the generator: a tick publishes at most
+  `IB_TEST_GEN_CATCHUP_TICKS` (2) ticks' share of the rate (`IB_TEST_GEN_BURST_LIMIT`), which at the floor
+  fits the shallowest pipe it is designed for (`IB_TEST_GEN_MIN_PIPE_DEPTH` 10, less
+  `IB_TEST_GEN_PIPE_RESERVE` 2 for the other telemetry), asserted at compile time and in the host harness;
+  the same generator stall then loses nothing (largest burst 2). The 1k test checks the pipe's depth
+  from that console line and fails, with what to raise, below 10 (or, naming the missing line, when the cFS build prints none). TO_LAB itself off-CPU for longer than
+  its pipe covers is a host-scheduling loss inside cFS that ironbird cannot prevent; the test requires
+  every such packet to be counted by SB (`PipeOverflowErrorCounter`) and keeps ironbird's side exact.
+  Remedy for a source lossless under host load (1k/s with a stalled TO_LAB, and 10k/s): raise
+  `fs.mqueue.msg_max` to at least 50 on the host, so the 50-deep pipe cFE asks for is kept (a host setting;
+  alternatively a user+IPC namespace whose own `msg_max` is raised, which works unprivileged on recent kernels
+  but not under Ubuntu's user-namespace restriction, Docker's default seccomp profile or an EL8 kernel).
+  No cFS configuration change is needed; the 10k test accounts for any loss on a default host through the SB
+  counter. Deferred: a pipe deeper than 50 (`OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's `TLM_PIPE_DEPTH`), which
+  nothing measured needs.
 - Throughput gate (`tests/bench/`, `gate.py`, `blaster.py`, `test_throughput_gate.py`). The blaster is a
   separate process that sends 200-byte valid telemetry (`GATE_TLM`: `uint32 serial` plus a string) to the
   recorder's UDP port on an absolute schedule (a late slot is followed by catch-up bursts of at most 64
