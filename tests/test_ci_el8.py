@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -454,12 +455,13 @@ def test_workflow_check_catches_privilege_regressions(mutation: str) -> None:
 
 TO_LAB_VALUES = REPO / "tools" / "cfs" / "sample_defs" / "cpu1_to_lab_internal_cfg_values.h"
 REQUIRE_FULL_DEPTH_ENV = "IRONBIRD_CFS_REQUIRE_FULL_DEPTH"
+CFS_ENV = "IRONBIRD_CFS"
 _pipe_depth = re.search(
     r"^#define\s+IRONBIRD_TO_LAB_CFGVAL_TLM_PIPE_DEPTH\s+(\d+)\b", TO_LAB_VALUES.read_text(), re.M
 )
 assert _pipe_depth is not None, f"TO_LAB's telemetry pipe depth not defined in {TO_LAB_VALUES}"
 MIN_MSG_MAX = int(_pipe_depth.group(1))  # the depth TO_LAB asks for
-_SYSCTL_OPTION = re.compile(r"(?:^|\s)--sysctl[= ]fs\.mqueue\.msg_max=(\d+)(?=\s|$)")
+_MSG_MAX_SETTING = re.compile(r"fs\.mqueue\.msg_max=(\d+)")
 # the step fails when the value read back from /proc is below the threshold (captured)
 _MSG_MAX_READ_BACK = re.compile(
     r"^\s*test \"\$\(cat /proc/sys/fs/mqueue/msg_max\)\" -ge (\d+)\s*$", re.M
@@ -473,6 +475,83 @@ _SHELL_OPTIONS_OFF = re.compile(r"^\s*set\s+\+", re.M)
 # step or job keys that let a failing (or never-run) step go unnoticed
 _BYPASS_KEYS = ("if", "continue-on-error", "shell")
 EL8_TESTS_CONDITION = "steps.setup.outputs.ready == 'true'"
+
+
+def _container_msg_max_values(options: str) -> tuple[list[int], bool]:
+    """The ``fs.mqueue.msg_max`` values that ``docker create`` options set through ``--sysctl``
+    (``--sysctl K=V``, ``--sysctl=K=V``, quoted or not) and whether every mention of msg_max in
+    ``options`` was one of those."""
+    try:
+        words = shlex.split(options)
+    except ValueError:
+        return [], False
+    values: list[int] = []
+    for i, word in enumerate(words):
+        if word == "--sysctl" and i + 1 < len(words):
+            setting = words[i + 1]
+        elif word.startswith("--sysctl="):
+            setting = word[len("--sysctl=") :]
+        else:
+            continue
+        match = _MSG_MAX_SETTING.fullmatch(setting)
+        if match is not None:
+            values.append(int(match.group(1)))
+    return values, len(values) == options.count("msg_max")
+
+
+def _runs_pytest(run: str) -> bool:
+    return re.search(r"\bpytest\b", run) is not None
+
+
+# The one way the real-cFS tests may be started: no selection (-k, --deselect, a narrower -m or
+# path), no plugin or capture switches, no early stop, nothing before or after the command.
+_CFS_TEST_COMMAND = ["pytest", "tests/cfs", "-m", "cfs", "-n0", "-v", "-rP"]
+_BASETEMP_OPTION = re.compile(r"--basetemp=[\w$/.{}-]+")
+# `env` options and assignments that the el8-cfs default shell may carry
+_SHELL_ENV_NAMES = frozenset({"HOME", "USER", "LOGNAME", "PATH"})
+
+
+def _test_command_violations(label: str, name: str, run: str) -> list[str]:
+    lines = [line for _, line in _logical_lines(run)]
+    problems: list[str] = []
+    if lines[:-1] != ([ID_CHECK] if name == "el8-cfs" else []):
+        problems.append(f"{label}: the step runs more than the cFS test command")
+    lexer = shlex.shlex(lines[-1] if lines else "", posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        tokens = []
+    expected = len(_CFS_TEST_COMMAND) + 1
+    if not (
+        len(tokens) == expected
+        and tokens[: expected - 1] == _CFS_TEST_COMMAND
+        and _BASETEMP_OPTION.fullmatch(tokens[-1])
+    ):
+        problems.append(
+            f"{label}: the test command is not exactly '{' '.join(_CFS_TEST_COMMAND)} "
+            f"--basetemp=DIR' (got {lines[-1] if lines else ''!r})"
+        )
+    return problems
+
+
+def _shell_env_violations(shell: str) -> list[str]:
+    """The el8-cfs default shell may set only HOME, USER, LOGNAME and PATH through ``env``; an
+    option (``-i``, ``-u``, ``-S``, ``-C``) or any other name could clear or change the variables
+    the tests are configured with."""
+    words = shell.split()
+    if words.count("env") != 1:
+        return [
+            f"el8-cfs: the default shell must use env exactly once (found {words.count('env')})"
+        ]
+    problems: list[str] = []
+    for word in words[words.index("env") + 1 :]:
+        if word == "bash":
+            break
+        name, equals, _ = word.partition("=")
+        if not equals or name not in _SHELL_ENV_NAMES:
+            problems.append(f"el8-cfs: the default shell's env has unexpected argument {word!r}")
+    return problems
 
 
 def _report_chars(command: str) -> str | None:
@@ -501,17 +580,26 @@ def _default_shell(container: dict[str, Any]) -> object:
     return run.get("shell") if isinstance(run, dict) else None
 
 
+def _env_of(container: dict[str, Any]) -> dict[str, Any]:
+    """``env`` of a workflow or a job, or an empty dict."""
+    env = container.get("env")
+    return env if isinstance(env, dict) else {}
+
+
 def _cfs_job_violations(name: str, job: dict[str, Any], workflow: dict[str, Any]) -> list[str]:
     """What can skip, soften or hide the real-cFS test step of the job ``name``."""
     problems: list[str] = []
+    workflow_env, job_env = _env_of(workflow), _env_of(job)
     if _default_shell(workflow) is not None:
         problems.append(f"{name}: the workflow sets defaults.run.shell")
     if "continue-on-error" in job:
         problems.append(f"{name}: the job sets continue-on-error")
-    if job.get("env", {}).get(REQUIRE_FULL_DEPTH_ENV) != "1":
+    if job_env.get(REQUIRE_FULL_DEPTH_ENV) != "1":
         problems.append(f"{name}: env {REQUIRE_FULL_DEPTH_ENV} must be the string '1'")
-    if "PYTEST_ADDOPTS" in job.get("env", {}):
-        problems.append(f"{name}: the job env sets PYTEST_ADDOPTS, which can change -r or -k")
+    for scope, env in (("workflow", workflow_env), (f"{name} job", job_env)):
+        for key in env:
+            if str(key).startswith("PYTEST_"):
+                problems.append(f"{scope} env sets {key}, which can change what pytest runs")
     shell = _default_shell(job)
     if name == "cfs" and shell is not None:
         problems.append("cfs: the job sets defaults.run.shell, which can lose errexit")
@@ -519,13 +607,19 @@ def _cfs_job_violations(name: str, job: dict[str, Any], workflow: dict[str, Any]
         not isinstance(shell, str) or not any(re.fullmatch(r"-\w*e\w*", w) for w in shell.split())
     ):
         problems.append("el8-cfs: the default shell does not run with errexit (-e)")
+    if name == "el8-cfs" and isinstance(shell, str):
+        problems += _shell_env_violations(shell)
     for step in _steps(job):
         label = f"{name}/{step.get('name', step.get('uses'))}"
         step_env = step.get("env", {})
-        if isinstance(step_env, dict) and step_env.get(REQUIRE_FULL_DEPTH_ENV, "1") != "1":
-            problems.append(f"{label}: the step overrides {REQUIRE_FULL_DEPTH_ENV}")
-        if isinstance(step_env, dict) and "PYTEST_ADDOPTS" in step_env:
-            problems.append(f"{label}: the step env sets PYTEST_ADDOPTS")
+        if not isinstance(step_env, dict):
+            step_env = {}
+        for key in (REQUIRE_FULL_DEPTH_ENV, CFS_ENV):
+            if step_env.get(key, "1") != "1":
+                problems.append(f"{label}: the step overrides {key}")
+        for key in step_env:
+            if str(key).startswith("PYTEST_"):
+                problems.append(f"{label}: the step env sets {key}")
         run = str(step.get("run", ""))
         if REQUIRE_FULL_DEPTH_ENV in run or "PYTEST_ADDOPTS" in run:
             problems.append(
@@ -534,7 +628,7 @@ def _cfs_job_violations(name: str, job: dict[str, Any], workflow: dict[str, Any]
         if _SHELL_OPTIONS_OFF.search(run):
             problems.append(f"{label}: the script turns shell options off (set +...)")
         for line in run.splitlines():
-            if "msg_max" not in line:
+            if "msg_max" not in line and not re.search(r"\bsysctl\b", line):
                 continue
             command = _SYSCTL_COMMAND.fullmatch(line.strip())
             if command is not None:
@@ -542,8 +636,13 @@ def _cfs_job_violations(name: str, job: dict[str, Any], workflow: dict[str, Any]
                     problems.append(f"{label}: sysctl sets fs.mqueue.msg_max below {MIN_MSG_MAX}")
             elif not (_MSG_MAX_READ_BACK.fullmatch(line) or _MSG_MAX_ECHO.fullmatch(line)):
                 problems.append(f"{label}: unrecognised use of msg_max: {line.strip()!r}")
-        if "pytest tests/cfs" not in run:
+        if not _runs_pytest(run):
             continue
+        problems += _test_command_violations(label, name, run)
+        for key in (REQUIRE_FULL_DEPTH_ENV, CFS_ENV):
+            effective = step_env.get(key, job_env.get(key, workflow_env.get(key)))
+            if effective != "1":
+                problems.append(f"{label}: {key} is not the string '1' for the cFS test step")
         condition = step.get("if")
         if name == "cfs" and condition is not None:
             problems.append(f"{label}: the cFS test step has an if ({condition!r})")
@@ -563,23 +662,27 @@ def _msg_max_violations(text: str) -> list[str]:
     """Everything wrong with how the real-cFS jobs set ``fs.mqueue.msg_max``; empty if sound."""
     jobs = _jobs(_load(text))
     problems: list[str] = []
+    # `run: ! cmd` parses to the same string as `run: cmd` but is not what a reader sees.
+    tagged = sorted({str(e.tag) for e in yaml.parse(text) if getattr(e, "tag", None) is not None})
+    if tagged:
+        problems.append(f"the workflow uses explicit YAML tags {tagged}")
 
     container = jobs["el8-cfs"].get("container")
     options = container.get("options", "") if isinstance(container, dict) else ""
-    values = [int(v) for v in _SYSCTL_OPTION.findall(str(options))]
-    if not values or min(values) < MIN_MSG_MAX:
+    values, understood = _container_msg_max_values(str(options))
+    if not values or min(values) < MIN_MSG_MAX or not understood:
         problems.append(
             f"el8-cfs: container options lack --sysctl fs.mqueue.msg_max>={MIN_MSG_MAX} "
-            f"(every value must; found {values})"
+            f"(every value must, and every mention must be a plain --sysctl; found {values})"
         )
 
     workflow = _load(text)
     for name in ("cfs", "el8-cfs"):
         job = jobs[name]
         problems += _cfs_job_violations(name, job, workflow)
-        tests = [s for s in _steps(job) if "pytest tests/cfs" in str(s.get("run", ""))]
+        tests = [s for s in _steps(job) if _runs_pytest(str(s.get("run", "")))]
         if len(tests) != 1:
-            problems.append(f"{name}: expected one 'pytest tests/cfs' step, found {len(tests)}")
+            problems.append(f"{name}: expected one pytest step, found {len(tests)}")
 
     steps = _steps(jobs["cfs"])
     runs = [str(step.get("run", "")) for step in steps]
@@ -588,7 +691,7 @@ def _msg_max_violations(text: str) -> list[str]:
         for i, run in enumerate(runs)
         if (m := _SYSCTL_COMMAND.search(run)) and int(m.group(1)) >= MIN_MSG_MAX
     ]
-    ran = [i for i, run in enumerate(runs) if "pytest tests/cfs" in run]
+    ran = [i for i, run in enumerate(runs) if _runs_pytest(run)]
     if not raised:
         problems.append(f"cfs: no step runs sudo sysctl -w fs.mqueue.msg_max>={MIN_MSG_MAX}")
     elif not ran or raised[0] > ran[0]:
@@ -619,6 +722,9 @@ _READ_BACK = '          test "$(cat /proc/sys/fs/mqueue/msg_max)" -ge 1000\n'
 _SYSCTL_COMMAND_LINE = "          sudo sysctl -w fs.mqueue.msg_max=65536\n"
 _CFS_TESTS_STEP = "      - name: Real-cFS acceptance tests\n"
 _EL8_TESTS_STEP = "      - name: Real-cFS acceptance tests as a non-root user\n"
+
+_CFS_RUN = 'run: pytest tests/cfs -m cfs -n0 -v -rP --basetemp="$RUNNER_TEMP/pytest"'
+_EL8_RUN = '          pytest tests/cfs -m cfs -n0 -v -rP --basetemp="$HOME/pytest-cfs"'
 
 MSG_MAX_MUTATIONS: dict[str, Callable[[str], str]] = {
     "container sysctl removed": _replace_once(" --sysctl fs.mqueue.msg_max=65536", ""),
@@ -760,6 +866,81 @@ MSG_MAX_MUTATIONS: dict[str, Callable[[str], str]] = {
     ),
     "el8-cfs tests set PYTEST_ADDOPTS inline": _replace_once(
         "          pytest tests/cfs", "          PYTEST_ADDOPTS=-rN pytest tests/cfs"
+    ),
+    "cfs tests deselected with -k": _replace_once(_CFS_RUN, _CFS_RUN + ' -k "not ten_thousand"'),
+    "el8-cfs tests deselected with -k": _replace_once(_EL8_RUN, _EL8_RUN + " -k generator"),
+    "cfs tests --deselect": _replace_once(
+        _CFS_RUN, _CFS_RUN + " --deselect tests/cfs/test_cfs_generator.py"
+    ),
+    "el8-cfs tests --deselect": _replace_once(
+        _EL8_RUN, _EL8_RUN + " --deselect=tests/cfs/test_cfs_generator.py"
+    ),
+    "cfs tests --show-capture=no": _replace_once(_CFS_RUN, _CFS_RUN + " --show-capture=no"),
+    "el8-cfs tests --show-capture=no": _replace_once(_EL8_RUN, _EL8_RUN + " --show-capture no"),
+    "cfs tests narrow -m": _replace_once(
+        '-m cfs -n0 -v -rP --basetemp="$RUNNER',
+        "-m 'cfs and not slow' -n0 -v -rP --basetemp=\"$RUNNER",
+    ),
+    "el8-cfs tests narrow -m": _replace_once(_EL8_RUN, _EL8_RUN.replace("-m cfs", "-m 'not slow'")),
+    "cfs tests run another path": _replace_once(
+        _CFS_RUN, _CFS_RUN.replace("tests/cfs", "tests/cfs/test_cfs_smoke.py")
+    ),
+    "cfs tests run through python -m": _replace_once(
+        _CFS_RUN, _CFS_RUN.replace("pytest tests", "python -m pytest tests")
+    ),
+    "cfs tests stop at the first failure": _replace_once(_CFS_RUN, _CFS_RUN + " -x"),
+    "cfs tests disable a plugin": _replace_once(_CFS_RUN, _CFS_RUN + " -p no:terminal"),
+    "cfs tests followed by ; true": _replace_once(_CFS_RUN, _CFS_RUN + "; true"),
+    "cfs tests negated with a YAML tag": _replace_once(
+        _CFS_RUN, _CFS_RUN.replace("run: ", "run: ! ")
+    ),
+    "el8-cfs tests behind env -i": _replace_once(
+        _EL8_RUN, _EL8_RUN.replace("pytest", 'env -i PATH="$PATH" HOME="$HOME" pytest')
+    ),
+    "el8-cfs tests behind env -u": _replace_once(
+        _EL8_RUN, _EL8_RUN.replace("pytest", "env -u IRONBIRD_CFS pytest")
+    ),
+    "el8-cfs default shell clears the environment": _replace_last(
+        "env HOME=/home/ci USER=ci", "env -i HOME=/home/ci USER=ci"
+    ),
+    "el8-cfs default shell unsets IRONBIRD_CFS": _replace_last(
+        "env HOME=/home/ci USER=ci", "env -u IRONBIRD_CFS HOME=/home/ci USER=ci"
+    ),
+    "el8-cfs default shell sets IRONBIRD_CFS": _replace_last(
+        "env HOME=/home/ci USER=ci", "env IRONBIRD_CFS=0 HOME=/home/ci USER=ci"
+    ),
+    "quoted second container sysctl lowers it": _replace_once(
+        "--sysctl fs.mqueue.msg_max=65536\n",
+        '--sysctl fs.mqueue.msg_max=65536 --sysctl "fs.mqueue.msg_max=10"\n',
+    ),
+    "quoted only container sysctl too small": _replace_once(
+        "--sysctl fs.mqueue.msg_max=65536\n", "--sysctl 'fs.mqueue.msg_max=10'\n"
+    ),
+    "=-form container sysctl lowers it": _replace_once(
+        "--sysctl fs.mqueue.msg_max=65536\n",
+        "--sysctl fs.mqueue.msg_max=65536 --sysctl=fs.mqueue.msg_max=10\n",
+    ),
+    "sysctl -p in the ubuntu job": _replace_once(
+        _SYSCTL_COMMAND_LINE, _SYSCTL_COMMAND_LINE + "          sudo sysctl -p /etc/lower.conf\n"
+    ),
+    "sysctl --system in the ubuntu job": _replace_once(
+        _SYSCTL_COMMAND_LINE, _SYSCTL_COMMAND_LINE + "          sudo sysctl --system\n"
+    ),
+    "sysctl in another ubuntu step": _replace_once(
+        _CFS_TESTS_STEP, "      - name: Tune\n        run: sudo sysctl -p\n" + _CFS_TESTS_STEP
+    ),
+    "cfs tests step overrides IRONBIRD_CFS": _replace_once(
+        _CFS_TESTS_STEP + '        env:\n          IRONBIRD_CFS: "1"\n',
+        _CFS_TESTS_STEP + '        env:\n          IRONBIRD_CFS: "0"\n',
+    ),
+    "cfs tests step lacks IRONBIRD_CFS": _replace_once(
+        _CFS_TESTS_STEP + '        env:\n          IRONBIRD_CFS: "1"\n', _CFS_TESTS_STEP
+    ),
+    "el8-cfs tests step overrides IRONBIRD_CFS": _replace_once(
+        _EL8_TESTS_STEP, _EL8_TESTS_STEP + '        env:\n          IRONBIRD_CFS: "0"\n'
+    ),
+    "workflow env sets PYTEST_PLUGINS": _replace_once(
+        "\njobs:\n", "\nenv:\n  PYTEST_PLUGINS: x\n\njobs:\n"
     ),
     "cfs tests followed by || true": _replace_once(
         '--basetemp="$RUNNER_TEMP/pytest"', '--basetemp="$RUNNER_TEMP/pytest" || true'

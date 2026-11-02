@@ -3806,7 +3806,10 @@ Built (all items below are done; the differences from the first design are state
   The build deepens the pipe: `tools/cfs/build.sh` copies `tools/cfs/sample_defs/` into the checkout's
   `sample_defs/`, the mission directory cFS reads its overrides from (never editing a stock file; it checks every name against the checkout's tracked files before copying any, and
   removes an earlier run's override that is no longer in `tools/cfs/sample_defs`, tracked in a manifest in the build
-  directory, so a rebuild matches a fresh build). `cpu1_osconfig.cmake` sets `OSAL_CONFIG_QUEUE_MAX_DEPTH` 1000 (OSAL's cap, and so the
+  directory, so a rebuild matches a fresh build; it refuses symlinks, control characters and paths
+  leaving `sample_defs/`, and writes the manifest before copying so an interrupted copy is still
+  cleaned up; deferred: the app copy into `apps/<app>` is not hardened against symlinks the same
+  way). `cpu1_osconfig.cmake` sets `OSAL_CONFIG_QUEUE_MAX_DEPTH` 1000 (OSAL's cap, and so the
   deepest SB pipe), and `cpu1_to_lab_internal_cfg_values.h` sets `TO_LAB_PLATFORM_TLM_PIPE_DEPTH` 1000, checked
   against OSAL's cap at compile time. TO_LAB then asks for a pipe that holds 100 ms of 10k packets/s, and the
   generator tests read that depth from the build tree (not a constant). A subscription's own limit is a

@@ -304,15 +304,9 @@ def test_a_recorder_killed_mid_capture_leaves_a_recording_that_replays_and_repai
     env = _env(_recording_config(tmp_path))
     torn = tmp_path / "killed.ibrec"
     err_path = tmp_path / "record.stderr"
-    for mid in (IB_TEST_GEN_MID, IB_TEST_GEN_MID + 1):
-        g.send(
-            "TO_LAB_ADD_PKT",
-            f"Stream={mid:#x}",
-            "QosPriority=0",
-            "QosReliability=0",
-            "BufLimit=49",
-            "Padding=00",
-        )
+    # The generator's MIDs are already in TO_LAB's subscription table, so no command is needed
+    # (and a re-subscription would be rejected and counted as a TO_LAB command error).
+    to_lab_errors = g.fresh("TO_LAB_HK", "TO_LAB_SEND_HK")["CommandErrorCounter"]
     with g.listener_paused(), err_path.open("w") as err:
         recorder = subprocess.Popen(
             [*IB, "record", "-o", str(torn), "--quiet"], stderr=err, env=env
@@ -333,6 +327,7 @@ def test_a_recorder_killed_mid_capture_leaves_a_recording_that_replays_and_repai
                 recorder.kill()
                 recorder.wait(timeout=10)
             g.send("IB_TEST_GEN_STOP", check=False)
+    assert g.fresh("TO_LAB_HK", "TO_LAB_SEND_HK")["CommandErrorCounter"] == to_lab_errors
 
     # SIGKILL stops the process between two writes, so the file ends on a record boundary: no
     # trailer, nothing cut. A power loss can also cut a record in two; that is a copy of the same
