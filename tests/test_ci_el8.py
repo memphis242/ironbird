@@ -433,3 +433,76 @@ def test_workflow_check_catches_privilege_regressions(mutation: str) -> None:
     mutated = MUTATIONS[mutation](WORKFLOW.read_text())
     assert mutated != WORKFLOW.read_text()
     assert _workflow_violations(mutated), f"not caught: {mutation}"
+
+
+# --- fs.mqueue.msg_max for the real-cFS jobs ---------------------------------------------------
+# A non-root cFS has OSAL truncate every queue to fs.mqueue.msg_max (10 by default), so TO_LAB's
+# 50-deep telemetry pipe would be 10 deep and the generator tests (tests/cfs/test_cfs_generator.py,
+# strict at a depth of at least 50) would run in their lenient mode. Every job that runs real cFS
+# must therefore raise it, and a dropped line must not go unnoticed.
+
+MIN_MSG_MAX = 50  # TO_LAB's TLM pipe depth (OS_QUEUE_MAX_DEPTH)
+_SYSCTL_OPTION = re.compile(r"(?:^|\s)--sysctl[= ]fs\.mqueue\.msg_max=(\d+)(?:\s|$)")
+# the step fails when the value read back from /proc is below the minimum
+_MSG_MAX_READ_BACK = re.compile(
+    r"^\s*test \"\$\(cat /proc/sys/fs/mqueue/msg_max\)\" -ge \d+\s*$", re.M
+)
+_SYSCTL_COMMAND = re.compile(r"^\s*sudo sysctl -w fs\.mqueue\.msg_max=(\d+)\s*$", re.M)
+
+
+def _msg_max_violations(text: str) -> list[str]:
+    """Everything wrong with how the real-cFS jobs set ``fs.mqueue.msg_max``; empty if sound."""
+    jobs = _jobs(_load(text))
+    problems: list[str] = []
+
+    container = jobs["el8-cfs"].get("container")
+    options = container.get("options", "") if isinstance(container, dict) else ""
+    found = _SYSCTL_OPTION.search(str(options))
+    if found is None or int(found.group(1)) < MIN_MSG_MAX:
+        problems.append(
+            f"el8-cfs: container options lack --sysctl fs.mqueue.msg_max>={MIN_MSG_MAX}"
+        )
+
+    steps = _steps(jobs["cfs"])
+    names = [str(step.get("run", "")) for step in steps]
+    raised = [
+        i
+        for i, run in enumerate(names)
+        if (m := _SYSCTL_COMMAND.search(run)) and int(m.group(1)) >= MIN_MSG_MAX
+    ]
+    ran = [i for i, run in enumerate(names) if "pytest tests/cfs" in run]
+    if not raised:
+        problems.append(f"cfs: no step runs sudo sysctl -w fs.mqueue.msg_max>={MIN_MSG_MAX}")
+    elif not ran or raised[0] > ran[0]:
+        problems.append("cfs: fs.mqueue.msg_max is not raised before the cFS tests run")
+    elif not _MSG_MAX_READ_BACK.search(names[raised[0]]):
+        problems.append("cfs: the raised fs.mqueue.msg_max is not read back and checked")
+    return problems
+
+
+def test_real_cfs_jobs_raise_the_message_queue_depth_limit() -> None:
+    assert _msg_max_violations(WORKFLOW.read_text()) == []
+
+
+MSG_MAX_MUTATIONS: dict[str, Callable[[str], str]] = {
+    "container sysctl removed": _replace_once(" --sysctl fs.mqueue.msg_max=65536", ""),
+    "container sysctl too small": _replace_once(
+        "--sysctl fs.mqueue.msg_max=65536", "--sysctl fs.mqueue.msg_max=10"
+    ),
+    "ubuntu sysctl removed": _replace_once(
+        "          sudo sysctl -w fs.mqueue.msg_max=65536\n", ""
+    ),
+    "ubuntu sysctl too small": _replace_once(
+        "sudo sysctl -w fs.mqueue.msg_max=65536", "sudo sysctl -w fs.mqueue.msg_max=10"
+    ),
+    "ubuntu read-back removed": _replace_once(
+        '          test "$(cat /proc/sys/fs/mqueue/msg_max)" -ge 50\n', ""
+    ),
+}
+
+
+@pytest.mark.parametrize("mutation", sorted(MSG_MAX_MUTATIONS))
+def test_msg_max_check_catches_regressions(mutation: str) -> None:
+    mutated = MSG_MAX_MUTATIONS[mutation](WORKFLOW.read_text())
+    assert mutated != WORKFLOW.read_text()
+    assert _msg_max_violations(mutated), f"not caught: {mutation}"

@@ -545,6 +545,24 @@ the pipe covers, on a loaded host; the software bus drops those packets and `CFE
 `PipeOverflowErrorCounter` (`SB_HK`) counts them (it also counts other telemetry dropped meanwhile). At 10k
 packets/s a 10-deep pipe overflows whenever TO_LAB's forwarding task is off-CPU for a millisecond or so (about 4% of
 30,000 packets in one run), every drop counted the same way. With `fs.mqueue.msg_max` raised to at least 50
-(`unshare --ipc`, `msg_max` 64) the stock 50-deep pipe is lossless at 10k packets/s (0 of 30,000, 3 of 3 runs). A
-source lossless under host load therefore needs that host setting and no cFS configuration change; a pipe deeper
-than 50 would need `OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's `TLM_PIPE_DEPTH`, which nothing measured needs.
+(`unshare --ipc`, `msg_max` 64) the stock 50-deep pipe was lossless at 10k packets/s in 3 of 3 runs (0 of 30,000), though
+more runs later were not (below).
+CI sets it to 65536, the kernel's maximum (`HARD_MSGMAX`; the sysctl has no "unlimited" and rejects 65537)
+(`.github/workflows/ci.yml`: `--sysctl fs.mqueue.msg_max=65536` on the `el8-cfs` containers, which works
+unprivileged because the sysctl is IPC-namespaced; `sudo sysctl -w fs.mqueue.msg_max=65536` on the Ubuntu `cfs` job,
+whose step reads the value back; `tests/test_ci_el8.py` guards both). When the console's
+`Maximum user msg queue depth` is at least 50 (TO_LAB's `TO_LAB_PLATFORM_TLM_PIPE_DEPTH`, default
+`OS_QUEUE_MAX_DEPTH` 50), the 1k packets/s generator test is strict: zero SB drops (`PipeOverflowErrorCounter` plus
+`MsgLimitErrorCounter` growth) and zero packets missing (8 of 8 runs here). The 10k packets/s test stays an
+accounting test even then (`lost <=` SB drops `+` recorded kernel drops): 50 slots, 49 per subscription, hold 5 ms
+of 10k packets/s, and 6 of 18 runs here lost 15 to 470 of 30,000 when TO_LAB's task was off-CPU longer, every one
+counted by SB (the `Msg Limit Err` events, which `MsgLimitErrorCounter` counts, are the drops that hit the
+subscription limit before the pipe's depth; no `msg_max` changes that). Below 50 (a developer host at the default 10)
+both keep the accounting. Each test prints which mode it ran in.
+`msg_max` only caps what OSAL truncates to: each queue is still created at the depth cFS requests, so memory does not
+follow the sysctl. The per-user `RLIMIT_MSGQUEUE` (819200 bytes by default, across all of the user's queues) must
+cover the requested depths: cFS with the test apps starts under a limit of 12000 bytes and fails at 10000
+(`OS_QueueCreate ... errno = 24`), so the default has a 65x margin.
+A source lossless under host load therefore needs that host setting and no cFS configuration change; a pipe deeper
+than 50 would need `OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's `TLM_PIPE_DEPTH`, which the 1k floor does not need and
+which a strict 10k packets/s test would.

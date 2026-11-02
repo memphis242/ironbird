@@ -99,6 +99,15 @@ jobs:
           key: ${{ steps.cache.outputs.cache-primary-key }}
       - name: Install ironbird
         run: python -m pip install -c constraints-dev.txt -e '.[dev]'
+      # A non-root cFS has OSAL truncate every queue to fs.mqueue.msg_max (10 by default), which
+      # would cut TO_LAB's 50-deep telemetry pipe to 10; 65536 (the kernel's maximum) only caps
+      # that truncation, so every queue keeps the depth cFS requests. The
+      # runner has passwordless sudo, and the value is read back so a silent no-op fails the job.
+      - name: Raise fs.mqueue.msg_max so cFS keeps its 50-deep pipes
+        run: |
+          sudo sysctl -w fs.mqueue.msg_max=65536
+          test "$(cat /proc/sys/fs/mqueue/msg_max)" -ge 50
+          echo "fs.mqueue.msg_max = $(cat /proc/sys/fs/mqueue/msg_max)"
       - name: Real-cFS acceptance tests
         env:
           IRONBIRD_CFS: "1"
@@ -225,7 +234,13 @@ jobs:
     container:
       image: ${{ matrix.image }}
       # EL8 logins get a soft nofile limit of 1024 (PAM); Docker's default is far higher.
-      options: --ulimit nofile=1024:524288
+      # fs.mqueue.msg_max is IPC-namespaced, so Docker sets it for this container alone (a
+      # namespaced sysctl, allowed unprivileged): a non-root cFS has OSAL truncate every queue to
+      # it, and 10 (the default) would cut TO_LAB's 50-deep telemetry pipe to 10. 65536 is the
+      # kernel's maximum (HARD_MSGMAX; there is no "unlimited"); it only caps that truncation, so
+      # each queue keeps the depth cFS requests (the generator tests check the 50 TO_LAB asks
+      # for: tests/cfs/test_cfs_generator.py).
+      options: --ulimit nofile=1024:524288 --sysctl fs.mqueue.msg_max=65536
     env:
       LANG: en_US.UTF-8
       # Inside the user's home so the cached tree has one stable absolute path.
