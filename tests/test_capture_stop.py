@@ -28,7 +28,7 @@ from ironbird.errors import Code
 from ironbird.ledger import Ledger
 from ironbird.notice import Notice
 from ironbird.session import Session
-from ironbird.transport import UdpTransport, udp
+from ironbird.transport import LinkEnd, UdpTransport, udp
 from recutil import write_config
 
 # ``ib`` with the UDP stop under traffic: ``early`` datagrams reach the receiving socket right
@@ -217,3 +217,60 @@ def test_frames_the_close_hands_over_are_queued_for_the_consumer(
     stats = _run(main())
     assert (stats.frames, stats.unread, stats.not_shown) == (5, 5, 0)
     assert not [n for n in notices if n.code is Code.TX_OVERRUN], notices
+
+
+def test_engine_close_of_a_multi_end_capture_queues_what_every_end_hands_over(
+    mock_config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A capture's queue is shared by its link ends. Datagrams reach the second end after the
+    first end's close finished (during that close's drop-counter read, so no loop turn in
+    between); the second end's close hands them over, and the queue must still take them:
+    ``sent == shown + unread in the queue``."""
+    scan = udp.scan_kernel_drops
+    count = 5
+
+    async def main() -> tuple[CaptureStats, int, list[dict[str, Any]]]:
+        ground = Session(
+            load_config(mock_config_path),
+            role="ground",
+            ledger=Ledger(tmp_path / "ledger", session_id="stop"),
+            notify=lambda _notice: None,
+        )
+        async with ground:
+            data = ground.codec_for("fc").encode_telemetry("MOCK_HK").data
+            link = ground.route("fc").link
+            engine = ground._engine
+            capture = await engine.open_capture(
+                [(link, LinkEnd.SOURCE), (link, LinkEnd.DESTINATION)]
+            )
+            first, second = list(engine._ios.values())[:2]
+            assert first.transport is not None and second.transport is not None
+            address = second.transport.local_address
+            assert address is not None
+            scans = 0
+
+            async def scanning(transports: Any) -> None:
+                nonlocal scans
+                await scan(transports)
+                scans += 1
+                if scans == 1:  # the first end has stopped; the second has not
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                        for _ in range(count):
+                            sock.sendto(data, address)
+
+            monkeypatch.setattr(udp, "scan_kernel_drops", scanning)
+            await engine.close()
+            monkeypatch.undo()
+            stats = capture.stats()
+            read = 0
+            while batch := await capture.next_batch():
+                read += len(batch)
+            ledger = ground.ledger
+            ledger.flush()
+            records = [json.loads(line) for line in ledger.path.read_text().splitlines()]
+        return stats, read, records
+
+    stats, read, records = _run(main())
+    assert (stats.frames, stats.unread, stats.not_shown, stats.after_close) == (count, count, 0, 0)
+    assert read == count
+    assert not [rec for rec in records if rec["event"] == "rx.closed_drops"], records

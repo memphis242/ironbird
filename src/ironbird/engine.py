@@ -131,6 +131,7 @@ class CaptureStats:
     queued_bytes: int = 0  # charged to the queue now: unread frames plus a batch still held
     peak_bytes: int = 0  # most the queue ever counted as held (never below what it held)
     not_shown_bytes: int = 0  # data bytes of the frames in ``not_shown``
+    after_close: int = 0  # arrived at a link end after this capture's queue was closed
 
 
 class _Closing(Exception):
@@ -298,6 +299,8 @@ class _Subscription:
     dropped: int = 0  # frames the queue refused
     dropped_to_sinks: int = 0  # of those, frames a sink had already received
     reported: int = 0
+    refused_closed: int = 0  # frames that arrived after the queue was closed (not a lag)
+    reported_closed: int = 0
 
 
 @dataclass(slots=True, eq=False)
@@ -440,6 +443,7 @@ class Capture:
             queue.queued_bytes,
             queue.peak_bytes,
             queue.dropped_bytes,
+            sum(sub.refused_closed for sub in self._subs),
         )
 
     async def close(self) -> None:
@@ -1014,32 +1018,36 @@ class Engine:
         """Close every transport still open (a capture its owner never closed, a send-only one)
         and end every capture's iteration, so a consumer still waiting does not wait forever.
 
-        A link end's captures are ended once its transport is closed (or failed to close), so
-        what the close still hands over (the datagrams already in a UDP socket) reaches them and
-        is counted with the rest of their frames."""
+        Every link end's transport is closed (or fails to close) before any capture is ended: a
+        capture's queue is shared by all its link ends, so ending it after the first end would
+        refuse what the next end's close still hands over (the datagrams already in a UDP
+        socket). Captures ended after all of them receive and count every frame the closes hand
+        over."""
         self._closed = True
         failure: BaseException | None = None
         ios = list(self._ios.values())
         for io in ios:
             if io.opening is not None:  # an open in progress must not hold the lock for its timeout
                 io.opening.cancel()
-        for io in ios:
-            try:
-                async with io.lock:
-                    transport = io.transport
-                    if transport is None:
-                        continue
-                    try:
-                        await transport.close()
-                    finally:
-                        if io.receiving:
-                            self._poll_kernel(io, transport)
-                        self._note_unread(io, transport)
-                        self._close_down_link(io)
-                        io.transport, io.receiving = None, False
-            except BaseException as exc:  # the other link ends are still closed
-                failure = failure or exc
-            finally:
+        try:
+            for io in ios:
+                try:
+                    async with io.lock:
+                        transport = io.transport
+                        if transport is None:
+                            continue
+                        try:
+                            await transport.close()
+                        finally:
+                            if io.receiving:
+                                self._poll_kernel(io, transport)
+                            self._note_unread(io, transport)
+                            self._close_down_link(io)
+                            io.transport, io.receiving = None, False
+                except BaseException as exc:  # the other link ends are still closed
+                    failure = failure or exc
+        finally:
+            for io in ios:
                 self._end_subscriptions(io)
         if failure is not None:
             raise failure
@@ -1155,6 +1163,7 @@ class Engine:
             queue = sub.queue
             if not queue.put(frame):
                 if queue.closed:  # ended (a failed link end of the same capture): not a lag
+                    sub.refused_closed += 1  # counted; ledgered, coalesced, by ``_poll_sub``
                     continue
                 io.lossy = True
                 sub.dropped += 1
@@ -1199,6 +1208,19 @@ class Engine:
 
     def _poll_sub(self, sub: _Subscription) -> None:
         """Report frames this consumer's queue refused since the last poll (coalesced, ledgered)."""
+        closed_total = sub.refused_closed
+        if closed_total != sub.reported_closed:
+            # Frames that reached a link end whose capture queue had already been closed: they
+            # went to the sinks but not to the consumer. Ledger only, since the closure itself
+            # (a failed link end, IB-TX-003) is what the user is told.
+            self._ledger.record(
+                "state",
+                "rx.closed_drops",
+                label=sub.io.description,
+                delta=closed_total - sub.reported_closed,
+                total=closed_total,
+            )
+            sub.reported_closed = closed_total
         total = sub.dropped
         if total == sub.reported:
             return

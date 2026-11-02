@@ -875,7 +875,15 @@ As built (where the build differs from, or settles, the text above)
   accounts for every frame: `sent == shown + kernel drops + unread in the socket + unread in the
   queue`. Deferred: under overload, a kernel drop that happens during that final drop-counter
   read (after the stop) is still counted, which needs the just-emptied receive buffer to refill
-  within milliseconds.
+  within milliseconds. `Engine.close` closes every link end's transport first and only then ends
+  the captures, because a multi-end capture shares one queue and ending it after the first end
+  would refuse what the next end's close hands over. Consumers therefore end after all link ends'
+  transports have closed, so a hung transport close delays them (a signal still ends the
+  process). A frame that does reach a link end whose capture queue is already closed (the other
+  end of a capture that failed) is counted per subscription (`CaptureStats.after_close`) and
+  ledgered, coalesced per poll, as `rx.closed_drops`; it still reaches the sinks. Frames a serial
+  close flushes (a partial packet cut by the close) now reach the consumer queue as well as the
+  sinks.
 - Per-MID statistics count only frames that pass `Codec.check`.
 - A link end's transport is opened, joined and closed under the end's lock: a capture subscribes
   inside the lock, the closer re-checks the subscribers inside it, and the end's state changes
@@ -2033,8 +2041,8 @@ As built (where the build differs from, or settles, the text above)
 - **Tier table.** `ledger.RECORD_TIERS` lists every record name `src/` writes; a test parses `src/`
   and fails on a name that is missing. Errors take their tier from the code (`IB-DEC-*`,
   `IB-RSP-*`, `IB-TX-003/004`, `IB-ENG-001` are evidence). `rx.unread_at_close` and `rx.failed` are
-  essential (once per close or failure); `rx.first`, `rx.queue_drops`, `rx.kernel_drops` are
-  evidence. The queue slices are 100 000 evidence and 50 000 event records (32 and 16 MiB) of
+  essential (once per close or failure); `rx.first`, `rx.queue_drops`, `rx.closed_drops`, `rx.kernel_drops`
+  are evidence. The queue slices are 100 000 evidence and 50 000 event records (32 and 16 MiB) of
   200 000 (64 MiB).
 - **Sampling keys.** `rx.malformed` records and their error records sample under separate keys
   (`CODE:MID:stream` and the same with `|error`), the responder's received commands under

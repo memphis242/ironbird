@@ -126,6 +126,7 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "rx.command": Tier.EVIDENCE,
         "rx.command.summary": Tier.EVIDENCE,
         "rx.queue_drops": Tier.EVIDENCE,
+        "rx.closed_drops": Tier.EVIDENCE,
         "rx.kernel_drops": Tier.EVIDENCE,
         "link.down": Tier.EVIDENCE,  # a flapping cable drives the rate
         "link.up": Tier.EVIDENCE,
