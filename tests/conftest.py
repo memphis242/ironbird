@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import os
 import shutil
 import socket
@@ -70,18 +71,51 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(pytest.mark.skip(reason=reason))
 
 
-def free_udp_ports(count: int) -> list[int]:
-    """Distinct currently-free UDP ports on loopback (closed again before returning)."""
-    socks: list[socket.socket] = []
+# Ports handed to tests come from a block per xdist worker below the kernel's ephemeral range
+# (32768-60999 by default), so the kernel never gives one to another socket and no two workers
+# share one. Within a block they are handed out in turn, each probed free before it is returned.
+_PORT_BASE = 20000
+_PORT_BLOCK = 400
+_PORT_WORKERS = 30
+assert _PORT_BASE + _PORT_BLOCK * _PORT_WORKERS <= 32768
+
+
+def _worker_index() -> int:
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+    digits = worker.removeprefix("gw")
+    return int(digits) % _PORT_WORKERS if digits.isdigit() else 0
+
+
+_BLOCK_START = _PORT_BASE + _PORT_BLOCK * _worker_index()
+# Start at a per-process offset so separate pytest sessions on one host rarely meet.
+_block_ports = itertools.islice(
+    itertools.cycle(range(_BLOCK_START, _BLOCK_START + _PORT_BLOCK)),
+    os.getpid() % _PORT_BLOCK,
+    None,
+)
+
+
+def _port_is_free(port: int) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        for _ in range(count):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.bind(("127.0.0.1", 0))
-            socks.append(sock)
-        return [int(s.getsockname()[1]) for s in socks]
+        sock.bind(("127.0.0.1", port))
+    except OSError:
+        return False
     finally:
-        for sock in socks:
-            sock.close()
+        sock.close()
+    return True
+
+
+def free_udp_ports(count: int) -> list[int]:
+    """Distinct free UDP ports on loopback, from this worker's block outside the ephemeral range."""
+    ports: list[int] = []
+    for port in itertools.islice(_block_ports, _PORT_BLOCK):
+        if _port_is_free(port):
+            ports.append(port)
+            if len(ports) == count:
+                return ports
+    end = _BLOCK_START + _PORT_BLOCK
+    raise AssertionError(f"no {count} free UDP ports in {_BLOCK_START}..{end}")
 
 
 _PROC_UDP_TABLES = ("/proc/net/udp", "/proc/net/udp6")
