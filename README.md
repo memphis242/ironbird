@@ -383,8 +383,9 @@ ib export run1.ibrec --format text --from +90s --to +2m -o minute.txt
   and leaves nothing: they ignore SIGINT and SIGHUP, which only the export acts on, and exit by
   themselves if the export is killed. `[export] pool_min_bytes` (8MiB; `0` for always) moves the
   size from which workers are used. The ledger records the start (options, workers), the pool
-  (`export.pool`: ranges, ranges read again, ranges cut short or read in the calling process) and the
-  end (counts per table, how it ended). Measured on the development host (4 vCPU): 62-field,
+  (`export.pool`: ranges, ranges read again, ranges cut short or read in the calling process, and
+  `scanned`, the bytes the resync scans read, which leaves out the per-candidate chain-validation
+  reads) and the end (counts per table, how it ended). Measured on the development host (4 vCPU): 62-field,
   200-byte packets as CSV, 18,100 rows/s in one process and 51,000 to 67,000 rows/s with four workers
   (the host is shared; two runs).
 

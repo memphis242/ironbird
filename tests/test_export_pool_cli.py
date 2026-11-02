@@ -586,8 +586,8 @@ def test_a_long_run_of_zeros_does_not_cost_a_scan_per_range(
     pool = [e for e in ledger_events(tmp_path) if e["event"] == "export.pool"]
     assert len(pool) == 1 and pool[0]["ranges"] > zeros // 32768 // 2, pool
     # The range holding the start of the zeros finds the next record by one scan of them, and
-    # each range inside them scans its own length.
-    assert pool[0]["scanned"] < 3 * zeros, (pool[0]["scanned"], zeros)
+    # each range inside them scans its own length: about twice the zeros are scanned.
+    assert zeros <= pool[0]["scanned"] < 2.5 * zeros, (pool[0]["scanned"], zeros)
 
 
 def test_wide_rows_do_not_grow_the_memory_of_the_export(

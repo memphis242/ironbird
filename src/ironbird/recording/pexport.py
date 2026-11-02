@@ -409,9 +409,8 @@ class Outcome:
     used_streams: list[int] = field(default_factory=list)  # ids the range found in its seed
     used_sources: list[int] = field(default_factory=list)
     work: int = 0  # bytes charged to the resync budget by the range
-    scanned: int = (
-        0  # bytes the range's resync scans read, the search for its first record included
-    )
+    # bytes the range's resync scans read, the search for its first record included
+    scanned: int = 0
     trailer: bool = False
     seen: bool = False  # the parent has learned from its size
     partial: bool = False  # cut short at a cap: the range goes on from ``end``
@@ -1177,6 +1176,19 @@ def _align_up(value: int) -> int:
     return (value + ALIGN - 1) & ~(ALIGN - 1)
 
 
+def head_seed(reader: RecordingReader, size: int) -> Seed:
+    """The streams and sources the head of the file defines: what the first ranges are seeded
+    with, before the walk has shown what is in force."""
+    streams: dict[int, Stream] = {}
+    sources: dict[int, str] = {}
+    for item in reader.head_records(reader.body_start, size):
+        if item.rtype == RecordType.STREAM:
+            streams[item.value.id] = item.value
+        elif item.rtype == RecordType.SOURCE:
+            sources[item.value[0]] = item.value[1]
+    return Seed(streams, sources, 0, 0)
+
+
 class _Runner:
     """Drives the parts of one replay through the pool and the calling process."""
 
@@ -1329,7 +1341,7 @@ class _Runner:
         options, report = self._options, self._report
         body = reader.body_start
         walk = _Walk(end=body, work=reader.work)  # the work of the single process at this point
-        guess_seed = self._head_seed(reader, size)
+        guess_seed = head_seed(reader, size)
         edges = [body]  # edges[k]: where range k begins; the last range has no edge after it
         last = False  # the last range (it reads to the end of the file) is planned
         jobs: dict[int, Job] = {}
@@ -1478,18 +1490,6 @@ class _Runner:
         outcome = self._local.run(job, reader)
         self._report.scanned += outcome.scanned
         return outcome
-
-    def _head_seed(self, reader: RecordingReader, size: int) -> Seed:
-        """The streams and sources the head of the file defines: what the first ranges are
-        seeded with, before the walk has shown what is in force."""
-        streams: dict[int, Stream] = {}
-        sources: dict[int, str] = {}
-        for item in reader.head_records(reader.body_start, size):
-            if item.rtype == RecordType.STREAM:
-                streams[item.value.id] = item.value
-            elif item.rtype == RecordType.SOURCE:
-                sources[item.value[0]] = item.value[1]
-        return Seed(streams, sources, 0, 0)
 
     @staticmethod
     def _accepted(job: Job, outcome: Outcome, walk: _Walk, limit: int) -> bool:
