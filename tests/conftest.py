@@ -71,28 +71,158 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(pytest.mark.skip(reason=reason))
 
 
-# Ports handed to tests come from a block per xdist worker below the kernel's ephemeral range
-# (32768-60999 by default), so the kernel never gives one to another socket and no two workers
-# share one. Within a block they are handed out in turn, each probed free before it is returned.
-_PORT_BASE = 20000
-_PORT_BLOCK = 400
-_PORT_WORKERS = 30
-assert _PORT_BASE + _PORT_BLOCK * _PORT_WORKERS <= 32768
+# Ports handed to tests come from a window below the kernel's ephemeral range (the kernel's
+# ip_local_port_range, 32768-60999 by default), so the kernel never gives one to another socket.
+# The window is split into one block per xdist worker, so no two workers share a port; within a
+# block ports are handed out in turn, each probed free before it is returned.
+_EPHEMERAL_RANGE_FILE = Path("/proc/sys/net/ipv4/ip_local_port_range")
+_PORT_BASE_ENV = "IRONBIRD_TEST_PORT_BASE"
+_PORT_END_ENV = "IRONBIRD_TEST_PORT_END"
+_DEFAULT_PORT_WINDOW = (20000, 32768)  # half-open: [20000, 32768)
+_PRIVILEGED_PORT_END = 1024
+_PORT_SPACE_END = 0x10000
+MAX_PORTS_PER_TEST = 4  # the most any one free_udp_ports call may ask for
 
 
-def _worker_index() -> int:
-    worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
-    digits = worker.removeprefix("gw")
-    return int(digits) % _PORT_WORKERS if digits.isdigit() else 0
+class PortWindowError(Exception):
+    """The test port window cannot be used on this host; the message says how to fix it."""
 
 
-_BLOCK_START = _PORT_BASE + _PORT_BLOCK * _worker_index()
+def _ephemeral_range() -> tuple[int, int] | None:
+    """The kernel's ephemeral port range as ``(first, last)`` inclusive; None if unreadable."""
+    try:
+        first, last = _EPHEMERAL_RANGE_FILE.read_text(encoding="ascii").split()
+    except (OSError, ValueError):
+        return None
+    if not (first.isdecimal() and last.isdecimal()):
+        return None
+    return int(first), int(last)
+
+
+def _env_port(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    if not (value.isascii() and value.isdecimal()):
+        raise PortWindowError(f"{name}={value!r} is not a decimal port number")
+    return int(value)
+
+
+def _port_window() -> tuple[int, int]:
+    """The half-open window ``[base, end)`` of ports for the whole test run.
+
+    The default is 20000-32767, or the window named by ``IRONBIRD_TEST_PORT_BASE`` and
+    ``IRONBIRD_TEST_PORT_END`` (end exclusive). Either way it must not overlap the kernel's
+    ephemeral range, where the kernel can hand a port to any other socket at any time.
+    """
+    base_env = _env_port(_PORT_BASE_ENV)
+    end_env = _env_port(_PORT_END_ENV)
+    if (base_env is None) != (end_env is None):
+        raise PortWindowError(f"set both {_PORT_BASE_ENV} and {_PORT_END_ENV}, or neither")
+    overridden = base_env is not None and end_env is not None
+    if base_env is not None and end_env is not None:
+        base, end = base_env, end_env
+    else:
+        base, end = _DEFAULT_PORT_WINDOW
+    if not _PRIVILEGED_PORT_END <= base < end <= _PORT_SPACE_END:
+        raise PortWindowError(
+            f"the test port window [{base}, {end}) must satisfy "
+            f"{_PRIVILEGED_PORT_END} <= base < end <= {_PORT_SPACE_END}"
+        )
+    ephemeral = _ephemeral_range()
+    how = (
+        f"set {_PORT_BASE_ENV} and {_PORT_END_ENV} to a window outside it (end exclusive), or "
+        "raise the ephemeral range's start to 32768 (sysctl net.ipv4.ip_local_port_range)"
+    )
+    if ephemeral is None:
+        if overridden:
+            return base, end  # cannot be checked here; the caller vouches for the window
+        raise PortWindowError(
+            f"cannot read {_EPHEMERAL_RANGE_FILE}, so the default test port window "
+            f"[{base}, {end}) cannot be checked against the ephemeral range: "
+            f"set {_PORT_BASE_ENV} and {_PORT_END_ENV} to a window known to be outside it"
+        )
+    first, last = ephemeral
+    if base <= last and first < end:
+        raise PortWindowError(
+            f"the test port window [{base}, {end}) overlaps the kernel's ephemeral port range "
+            f"{first}-{last} ({_EPHEMERAL_RANGE_FILE}), so another socket could take a test's "
+            f"port: {how}"
+        )
+    return base, end
+
+
+def _split_window(base: int, end: int, workers: int, number: int) -> tuple[int, int]:
+    """Worker ``number``'s half-open block ``[start, stop)`` of the window shared by ``workers``."""
+    assert workers > 0 and 0 <= number < workers
+    size = (end - base) // workers
+    if size < MAX_PORTS_PER_TEST:
+        raise PortWindowError(
+            f"the test port window [{base}, {end}) gives each of {workers} workers only {size} "
+            f"ports, fewer than the {MAX_PORTS_PER_TEST} one test can take: run fewer workers "
+            f"(-n) or widen the window with {_PORT_BASE_ENV} and {_PORT_END_ENV}"
+        )
+    start = base + size * number
+    return start, start + size
+
+
+def _process_block(base: int, end: int) -> tuple[int, int]:
+    """This process's block of the window.
+
+    Every xdist worker has ``PYTEST_XDIST_WORKER_COUNT`` and ``PYTEST_XDIST_WORKER`` (gw<N>) set,
+    and N picks the block; any other process uses the whole window.
+    """
+    count_env = os.environ.get("PYTEST_XDIST_WORKER_COUNT")
+    if count_env is None:
+        return base, end
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "")
+    number = worker.removeprefix("gw")
+    if not (count_env.isascii() and count_env.isdecimal() and int(count_env) > 0):
+        raise PortWindowError(f"PYTEST_XDIST_WORKER_COUNT={count_env!r} is not a positive integer")
+    if not (worker.startswith("gw") and number.isascii() and number.isdecimal()):
+        raise PortWindowError(f"PYTEST_XDIST_WORKER={worker!r} is not of the form gw<N>")
+    if int(number) >= int(count_env):
+        raise PortWindowError(
+            f"worker {worker} is outside the {count_env} workers of this run "
+            "(a restarted worker takes a new number; fix the failure that made it exit)"
+        )
+    return _split_window(base, end, int(count_env), int(number))
+
+
+def _resolve_block() -> tuple[int, int, PortWindowError | None]:
+    """This process's block ``[start, stop)``, or a placeholder block and why there is none."""
+    try:
+        window = _port_window()
+        return (*_process_block(*window), None)
+    except PortWindowError as error:
+        return 0, MAX_PORTS_PER_TEST, error
+
+
+# Reported once, cleanly, by pytest_sessionstart (and by free_udp_ports outside pytest).
+_block_start, _block_end, _PORT_ERROR = _resolve_block()
+_block_size = _block_end - _block_start
+assert _block_size >= MAX_PORTS_PER_TEST
 # Start at a per-process offset so separate pytest sessions on one host rarely meet.
 _block_ports = itertools.islice(
-    itertools.cycle(range(_BLOCK_START, _BLOCK_START + _PORT_BLOCK)),
-    os.getpid() % _PORT_BLOCK,
+    itertools.cycle(range(_block_start, _block_end)),
+    os.getpid() % _block_size,
     None,
 )
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Stop the run before any test starts if the test port window cannot be used, or cannot be
+    shared by the requested number of xdist workers (checked here so the run stops once, in the
+    controller, rather than in every worker)."""
+    error = _PORT_ERROR
+    workers = getattr(session.config.option, "numprocesses", None)
+    if error is None and isinstance(workers, int) and workers > 0:
+        try:
+            _split_window(*_port_window(), workers, 0)
+        except PortWindowError as too_many:
+            error = too_many
+    if error is not None:
+        pytest.exit(f"ironbird tests: {error}", returncode=4)
 
 
 def _port_is_free(port: int) -> bool:
@@ -107,15 +237,17 @@ def _port_is_free(port: int) -> bool:
 
 
 def free_udp_ports(count: int) -> list[int]:
-    """Distinct free UDP ports on loopback, from this worker's block outside the ephemeral range."""
+    """Distinct free UDP ports on loopback, from this process's block below the ephemeral range."""
+    if _PORT_ERROR is not None:
+        raise _PORT_ERROR
+    assert 0 < count <= MAX_PORTS_PER_TEST
     ports: list[int] = []
-    for port in itertools.islice(_block_ports, _PORT_BLOCK):
+    for port in itertools.islice(_block_ports, _block_size):
         if _port_is_free(port):
             ports.append(port)
             if len(ports) == count:
                 return ports
-    end = _BLOCK_START + _PORT_BLOCK
-    raise AssertionError(f"no {count} free UDP ports in {_BLOCK_START}..{end}")
+    raise AssertionError(f"no {count} free UDP ports in [{_block_start}, {_block_end})")
 
 
 _PROC_UDP_TABLES = ("/proc/net/udp", "/proc/net/udp6")

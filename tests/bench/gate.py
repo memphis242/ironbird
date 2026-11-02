@@ -18,13 +18,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from conftest import EXAMPLES
+from conftest import EXAMPLES, free_udp_ports
 from ironbird.config import load_config
 from ironbird.ledger import Ledger
 from ironbird.recording import inspect as rec_inspect
 from ironbird.recording.reader import RecordingReader
 from ironbird.session import Session
-from recutil import Proc, high_ports
+from recutil import Proc
 
 BLASTER = Path(__file__).with_name("blaster.py")
 PACKET_BYTES = 200
@@ -92,7 +92,7 @@ def gate_config(directory: Path) -> tuple[Path, int, bytes]:
     )
     ccdd_path = directory / "gate.json"
     ccdd_path.write_text(json.dumps(ccdd))
-    command_port, telemetry_port = high_ports(2)
+    command_port, telemetry_port = free_udp_ports(2)
     path = directory / "gate.toml"
     path.write_text(
         f"""[ironbird]

@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 import yaml
 
-from conftest import EXAMPLES, REPO
+from conftest import EXAMPLES, REPO, free_udp_ports
 from filter_defs import make_frame
 from hosttiming import needs_a_quiet_host
 from ironbird import render
@@ -41,7 +41,6 @@ from ironbird.ledger import Ledger
 from ironbird.notice import Level
 from ironbird.session import Session
 from ironbird.transport import LinkEnd
-from recutil import high_ports
 from test_engine import _Probe
 
 DECODE_CEILING_S = 100e-6
@@ -482,7 +481,7 @@ def _bench_config(tmp_path: Path) -> Path:
     )
     ccdd_path = tmp_path / "bench.json"
     ccdd_path.write_text(json.dumps(ccdd))
-    command_port, telemetry_port = high_ports(2)
+    command_port, telemetry_port = free_udp_ports(2)
     path = tmp_path / "bench.toml"
     path.write_text(
         f"""[ironbird]

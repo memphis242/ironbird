@@ -10,6 +10,7 @@ from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
+from conftest import free_udp_ports
 from ironbird.ccdd.model import MessageKind
 from ironbird.frame import (
     FLAGS_BY_BITS,
@@ -205,30 +206,9 @@ CLI_MAIN = "import sys; from ironbird.cli.main import main; sys.exit(main())"
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 
 
-def high_ports(count: int) -> list[int]:
-    """Free UDP ports in 52000-52999 (mock tests keep clear of the fixed cFS ports)."""
-    import random
-
-    found: list[int] = []
-    candidates = list(range(52000, 53000))
-    random.shuffle(candidates)
-    for port in candidates:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.bind(("127.0.0.1", port))
-        except OSError:
-            continue
-        finally:
-            sock.close()
-        found.append(port)
-        if len(found) == count:
-            return found
-    raise AssertionError("no free port in 52000-52999")
-
-
 def write_config(directory: Path, extra: str = "") -> tuple[Path, int, int]:
     """examples/mock.toml with absolute paths, high ports and a recording table."""
-    command_port, telemetry_port = high_ports(2)
+    command_port, telemetry_port = free_udp_ports(2)
     text = (EXAMPLES / "mock.toml").read_text()
     text = text.replace('"ccdd/', f'"{EXAMPLES}/ccdd/').replace(
         '"headers/', f'"{EXAMPLES}/headers/'

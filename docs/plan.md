@@ -2489,9 +2489,16 @@ As built (where the build differs from, or settles, the text above)
   excludes a match; no frame outside it is decoded), `tests/test_filter_diff.py` (seeded random
   expressions and frames against a second, independently written reference,
   `tests/filter_ref_independent.py`, written from the documented semantics alone), `tests/test_filter_live.py`
-  (loopback sessions and CLI processes on ports 53000-53999), corpus `tests/corpus/malformed/flt-*.txt`
+  (loopback sessions and CLI processes on ports from `free_udp_ports`), corpus `tests/corpus/malformed/flt-*.txt`
   and `frame-garbage-flagged-valid-looking-tlm.bin` (a valid packet flagged garbage),
   `tools/fuzz/fuzz_filter.py` (atheris), two `cfs` acceptance cases.
+- Test UDP ports (`tests/conftest.py` `free_udp_ports`, the only port helper): a window below the
+  kernel's ephemeral range, `[20000, 32768)` by default or `IRONBIRD_TEST_PORT_BASE`/`_END`, split
+  into one block per xdist worker (`PYTEST_XDIST_WORKER_COUNT`), each port probed free before it is
+  handed out. A window that overlaps `net.ipv4.ip_local_port_range`, or blocks smaller than one
+  test's ports, stops the session with a message naming the setting. Deferred: a worker that xdist
+  restarts after a crash gets a number past the count and fails its block lookup (after the crash
+  itself is reported).
 - Benchmarks (`tests/test_benchmarks.py`, 4-core dev host): per frame, frame-level
   `seq > 0 and node == fc and dir == rx and len >= 16` 1.4-1.6 us (about 650k frames/s); model-level
   (`msg == MOCK_HK and category == housekeeping`) 0.9-1.0 us (1.1M/s); check-level 0.5-0.8 us; decode-level
@@ -2637,7 +2644,7 @@ As built (where the build differs from, or settles, the text above)
   contents, over bit flips and cuts of a file with embedded definitions in every format, over any
   payload in any frame, and over ranges with clock steps equal to a frame-by-frame selection, plus
   a flip of every 97th bit and a cut every 37 bytes of the head), `test_replay_cli.py` (41 over
-  loopback on ports 58000-58999: the `respond` + `listen --record` round trip against replay by
+  loopback on ports from `free_udp_ports`: the `respond` + `listen --record` round trip against replay by
   record, nothing sent, exit codes, SIGTERM during pacing and while blocked, closed and slow
   readers, following a real `ib record` to a clean close and to `kill -9`), a `cfs` acceptance
   case (record a session with K NOOPs; `--where 'event.app == "SAMPLE_APP" and event.id == 3'`
