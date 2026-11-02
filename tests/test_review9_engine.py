@@ -29,7 +29,7 @@ from ironbird.header import load_profile
 from ironbird.ledger import Ledger
 from ironbird.notice import Notice
 from ironbird.session import Session
-from ironbird.transport import LinkEnd, UdpTransport
+from ironbird.transport import LinkEnd, UdpTransport, udp
 from test_engine import _Probe
 
 T = TypeVar("T")
@@ -518,10 +518,10 @@ def test_udp_close_counts_the_datagrams_still_in_its_socket_buffer() -> None:
         address = transport.local_address
         assert address is not None
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        for _ in range(50):
+        for _ in range(udp.BATCH + 50):
             sock.sendto(b"x" * 20, address)
         sock.close()
-        await transport.close()  # the loop never got to read them
+        await transport.close()  # the loop never got to read them; the close reads one batch
         return transport.stats().unread_at_close
 
     assert _run(main()) == 50
@@ -547,7 +547,8 @@ def test_closing_an_overloaded_listener_reports_what_it_left_unread(
             assert address is not None
             await _burst(address, data, 10)
             await _until(lambda: listener.capture.stats().frames == 10)
-            await _burst(address, data, 7)  # still in the socket buffer when the end closes
+            # One batch the close still reads, and 7 more left in the socket buffer.
+            await _burst(address, data, udp.BATCH + 7)
             await listener.close()
 
     _run(main())

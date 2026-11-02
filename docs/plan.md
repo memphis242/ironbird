@@ -862,11 +862,20 @@ As built (where the build differs from, or settles, the text above)
   reported and ledgered once (`sink.detached`), never once per frame; its holders stay counted,
   so asking for it again re-attaches it and an old holder's release cannot detach it from a
   newer one.
-- Datagrams still in a UDP receive buffer when its transport closes are read, discarded and
-  counted (`TransportStats.unread_at_close`, ledger `rx.unread_at_close`); on a link end that
-  was already losing frames the count is reported (`IB-TX-004`), and `Listener.close` reports the
-  frames left unread in the queue, so a SIGTERM under overload accounts for every frame:
-  `sent == shown + kernel drops + unread in the socket + unread in the queue`.
+- A UDP receiving transport stops at one synchronous instant: its close hands the receiver what
+  the socket already holds (one read batch, as a wakeup would), stops reading, and reads,
+  discards and counts what is still buffered (`TransportStats.unread_at_close`, ledger
+  `rx.unread_at_close`, a `kernel_drop` GAP for a recorder). Only then does it read the kernel's
+  drop counter, off the loop; a datagram arriving during that read came after the stop and is
+  neither delivered nor counted. A capture stays subscribed until its link end's transport is
+  closed (by `Capture.close` or `Engine.close`), so what the close hands over is queued for it
+  and reaches the sinks: a recorder stopped under ordinary traffic records a clean tail. On a
+  link end that was already losing frames the unread count is reported (`IB-TX-004`), and
+  `Listener.close` reports the frames left unread in the queue, so a SIGTERM under overload
+  accounts for every frame: `sent == shown + kernel drops + unread in the socket + unread in the
+  queue`. Deferred: under overload, a kernel drop that happens during that final drop-counter
+  read (after the stop) is still counted, which needs the just-emptied receive buffer to refill
+  within milliseconds.
 - Per-MID statistics count only frames that pass `Codec.check`.
 - A link end's transport is opened, joined and closed under the end's lock: a capture subscribes
   inside the lock, the closer re-checks the subscribers inside it, and the end's state changes
