@@ -3919,6 +3919,17 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   most); before the bounds the same export peaked at 378 MiB (144 MB waiting) in 17.6 s, and grew with
   the width of the rows and the size of the ranges. The bounds without the shorter ranges (cut and
   continued serially) kept the memory but not the speed: 56 s.
+- **Scan work in the report.** `RecordingReader.scanned` counts the bytes the resync scans read
+  (`find_boundary` and the search after damage; one integer add per block, never reset or seeded),
+  and each `Outcome.scanned` is its range's share, the search for its first record included. The
+  report's `scanned` (`export.pool` in the ledger) sums it over the outcomes the walk received
+  (a range cancelled after the walk ended is not in it). It is the deterministic measure that a
+  guessed range's search stops at its own end: `tests/test_export_pool_cli.py` builds a recording
+  with 8 MiB of zeros in the middle, 600 frames on each side, and asserts `scanned` under three
+  times the zeros (about two times is measured: one scan of the zeros by the range that holds their
+  start, and each range inside them scanning its own length); a search that ignores the limit reads
+  1.1 GB there. Wall-clock ratios between a pooled and a single run are not a test of this: they
+  failed on a loaded shared runner.
 - **Output closing and failing.** A worker records the kind of each row it makes (one byte per row; for
   CSV, which table each line went to) and how many rows came before each damage and each GAP record. A
   range that holds damage or gaps, and every range for a destination that takes one line at a time and
