@@ -386,6 +386,15 @@ def _replace_once(old: str, new: str) -> Callable[[str], str]:
     return mutate
 
 
+def _replace_last(old: str, new: str) -> Callable[[str], str]:
+    def mutate(text: str) -> str:
+        head, found, tail = text.rpartition(old)
+        assert found, f"mutation anchor not found: {old!r}"
+        return head + new + tail
+
+    return mutate
+
+
 def _comment_out_defaults(text: str) -> str:
     block = _defaults_block(text)
     return text.replace(block, "".join(f"    # {line.strip()}\n" for line in block.splitlines()), 1)
@@ -450,14 +459,104 @@ _pipe_depth = re.search(
 )
 assert _pipe_depth is not None, f"TO_LAB's telemetry pipe depth not defined in {TO_LAB_VALUES}"
 MIN_MSG_MAX = int(_pipe_depth.group(1))  # the depth TO_LAB asks for
-_SYSCTL_OPTION = re.compile(r"(?:^|\s)--sysctl[= ]fs\.mqueue\.msg_max=(\d+)(?:\s|$)")
+_SYSCTL_OPTION = re.compile(r"(?:^|\s)--sysctl[= ]fs\.mqueue\.msg_max=(\d+)(?=\s|$)")
 # the step fails when the value read back from /proc is below the threshold (captured)
 _MSG_MAX_READ_BACK = re.compile(
     r"^\s*test \"\$\(cat /proc/sys/fs/mqueue/msg_max\)\" -ge (\d+)\s*$", re.M
 )
 _SYSCTL_COMMAND = re.compile(r"^\s*sudo sysctl -w fs\.mqueue\.msg_max=(\d+)\s*$", re.M)
+_MSG_MAX_ECHO = re.compile(
+    r"^\s*echo \"fs\.mqueue\.msg_max = \$\(cat /proc/sys/fs/mqueue/msg_max\)\"\s*$", re.M
+)
+# `set +e`, `set +o errexit`, `set +eu`: anything that turns shell options off
+_SHELL_OPTIONS_OFF = re.compile(r"^\s*set\s+\+", re.M)
 # step or job keys that let a failing (or never-run) step go unnoticed
 _BYPASS_KEYS = ("if", "continue-on-error", "shell")
+EL8_TESTS_CONDITION = "steps.setup.outputs.ready == 'true'"
+
+
+def _report_chars(command: str) -> str | None:
+    """The characters of pytest's last ``-r`` option on ``command`` (the last one wins), or None.
+    A short-option cluster such as ``-vrP`` ends in ``r`` plus its argument, which is the rest of
+    the token or, when the token ends at ``r``, the next token."""
+    tokens = command.split()
+    chars: str | None = None
+    for i, token in enumerate(tokens):
+        if not token.startswith("-") or token.startswith("--"):
+            continue
+        position = token.find("r", 1)
+        if position < 0:
+            continue
+        rest = token[position + 1 :]
+        if not rest and i + 1 < len(tokens):
+            rest = tokens[i + 1]
+        chars = rest
+    return chars
+
+
+def _default_shell(container: dict[str, Any]) -> object:
+    """``defaults.run.shell`` of a workflow or a job, or None."""
+    defaults = container.get("defaults")
+    run = defaults.get("run") if isinstance(defaults, dict) else None
+    return run.get("shell") if isinstance(run, dict) else None
+
+
+def _cfs_job_violations(name: str, job: dict[str, Any], workflow: dict[str, Any]) -> list[str]:
+    """What can skip, soften or hide the real-cFS test step of the job ``name``."""
+    problems: list[str] = []
+    if _default_shell(workflow) is not None:
+        problems.append(f"{name}: the workflow sets defaults.run.shell")
+    if "continue-on-error" in job:
+        problems.append(f"{name}: the job sets continue-on-error")
+    if job.get("env", {}).get(REQUIRE_FULL_DEPTH_ENV) != "1":
+        problems.append(f"{name}: env {REQUIRE_FULL_DEPTH_ENV} must be the string '1'")
+    if "PYTEST_ADDOPTS" in job.get("env", {}):
+        problems.append(f"{name}: the job env sets PYTEST_ADDOPTS, which can change -r or -k")
+    shell = _default_shell(job)
+    if name == "cfs" and shell is not None:
+        problems.append("cfs: the job sets defaults.run.shell, which can lose errexit")
+    if name == "el8-cfs" and (
+        not isinstance(shell, str) or not any(re.fullmatch(r"-\w*e\w*", w) for w in shell.split())
+    ):
+        problems.append("el8-cfs: the default shell does not run with errexit (-e)")
+    for step in _steps(job):
+        label = f"{name}/{step.get('name', step.get('uses'))}"
+        step_env = step.get("env", {})
+        if isinstance(step_env, dict) and step_env.get(REQUIRE_FULL_DEPTH_ENV, "1") != "1":
+            problems.append(f"{label}: the step overrides {REQUIRE_FULL_DEPTH_ENV}")
+        if isinstance(step_env, dict) and "PYTEST_ADDOPTS" in step_env:
+            problems.append(f"{label}: the step env sets PYTEST_ADDOPTS")
+        run = str(step.get("run", ""))
+        if REQUIRE_FULL_DEPTH_ENV in run or "PYTEST_ADDOPTS" in run:
+            problems.append(
+                f"{label}: the script sets or unsets {REQUIRE_FULL_DEPTH_ENV} or PYTEST_ADDOPTS"
+            )
+        if _SHELL_OPTIONS_OFF.search(run):
+            problems.append(f"{label}: the script turns shell options off (set +...)")
+        for line in run.splitlines():
+            if "msg_max" not in line:
+                continue
+            command = _SYSCTL_COMMAND.fullmatch(line.strip())
+            if command is not None:
+                if int(command.group(1)) < MIN_MSG_MAX:
+                    problems.append(f"{label}: sysctl sets fs.mqueue.msg_max below {MIN_MSG_MAX}")
+            elif not (_MSG_MAX_READ_BACK.fullmatch(line) or _MSG_MAX_ECHO.fullmatch(line)):
+                problems.append(f"{label}: unrecognised use of msg_max: {line.strip()!r}")
+        if "pytest tests/cfs" not in run:
+            continue
+        condition = step.get("if")
+        if name == "cfs" and condition is not None:
+            problems.append(f"{label}: the cFS test step has an if ({condition!r})")
+        if name == "el8-cfs" and condition != EL8_TESTS_CONDITION:
+            problems.append(f"{label}: the cFS test step's if is not {EL8_TESTS_CONDITION!r}")
+        if "continue-on-error" in step:
+            problems.append(f"{label}: the cFS test step sets continue-on-error")
+        if "||" in run:
+            problems.append(f"{label}: the cFS tests are followed by ||")
+        chars = _report_chars(run)
+        if chars is None or not ({"P", "A"} & set(chars)):
+            problems.append(f"{label}: the last -r option hides the passed tests' mode line")
+    return problems
 
 
 def _msg_max_violations(text: str) -> list[str]:
@@ -467,26 +566,20 @@ def _msg_max_violations(text: str) -> list[str]:
 
     container = jobs["el8-cfs"].get("container")
     options = container.get("options", "") if isinstance(container, dict) else ""
-    found = _SYSCTL_OPTION.search(str(options))
-    if found is None or int(found.group(1)) < MIN_MSG_MAX:
+    values = [int(v) for v in _SYSCTL_OPTION.findall(str(options))]
+    if not values or min(values) < MIN_MSG_MAX:
         problems.append(
-            f"el8-cfs: container options lack --sysctl fs.mqueue.msg_max>={MIN_MSG_MAX}"
+            f"el8-cfs: container options lack --sysctl fs.mqueue.msg_max>={MIN_MSG_MAX} "
+            f"(every value must; found {values})"
         )
 
+    workflow = _load(text)
     for name in ("cfs", "el8-cfs"):
         job = jobs[name]
-        if job.get("env", {}).get(REQUIRE_FULL_DEPTH_ENV) != "1":
-            problems.append(f"{name}: env {REQUIRE_FULL_DEPTH_ENV} must be the string '1'")
-        if "continue-on-error" in job:
-            problems.append(f"{name}: the job sets continue-on-error")
+        problems += _cfs_job_violations(name, job, workflow)
         tests = [s for s in _steps(job) if "pytest tests/cfs" in str(s.get("run", ""))]
         if len(tests) != 1:
             problems.append(f"{name}: expected one 'pytest tests/cfs' step, found {len(tests)}")
-        for step in tests:
-            if not re.search(r"\s-\w*rP", str(step["run"])):
-                problems.append(f"{name}: the cFS tests run without -rP (the mode line is hidden)")
-            if "continue-on-error" in step:
-                problems.append(f"{name}: the cFS test step sets continue-on-error")
 
     steps = _steps(jobs["cfs"])
     runs = [str(step.get("run", "")) for step in steps]
@@ -523,6 +616,9 @@ def test_real_cfs_jobs_raise_the_message_queue_depth_limit() -> None:
 _SYSCTL_STEP = "      - name: Raise fs.mqueue.msg_max so cFS keeps its 1000-deep pipes\n"
 _SYSCTL_OPTIONS = "      options: --ulimit nofile=1024:524288 --sysctl fs.mqueue.msg_max=65536\n"
 _READ_BACK = '          test "$(cat /proc/sys/fs/mqueue/msg_max)" -ge 1000\n'
+_SYSCTL_COMMAND_LINE = "          sudo sysctl -w fs.mqueue.msg_max=65536\n"
+_CFS_TESTS_STEP = "      - name: Real-cFS acceptance tests\n"
+_EL8_TESTS_STEP = "      - name: Real-cFS acceptance tests as a non-root user\n"
 
 MSG_MAX_MUTATIONS: dict[str, Callable[[str], str]] = {
     "container sysctl removed": _replace_once(" --sysctl fs.mqueue.msg_max=65536", ""),
@@ -581,6 +677,93 @@ MSG_MAX_MUTATIONS: dict[str, Callable[[str], str]] = {
         ' -v -rP --basetemp="$RUNNER_TEMP', ' -v --basetemp="$RUNNER_TEMP'
     ),
     "el8-cfs tests lose -rP": _replace_once(' -v -rP --basetemp="$HOME', ' -v --basetemp="$HOME'),
+    "cfs tests step overrides the full depth": _replace_once(
+        _CFS_TESTS_STEP + '        env:\n          IRONBIRD_CFS: "1"\n',
+        _CFS_TESTS_STEP
+        + '        env:\n          IRONBIRD_CFS: "1"\n          '
+        + REQUIRE_FULL_DEPTH_ENV
+        + ': "0"\n',
+    ),
+    "el8-cfs tests step overrides the full depth": _replace_once(
+        _EL8_TESTS_STEP,
+        _EL8_TESTS_STEP + "        env:\n          " + REQUIRE_FULL_DEPTH_ENV + ': "0"\n',
+    ),
+    "cfs tests set the full depth inline": _replace_once(
+        "run: pytest tests/cfs", "run: " + REQUIRE_FULL_DEPTH_ENV + "=0 pytest tests/cfs"
+    ),
+    "el8-cfs tests set the full depth inline": _replace_once(
+        "          pytest tests/cfs", "          " + REQUIRE_FULL_DEPTH_ENV + "=0 pytest tests/cfs"
+    ),
+    "cfs tests unset the full depth": _replace_once(
+        "run: pytest tests/cfs", "run: env -u " + REQUIRE_FULL_DEPTH_ENV + " pytest tests/cfs"
+    ),
+    "second container sysctl too small": _replace_once(
+        "--sysctl fs.mqueue.msg_max=65536\n",
+        "--sysctl fs.mqueue.msg_max=65536 --sysctl fs.mqueue.msg_max=10\n",
+    ),
+    "first container sysctl too small": _replace_once(
+        "--sysctl fs.mqueue.msg_max=65536\n",
+        "--sysctl fs.mqueue.msg_max=10 --sysctl fs.mqueue.msg_max=65536\n",
+    ),
+    "sysctl step turns errexit off": _replace_once(
+        _SYSCTL_COMMAND_LINE, "          set +e\n" + _SYSCTL_COMMAND_LINE
+    ),
+    "sysctl step turns errexit off by name": _replace_once(
+        _SYSCTL_COMMAND_LINE, "          set +o errexit\n" + _SYSCTL_COMMAND_LINE
+    ),
+    "second sysctl lowers the value": _replace_once(
+        _SYSCTL_COMMAND_LINE,
+        _SYSCTL_COMMAND_LINE + "          sudo sysctl -w fs.mqueue.msg_max=10\n",
+    ),
+    "second sysctl lowers the value after the read-back": _replace_once(
+        _READ_BACK, _READ_BACK + "          sudo sysctl -w fs.mqueue.msg_max=10\n"
+    ),
+    "value lowered through /proc": _replace_once(
+        _READ_BACK, _READ_BACK + "          echo 10 > /proc/sys/fs/mqueue/msg_max\n"
+    ),
+    "value lowered in another step": _replace_once(
+        "      - name: Real-cFS acceptance tests\n",
+        "      - name: Lower it again\n        run: sudo sysctl -w fs.mqueue.msg_max=10\n"
+        "      - name: Real-cFS acceptance tests\n",
+    ),
+    "cfs job default shell without errexit": _replace_once(
+        "      " + REQUIRE_FULL_DEPTH_ENV + ': "1"\n    steps:\n',
+        "      " + REQUIRE_FULL_DEPTH_ENV + ': "1"\n    defaults:\n      run:\n'
+        "        shell: bash {0}\n    steps:\n",
+    ),
+    "workflow default shell": _replace_once(
+        "\njobs:\n", "\ndefaults:\n  run:\n    shell: bash {0}\n\njobs:\n"
+    ),
+    "el8-cfs default shell loses errexit": _replace_last("-eo pipefail {0}", "-o pipefail {0}"),
+    "later -r overrides -rP (cfs)": _replace_once(
+        ' -v -rP --basetemp="$RUNNER_TEMP', ' -v -rP -rfE --basetemp="$RUNNER_TEMP'
+    ),
+    "later -r overrides -rP (el8-cfs)": _replace_once(
+        ' -v -rP --basetemp="$HOME', ' -v -rP -r fE --basetemp="$HOME'
+    ),
+    "later -rN clears the report (cfs)": _replace_once(
+        ' -v -rP --basetemp="$RUNNER_TEMP', ' -v -rP -rN --basetemp="$RUNNER_TEMP'
+    ),
+    "cfs tests step has an if": _replace_once(
+        _CFS_TESTS_STEP, _CFS_TESTS_STEP + "        if: github.event_name == 'push'\n"
+    ),
+    "cfs tests step skipped with if: false": _replace_once(
+        _CFS_TESTS_STEP, _CFS_TESTS_STEP + "        if: false\n"
+    ),
+    "el8-cfs tests step skipped": _replace_once(
+        "        if: steps.setup.outputs.ready == 'true'\n        # One cFS instance",
+        "        if: steps.setup.outputs.ready == 'true' && false\n        # One cFS instance",
+    ),
+    "cfs job sets PYTEST_ADDOPTS": _replace_once(
+        "      " + REQUIRE_FULL_DEPTH_ENV + ': "1"\n    steps:\n',
+        "      " + REQUIRE_FULL_DEPTH_ENV + ': "1"\n      PYTEST_ADDOPTS: -rN\n    steps:\n',
+    ),
+    "el8-cfs tests set PYTEST_ADDOPTS inline": _replace_once(
+        "          pytest tests/cfs", "          PYTEST_ADDOPTS=-rN pytest tests/cfs"
+    ),
+    "cfs tests followed by || true": _replace_once(
+        '--basetemp="$RUNNER_TEMP/pytest"', '--basetemp="$RUNNER_TEMP/pytest" || true'
+    ),
 }
 
 
@@ -589,3 +772,20 @@ def test_msg_max_check_catches_regressions(mutation: str) -> None:
     mutated = MSG_MAX_MUTATIONS[mutation](WORKFLOW.read_text())
     assert mutated != WORKFLOW.read_text()
     assert _msg_max_violations(mutated), f"not caught: {mutation}"
+
+
+@pytest.mark.parametrize(
+    ("command", "chars"),
+    [
+        ("pytest tests/cfs -v -rP", "P"),
+        ("pytest tests/cfs -vrP", "P"),
+        ("pytest tests/cfs -r P -v", "P"),
+        ("pytest tests/cfs -rfE -rP", "P"),
+        ("pytest tests/cfs -rP -rfE", "fE"),
+        ("pytest tests/cfs -rP -r N", "N"),
+        ("pytest tests/cfs -v", None),
+        ("pytest tests/cfs --basetemp=/x/rP", None),
+    ],
+)
+def test_the_last_report_option_wins(command: str, chars: str | None) -> None:
+    assert _report_chars(command) == chars

@@ -16,13 +16,21 @@
 /*
  * Depth of TO_LAB's telemetry pipe: 100 ms of the 10k packets/s throughput test's stream
  * (tests/cfs/test_cfs_generator.py, which reads this line). It cannot exceed OS_QUEUE_MAX_DEPTH
- * (sample_defs/cpu1_osconfig.cmake), and a subscription's BufLimit (TO_LAB_ADD_PKT)
- * must be below it.
+ * (sample_defs/cpu1_osconfig.cmake). A subscription's BufLimit is bounded by it too: TO_LAB_ADD_PKT
+ * needs a limit below it (and a uint8, so 255 at most), while the subscription table
+ * (sample_defs/tables/cpu1_to_lab_sub.c) may use the depth itself, which it does for the generator.
  */
 #define IRONBIRD_TO_LAB_CFGVAL_TLM_PIPE_DEPTH 1000
 
+/*
+ * Telemetry packets TO_LAB forwards per wakeup before it looks at its command pipe. TO_LAB's own
+ * default is OS_QUEUE_MAX_DEPTH, which is 50 in stock cFS and would follow the deeper queues of
+ * this build to 1000: with a 10k packets/s stream that is 100 ms between command-pipe checks. This
+ * is the stock value, so the command pipe is checked about every 5 ms at that rate.
+ */
+#define IRONBIRD_TO_LAB_CFGVAL_MAX_TLM_PKTS 50
+
 #define IRONBIRD_TO_LAB_CFGVAL_TLM_PIPE_TIMEOUT     DEFAULT_TO_LAB_PLATFORM_TLM_PIPE_TIMEOUT
-#define IRONBIRD_TO_LAB_CFGVAL_MAX_TLM_PKTS         DEFAULT_TO_LAB_PLATFORM_MAX_TLM_PKTS
 #define IRONBIRD_TO_LAB_CFGVAL_CMD_PIPE_DEPTH       DEFAULT_TO_LAB_PLATFORM_CMD_PIPE_DEPTH
 #define IRONBIRD_TO_LAB_CFGVAL_STARTUP_SYNC_TIMEOUT DEFAULT_TO_LAB_PLATFORM_STARTUP_SYNC_TIMEOUT
 

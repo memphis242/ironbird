@@ -1,5 +1,6 @@
-# ironbird's OSAL configuration for the cpu1 target, layered over sample_defs/default_osconfig.cmake
-# and sample_defs/native_osconfig.cmake (cFS includes ${cpu}_osconfig.cmake last).
+# ironbird's OSAL configuration for the cpu1 target. cFS includes ${cpu}_osconfig.cmake first and
+# then sample_defs/default_osconfig.cmake and sample_defs/native_osconfig.cmake, so those stock files
+# win for any option they also set; this file only sets options they leave alone.
 #
 # tools/cfs/build.sh copies this file into the checkout's sample_defs/.
 

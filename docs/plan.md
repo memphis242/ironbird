@@ -3797,22 +3797,33 @@ Built (all items below are done; the differences from the first design are state
   `fs.mqueue.msg_max`, instead of running in their lenient mode when the pipe is shallower than TO_LAB asks for
   (a sysctl that silently did not take effect cannot pass). `tests/test_ci_el8.py` fails if the sysctl, its
   read-back (which must accept nothing below the pipe depth), the variable, or `-rP` on the cFS test commands (which
-  puts the tests' "mode" line in the CI log) is dropped, or if the sysctl step gains an `if`, `continue-on-error` or
-  `shell`.
+  puts the tests' "mode" line in the CI log) is dropped, or if the sysctl step gains an `if`, `continue-on-error`,
+  `shell` or a `set +...`, or if anything else could soften the result: a container `--sysctl` or `sysctl -w` below the
+  pipe depth (every one is checked, and any other line mentioning `msg_max`), a step-level or inline override of
+  `IRONBIRD_CFS_REQUIRE_FULL_DEPTH` or `PYTEST_ADDOPTS`, a later `-r` option replacing `-rP` (the last one wins in
+  pytest), an `if`, `continue-on-error` or `||` on the cFS test step, or a `defaults.run.shell` (workflow or job)
+  without errexit; each has a mutation test.
   The build deepens the pipe: `tools/cfs/build.sh` copies `tools/cfs/sample_defs/` into the checkout's
-  `sample_defs/`, the mission directory cFS reads its overrides from (never editing a stock file; it refuses a
-  name the checkout tracks). `cpu1_osconfig.cmake` sets `OSAL_CONFIG_QUEUE_MAX_DEPTH` 1000 (OSAL's cap, and so the
+  `sample_defs/`, the mission directory cFS reads its overrides from (never editing a stock file; it checks every name against the checkout's tracked files before copying any, and
+  removes an earlier run's override that is no longer in `tools/cfs/sample_defs`, tracked in a manifest in the build
+  directory, so a rebuild matches a fresh build). `cpu1_osconfig.cmake` sets `OSAL_CONFIG_QUEUE_MAX_DEPTH` 1000 (OSAL's cap, and so the
   deepest SB pipe), and `cpu1_to_lab_internal_cfg_values.h` sets `TO_LAB_PLATFORM_TLM_PIPE_DEPTH` 1000, checked
   against OSAL's cap at compile time. TO_LAB then asks for a pipe that holds 100 ms of 10k packets/s, and the
   generator tests read that depth from the build tree (not a constant). A subscription's own limit is a
-  separate setting: `TO_LAB_ADD_PKT`'s `BufLimit` is a `uint8`, so the tests ask for 255 (25 ms of the generator's
-  stream; a subscription table could carry up to 999, not needed so far). With the console reporting a queue depth of at
+  separate setting: `TO_LAB_ADD_PKT`'s `BufLimit` is a `uint8`, so 255 at most (25 ms of the generator's stream), which
+  lost 33 of 30,000 packets in 1 of 20 strict 10k/s runs under 8 CPU burners (all `Msg Limit Err, MsgId 0x8e2`).
+  The generator's two messages are therefore subscribed by a TO_LAB subscription table override,
+  `tools/cfs/sample_defs/tables/cpu1_to_lab_sub.c`, with a `uint16` `BufLimit` of 1000, the pipe depth (TO_LAB's
+  table validation accepts it; compile-time checks tie the two), and `cpu1_to_lab_internal_cfg_values.h` keeps
+  `TO_LAB_PLATFORM_MAX_TLM_PKTS` at its stock 50 instead of the 1000 `OS_QUEUE_MAX_DEPTH` would give it, so
+  TO_LAB still checks its command pipe about every 5 ms at 10k packets/s. With the console reporting a queue depth of at
   least the pipe depth, both generator tests are strict: the 1k test requires zero SB drops and zero missing
   packets, the 10k test zero SB drops and every missing packet a recorded `kernel_drop` GAP (the exact
   zero-kernel-drop check stays the throughput gate's). Below it (a developer host at the default 10) both keep the
   accounting through the SB counters, and print which mode ran. Measured on the development host (4 vCPU,
-  `unshare --ipc`, `msg_max` 65536, depth 1000, `BufLimit` 255): both tests strict, the 10k/s test lossless in 31 of
-  31 runs and the 1k/s test in 30 of 30 (30,000 of 30,000 at 10k/s, no SB drop, no kernel drop). Before the deeper pipe (depth 50, `BufLimit`
+  `unshare --net --ipc`, `msg_max` 65536, depth 1000, generator `BufLimit` 1000 from the table): both tests strict,
+  lossless in 10 of 10 idle runs and in 50 of 50 runs under 8 `yes` CPU burners (30,000 of 30,000 at 10k/s each, no SB
+  drop, no kernel drop); the same burners with `BufLimit` 255 lost 33 packets in 1 of 20 runs. Before the deeper pipe (depth 50, `BufLimit`
   49) the 1k/s test was strict 8 of 8 and the 10k/s test lost 10 to 470 of 30,000 in 6 of 18 runs, every one counted
   by SB (`PipeOverflowErrorCounter` plus `MsgLimitErrorCounter`; the second counts the drops that hit the
   subscription's limit first, which the earlier accounting missed).

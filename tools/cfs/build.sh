@@ -78,20 +78,56 @@ for app_dir in "$APPS_SRC"/*/; do
     echo "build.sh: added ironbird app $app to the build"
 done
 
-# ironbird's cFS configuration (tools/cfs/sample_defs/*) goes into the checkout's sample_defs/, where
-# cFS looks for mission overrides of its OSAL options and of an app's configuration headers (an
-# override replaces the app's own default file of that name, which stays untouched). Only a name the
-# checkout does not already track is copied, so a stock cFS file is never replaced.
+# ironbird's cFS configuration (tools/cfs/sample_defs/**) goes into the checkout's sample_defs/,
+# where cFS looks for mission overrides of its OSAL options, of an app's configuration headers and
+# of its tables (an override replaces the app's own default file of that name, which stays
+# untouched). A path the checkout already tracks is a stock cFS file and is never replaced, and all
+# paths are checked before any is copied. The installed paths are recorded in a manifest, so an
+# override removed from tools/cfs/sample_defs is removed from the checkout on the next run and a
+# rebuild matches a fresh build.
 readonly DEFS_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sample_defs"
-for def_file in "$DEFS_SRC"/*; do
-    [[ -f "$def_file" ]] || continue
-    def="$(basename "$def_file")"
+readonly DEFS_DST="$SRC_DIR/sample_defs"
+readonly DEFS_MANIFEST="$CFS_BUILD_DIR/IRONBIRD_SAMPLE_DEFS"
+[[ -d "$DEFS_DST" ]] || die "$DEFS_DST not found; is $SRC_DIR a cFS bundle?"
+defs=()
+while IFS= read -r -d '' def_file; do
+    defs+=("${def_file#"$DEFS_SRC"/}")
+done < <(find "$DEFS_SRC" -type f -print0 | sort -z)
+for def in "${defs[@]}"; do
     if git -C "$SRC_DIR" ls-files --error-unmatch "sample_defs/$def" >/dev/null 2>&1; then
         die "sample_defs/$def is a stock cFS file; ironbird's override must use another name"
     fi
-    cp -f "$def_file" "$SRC_DIR/sample_defs/$def"
+done
+
+if [[ -f "$DEFS_MANIFEST" ]]; then
+    while IFS= read -r old_def; do
+        [[ -n "$old_def" ]] || continue
+        # Only what an earlier run installed and cFS does not track, and nothing outside sample_defs/.
+        case "$old_def" in
+            /* | ../* | */../* | *..) die "$DEFS_MANIFEST names an unsafe path: $old_def" ;;
+        esac
+        if git -C "$SRC_DIR" ls-files --error-unmatch "sample_defs/$old_def" >/dev/null 2>&1; then
+            continue
+        fi
+        if [[ ! -f "$DEFS_SRC/$old_def" && -e "$DEFS_DST/$old_def" ]]; then
+            rm -f "${DEFS_DST:?}/$old_def"
+            # and the directories it leaves empty (the stock ones are never empty)
+            old_dir="$(dirname "$DEFS_DST/$old_def")"
+            while [[ "$old_dir" != "$DEFS_DST" ]] && rmdir "$old_dir" 2>/dev/null; do
+                old_dir="$(dirname "$old_dir")"
+            done
+            echo "build.sh: removed ironbird cFS configuration sample_defs/$old_def (no longer in tools/cfs/sample_defs)"
+        fi
+    done < "$DEFS_MANIFEST"
+fi
+
+for def in "${defs[@]}"; do
+    mkdir -p "$(dirname "$DEFS_DST/$def")"
+    cp -f "$DEFS_SRC/$def" "$DEFS_DST/$def"
     echo "build.sh: installed ironbird cFS configuration sample_defs/$def"
 done
+printf '%s\n' "${defs[@]}" > "$DEFS_MANIFEST.tmp"
+mv "$DEFS_MANIFEST.tmp" "$DEFS_MANIFEST"
 
 cd "$SRC_DIR"
 make "${CFS_CONFIG}.prep"

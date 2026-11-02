@@ -15,7 +15,10 @@ validated) and what ironbird makes of the stream:
   run's ``MaxBurst``); a packet still missing was dropped by cFS's software bus while TO_LAB was
   off-CPU for longer than the pipe covers, a host-scheduling loss outside ironbird that SB
   housekeeping counts (``PipeOverflowErrorCounter``, plus ``MsgLimitErrorCounter`` when the
-  subscription's own limit is hit first), and the test requires those counts to cover it. When the
+  subscription's own limit is hit first), and the test requires those counts to cover it. The
+  generator's two messages are subscribed by TO_LAB's subscription table
+  (``tools/cfs/sample_defs/tables/cpu1_to_lab_sub.c``) with a per-message limit equal to the pipe's
+  depth, so the pipe alone bounds the stream. When the
   cFS console shows the pipe at the full depth TO_LAB asks for (``msg_max`` of at least that, which
   CI sets), the test is strict instead: zero SB drops and zero packets missing;
 * at 10k packets/s ``ib record`` loses nothing silently: no duplicate, nothing out of order, no
@@ -24,8 +27,9 @@ validated) and what ironbird makes of the stream:
   software bus when the forwarding task is descheduled for a millisecond or so; SB housekeeping
   counts those drops in ``PipeOverflowErrorCounter`` and ``MsgLimitErrorCounter``) or by a
   ``kernel_drop`` GAP record in the recording itself, which a loaded CI runner can produce. At the
-  full pipe depth the test is strict about cFS too: the pipe holds 100 ms of the stream, so the
-  software bus drops nothing, and every packet missing is a recorded kernel drop.
+  full pipe depth the test is strict about cFS too: the pipe, and so each of the generator's
+  subscriptions, holds 100 ms of the stream, so the software bus drops nothing, and every packet
+  missing is a recorded kernel drop.
 
 With ``IRONBIRD_CFS_REQUIRE_FULL_DEPTH=1`` (set by CI) both tests fail, naming
 ``fs.mqueue.msg_max``, instead of running in their lenient mode when the pipe is shallower than
@@ -93,7 +97,8 @@ OS_QUEUE_MAX_DEPTH_DEFINE = re.compile(r"^#define\s+OS_QUEUE_MAX_DEPTH\s+(\d+)\b
 TO_LAB_TLM_PIPE_DEPTH_DEFINE = re.compile(
     r"^#define\s+IRONBIRD_TO_LAB_CFGVAL_TLM_PIPE_DEPTH\s+(\d+)\b", re.M
 )
-TO_LAB_ADD_PKT_MAX_BUF_LIMIT = 255  # BufLimit is a uint8 in TO_LAB_ADD_PKT
+# The BufLimit a housekeeping subscription made with TO_LAB_ADD_PKT asks for (a uint8 there)
+HK_BUF_LIMIT = 8
 # Set to 1 by CI: a pipe shallower than TO_LAB asks for fails the generator tests
 REQUIRE_FULL_DEPTH_ENV = "IRONBIRD_CFS_REQUIRE_FULL_DEPTH"
 
@@ -111,18 +116,19 @@ STATUS = "msg == IB_TEST_GEN_STATUS"
 
 @pytest.fixture
 def generator_output(ground: Ground) -> Ground:
-    """TO_LAB told to forward the generator's two packets and the app's housekeeping (once per
-    cFS instance)."""
+    """TO_LAB forwarding the generator's two packets, which its subscription table subscribes at
+    start-up (cpu1_to_lab_sub.c: the per-message limit is the pipe's depth, more than
+    TO_LAB_ADD_PKT can ask for), and the app's housekeeping, told to it here (once per cFS
+    instance)."""
     if not getattr(ground, "generator_added", False):
-        for mid in (IB_TEST_HK_MID, GEN_MID, GEN_STATUS_MID):
-            ground.send(
-                "TO_LAB_ADD_PKT",
-                f"Stream={mid:#x}",
-                "QosPriority=0",
-                "QosReliability=0",
-                f"BufLimit={_buf_limit()}",
-                "Padding=00",
-            )
+        ground.send(
+            "TO_LAB_ADD_PKT",
+            f"Stream={IB_TEST_HK_MID:#x}",
+            "QosPriority=0",
+            "QosReliability=0",
+            f"BufLimit={HK_BUF_LIMIT}",
+            "Padding=00",
+        )
         ground.generator_added = True  # type: ignore[attr-defined]
     return ground
 
@@ -166,7 +172,8 @@ def _generated(g: Ground, tmp_path: Path, name: str, rate: int, count: int) -> d
 
     # The software bus drops a packet in two ways, each with its own counter: the destination
     # pipe is full (PipeOverflowErrorCounter), or the pipe holds as many of that message as the
-    # subscription allows (MsgLimitErrorCounter; TO_LAB subscribes with the BufLimit sent above).
+    # subscription allows (MsgLimitErrorCounter; the generator's subscriptions allow the pipe's
+    # whole depth, so only the pipe itself limits them).
     sb_dropped = grown("PipeOverflowErrorCounter") + grown("MsgLimitErrorCounter")
     return {"out": out, "env": env, "status": done["fields"], "sb_overflow": sb_dropped}
 
@@ -191,12 +198,6 @@ def _to_lab_pipe_depth() -> int:
         if override is not None:
             depth = min(depth, int(override.group(1)))
     return depth
-
-
-def _buf_limit() -> int:
-    """The per-message subscription limit the tests ask TO_LAB for: the most it accepts (below the
-    pipe's depth) that the command's 8-bit field (``BufLimit``, 0..255) can carry."""
-    return min(_to_lab_pipe_depth() - 1, TO_LAB_ADD_PKT_MAX_BUF_LIMIT)
 
 
 @functools.cache
@@ -375,8 +376,9 @@ def test_ten_thousand_packets_a_second_are_not_lost_silently_by_ironbird(
         f"largest burst {status['MaxBurst']}"
     )
     if _strict_mode(limit):
-        # the pipe is as deep as TO_LAB asks for (100 ms of this stream): the software bus drops
-        # nothing, and a packet missing is a kernel drop that ironbird recorded
+        # the pipe is as deep as TO_LAB asks for (100 ms of this stream) and the generator's
+        # subscriptions allow all of it: the software bus drops nothing, and a packet missing is a
+        # kernel drop that ironbird recorded
         assert result["sb_overflow"] == 0, (lost, result["sb_overflow"], kernel)
         assert 0 <= lost <= kernel, (lost, result["sb_overflow"], kernel)
     else:
