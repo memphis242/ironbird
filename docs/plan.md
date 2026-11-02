@@ -4011,12 +4011,13 @@ Decided by the user (2026-10-30, later):
    (3) navigational flow; (4) final touches. Follow the `gui-principles` skill. TUI feature
    work starts only after the user signs off the design. Screenshots are delivered as PNGs
    (readable on a phone), grouped by variant; an HTML page only as an optional extra.
-   **Page structure (user, 2026-11-02):** two main pages, each with its auxiliary elements:
-   the **recording page** (designed first) and the **commanding page** (manual sends and
-   sends on a schedule or in a user-specified pattern; Stages 4-5). Settings live in one
-   **settings modal**, which grows as options appear. Open for the navigation pass: where
-   the Events view and the ledger viewer listed above sit in this structure (views or
-   panels of the recording page, or modals).
+   **Page structure (user, 2026-11-02):** three main pages, each with its auxiliary
+   elements: the **recording page** (designed first), the **Events page** (above), and the
+   **commanding page** (manual sends and sends on a schedule or in a user-specified
+   pattern; Stages 4-5). Modals: a **settings modal**, which grows as options appear, and a
+   **recordings browser** listing recent recordings to open and replay in the recording
+   page. The ledger viewer is kept; where it sits (its own page, or a panel reached from
+   the error line and details pane) is decided in the navigation pass.
    **Pass 1 decisions so far:** Bench (variant A) colors; Cockpit (variant B) layout, the
    packet list on the left and fields above bytes on the right; Bench's top and bottom
    status bars; a quiet list with no latest-values summary column by default (it can be
