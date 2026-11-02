@@ -78,6 +78,21 @@ for app_dir in "$APPS_SRC"/*/; do
     echo "build.sh: added ironbird app $app to the build"
 done
 
+# ironbird's cFS configuration (tools/cfs/sample_defs/*) goes into the checkout's sample_defs/, where
+# cFS looks for mission overrides of its OSAL options and of an app's configuration headers (an
+# override replaces the app's own default file of that name, which stays untouched). Only a name the
+# checkout does not already track is copied, so a stock cFS file is never replaced.
+readonly DEFS_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sample_defs"
+for def_file in "$DEFS_SRC"/*; do
+    [[ -f "$def_file" ]] || continue
+    def="$(basename "$def_file")"
+    if git -C "$SRC_DIR" ls-files --error-unmatch "sample_defs/$def" >/dev/null 2>&1; then
+        die "sample_defs/$def is a stock cFS file; ironbird's override must use another name"
+    fi
+    cp -f "$def_file" "$SRC_DIR/sample_defs/$def"
+    echo "build.sh: installed ironbird cFS configuration sample_defs/$def"
+done
+
 cd "$SRC_DIR"
 make "${CFS_CONFIG}.prep"
 make -j"$JOBS" "${CFS_CONFIG}.install"

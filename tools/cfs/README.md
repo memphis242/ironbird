@@ -38,8 +38,13 @@ string, stored and published as `IB_TEST_VAR`), `IB_TEST_SEND_VAR` and `IB_TEST_
 (`IB_TEST_GEN_START Rate=1..10000 Count=N`, `IB_TEST_GEN_STOP`, `IB_TEST_GEN_SEND_STATUS`) that publishes
 fixed-size 200-byte telemetry (`IB_TEST_GEN`, with `IB_TEST_GEN_STATUS` at the end of a run); telemetry MIDs
 0x08E0 (HK), 0x08E1 (VAR), 0x08E2 (GEN) and 0x08E3 (GEN_STATUS) are not in TO_LAB's table, so a test adds them
-with `TO_LAB_ADD_PKT` (`BufLimit` below 50).
+with `TO_LAB_ADD_PKT` (`BufLimit` 0..255, below TO_LAB's telemetry pipe depth, 1000 in this build).
 The layouts are in `apps/ib_test/fsw/src/ib_test.h` and `examples/ccdd/cfs.json`.
+
+`sample_defs/` holds ironbird's cFS configuration: `build.sh` copies each file into the checkout's `sample_defs/`
+(never over a stock file), where cFS reads mission overrides. `cpu1_osconfig.cmake` raises OSAL's maximum queue depth
+and `cpu1_to_lab_internal_cfg_values.h` sets TO_LAB's telemetry pipe to that depth (1000), so the 10k packets/s generator
+test can be strict; see `NOTES.md` section 8 for the numbers and for the `fs.mqueue.msg_max` the host needs.
 
 Behind the agent proxy a failed clone is a proxy problem, see `/root/.ccr/README.md`.
 

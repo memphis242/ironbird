@@ -8,27 +8,28 @@ validated) and what ironbird makes of the stream:
 * at 1k packets/s ironbird loses nothing (no GAP of any reason, kernel drops included, nothing out
   of order) and the generator never overruns TO_LAB's telemetry pipe by itself. That pipe is
   ``fs.mqueue.msg_max`` deep at most (10 on a default Linux host: OSAL truncates every queue a
-  non-root cFS creates to it), not the 50 TO_LAB asks for, so it covers 10 ms of TO_LAB's task being
-  off-CPU at 1k packets/s. The generator's catch-up after its own stall is limited to what fits in
-  the pipe (``IB_TEST_GEN_BURST_LIMIT``, asserted at compile time in ``ib_test.h``, and here
-  through the run's ``MaxBurst``); a packet still missing was dropped by cFS's software bus while
-  TO_LAB was off-CPU for longer than the pipe covers, a host-scheduling loss outside ironbird that
-  SB housekeeping counts (``PipeOverflowErrorCounter``, plus ``MsgLimitErrorCounter`` when the
+  non-root cFS creates to it), not the depth TO_LAB asks for (1000 in this build:
+  ``tools/cfs/sample_defs``), so on a default host it covers 10 ms of TO_LAB's task being off-CPU at
+  1k packets/s. The generator's catch-up after its own stall is limited to what fits in the pipe
+  (``IB_TEST_GEN_BURST_LIMIT``, asserted at compile time in ``ib_test.h``, and here through the
+  run's ``MaxBurst``); a packet still missing was dropped by cFS's software bus while TO_LAB was
+  off-CPU for longer than the pipe covers, a host-scheduling loss outside ironbird that SB
+  housekeeping counts (``PipeOverflowErrorCounter``, plus ``MsgLimitErrorCounter`` when the
   subscription's own limit is hit first), and the test requires those counts to cover it. When the
-  cFS console shows the pipe at the full depth TO_LAB asks for (``msg_max`` of at least 50, which CI
-  sets), the test is strict instead: zero SB drops and zero packets missing;
+  cFS console shows the pipe at the full depth TO_LAB asks for (``msg_max`` of at least that, which
+  CI sets), the test is strict instead: zero SB drops and zero packets missing;
 * at 10k packets/s ``ib record`` loses nothing silently: no duplicate, nothing out of order, no
   recorder-buffer or capture-queue loss, and every packet missing from the recording is accounted
-  for, either by cFS (with the default ``fs.mqueue.msg_max`` of 10 its software bus overflows
-  TO_LAB's pipe when the forwarding task is descheduled for a millisecond or so; SB housekeeping
+  for, either by cFS (a pipe truncated to a default ``fs.mqueue.msg_max`` of 10 is overflowed by the
+  software bus when the forwarding task is descheduled for a millisecond or so; SB housekeeping
   counts those drops in ``PipeOverflowErrorCounter`` and ``MsgLimitErrorCounter``) or by a
-  ``kernel_drop`` GAP record in the recording itself, which a loaded CI runner can produce.
-  Unlike the 1k test this one stays an accounting test at the full pipe depth (CI sets
-  ``msg_max`` 65536): 50 slots hold 5 ms of 10k packets/s, and on a shared host TO_LAB's task is
-  off-CPU longer than that often enough that zero SB drops cannot be required (about a third of
-  the runs on a 4-vCPU development host dropped 15 to 470 of 30000, every one counted by SB). A
-  run with zero kernel drops is enforced by the throughput gate
-  (``tests/bench``), whose blaster is not subject to cFS's pipe.
+  ``kernel_drop`` GAP record in the recording itself, which a loaded CI runner can produce. At the
+  full pipe depth the test is strict about cFS too: the pipe holds 100 ms of the stream, so the
+  software bus drops nothing, and every packet missing is a recorded kernel drop.
+
+With ``IRONBIRD_CFS_REQUIRE_FULL_DEPTH=1`` (set by CI) both tests fail, naming
+``fs.mqueue.msg_max``, instead of running in their lenient mode when the pipe is shallower than
+TO_LAB asks for, so a CI host whose setting did not take effect cannot pass unnoticed.
 
 Each test prints which mode it ran in ("strict" or "accounting").
 
@@ -40,6 +41,7 @@ from __future__ import annotations
 
 import functools
 import itertools
+import os
 import re
 import signal
 import struct
@@ -76,12 +78,24 @@ IB_TEST_HEADER_IN_BUILD = CFS_BUILD_DIR / "src" / "apps" / "ib_test" / "fsw" / "
 # What the OSAL BSP prints when it truncates every queue to fs.mqueue.msg_max (a non-root cFS)
 QUEUE_DEPTH_LINE = re.compile(rb"Maximum user msg queue depth = (\d+)")
 
-# The depth of the telemetry pipe TO_LAB asks for: TO_LAB_PLATFORM_TLM_PIPE_DEPTH, which defaults to
-# OSAL's OS_QUEUE_MAX_DEPTH (50; apps/to_lab/fsw/inc/to_lab_internal_cfg.h and
-# build-native_std/osal_public_api/osconfig.gen in the pinned cFS bundle). A pipe the OSAL BSP
-# truncated below it can overflow under host load; one at least this deep is the pipe as cFE
-# configured it.
-TO_LAB_TLM_PIPE_DEPTH = 50
+# The cFS build tree this run uses, and what it was configured with: TO_LAB's telemetry pipe depth
+# is TO_LAB_PLATFORM_TLM_PIPE_DEPTH (tools/cfs/sample_defs/cpu1_to_lab_internal_cfg_values.h, which
+# build.sh stages into the checkout), never more than OSAL's OS_QUEUE_MAX_DEPTH
+# (sample_defs/cpu1_osconfig.cmake). Either falls back to the other's default when not overridden.
+CFS_CPU_BUILD = (
+    CFS_BUILD_DIR
+    / "src"
+    / f"build-{os.environ.get('CFS_CONFIG', 'native_std')}"
+    / "native"
+    / "default_cpu1"
+)
+OS_QUEUE_MAX_DEPTH_DEFINE = re.compile(r"^#define\s+OS_QUEUE_MAX_DEPTH\s+(\d+)\b", re.M)
+TO_LAB_TLM_PIPE_DEPTH_DEFINE = re.compile(
+    r"^#define\s+IRONBIRD_TO_LAB_CFGVAL_TLM_PIPE_DEPTH\s+(\d+)\b", re.M
+)
+TO_LAB_ADD_PKT_MAX_BUF_LIMIT = 255  # BufLimit is a uint8 in TO_LAB_ADD_PKT
+# Set to 1 by CI: a pipe shallower than TO_LAB asks for fails the generator tests
+REQUIRE_FULL_DEPTH_ENV = "IRONBIRD_CFS_REQUIRE_FULL_DEPTH"
 
 SHARED_FIXTURES = (_artifact_safe_paths, cfs, ground, ground_session)
 
@@ -106,7 +120,7 @@ def generator_output(ground: Ground) -> Ground:
                 f"Stream={mid:#x}",
                 "QosPriority=0",
                 "QosReliability=0",
-                "BufLimit=49",  # the most TO_LAB accepts
+                f"BufLimit={_buf_limit()}",
                 "Padding=00",
             )
         ground.generator_added = True  # type: ignore[attr-defined]
@@ -152,9 +166,37 @@ def _generated(g: Ground, tmp_path: Path, name: str, rate: int, count: int) -> d
 
     # The software bus drops a packet in two ways, each with its own counter: the destination
     # pipe is full (PipeOverflowErrorCounter), or the pipe holds as many of that message as the
-    # subscription allows (MsgLimitErrorCounter; TO_LAB subscribes with the 49 BufLimit sent above).
+    # subscription allows (MsgLimitErrorCounter; TO_LAB subscribes with the BufLimit sent above).
     sb_dropped = grown("PipeOverflowErrorCounter") + grown("MsgLimitErrorCounter")
     return {"out": out, "env": env, "status": done["fields"], "sb_overflow": sb_dropped}
+
+
+@functools.cache
+def _to_lab_pipe_depth() -> int:
+    """The depth of the telemetry pipe TO_LAB asks cFE for, as this cFS build was configured. A
+    pipe the OSAL BSP truncated below it can overflow under host load; one at least this deep is
+    the pipe as cFE configured it."""
+    osconfig = CFS_CPU_BUILD / "osal" / "inc" / "osconfig.h"
+    wrapper = CFS_CPU_BUILD / "inc" / "to_lab_internal_cfg_values.h"
+    assert osconfig.is_file() and wrapper.is_file(), (
+        f"{osconfig} or {wrapper} not found: the cFS build tree is missing or incomplete "
+        "(tools/cfs/build.sh)"
+    )
+    found = OS_QUEUE_MAX_DEPTH_DEFINE.search(osconfig.read_text())
+    assert found is not None, f"OS_QUEUE_MAX_DEPTH not defined in {osconfig}"
+    depth = int(found.group(1))
+    # the generated wrapper includes the file cFS picked for TO_LAB's values
+    for included in re.findall(r'^#include "([^"]+)"', wrapper.read_text(), re.M):
+        override = TO_LAB_TLM_PIPE_DEPTH_DEFINE.search(Path(included).read_text())
+        if override is not None:
+            depth = min(depth, int(override.group(1)))
+    return depth
+
+
+def _buf_limit() -> int:
+    """The per-message subscription limit the tests ask TO_LAB for: the most it accepts (below the
+    pipe's depth) that the command's 8-bit field (``BufLimit``, 0..255) can carry."""
+    return min(_to_lab_pipe_depth() - 1, TO_LAB_ADD_PKT_MAX_BUF_LIMIT)
 
 
 @functools.cache
@@ -193,23 +235,30 @@ def _queue_depth_limit(console: Path) -> int:
 
 def _strict_mode(queue_depth_limit: int) -> bool:
     """Whether the pipe is as deep as TO_LAB asks for, so cFS itself must lose nothing."""
-    return queue_depth_limit >= TO_LAB_TLM_PIPE_DEPTH
+    return queue_depth_limit >= _to_lab_pipe_depth()
 
 
-def _mode_line(limit: int, *, can_be_strict: bool = True) -> str:
+def _require_full_depth_if_asked(queue_depth_limit: int) -> None:
+    """Fail, naming the setting, when CI demands the full pipe depth and this cFS lacks it."""
+    if os.environ.get(REQUIRE_FULL_DEPTH_ENV) != "1":
+        return
+    assert _strict_mode(queue_depth_limit), (
+        f"{REQUIRE_FULL_DEPTH_ENV}=1 but cFS truncated its queues to fs.mqueue.msg_max = "
+        f"{queue_depth_limit}, below the {_to_lab_pipe_depth()} deep telemetry pipe TO_LAB asks "
+        "for: raise fs.mqueue.msg_max on this host (CI: the sysctl step or the container's "
+        "--sysctl option in .github/workflows/ci.yml did not take effect)"
+    )
+
+
+def _mode_line(limit: int) -> str:
     """Which checks a test ran: strict (cFS must lose nothing) or accounting (every loss must be
     counted by the software bus or recorded as a kernel drop)."""
-    if _strict_mode(limit) and can_be_strict:
-        return f"strict (queue depth limit {limit} >= {TO_LAB_TLM_PIPE_DEPTH}: no SB drop)"
+    depth = _to_lab_pipe_depth()
     if _strict_mode(limit):
-        return (
-            f"accounting (queue depth limit {limit} >= {TO_LAB_TLM_PIPE_DEPTH}, but this rate "
-            "outruns the pipe whenever TO_LAB is off-CPU for ~5 ms: loss must be counted by SB "
-            "or recorded as a kernel drop)"
-        )
+        return f"strict (queue depth limit {limit} >= {depth}: no SB drop)"
     return (
-        f"accounting (queue depth limit {limit} < {TO_LAB_TLM_PIPE_DEPTH}: loss must be counted "
-        "by SB or recorded as a kernel drop)"
+        f"accounting (queue depth limit {limit} < {depth}: loss must be counted by SB or "
+        "recorded as a kernel drop)"
     )
 
 
@@ -255,6 +304,7 @@ def test_one_thousand_packets_a_second_reach_the_recording_unless_cfs_counts_the
         f"cFS truncated its queues to fs.mqueue.msg_max = {limit}, below the {min_depth} the "
         "ib_test generator is designed for; raise fs.mqueue.msg_max on this host"
     )
+    _require_full_depth_if_asked(limit)
     result = _generated(generator_output, tmp_path, "floor", rate, count)
     found = _packets(result["out"])
     status = result["status"]
@@ -303,6 +353,7 @@ def test_ten_thousand_packets_a_second_are_not_lost_silently_by_ironbird(
 ) -> None:
     count = 30_000
     limit = _queue_depth_limit(cfs)
+    _require_full_depth_if_asked(limit)
     result = _generated(generator_output, tmp_path, "target", 10_000, count)
     found = _packets(result["out"])
     status = result["status"]
@@ -318,17 +369,20 @@ def test_ten_thousand_packets_a_second_are_not_lost_silently_by_ironbird(
     assert report["missing_frames"] == 0
     lost = count - len(found)
     print(
-        f"\ncFS generator at 10k/s, mode {_mode_line(limit, can_be_strict=False)}: "
+        f"\ncFS generator at 10k/s, mode {_mode_line(limit)}: "
         f"{len(found)}/{count} recorded, {lost} lost, "
         f"SB pipe overflows {result['sb_overflow']}, kernel drops {kernel}, "
         f"largest burst {status['MaxBurst']}"
     )
-    # Every missing packet is a software-bus drop inside cFS (the counters also count other
-    # telemetry, so they can exceed the loss) or a kernel drop that ironbird recorded. This holds
-    # at the full pipe depth too: the 50 slots TO_LAB asks for (49 per message) hold 5 ms of
-    # packets at 10k/s, so TO_LAB's task being off-CPU for longer than that on a shared host
-    # drops some, which no msg_max prevents; only the 1k/s test can be strict about cFS.
-    assert 0 <= lost <= result["sb_overflow"] + kernel, (lost, result["sb_overflow"], kernel)
+    if _strict_mode(limit):
+        # the pipe is as deep as TO_LAB asks for (100 ms of this stream): the software bus drops
+        # nothing, and a packet missing is a kernel drop that ironbird recorded
+        assert result["sb_overflow"] == 0, (lost, result["sb_overflow"], kernel)
+        assert 0 <= lost <= kernel, (lost, result["sb_overflow"], kernel)
+    else:
+        # every missing packet is a software-bus drop inside cFS (the counters also count other
+        # telemetry, so they can exceed the loss) or a kernel drop that ironbird recorded
+        assert 0 <= lost <= result["sb_overflow"] + kernel, (lost, result["sb_overflow"], kernel)
 
 
 def test_the_generator_validates_its_commands(generator_output: Ground) -> None:

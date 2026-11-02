@@ -437,17 +437,27 @@ def test_workflow_check_catches_privilege_regressions(mutation: str) -> None:
 
 # --- fs.mqueue.msg_max for the real-cFS jobs ---------------------------------------------------
 # A non-root cFS has OSAL truncate every queue to fs.mqueue.msg_max (10 by default), so TO_LAB's
-# 50-deep telemetry pipe would be 10 deep and the generator tests (tests/cfs/test_cfs_generator.py,
-# strict at a depth of at least 50) would run in their lenient mode. Every job that runs real cFS
-# must therefore raise it, and a dropped line must not go unnoticed.
+# telemetry pipe would be 10 deep instead of the depth it asks for and the generator tests
+# (tests/cfs/test_cfs_generator.py, strict only at the full depth) would run in their lenient mode.
+# Every job that runs real cFS must therefore raise it, a dropped or neutered line must not go
+# unnoticed, and the tests must fail (not fall back to the lenient mode) when it did not take
+# effect: IRONBIRD_CFS_REQUIRE_FULL_DEPTH=1 in both jobs.
 
-MIN_MSG_MAX = 50  # TO_LAB's TLM pipe depth (OS_QUEUE_MAX_DEPTH)
+TO_LAB_VALUES = REPO / "tools" / "cfs" / "sample_defs" / "cpu1_to_lab_internal_cfg_values.h"
+REQUIRE_FULL_DEPTH_ENV = "IRONBIRD_CFS_REQUIRE_FULL_DEPTH"
+_pipe_depth = re.search(
+    r"^#define\s+IRONBIRD_TO_LAB_CFGVAL_TLM_PIPE_DEPTH\s+(\d+)\b", TO_LAB_VALUES.read_text(), re.M
+)
+assert _pipe_depth is not None, f"TO_LAB's telemetry pipe depth not defined in {TO_LAB_VALUES}"
+MIN_MSG_MAX = int(_pipe_depth.group(1))  # the depth TO_LAB asks for
 _SYSCTL_OPTION = re.compile(r"(?:^|\s)--sysctl[= ]fs\.mqueue\.msg_max=(\d+)(?:\s|$)")
-# the step fails when the value read back from /proc is below the minimum
+# the step fails when the value read back from /proc is below the threshold (captured)
 _MSG_MAX_READ_BACK = re.compile(
-    r"^\s*test \"\$\(cat /proc/sys/fs/mqueue/msg_max\)\" -ge \d+\s*$", re.M
+    r"^\s*test \"\$\(cat /proc/sys/fs/mqueue/msg_max\)\" -ge (\d+)\s*$", re.M
 )
 _SYSCTL_COMMAND = re.compile(r"^\s*sudo sysctl -w fs\.mqueue\.msg_max=(\d+)\s*$", re.M)
+# step or job keys that let a failing (or never-run) step go unnoticed
+_BYPASS_KEYS = ("if", "continue-on-error", "shell")
 
 
 def _msg_max_violations(text: str) -> list[str]:
@@ -463,26 +473,56 @@ def _msg_max_violations(text: str) -> list[str]:
             f"el8-cfs: container options lack --sysctl fs.mqueue.msg_max>={MIN_MSG_MAX}"
         )
 
+    for name in ("cfs", "el8-cfs"):
+        job = jobs[name]
+        if job.get("env", {}).get(REQUIRE_FULL_DEPTH_ENV) != "1":
+            problems.append(f"{name}: env {REQUIRE_FULL_DEPTH_ENV} must be the string '1'")
+        if "continue-on-error" in job:
+            problems.append(f"{name}: the job sets continue-on-error")
+        tests = [s for s in _steps(job) if "pytest tests/cfs" in str(s.get("run", ""))]
+        if len(tests) != 1:
+            problems.append(f"{name}: expected one 'pytest tests/cfs' step, found {len(tests)}")
+        for step in tests:
+            if not re.search(r"\s-\w*rP", str(step["run"])):
+                problems.append(f"{name}: the cFS tests run without -rP (the mode line is hidden)")
+            if "continue-on-error" in step:
+                problems.append(f"{name}: the cFS test step sets continue-on-error")
+
     steps = _steps(jobs["cfs"])
-    names = [str(step.get("run", "")) for step in steps]
+    runs = [str(step.get("run", "")) for step in steps]
     raised = [
         i
-        for i, run in enumerate(names)
+        for i, run in enumerate(runs)
         if (m := _SYSCTL_COMMAND.search(run)) and int(m.group(1)) >= MIN_MSG_MAX
     ]
-    ran = [i for i, run in enumerate(names) if "pytest tests/cfs" in run]
+    ran = [i for i, run in enumerate(runs) if "pytest tests/cfs" in run]
     if not raised:
         problems.append(f"cfs: no step runs sudo sysctl -w fs.mqueue.msg_max>={MIN_MSG_MAX}")
     elif not ran or raised[0] > ran[0]:
         problems.append("cfs: fs.mqueue.msg_max is not raised before the cFS tests run")
-    elif not _MSG_MAX_READ_BACK.search(names[raised[0]]):
-        problems.append("cfs: the raised fs.mqueue.msg_max is not read back and checked")
+    else:
+        step, run = steps[raised[0]], runs[raised[0]]
+        for key in _BYPASS_KEYS:
+            if key in step:
+                problems.append(f"cfs: the sysctl step sets '{key}', which can hide its failure")
+        sysctl, read_back = _SYSCTL_COMMAND.search(run), _MSG_MAX_READ_BACK.search(run)
+        if read_back is None or sysctl is None or read_back.start() < sysctl.start():
+            problems.append("cfs: the raised fs.mqueue.msg_max is not read back and checked")
+        elif int(read_back.group(1)) < MIN_MSG_MAX:
+            problems.append(
+                f"cfs: the read-back accepts fs.mqueue.msg_max below {MIN_MSG_MAX} "
+                f"(-ge {read_back.group(1)})"
+            )
     return problems
 
 
 def test_real_cfs_jobs_raise_the_message_queue_depth_limit() -> None:
     assert _msg_max_violations(WORKFLOW.read_text()) == []
 
+
+_SYSCTL_STEP = "      - name: Raise fs.mqueue.msg_max so cFS keeps its 1000-deep pipes\n"
+_SYSCTL_OPTIONS = "      options: --ulimit nofile=1024:524288 --sysctl fs.mqueue.msg_max=65536\n"
+_READ_BACK = '          test "$(cat /proc/sys/fs/mqueue/msg_max)" -ge 1000\n'
 
 MSG_MAX_MUTATIONS: dict[str, Callable[[str], str]] = {
     "container sysctl removed": _replace_once(" --sysctl fs.mqueue.msg_max=65536", ""),
@@ -495,9 +535,52 @@ MSG_MAX_MUTATIONS: dict[str, Callable[[str], str]] = {
     "ubuntu sysctl too small": _replace_once(
         "sudo sysctl -w fs.mqueue.msg_max=65536", "sudo sysctl -w fs.mqueue.msg_max=10"
     ),
-    "ubuntu read-back removed": _replace_once(
-        '          test "$(cat /proc/sys/fs/mqueue/msg_max)" -ge 50\n', ""
+    "ubuntu read-back removed": _replace_once(_READ_BACK, ""),
+    "read-back threshold -ge 1": _replace_once(_READ_BACK, _READ_BACK.replace("-ge 1000", "-ge 1")),
+    "read-back threshold -ge 0": _replace_once(_READ_BACK, _READ_BACK.replace("-ge 1000", "-ge 0")),
+    "read-back below the pipe depth": _replace_once(
+        _READ_BACK, _READ_BACK.replace("-ge 1000", f"-ge {MIN_MSG_MAX - 1}")
     ),
+    "read-back made optional": _replace_once(_READ_BACK, _READ_BACK.rstrip("\n") + " || true\n"),
+    "read-back before the sysctl": _replace_once(
+        "          sudo sysctl -w fs.mqueue.msg_max=65536\n" + _READ_BACK,
+        _READ_BACK + "          sudo sysctl -w fs.mqueue.msg_max=65536\n",
+    ),
+    "sysctl step skipped with if: false": _replace_once(
+        _SYSCTL_STEP, _SYSCTL_STEP + "        if: false\n"
+    ),
+    "sysctl step conditional": _replace_once(
+        _SYSCTL_STEP, _SYSCTL_STEP + "        if: github.event_name == 'push'\n"
+    ),
+    "sysctl step continue-on-error": _replace_once(
+        _SYSCTL_STEP, _SYSCTL_STEP + "        continue-on-error: true\n"
+    ),
+    "sysctl step shell without errexit": _replace_once(
+        _SYSCTL_STEP, _SYSCTL_STEP + "        shell: bash {0}\n"
+    ),
+    "cfs job continue-on-error": _replace_once(
+        "    name: real cFS acceptance\n",
+        "    name: real cFS acceptance\n    continue-on-error: true\n",
+    ),
+    "cfs tests continue-on-error": _replace_once(
+        "      - name: Real-cFS acceptance tests\n",
+        "      - name: Real-cFS acceptance tests\n        continue-on-error: true\n",
+    ),
+    "cfs job requires no full depth": _replace_once(
+        "      " + REQUIRE_FULL_DEPTH_ENV + ': "1"\n    steps:\n', "    steps:\n"
+    ),
+    "el8-cfs requires no full depth": _replace_once(
+        '      IRONBIRD_CFS: "1"\n      ' + REQUIRE_FULL_DEPTH_ENV + ': "1"\n',
+        '      IRONBIRD_CFS: "1"\n',
+    ),
+    "el8-cfs full depth set to 0": _replace_once(
+        REQUIRE_FULL_DEPTH_ENV + ': "1"\n    defaults',
+        REQUIRE_FULL_DEPTH_ENV + ': "0"\n    defaults',
+    ),
+    "cfs tests lose -rP": _replace_once(
+        ' -v -rP --basetemp="$RUNNER_TEMP', ' -v --basetemp="$RUNNER_TEMP'
+    ),
+    "el8-cfs tests lose -rP": _replace_once(' -v -rP --basetemp="$HOME', ' -v --basetemp="$HOME'),
 }
 
 

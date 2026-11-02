@@ -542,27 +542,37 @@ what fits beside 2 slots left for other telemetry (`IB_TEST_GEN_MIN_PIPE_DEPTH` 
 `IB_TEST_GEN_BURST_LIMIT` in `ib_test.h`): with its 16-packet cap, a 15 ms stall of the generator's own thread
 overflowed the pipe while TO_LAB ran. What remains at 1k packets/s is TO_LAB itself off-CPU for longer than
 the pipe covers, on a loaded host; the software bus drops those packets and `CFE_SB_HousekeepingTlm`
-`PipeOverflowErrorCounter` (`SB_HK`) counts them (it also counts other telemetry dropped meanwhile). At 10k
+`PipeOverflowErrorCounter` (`SB_HK`) counts them (it also counts other telemetry dropped meanwhile), as does
+`MsgLimitErrorCounter` for a packet that hits its subscription's limit before the pipe's depth. At 10k
 packets/s a 10-deep pipe overflows whenever TO_LAB's forwarding task is off-CPU for a millisecond or so (about 4% of
-30,000 packets in one run), every drop counted the same way. With `fs.mqueue.msg_max` raised to at least 50
-(`unshare --ipc`, `msg_max` 64) the stock 50-deep pipe was lossless at 10k packets/s in 3 of 3 runs (0 of 30,000), though
-more runs later were not (below).
-CI sets it to 65536, the kernel's maximum (`HARD_MSGMAX`; the sysctl has no "unlimited" and rejects 65537)
+30,000 packets in one run), every drop counted the same way, and the stock 50-deep pipe (5 ms at 10k/s) still lost
+10 to 470 of 30,000 in 6 of 18 runs once `msg_max` allowed it.
+
+The test build therefore deepens the pipe. `build.sh` copies `tools/cfs/sample_defs/` into the checkout's
+`sample_defs/`, where cFS looks for mission overrides: `cpu1_osconfig.cmake` sets `OSAL_CONFIG_QUEUE_MAX_DEPTH`
+1000 (the deepest queue OSAL accepts, `OS_QUEUE_MAX_DEPTH`) and `cpu1_to_lab_internal_cfg_values.h` replaces TO_LAB's
+default platform values for cpu1 (cFS's `cfe_locate_implementation_file` prefers a `<cpu>_`-named file in
+`sample_defs/` to `apps/to_lab/config/default_to_lab_internal_cfg_values.h`) and sets
+`TO_LAB_PLATFORM_TLM_PIPE_DEPTH` 1000, compile-time checked against `OS_QUEUE_MAX_DEPTH`. A subscription's own limit is separate:
+`TO_LAB_ADD_PKT`'s `BufLimit` is a `uint8` (and must stay below the pipe depth), so the generator tests ask for 255,
+25 ms of the generator's stream; only a subscription table (`uint16`) could go higher. The tests read the depth from
+the build tree.
+CI sets `fs.mqueue.msg_max` to 65536, the kernel's maximum (`HARD_MSGMAX`; the sysctl has no "unlimited" and rejects 65537)
 (`.github/workflows/ci.yml`: `--sysctl fs.mqueue.msg_max=65536` on the `el8-cfs` containers, which works
 unprivileged because the sysctl is IPC-namespaced; `sudo sysctl -w fs.mqueue.msg_max=65536` on the Ubuntu `cfs` job,
-whose step reads the value back; `tests/test_ci_el8.py` guards both). When the console's
-`Maximum user msg queue depth` is at least 50 (TO_LAB's `TO_LAB_PLATFORM_TLM_PIPE_DEPTH`, default
-`OS_QUEUE_MAX_DEPTH` 50), the 1k packets/s generator test is strict: zero SB drops (`PipeOverflowErrorCounter` plus
-`MsgLimitErrorCounter` growth) and zero packets missing (8 of 8 runs here). The 10k packets/s test stays an
-accounting test even then (`lost <=` SB drops `+` recorded kernel drops): 50 slots, 49 per subscription, hold 5 ms
-of 10k packets/s, and 6 of 18 runs here lost 15 to 470 of 30,000 when TO_LAB's task was off-CPU longer, every one
-counted by SB (the `Msg Limit Err` events, which `MsgLimitErrorCounter` counts, are the drops that hit the
-subscription limit before the pipe's depth; no `msg_max` changes that). Below 50 (a developer host at the default 10)
-both keep the accounting. Each test prints which mode it ran in.
+whose step reads the value back; `tests/test_ci_el8.py` guards both), and `IRONBIRD_CFS_REQUIRE_FULL_DEPTH=1` in both
+jobs, so a host where that did not take effect fails the generator tests (naming `fs.mqueue.msg_max`) instead of
+running them leniently. When the console's `Maximum user msg queue depth` is at least the pipe depth, both generator
+tests are strict. The 1k packets/s test requires zero SB drops (`PipeOverflowErrorCounter` plus `MsgLimitErrorCounter`
+growth) and zero packets missing; the 10k packets/s test requires zero SB drops and every missing packet a recorded
+`kernel_drop` GAP. Measured here (`unshare --ipc`, `msg_max` 65536): both strict, the 10k/s test lossless in 31 of 31 runs
+(30,000 of 30,000) and the 1k/s test in 30 of 30. Below the depth (a developer host at the default 10) both keep the accounting. Each test
+prints which mode it ran in, and CI runs the cFS tests with `-rP` so the line is in the log.
 `msg_max` only caps what OSAL truncates to: each queue is still created at the depth cFS requests, so memory does not
-follow the sysctl. The per-user `RLIMIT_MSGQUEUE` (819200 bytes by default, across all of the user's queues) must
-cover the requested depths: cFS with the test apps starts under a limit of 12000 bytes and fails at 10000
-(`OS_QueueCreate ... errno = 24`), so the default has a 65x margin.
-A source lossless under host load therefore needs that host setting and no cFS configuration change; a pipe deeper
-than 50 would need `OSAL_CONFIG_QUEUE_MAX_DEPTH` and TO_LAB's `TLM_PIPE_DEPTH`, which the 1k floor does not need and
-which a strict 10k packets/s test would.
+follow the sysctl, but the deeper pipe does cost kernel bytes. The per-user `RLIMIT_MSGQUEUE` (819200 bytes by default,
+across all of the user's queues) must cover the requested depths. Measured with `prlimit --msgqueue` on `run.sh` at
+`msg_max` 65536 and the 1000-deep pipe: cFE reaches OPERATIONAL under every limit, but at 125000 bytes and below apps
+fail to create pipes (`OS_QueueCreate ... errno = 24`; 2 to 4 errors from 100000 to 125000) and from 128000 up it starts
+clean, so the default has a margin of about 6x. With the stock 50-deep pipe: 12000 bytes fails CI_LAB, TO_LAB, SAMPLE_APP and
+IB_TEST, 20000 gives 4 errors, 25000 gives 2, 30000 is clean (about 27x). (At `msg_max` 10, where every queue is 10 deep,
+12000 is enough and 10000 fails; those figures do not hold at 65536.)
