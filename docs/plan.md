@@ -4009,7 +4009,18 @@ Decided by the user (2026-10-30, later):
    Claude artifact; the user picks and refines; repeat. Order of passes: (1) base colors,
    highlights and rough layout; (2) individual UI elements and their behaviour;
    (3) navigational flow; (4) final touches. Follow the `gui-principles` skill. TUI feature
-   work starts only after the user signs off the design.
+   work starts only after the user signs off the design. Screenshots are delivered as PNGs
+   (readable on a phone), grouped by variant; an HTML page only as an optional extra.
+   **Page structure (user, 2026-11-02):** two main pages, each with its auxiliary elements:
+   the **recording page** (designed first) and the **commanding page** (manual sends and
+   sends on a schedule or in a user-specified pattern; Stages 4-5). Settings live in one
+   **settings modal**, which grows as options appear. Open for the navigation pass: where
+   the Events view and the ledger viewer listed above sit in this structure (views or
+   panels of the recording page, or modals).
+   **Pass 1 decisions so far:** Bench (variant A) colors; Cockpit (variant B) layout, the
+   packet list on the left and fields above bytes on the right; Bench's top and bottom
+   status bars; a quiet list with no latest-values summary column by default (it can be
+   enabled in configuration).
 4. TUI command composer with tiered search and argument entry.
 5. Send modes: scheduled at T, repeat N, every M ms/s until T or for duration.
 6. xlsx export, optional semantic search (local sentence-transformer as an extra),
