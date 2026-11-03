@@ -404,8 +404,7 @@ class UdpTransport:
         error = IronbirdError(
             Code.TX_RECV,
             f"{self.description}: receive failed: {reason}; "
-            f"{self._rx_errors} read error(s), the link end can no longer receive - "
-            "restart the command",
+            f"{self._rx_errors} read error(s), it can no longer receive - restart the command",
             cause=exc,
         )
         if self._failed is not None:

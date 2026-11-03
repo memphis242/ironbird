@@ -48,7 +48,7 @@ def test_example_configs_load() -> None:
         (
             lambda d: d["links"][0].update(command_endpoint="h:70000"),
             Code.CFG_SCHEMA,
-            "port must be",
+            "70000",
         ),
         (
             lambda d: d["links"][0].update(transport="tcp"),

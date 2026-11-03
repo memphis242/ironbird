@@ -163,7 +163,7 @@ def test_a_little_endian_fixed_field_is_checked_in_wire_form() -> None:
     assert packet[2:] == b"\xfe\xca"
     bad = header.check(profile, packet[:2] + b"\xca\xfe")
     assert isinstance(bad, DecodeError) and bad.code is Code.DEC_FIXED and bad.offset == 2
-    assert bad.reason == "magic is 65226, expected 51966"
+    assert "magic" in bad.reason and "65226" in bad.reason and "51966" in bad.reason
 
 
 def test_little_endian_on_one_byte_is_the_same_as_big_endian() -> None:

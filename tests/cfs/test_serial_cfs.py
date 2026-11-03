@@ -233,5 +233,5 @@ def test_line_noise_between_cfs_packets_is_reported_and_costs_none_of_them(
             listener.stop()
     finally:
         box.stop()
-    assert "resynchronised" in listener.stderr
+    assert "IB-TX-007" in listener.stderr  # the skipped noise is reported, by its code
     assert "IB-DEC-" not in listener.stderr  # the noise is one notice, not a decode error each

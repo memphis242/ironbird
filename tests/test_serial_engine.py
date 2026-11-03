@@ -224,8 +224,10 @@ def test_a_link_that_goes_down_and_comes_back_is_a_gap_two_marks_and_ledger_stat
     assert [e["event"] for e in states] == ["link.down", "link.up"]
     assert states[0]["code"] == Code.TX_DOWN.value and states[1]["down_s"] >= 0
     down = [n for n in notices if n.code is Code.TX_DOWN]
-    assert [n.level for n in down if "link lost" in n.summary] == [Level.ERROR]
-    assert [n.level for n in down if "restored" in n.summary] == [Level.INFO]
+    assert [n.level for n in down] == [Level.WARNING]  # the run goes on: not an error
+    back = [n for n in notices if n.code is Code.TX_UP]  # its own code, not the "lost" one
+    assert [n.level for n in back] == [Level.INFO]
+    assert "marked" in back[0].summary  # the sink takes gaps, so it is a recording
 
 
 def test_a_link_still_down_when_the_capture_closes_ends_its_gap_there(

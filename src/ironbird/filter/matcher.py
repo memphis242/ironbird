@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 
 from ironbird.codec import Codec, Resolved
-from ironbird.errors import DecodeError
+from ironbird.errors import DecodeError, IronbirdError
 from ironbird.frame import FLAG_GARBAGE, FLAG_TRUNCATED, Decoded, Frame, garbage_error
 
 FrameDecode = Callable[[Frame], Decoded | DecodeError]
@@ -51,6 +51,10 @@ class Filter:
     match: MatchFn
     cost: Cost
     nodes: frozenset[str] | None = None
+    #: Parts of the expression that can never be true for some message (a bound outside a
+    #: field's range): the filter is usable, but those parts match nothing there. ``IB-FLT-003``
+    #: errors that the caller reports as warnings.
+    warnings: tuple[IronbirdError, ...] = ()
 
     def bind(self, decode: FrameDecode, codec_for: Callable[[str], Codec]) -> Matcher:
         """A matcher for one consumer. ``decode`` turns a frame into a packet (or the error that

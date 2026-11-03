@@ -29,7 +29,7 @@ import traceback
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Final, Protocol
+from typing import Any, Final, NamedTuple, Protocol
 
 from ironbird.ccdd.model import MessageKind
 from ironbird.codec import Codec, Resolved
@@ -295,12 +295,29 @@ class _FrameQueue:
             raise self.error
 
 
+class Consumer(NamedTuple):
+    """What a capture's consumer is, as the user is told when its queue refuses frames: ``name``
+    the consumer, ``lost`` what the refused frames were, ``level`` how serious losing them is
+    (``None``: nothing is lost, the frames are only ledgered)."""
+
+    name: str
+    lost: str
+    level: Level | None
+
+
+DISPLAY: Final = Consumer("the display", "frame(s) not shown", Level.WARNING)
+EVENT_STREAM: Final = Consumer("the event stream", "frame(s) not checked for events", Level.ERROR)
+RESPONDER: Final = Consumer("the responder", "command(s) not answered", Level.ERROR)
+RECORDER: Final = Consumer("the recorder's queue", "frame(s) not queued", None)  # its sink saw them
+
+
 @dataclass(slots=True, eq=False)
 class _Subscription:
     """One consumer queue attached to one link end's receive stream."""
 
     queue: _FrameQueue
     io: _LinkIO
+    consumer: Consumer = DISPLAY
     dropped: int = 0  # frames the queue refused
     dropped_to_sinks: int = 0  # of those, frames a sink had already received
     reported: int = 0
@@ -651,7 +668,9 @@ class Engine:
         if existing is not None:
             return existing
         if len(self._labels) + 2 > _MAX_STREAMS:
-            raise IronbirdError(Code.CFG_LINK, "too many link ends in use (stream ids exhausted)")
+            raise IronbirdError(
+                Code.SYS_RESOURCE, "too many links open at once; select fewer with --link or --node"
+            )
         match link.transport:
             case "udp":
                 spec = link.udp
@@ -691,9 +710,16 @@ class Engine:
                 return
             self._rcvbuf_warned = True
         if err.code is Code.TX_RESYNC:  # the line's bytes cause it at will: evidence, sampled
-            self._report(err, context=label, evidence=True, sample=f"{err.code.value}:{label}")
+            self._report(
+                err,
+                context=label,
+                evidence=True,
+                sample=f"{err.code.value}:{label}",
+                level=Level.WARNING,  # the stream is skipped and read on
+            )
             return
-        self._report(err, context=label)
+        # a link that is still down is retried; the run goes on
+        self._report(err, context=label, level=Level.WARNING if err.code is Code.TX_DOWN else None)
 
     def _new_transport(self, io: _LinkIO) -> Transport:
         return open_transport(
@@ -709,10 +735,10 @@ class Engine:
     def _link_state(self, io: _LinkIO, up: bool, time_ns: int, error: IronbirdError | None) -> None:
         """A link end that was up lost its device, or got it back (serial reconnect).
 
-        Going down is ledgered, shown once (coalesced) as ``IB-TX-008`` and recorded as a MARK
-        by sinks that take them. Coming back is ledgered, shown as an info notice, marked, and
-        the time in between becomes one ``link_down`` GAP on the receive stream (UDP has no link
-        to lose, so it never gets one).
+        Going down is ledgered, shown once (coalesced) as an ``IB-TX-008`` warning (the run goes
+        on) and recorded as a MARK by sinks that take them. Coming back is ledgered, shown as an
+        ``IB-TX-009`` info notice, marked, and the time in between becomes one ``link_down`` GAP
+        on the receive stream (UDP has no link to lose, so it never gets one).
         """
         label = io.description
         if not up:
@@ -729,7 +755,7 @@ class Engine:
                 seq=self._seq,
             )
             self._notify_link(io, False, time_ns, f"{label}: link lost")
-            self._report(error, context=f"link down {label}")
+            self._report(error, context=f"link down {label}", level=Level.WARNING)
             return
         started = io.down
         if started is None:
@@ -741,13 +767,27 @@ class Engine:
         )
         self._notify_link(io, True, time_ns, f"{label}: link restored after {seconds:.1f} s")
         self._link_down_gap(io, started, time_ns)
+        marked = io.receiving and self._gap_taken(io.rx_stream)
         self._report(
             IronbirdError(
-                Code.TX_DOWN, f"{label}: link restored after {seconds:.1f} s; a gap is recorded"
+                Code.TX_UP,
+                f"{label}: back after {seconds:.1f} s"
+                + ("; the gap is marked in the recording" if marked else ""),
             ),
             context=f"link up {label}",
             level=Level.INFO,
         )
+
+    def _gap_taken(self, stream: Stream) -> bool:
+        """Whether a sink that takes gaps would write one for ``stream`` (a sink that cannot say
+        is assumed to)."""
+        for sink in self._sinks:
+            if getattr(sink, "gap", None) is None:
+                continue
+            accepts = getattr(sink, "accepts_gap", None)
+            if accepts is None or accepts(stream):
+                return True
+        return False
 
     def _link_down_gap(self, io: _LinkIO, started: tuple[int, int], end_ns: int) -> None:
         """Tell the gap sinks the receive stream of ``io`` was down from ``started`` until
@@ -906,9 +946,11 @@ class Engine:
         sinks: Sequence[FrameSink] = (),
         queue_frames: int | None = None,
         queue_bytes: int | None = None,
+        consumer: Consumer = DISPLAY,
     ) -> Capture:
         """Start receiving on ``ends``; every frame they receive reaches ``sinks`` and the
         returned capture. ``sinks`` stay attached to the whole engine until the capture closes.
+        ``consumer`` says what drains the capture, for the report of a queue that overflows.
 
         The capture's queue holds at most ``queue_frames`` frames and ``queue_bytes`` bytes
         (frame data plus ``FRAME_OVERHEAD_BYTES`` each); frames past either are not shown to this
@@ -930,7 +972,7 @@ class Engine:
         try:
             for link, end in ends:
                 io = self._io(link, end)
-                sub = _Subscription(queue, io)
+                sub = _Subscription(queue, io, consumer)
                 capture._subs.append(sub)
                 await self._attach(io, sub)
         except BaseException:
@@ -1273,13 +1315,17 @@ class Engine:
             queue_dropped_bytes=queue.dropped_bytes,
             queue_peak_bytes=queue.peak_bytes,
         )
-        tail = f"; {kept} of them still reached a sink" if kept else ""
+        consumer = sub.consumer
+        if consumer.level is None:
+            return
+        tail = f"; {kept} of them were still recorded" if kept else ""
         self._report(
             IronbirdError(
                 Code.ENG_LAG,
-                f"{label}: consumer fell behind, {total} frame(s) not shown so far{tail}",
+                f"{label}: {consumer.name} fell behind, {total} {consumer.lost} so far{tail}",
             ),
             context=f"queue {label}",
+            level=consumer.level,
         )
 
     def _note_unread(self, io: _LinkIO, transport: Transport) -> None:
@@ -1369,10 +1415,15 @@ class Engine:
 __all__ = [
     "CONSUMER_QUEUE_BYTES",
     "CONSUMER_QUEUE_FRAMES",
+    "DISPLAY",
+    "EVENT_STREAM",
     "FRAME_OVERHEAD_BYTES",
     "MAX_TRACKED_MIDS",
+    "RECORDER",
+    "RESPONDER",
     "Capture",
     "CaptureStats",
+    "Consumer",
     "Engine",
     "FrameDecoder",
     "FrameSink",

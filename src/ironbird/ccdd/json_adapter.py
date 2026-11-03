@@ -38,7 +38,7 @@ from ironbird.ccdd.model import (
     parse_element_type,
     parse_type,
 )
-from ironbird.errors import Code, IronbirdError
+from ironbird.errors import Code, IronbirdError, close_names
 from ironbird.fsops import read_capped
 
 SCHEMA_ID: Final = "ironbird-ccdd/1"  # the schema new files are written in
@@ -90,7 +90,9 @@ def _check_keys(
 ) -> None:
     for key in table:
         if key not in allowed:
-            raise ctx.fail(f"{path}.{key}" if path else key, "unknown key")
+            raise ctx.fail(
+                f"{path}.{key}" if path else key, "unknown key" + close_names(str(key), allowed)
+            )
     for key in sorted(required - table.keys()):
         raise ctx.fail(f"{path}.{key}" if path else key, "required key is missing")
 

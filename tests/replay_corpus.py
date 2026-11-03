@@ -200,6 +200,32 @@ def cases() -> dict[str, tuple[bytes, Expect]]:
         bytes(crafted([], raw_blobs=[lie]).out),
         Expect(Code.REC_DAMAGED, 5, 5, "BLOB content does not match its SHA-256"),
     )
+
+    # Damage in the head, read with --skip-damage (see test_replay_malformed.py): a BLOB that
+    # fails its CRC with the streams and frames after it intact, damage in the first FRAME with
+    # the head whole, and a head record the file ends inside.
+    built = crafted(good_blobs())
+    broken = bytearray(built.out)
+    broken[built.offsets[1] + 30] ^= 0xFF  # the CCDD blob (offsets[0] is META)
+    add(
+        "head-blob-damaged",
+        bytes(broken),
+        Expect(Code.REC_DAMAGED, 5, 5, "embedded-definitions record fails its CRC"),
+    )
+    first_frame = built.offsets[7]  # META, 3 BLOBs, 2 STREAMs, a SOURCE, then the frames
+    framed = bytearray(built.out)
+    framed[first_frame + 30] ^= 0xFF
+    add(
+        "head-frame-damaged",
+        bytes(framed),
+        Expect(Code.REC_DAMAGED, 5, 5, "FRAME record fails its CRC"),
+    )
+    cut = crafted(good_blobs(), frames=0)
+    add(
+        "head-record-incomplete-at-eof",
+        bytes(cut.out[: cut.offsets[2] + 20]),  # inside the second BLOB
+        Expect(None, 0, 0),  # a torn tail is a warning (IB-REC-007), not an error
+    )
     return out
 
 

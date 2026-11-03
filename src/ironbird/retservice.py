@@ -33,6 +33,7 @@ from ironbird.ledger import Ledger
 from ironbird.retention import (
     DirScan,
     ScanControl,
+    describe_reasons,
     full_scan,
     protected_bytes_by_reason,
     recording_blocks,
@@ -347,8 +348,9 @@ class Retention:
         extra = f"; {format_size(protected)} more protected" if protected else ""
         self._warn(
             Code.RET_AGE,
-            f"{len(selectable)} {what} older than {compact_duration(max_age)} "
-            f"({format_size(sum(s.size for s in selectable))}{extra}); review with '{command}'",
+            f"{len(selectable)} {what} ({format_size(sum(s.size for s in selectable))}{extra}) "
+            f"are older than retention.max_age ({compact_duration(max_age)}); delete them with "
+            f"'{command}'",
             scan.path,
         )
 
@@ -434,10 +436,25 @@ class Retention:
             if projected
             else f"past {format_size(cap)}"
         )
-        self._warn(
-            Code.RET_TOTAL,
-            f"ledger {format_size(ledger.total_bytes())} + recordings {format_size(rec_bytes)} "
-            f"({format_size(protected)} protected), {when}; run '{command} --until-under "
-            f"{size_argument(target)}' or raise retention.max_total_bytes",
-            target_scan.path,
+        scans = [scan for scan in (ledger, recordings) if scan is not None]
+        # a prune deletes only what is not protected: when the rest is still over the cap, it
+        # cannot succeed, and the only way out is a higher cap
+        reachable = usage - sum(selectable(scan) for scan in scans) <= cap
+        figures = (
+            f"ledger {format_size(ledger.total_bytes())} + recordings {format_size(rec_bytes)}"
         )
+        if reachable:
+            advice = (
+                f"run '{command} --until-under {size_argument(target)}' or raise "
+                "retention.max_total_bytes"
+            )
+        else:
+            reasons: dict[str, int] = {}
+            for scan in scans:
+                for reason, size in protected_bytes_by_reason(scan).items():
+                    reasons[reason] = reasons.get(reason, 0) + size
+            advice = (
+                f"{format_size(protected)} of it is protected ({describe_reasons(reasons)}), so "
+                "pruning cannot get under the cap; raise retention.max_total_bytes"
+            )
+        self._warn(Code.RET_TOTAL, f"{figures}, {when}; {advice}", target_scan.path)

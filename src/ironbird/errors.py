@@ -6,6 +6,8 @@ cause chain, raw bytes) rides along for ``--verbose`` and the ledger.
 
 from __future__ import annotations
 
+import difflib
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
@@ -21,7 +23,7 @@ class Code(StrEnum):
     CFG_SYNTAX = "IB-CFG-002"  # config TOML syntax error
     CFG_SCHEMA = "IB-CFG-003"  # config schema violation (unknown key, wrong type, ...)
     CFG_REF = "IB-CFG-004"  # unknown node / alias / message referenced
-    CFG_LINK = "IB-CFG-005"  # no usable link between nodes, or wrong role for the action
+    CFG_LINK = "IB-CFG-005"  # no usable link between nodes, wrong role, or two links on one device
     # Header profiles
     HDR_FILE = "IB-HDR-001"  # profile unreadable or TOML syntax error
     HDR_SCHEMA = "IB-HDR-002"  # profile schema violation
@@ -51,9 +53,10 @@ class Code(StrEnum):
     TX_RECV = "IB-TX-003"  # receive failed: a socket read errored (may end the capture)
     TX_OVERRUN = "IB-TX-004"  # datagrams dropped by the kernel socket buffer (or left unread)
     TX_RCVBUF = "IB-TX-005"  # kernel granted a smaller receive buffer than requested (warning)
-    TX_BUSY = "IB-TX-006"  # serial device locked by another process
+    TX_BUSY = "IB-TX-006"  # serial device locked by another process (not: a duplicate in config)
     TX_RESYNC = "IB-TX-007"  # serial stream resynchronised: bytes skipped
     TX_DOWN = "IB-TX-008"  # link lost (serial unplug or I/O error): reconnecting
+    TX_UP = "IB-TX-009"  # link restored after TX_DOWN (information)
     # Events
     EVT_NONE = "IB-EVT-001"  # no event telemetry is defined for the selected node(s)
     # Responder
@@ -86,7 +89,7 @@ class Code(StrEnum):
     REC_CREATE = "IB-REC-001"  # cannot create the recording or a repaired copy
     REC_WRITE = "IB-REC-002"  # a recording write or sync failed; recording stopped
     REC_OVERRUN = "IB-REC-003"  # recorder buffer full; frames dropped (GAP recorded)
-    REC_FORMAT = "IB-REC-004"  # not an ironbird recording (or unreadable)
+    REC_FORMAT = "IB-REC-004"  # not an ironbird recording (the file opens, its content is wrong)
     REC_VERSION = "IB-REC-005"  # unsupported version or unknown critical record type
     REC_DAMAGED = "IB-REC-006"  # damaged record mid-file
     REC_TORN = "IB-REC-007"  # recording ends in an incomplete record (not closed cleanly)
@@ -95,14 +98,17 @@ class Code(StrEnum):
     REC_SPACE = "IB-REC-010"  # low disk space for the recording
     REC_DIRSYNC = "IB-REC-011"  # the recording's directory cannot be synced (name not durable)
     REC_LEFTOVER = "IB-REC-012"  # a repaired copy is complete, but its temporary name is left over
+    REC_UNCOPIED = "IB-REC-013"  # valid frames after mid-file damage are only in the original
+    REC_OPEN = "IB-REC-014"  # the recording file cannot be opened or read (missing, permission)
     # Export
     EXP_WRITE = "IB-EXP-001"  # the export output could not be written
     EXP_EXISTS = "IB-EXP-002"  # the export output exists, is the input, or is a managed file
     EXP_WORKER = "IB-EXP-003"  # an export worker process failed (died, or could not decode)
+    EXP_OMITTED = "IB-EXP-004"  # frames left out of the export (they have no place in the format)
     # Engine
-    ENG_LAG = "IB-ENG-001"  # a consumer fell behind: frames not shown to it (sinks still saw them)
+    ENG_LAG = "IB-ENG-001"  # a consumer fell behind: frames it never got (sinks still saw them)
     # System resources
-    SYS_RESOURCE = "IB-SYS-001"  # the OS refused a resource needed to start (file descriptors)
+    SYS_RESOURCE = "IB-SYS-001"  # a resource needed ran out (OS file descriptors, stream ids)
     # Filter expressions (--where)
     FLT_SYNTAX = "IB-FLT-001"  # filter syntax error (column, excerpt)
     FLT_NAME = "IB-FLT-002"  # unknown name in a filter, or a reserved name misused
@@ -125,7 +131,7 @@ class Code(StrEnum):
 #: outside this set can be reported as a warning and a member can be reported as an error. A
 #: warning code is never raised, so it never decides an exit code.
 WARNING_CODES: Final[frozenset[Code]] = frozenset(
-    {Code.TX_RCVBUF, Code.REC_DIRSYNC, Code.REC_LEFTOVER}
+    {Code.TX_RCVBUF, Code.REC_DIRSYNC, Code.REC_LEFTOVER, Code.REC_UNCOPIED, Code.EXP_OMITTED}
 )
 
 
@@ -150,6 +156,8 @@ class IronbirdError(Exception):
         summary: str,
         details: str = "",
         cause: BaseException | None = None,
+        *,
+        tally: tuple[int, str] | None = None,
     ) -> None:
         # Summaries embed text from untrusted files and packets: control characters
         # (including newlines) become visible escapes so a summary is always one inert line.
@@ -160,6 +168,10 @@ class IronbirdError(Exception):
         self._summary: str = summary
         self.details: str = details
         self.cause: BaseException | None = cause
+        # (amount, summary with "{n}" in place of the amount): when a coalesced line stands for
+        # several of these, it shows the total of their amounts, not the latest one's
+        self.tally: tuple[int, str] | None = tally
+        assert tally is None or (tally[0] >= 0 and "{n}" in tally[1])
         if cause is not None:
             self.__cause__ = cause
 
@@ -196,6 +208,27 @@ class IronbirdError(Exception):
         CCDD, header profile, an unknown command or a bad argument value): the same invocation
         cannot succeed until that is changed. 1 for a failure while running."""
         return 2 if self.code.value.startswith(_USAGE_PREFIXES) else 1
+
+
+def close_names(name: str, known: Iterable[str]) -> str:
+    """``; did you mean 'x'?`` for the known name nearest to ``name``, else nothing."""
+    near = difflib.get_close_matches(name, sorted(known), n=1)
+    return f"; did you mean {near[0]!r}?" if near else ""
+
+
+def counted(
+    code: Code,
+    template: str,
+    amount: int,
+    details: str = "",
+    cause: BaseException | None = None,
+) -> IronbirdError:
+    """An error whose summary is ``template`` with ``{n}`` replaced by ``amount``; coalesced
+    repeats of it show the total of their amounts."""
+    assert "{n}" in template
+    return IronbirdError(
+        code, template.replace("{n}", str(amount)), details, cause, tally=(amount, template)
+    )
 
 
 @dataclass(frozen=True, slots=True)

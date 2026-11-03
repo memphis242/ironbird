@@ -498,6 +498,10 @@ def _element_packer(field: FieldDef) -> struct.Struct:
     return struct.Struct(field.endian.struct_prefix + field.var.element.struct_code)
 
 
+#: What a message over the packet cap is told to do about it (the cap is a configuration key).
+CAP_ADVICE: Final = " (ironbird.max_packet_bytes); raise it or shrink the message"
+
+
 class Codec:
     """Encode/decode for one target: its CCDD model plus its two header profiles."""
 
@@ -599,7 +603,8 @@ class Codec:
         if total > self.max_packet_bytes:
             raise IronbirdError(
                 Code.ENC_FIT,
-                f"{where}: packet of {total} bytes exceeds the {self.max_packet_bytes}-byte cap",
+                f"{where}: packet of {total} bytes exceeds the {self.max_packet_bytes}-byte cap"
+                f"{CAP_ADVICE}",
             )
         # Every size between the smallest and the largest packet must fit the header; a message
         # of one size has the one.
@@ -925,7 +930,11 @@ class Codec:
             assert mid is not None  # the MID window lies inside the header
             if not self.is_known_mid(kind, mid):
                 return DecodeError(
-                    Code.DEC_UNKNOWN, 0, f"unknown {kind.value} MID 0x{mid:04X}", mid
+                    Code.DEC_UNKNOWN,
+                    0,
+                    f"MID 0x{mid:04X} is not in the CCDD ({kind.value}); update the CCDD or check "
+                    "the sender",
+                    mid,
                 )
         word = hdr.check_word(profile, data, max_size=self.max_packet_bytes)
         if isinstance(word, DecodeError):
@@ -955,7 +964,8 @@ class Codec:
                     Code.DEC_PAYLOAD,
                     profile.size_bytes,
                     f"{msg.name} payload is {size - profile.min_bytes} bytes, "
-                    f"CCDD says {msg.payload_size}",
+                    f"CCDD says {msg.payload_size}: vehicle and CCDD disagree (check the CCDD "
+                    "version)",
                     mid,
                 )
             return Resolved(_ISSUE, msg, word, self, data)
@@ -965,7 +975,8 @@ class Codec:
                 Code.DEC_PAYLOAD,
                 profile.size_bytes,
                 f"{msg.name} payload is {payload} bytes, "
-                f"CCDD says {msg.min_payload} to {msg.payload_size}",
+                f"CCDD says {msg.min_payload} to {msg.payload_size}: vehicle and CCDD disagree "
+                "(check the CCDD version)",
                 mid,
             )
         counts = self._variable_counts(

@@ -595,7 +595,7 @@ def test_a_device_another_link_of_this_process_holds_is_refused_by_its_number_no
             with pytest.raises(IronbirdError) as info:
                 await second.open()
             error = info.value
-            assert error.code is Code.TX_BUSY and "same device" in error.summary
+            assert error.code is Code.CFG_LINK and "same device" in error.summary
             assert (
                 "another process" not in error.summary and "fix the device paths" in error.summary
             )

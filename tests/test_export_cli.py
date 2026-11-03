@@ -156,7 +156,7 @@ def test_a_nonexistent_input_and_a_file_that_is_not_a_recording_create_nothing(
     tmp_path: Path, env: dict[str, str]
 ) -> None:
     (tmp_path / "junk").write_bytes(b"not a recording" * 10)
-    for source, code in (("missing.ibrec", "IB-REC-004"), ("junk", "IB-REC-004")):
+    for source, code in (("missing.ibrec", "IB-REC-014"), ("junk", "IB-REC-004")):
         done = ib(tmp_path, env, str(tmp_path / source), "-o", str(tmp_path / "out"))
         assert done.returncode == 1 and f"error {code}" in done.stderr, done.stderr
     assert not (tmp_path / "out").exists() and temporaries(tmp_path) == []

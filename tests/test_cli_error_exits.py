@@ -45,8 +45,8 @@ CASES: list[tuple[list[str], Code]] = [
     (["listen", "ghost"], Code.CFG_REF),
     (["listen", "fc", "--where", "nope ==="], Code.FLT_SYNTAX),
     (["listen", "fc", "--where", "no_such_column == 1"], Code.FLT_NAME),
-    (["rec", "check", "/nonexistent.ibrec"], Code.REC_FORMAT),
-    (["rec", "info", "/nonexistent.ibrec"], Code.REC_FORMAT),
+    (["rec", "check", "/nonexistent.ibrec"], Code.REC_OPEN),
+    (["rec", "info", "/nonexistent.ibrec"], Code.REC_OPEN),
 ]
 
 

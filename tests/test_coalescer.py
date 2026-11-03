@@ -103,7 +103,7 @@ def test_a_group_lets_only_a_few_distinct_keys_speak_per_window() -> None:
     co.report(Code.DEC_UNKNOWN, Level.ERROR, "mid-later", "x", group=Code.DEC_UNKNOWN)
     assert any(n.key == "mid-later" for n in shown), "a new window never opened for the group"
     co.flush()
-    assert any(n.count > 1 and "more distinct" in n.summary for n in shown)
+    assert any(n.count > 1 and "other problems" in n.summary for n in shown)
 
 
 def test_a_later_occurrence_keeps_the_pointer_to_its_ledger_record() -> None:

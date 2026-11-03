@@ -30,7 +30,7 @@ from types import MappingProxyType
 from typing import Any, Final, Literal
 
 from ironbird import checksum
-from ironbird.errors import Code, DecodeError, IronbirdError
+from ironbird.errors import Code, DecodeError, IronbirdError, close_names
 from ironbird.fsops import read_capped
 
 DEFAULT_MAX_PACKET_BYTES: Final = 2048
@@ -304,7 +304,9 @@ def _expect_keys(
 ) -> None:
     for key in table:
         if key not in allowed:
-            raise ctx.fail(f"{path}.{key}" if path else key, "unknown key")
+            raise ctx.fail(
+                f"{path}.{key}" if path else key, "unknown key" + close_names(str(key), allowed)
+            )
     for key in sorted(required - table.keys()):
         raise ctx.fail(f"{path}.{key}" if path else key, "required key is missing")
 
@@ -1100,7 +1102,9 @@ def oversize_error(profile: HeaderProfile, data: Buffer, size: int, max_size: in
     return DecodeError(
         Code.DEC_OVERSIZE,
         max_size,
-        f"packet of {size} bytes exceeds cap {max_size}",
+        f"packet of {size} bytes is over the {max_size}-byte limit; raise "
+        "ironbird.max_packet_bytes if packets this large are expected (a recording keeps the "
+        "limit it was made with)",
         peek_mid(profile, data),
     )
 
@@ -1141,7 +1145,8 @@ def check_word(
         return DecodeError(
             Code.DEC_SHORT,
             n,
-            f"packet of {n} bytes is shorter than the {around}",
+            f"packet of {n} bytes is shorter than the {around} (a sender fault, or the wrong "
+            "header profile)",
             peek_mid(profile, data),
         )
     word = int.from_bytes(data[:size], "big")
@@ -1156,7 +1161,12 @@ def check_word(
             return DecodeError(
                 Code.DEC_LENGTH,
                 lf.offset,
-                f"{lf.name} field says {declared} bytes, got {n}",
+                f"{lf.name} field says {declared} bytes, got {n}"
+                + (
+                    " (packet cut short, or the profile's length bias is wrong)"
+                    if declared > n
+                    else " (extra bytes, or the profile's length bias is wrong)"
+                ),
                 peek_mid(profile, data),
             )
     if word & profile.fixed_mask != profile.fixed_value:
@@ -1166,7 +1176,7 @@ def check_word(
                 return DecodeError(
                     Code.DEC_FIXED,
                     f.offset,
-                    f"{f.name} is {got}, expected {f.value}",
+                    f"header field {f.name} is {got}, but the profile fixes it at {f.value}",
                     peek_mid(profile, data),
                 )
         raise AssertionError("fixed-field mask disagrees with the fields")  # pragma: no cover
@@ -1180,7 +1190,7 @@ def check_word(
                     return DecodeError(
                         Code.DEC_FIXED,
                         n - tsize + f.offset,
-                        f"{f.name} is {got}, expected {f.value}",
+                        f"trailer field {f.name} is {got}, but the profile fixes it at {f.value}",
                         peek_mid(profile, data),
                     )
             raise AssertionError("trailer mask disagrees with the fields")  # pragma: no cover

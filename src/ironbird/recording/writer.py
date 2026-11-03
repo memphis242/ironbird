@@ -827,6 +827,11 @@ class Recorder:
         self._offset += len(record)
         self._file_bytes += len(record)
 
+    def accepts_gap(self, stream: Stream) -> bool:
+        """Whether a gap on ``stream`` would be written (not once the recorder has stopped, and
+        not on a stream it does not record)."""
+        return not self._stopped and (self._accept is None or stream.id in self._accept)
+
     def gap(
         self,
         stream: Stream,

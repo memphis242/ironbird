@@ -484,7 +484,7 @@ def test_rec_repair_commands(tmp_path: Path, env: dict[str, str], mock_codec: Co
 
 def test_rec_tools_report_unreadable_files_with_codes(tmp_path: Path, env: dict[str, str]) -> None:
     missing = run_ib(tmp_path, ["rec", "info", str(tmp_path / "nope.ibrec")], env)
-    assert missing.returncode == 1 and "error IB-REC-004" in missing.stderr
+    assert missing.returncode == 1 and "error IB-REC-014" in missing.stderr  # not "not a recording"
     junk = tmp_path / "junk.ibrec"
     junk.write_bytes(b"x" * 100)
     for command in ("info", "check"):

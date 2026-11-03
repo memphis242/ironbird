@@ -254,7 +254,7 @@ def scan(path: Path | str, *, reader: RecordingReader | None = None) -> Report:
 
     Damage does not stop it (the reader resumes at the next valid chain), so one pass reports
     every damaged span. Only a file that cannot be read at all raises (``IB-REC-004`` to
-    ``IB-REC-007`` from the reader).
+    ``IB-REC-007``, or ``IB-REC-014``, from the reader).
     """
     own = reader is None
     rd = reader or RecordingReader(path, skip_damage=True)
@@ -592,15 +592,9 @@ def repair(
         size = reader.size()
         if damage is None and prefix_end < size and not reader.closes_cleanly_at(prefix_end):
             # The valid records stop at an INDEX or TRAILER that is not the end of the file: a
-            # stale index, a trailer in mid-file, or another file appended. All of it is left out.
-            damage = Damage(
-                prefix_end,
-                size - prefix_end,
-                False,
-                "an INDEX or TRAILER record is followed by more data",
-                None,
-                True,
-            )
+            # stale index, a trailer in mid-file, another file appended, or a closing that was
+            # cut short (a torn tail, as ``check`` calls it). All of it is left out.
+            damage = _closing_damage(reader, prefix_end, size)
         beyond = _frames_after(source, last_seq) if damage is not None and not damage.torn else 0
         suffix = _closing_records(reader, prefix_end, chunk_offsets, frames, last_seq, tail)
         total = prefix_end + len(suffix)
@@ -628,6 +622,24 @@ def repair(
         )
     finally:
         reader.close()
+
+
+def _closing_damage(reader: RecordingReader, prefix_end: int, size: int) -> Damage:
+    """The damage in the bytes from ``prefix_end`` (an INDEX or TRAILER that does not end the
+    file) to the end, classified as :func:`scan` does: a closing cut short is a torn tail."""
+    for item in reader.items(start=prefix_end):
+        if isinstance(item, Damage):
+            return item
+        if item.rtype not in (RecordType.INDEX, RecordType.TRAILER):
+            break
+    return Damage(
+        prefix_end,
+        size - prefix_end,
+        False,
+        "an INDEX or TRAILER record is followed by more data",
+        None,
+        True,
+    )
 
 
 def _repair_failure(output: Path, exc: OSError, force: bool) -> IronbirdError:

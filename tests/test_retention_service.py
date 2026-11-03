@@ -68,7 +68,7 @@ class Rig:
 def test_the_total_warning_appears_at_start_when_usage_is_already_past_the_cap(
     tmp_path: Path,
 ) -> None:
-    rig = Rig(tmp_path, RetentionConfig(max_total_bytes=MIB))
+    rig = Rig(tmp_path, RetentionConfig(max_total_bytes=MIB, keep_recent=0))
     for i in range(1, 6):
         make_session(rig.state, i, age_days=2, size=300_000, klass="short")
     rig.retention.start()
