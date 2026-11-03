@@ -30,15 +30,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import fcntl
 import grp
 import os
 import pwd
 import select
 import stat
+import sys
 import termios
 import threading
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final
 
@@ -154,6 +157,17 @@ def _denied_advice(device: str) -> str:
     return f"ask an admin to add your user to group {group_name}, then log in again"
 
 
+@dataclass(slots=True)
+class _TxWait:
+    """A send waiting for its packet, bytes ``[start, end)`` of the stream sent, to be written."""
+
+    start: int
+    end: int
+    future: asyncio.Future[None]
+    written: bool = False  # every byte reached the device
+    failure: IronbirdError | None = None  # how it failed (``TransportClosed``: none went out)
+
+
 _OPEN_DEVICES: Final[dict[int, SerialTransport]] = {}  # device number -> its transport
 _OPEN_DEVICES_LOCK: Final = threading.Lock()
 
@@ -230,13 +244,15 @@ class SerialTransport:
         self._txbuf = bytearray()
         self._tx_enqueued = 0  # bytes ever accepted for sending
         self._tx_written = 0  # bytes ever written to the device
-        self._tx_waiters: list[tuple[int, asyncio.Future[None]]] = []
+        self._tx_waiters: list[_TxWait] = []  # in stream order
+        self._tx_idle: asyncio.Future[None] | None = None  # a close waiting for the buffer
         self._writer_on = False
         self._opened = False
         self._closed = False
         self._down = False
         self._rx_frames = self._rx_bytes = self._rx_errors = 0
         self._tx_frames = self._tx_bytes = 0
+        self._unread_bytes_at_close = 0
 
     # -- Transport API: state ---------------------------------------------------------
 
@@ -247,6 +263,10 @@ class SerialTransport:
     @property
     def local_address(self) -> tuple[str, int] | None:
         return None
+
+    @property
+    def opening_step(self) -> str | None:
+        return None  # the open does not wait
 
     @property
     def is_down(self) -> bool:
@@ -261,6 +281,7 @@ class SerialTransport:
             tx_bytes=self._tx_bytes,
             rx_errors=self._rx_errors,
             ccdd_mismatched=self._framer.stats().mismatched,
+            unread_bytes_at_close=self._unread_bytes_at_close,
         )
 
     def facts(self) -> Mapping[str, object]:
@@ -478,7 +499,7 @@ class SerialTransport:
             self._timer = None
         self._deliver(self._framer.flush(now))
         self._detach()
-        self._fail_sends(self._down_error(f"link lost: {reason}"))
+        self._abort_sends(self._down_error(f"link lost: {reason}"), f"link lost: {reason}")
         error = IronbirdError(
             Code.TX_DOWN,
             f"{self.description}: link lost ({reason}); reconnecting, retry every "
@@ -551,15 +572,58 @@ class SerialTransport:
             return
 
     # -- sending ----------------------------------------------------------------------
+    #
+    # The buffer holds the bytes ``[_tx_written, _tx_enqueued)`` of the stream of packets sent,
+    # in order; each waiting send knows where its packet lies in that stream. A packet some of
+    # whose bytes reached the device is past the point of no return: it is never reported as not
+    # sent, and never taken back. One none of whose bytes did is taken back whole when its send
+    # is cancelled, so a cancelled send is really not sent.
 
-    def _fail_sends(self, error: IronbirdError | TransportClosed) -> None:
-        """Drop buffered bytes (they were never sent) and fail the sends waiting for them."""
-        self._txbuf.clear()
+    def _check_buffer(self) -> None:
+        assert len(self._txbuf) == self._tx_enqueued - self._tx_written
+        assert all(self._tx_written < wait.end for wait in self._tx_waiters)
+
+    def _torn(self, wait: _TxWait, why: str) -> IronbirdError:
+        """The error of a packet whose head went out and whose tail is being discarded."""
+        size = wait.end - wait.start
+        sent = min(size - 1, max(1, self._tx_written - wait.start))
+        return IronbirdError(
+            Code.TX_SEND,
+            f"{self.description}: {sent} of {size} bytes of a packet went out and the rest was "
+            f"discarded ({why}); the peer received a torn packet",
+        )
+
+    def _abort_sends(self, unsent: IronbirdError | TransportClosed, why: str) -> None:
+        """Drop the buffered bytes and fail the sends waiting for them: one none of whose bytes
+        went out with ``unsent`` (it was not sent); one whose head is on the line with a torn
+        packet error naming ``why`` (reported instead when its sender no longer waits)."""
         waiters, self._tx_waiters = self._tx_waiters, []
-        for _, future in waiters:
-            if not future.done():
-                future.set_exception(error)
+        for wait in waiters:
+            error = self._torn(wait, why) if self._tx_written > wait.start else unsent
+            wait.failure = error
+            if not wait.future.done():
+                wait.future.set_exception(error)
+            elif error is not unsent and self._report is not None:
+                self._report(error)  # its sender was cancelled after the head went out
+        self._txbuf.clear()
         self._tx_written = self._tx_enqueued
+        self._wake_idle()
+
+    def _withdraw(self, wait: _TxWait) -> None:
+        """Take back the packet of a cancelled send none of whose bytes went out."""
+        written = self._tx_written
+        assert wait.failure is None and wait.start >= written and wait in self._tx_waiters
+        size = wait.end - wait.start
+        del self._txbuf[wait.start - written : wait.end - written]
+        self._tx_waiters.remove(wait)
+        for later in self._tx_waiters:
+            if later.start >= wait.end:
+                later.start -= size
+                later.end -= size
+        self._tx_enqueued -= size
+        if not self._txbuf:
+            self._stop_writer()
+        self._check_buffer()
 
     def _drain_timeout(self, pending: int) -> float:
         """Seconds the line needs for ``pending`` bytes, doubled, with a floor."""
@@ -581,15 +645,17 @@ class SerialTransport:
             except (BlockingIOError, InterruptedError):
                 return
             except OSError as exc:
-                if exc.errno in _LOST_ERRNOS:
+                if exc.errno in _LOST_ERRNOS and not self._closed:
                     self._lost(exc)
                 else:  # the bytes cannot go out: refuse them rather than retry forever
-                    self._fail_sends(
+                    reason = exc.strerror or str(exc)
+                    self._abort_sends(
                         IronbirdError(
                             Code.TX_SEND,
-                            f"send to {self.description} failed: {exc.strerror or exc}",
+                            f"send to {self.description} failed: {reason}",
                             cause=exc,
-                        )
+                        ),
+                        f"write failed: {reason}",
                     )
                     self._stop_writer()
                 return
@@ -602,13 +668,14 @@ class SerialTransport:
 
     def _release_waiters(self) -> None:
         done = self._tx_written
-        keep: list[tuple[int, asyncio.Future[None]]] = []
-        for offset, future in self._tx_waiters:
-            if offset <= done:
-                if not future.done():
-                    future.set_result(None)
+        keep: list[_TxWait] = []
+        for wait in self._tx_waiters:
+            if wait.end <= done:
+                wait.written = True
+                if not wait.future.done():
+                    wait.future.set_result(None)
             else:
-                keep.append((offset, future))
+                keep.append(wait)
         self._tx_waiters = keep
 
     def _stop_writer(self) -> None:
@@ -616,6 +683,13 @@ class SerialTransport:
             with contextlib.suppress(ValueError, OSError):
                 self._loop.remove_writer(self._fd)
         self._writer_on = False
+        self._wake_idle()
+
+    def _wake_idle(self) -> None:
+        """The buffer emptied or was dropped: a close waiting for that goes on."""
+        idle, self._tx_idle = self._tx_idle, None
+        if idle is not None and not idle.done():
+            idle.set_result(None)
 
     async def send(
         self,
@@ -625,7 +699,12 @@ class SerialTransport:
         handed_off: Callable[[], None] | None = None,
     ) -> None:
         """Send one packet: the bytes are written to the device (``handed_off`` runs when they
-        all are), and ``confirm`` also waits for the UART to empty."""
+        all are, or when the send is cancelled after some of them were: the rest follows from
+        the buffer), and ``confirm`` also waits for the UART to empty.
+
+        Raises :class:`TransportClosed` only when none of the packet went out. A packet whose
+        head went out and whose tail cannot follow (a stall, a lost device, a close that could
+        not wait for it) fails with a coded error that says how much of it was sent."""
         if self._closed:
             raise TransportClosed
         if self._down or self._fd < 0:
@@ -640,6 +719,7 @@ class SerialTransport:
             )
         loop, fd = self._loop, self._fd
         assert loop is not None
+        start = self._tx_enqueued
         self._tx_enqueued += size
         written = 0
         if not self._txbuf:
@@ -660,28 +740,65 @@ class SerialTransport:
         self._tx_bytes += written
         if written < size:
             self._txbuf += data[written:]
-            future: asyncio.Future[None] = loop.create_future()
-            self._tx_waiters.append((self._tx_enqueued, future))
+            wait = _TxWait(start, start + size, loop.create_future())
+            self._tx_waiters.append(wait)
+            self._check_buffer()
             if not self._writer_on:
                 loop.add_writer(fd, self._on_writable)
                 self._writer_on = True
-            try:
-                async with asyncio.timeout(self._drain_timeout(len(self._txbuf))):
-                    await future
-            except TimeoutError as exc:
-                self._fail_sends(IronbirdError(Code.TX_SEND, f"send to {self.description} stalled"))
-                self._stop_writer()
-                raise IronbirdError(
-                    Code.TX_SEND,
-                    f"not sent: {self.description} accepted no bytes for "
-                    f"{self._drain_timeout(size):.1f} s (is the peer reading? flow control?)",
-                    cause=exc,
-                ) from exc
+            await self._wait_written(wait, handed_off)
         self._tx_frames += 1
         if handed_off is not None:
             handed_off()
         if confirm:
             await self._drain(size)
+
+    async def _wait_written(self, wait: _TxWait, handed_off: Callable[[], None] | None) -> None:
+        """Wait until the tail of ``wait``'s packet has gone from the buffer to the device."""
+        limit = self._drain_timeout(len(self._txbuf))
+        try:
+            async with asyncio.timeout(limit):
+                await wait.future
+        except TimeoutError as exc:
+            if wait.failure is not None:  # failed just as the time ran out
+                raise wait.failure from exc
+            if wait.written:  # written just as the time ran out
+                return
+            self._tx_waiters.remove(wait)
+            if self._tx_written > wait.start:
+                own = self._torn(wait, f"the device took no more within {limit:.1f} s")
+            else:
+                own = IronbirdError(
+                    Code.TX_SEND,
+                    f"not sent: {self.description} took none of its {wait.end - wait.start} "
+                    f"bytes within {limit:.1f} s",
+                )
+            self._abort_sends(
+                IronbirdError(
+                    Code.TX_SEND,
+                    f"not sent: {self.description} stalled (is the peer reading? flow control?)",
+                ),
+                "the line stalled",
+            )
+            self._stop_writer()
+            raise IronbirdError(
+                Code.TX_SEND,
+                f"{own.summary} (is the peer reading? flow control?)",
+                cause=exc,
+            ) from exc
+        except asyncio.CancelledError:
+            if wait.failure is not None:  # failed just before the cancel reached the sender
+                if not isinstance(wait.failure, TransportClosed) and self._report is not None:
+                    self._report(wait.failure)
+                raise
+            if wait.written or self._tx_written > wait.start:
+                # Its head is on the line and the rest follows from the buffer: it is sent.
+                self._tx_frames += 1
+                if handed_off is not None:
+                    handed_off()
+                raise
+            self._withdraw(wait)  # none of it went out: it is not sent
+            raise
 
     async def _drain(self, pending: int) -> None:
         """Wait for the UART to send what was written (``tcdrain`` in a helper thread).
@@ -751,6 +868,12 @@ class SerialTransport:
     # -- closing ---------------------------------------------------------------------
 
     async def close(self) -> None:
+        """Stop the link end: a packet partly on the line gets the time its tail needs, what
+        the device already received is handed over (one wakeup's reads, as UDP's close does)
+        and the rest counted (``unread_bytes_at_close``), then the device is released.
+
+        A cancellation of the caller cuts the wait for a packet's tail short (it is reported as
+        torn) and propagates once the device is released."""
         if self._closed:
             return
         self._closed = True
@@ -758,15 +881,84 @@ class SerialTransport:
             self._timer.cancel()
             self._timer = None
         task, self._reconnect = self._reconnect, None
-        if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        if not self._down:
-            self._deliver(self._framer.flush(self._wall_ns()))  # the line's last bytes
-        self._receiver = None
-        self._detach()
-        self._fail_sends(TransportClosed())
+        if task is not None:
+            task.cancel()  # it opens nothing once ``_closed`` is set
+        try:
+            if not self._down:
+                await self._finish_in_flight()
+        finally:
+            try:
+                if not self._down:
+                    self._read_tail()
+                    self._deliver(self._framer.flush(self._wall_ns()))  # the line's last bytes
+            finally:
+                self._receiver = None
+                self._detach()
+                self._abort_sends(TransportClosed(), "the transport closed")
+        if task is not None:
+            await self._reap(task)
+
+    async def _finish_in_flight(self) -> None:
+        """Drop the packets none of whose bytes went out (they are not sent), and wait, bounded
+        by its drain time, for the tail of the one whose head is already on the line."""
+        written = self._tx_written
+        started = [wait for wait in self._tx_waiters if wait.start < written]
+        assert len(started) <= 1, "only the packet at the head of the buffer can be partly out"
+        unsent = [wait for wait in self._tx_waiters if wait.start >= written]
+        self._tx_waiters = started
+        for wait in unsent:
+            wait.failure = TransportClosed()
+            if not wait.future.done():
+                wait.future.set_exception(wait.failure)
+        keep = started[0].end - written if started else 0
+        del self._txbuf[keep:]
+        self._tx_enqueued = written + len(self._txbuf)
+        self._check_buffer()
+        loop = self._loop
+        if not self._txbuf or loop is None:
+            self._stop_writer()
+            return
+        idle: asyncio.Future[None] = loop.create_future()
+        self._tx_idle = idle
+        try:
+            async with asyncio.timeout(self._drain_timeout(len(self._txbuf))):
+                await idle
+        except TimeoutError:
+            pass  # the abort that follows fails the packet as torn
+        finally:
+            self._tx_idle = None
+
+    def _read_tail(self) -> None:
+        """Hand the receiver what the device holds (one wakeup's reads) and count the bytes
+        left beyond that, which are discarded unread."""
+        if self._receiver is None or self._fd < 0:
+            return
+        self._read_available()
+        fd = self._fd
+        if fd < 0:
+            return
+        try:
+            raw = fcntl.ioctl(fd, termios.FIONREAD, b"\0\0\0\0")
+        except OSError:
+            return
+        self._unread_bytes_at_close += max(0, int.from_bytes(raw, sys.byteorder, signed=True))
+
+    async def _reap(self, task: asyncio.Task[None]) -> None:
+        """Wait for the cancelled reconnect task to end. A cancellation of the caller is not
+        absorbed (``asyncio.wait`` raises it, unlike awaiting the task); the task's own
+        cancellation is."""
+        await asyncio.wait({task})
+        if task.cancelled():
+            return
+        failure = task.exception()
+        if failure is not None and self._report is not None:
+            self._report(
+                IronbirdError(
+                    Code.INTERNAL,
+                    f"{self.description}: reconnecting failed: {type(failure).__name__}: {failure}",
+                    cause=failure,
+                )
+            )
 
 
 def _hung_up(fd: int) -> bool:

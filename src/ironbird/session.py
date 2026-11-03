@@ -217,8 +217,12 @@ class Session:
                 task.cancel()
             # A task that died is already reported by its done-callback. Collecting the results
             # (rather than suppressing CancelledError around each await) lets a cancellation of
-            # this very task, such as a signal, propagate.
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            # this very task, such as a signal, propagate, once the engine is closed.
+            try:
+                await asyncio.gather(*self._tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                await self._close_engine_cancelled()
+                raise
             await self._engine.close()
         finally:
             try:
@@ -226,6 +230,23 @@ class Session:
             finally:
                 self.ledger.settle()
                 self.ledger.flush()
+
+    async def _close_engine_cancelled(self) -> None:
+        """Close the engine on the way out of a cancelled exit; a failure of the close is
+        reported, so it neither goes unseen nor takes the cancellation's place."""
+        try:
+            await self._engine.close()
+        except Exception as exc:
+            self.report(
+                exc
+                if isinstance(exc, IronbirdError)
+                else IronbirdError(
+                    Code.INTERNAL,
+                    f"closing the session's links failed: {type(exc).__name__}: {exc}",
+                    details="".join(traceback.format_exception(exc)),
+                    cause=exc,
+                )
+            )
 
     def _background_done(self, task: asyncio.Task[None]) -> None:
         """Report a background task that died instead of being cancelled."""
@@ -244,11 +265,33 @@ class Session:
         )
 
     async def _ticker(self) -> None:
+        """The once-a-second work: coalesced summaries, the ledger's timers, drop accounting.
+
+        A step that fails is reported (coalesced by step, so a failure every second is one
+        notice with a count) and the ticking goes on: one failure must not silence the drop
+        reports for the rest of the session."""
         while True:
             await asyncio.sleep(TICK_S)
-            self._coalescer.tick()
-            self.ledger.tick()
-            await self._engine.tick()
+            for name, step in (("coalescer", self._coalescer.tick), ("ledger", self.ledger.tick)):
+                try:
+                    step()
+                except Exception as exc:
+                    self._tick_failed(name, exc)
+            try:
+                await self._engine.tick()
+            except Exception as exc:
+                self._tick_failed("engine", exc)
+
+    def _tick_failed(self, step: str, exc: Exception) -> None:
+        self.report(
+            IronbirdError(
+                Code.INTERNAL,
+                f"periodic {step} work failed: {type(exc).__name__}: {exc}",
+                details="".join(traceback.format_exception(exc)),
+                cause=exc,
+            ),
+            context=f"tick {step}",
+        )
 
     # -- error reporting ---------------------------------------------------------------
 
@@ -1032,7 +1075,10 @@ class EventStream:
         )
         self._event_mids = event_mids
         self._min_severity = min_severity
-        self._queue: asyncio.Queue[Event | BaseException] = asyncio.Queue(EVENT_QUEUE_SIZE)
+        # ``None`` is not an event: it wakes a consumer waiting on an empty queue at the end.
+        self._queue: asyncio.Queue[Event | None] = asyncio.Queue(EVENT_QUEUE_SIZE)
+        self._ended = False  # the pump is done: what is queued is all there will be
+        self._failure: Exception | None = None  # why it ended, raised after the queued events
         loop = asyncio.get_running_loop()
         self._pump_task = loop.create_task(self._pump(), name="events")
 
@@ -1045,11 +1091,17 @@ class EventStream:
         return self._iterate()
 
     async def _iterate(self) -> AsyncIterator[Event]:
+        """The queued events, then the end of the stream: the iteration ends once the capture
+        has ended (cleanly too, as when the engine closes) and the queue is empty, raising the
+        failure that ended it, if any."""
         while True:
+            if self._ended and self._queue.empty():
+                if self._failure is not None:
+                    raise self._failure
+                return
             item = await self._queue.get()
-            if isinstance(item, BaseException):
-                raise item
-            yield item
+            if item is not None:
+                yield item
 
     async def _pump(self) -> None:
         ledger = self._session.ledger
@@ -1076,10 +1128,12 @@ class EventStream:
                 if self._matcher is not None and not self._matcher(frame):
                     continue  # ledgered above; the filter only limits what is shown
                 await self._queue.put(event)
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:  # surfaced to the consumer, never lost with the task
-            await self._queue.put(exc)
+            self._failure = exc
+        finally:
+            self._ended = True
+            if not self._queue.full():  # a full queue has no consumer waiting on it
+                self._queue.put_nowait(None)
 
     async def close(self) -> None:
         self._pump_task.cancel()

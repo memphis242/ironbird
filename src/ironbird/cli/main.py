@@ -103,7 +103,7 @@ from ironbird.recording.session import (
     default_recording_dir,
     parse_split,
 )
-from ironbird.recording.writer import Recorder
+from ironbird.recording.writer import Recorder, RecorderStats
 from ironbird.retention import LONG_COMMANDS
 from ironbird.retnotices import Notices
 from ironbird.retservice import Retention
@@ -1033,10 +1033,18 @@ class _RecordingScope:
         pending = self._pending
         if pending is None:
             return
-        stats = await pending.finish(interrupted=isinstance(exc, asyncio.CancelledError))
-        recorder = self.recorder
-        if stats is None or recorder is None:
-            return
+        try:
+            stats = await pending.finish(interrupted=isinstance(exc, asyncio.CancelledError))
+        except asyncio.CancelledError:
+            # A signal while the recording closed: the close still completed (it finishes
+            # before a cancellation goes on), so what it wrote is still said.
+            if self.recorder is not None:
+                self._summarize(self.recorder, self.recorder.stats())
+            raise
+        if stats is not None and self.recorder is not None:
+            self._summarize(self.recorder, stats)
+
+    def _summarize(self, recorder: Recorder, stats: RecorderStats) -> None:
         where = term(str(recorder.path), 1000, err=True)
         size = size_text(stats.file_bytes)
         if recorder.failed is not None:
