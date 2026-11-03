@@ -84,7 +84,7 @@ import dataclasses
 import hashlib
 import multiprocessing
 import os
-import pickle
+import pickle  # nosec B403  # only the parent's private pipe to its own worker is unpickled
 import signal
 import threading
 import time
@@ -724,7 +724,7 @@ def serve(conn: connection.Connection, definitions: Definitions, parent: int) ->
     with contextlib.closing(conn):
         while True:
             try:
-                job = pickle.loads(conn.recv_bytes())  # noqa: S301 - the parent's own message
+                job = pickle.loads(conn.recv_bytes())  # noqa: S301  # nosec B301  # the parent's own message
             except (EOFError, OSError):
                 return
             outcome = run_job(job)
@@ -911,7 +911,7 @@ class WorkerPool:
 
     def _receive(self, slot: _Slot) -> None:
         try:
-            reply = pickle.loads(slot.conn.recv_bytes())  # noqa: S301 - our own worker's message
+            reply = pickle.loads(slot.conn.recv_bytes())  # noqa: S301  # nosec B301  # our own worker's message
         except (EOFError, OSError) as exc:
             self._fail(self.died(exc))
             return

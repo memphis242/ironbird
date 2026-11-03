@@ -480,13 +480,12 @@ def liveness(
             if session.id == own_session:
                 result[session.id] = LIVE
                 continue
-            held = False
-            for f in session.files:
-                if (f.is_reserve or (f.is_part and f.number == 1)) and probe_lock(
-                    fs, dir_fd, f.name
-                ) == "held":
-                    held = True
-                    break
+            # Every part is probed, not only part 1: a recorder holds part 1 for the session, but
+            # a reader of a split set holds the part it is on (or the first one it was given).
+            held = any(
+                (f.is_reserve or f.is_part) and probe_lock(fs, dir_fd, f.name) == "held"
+                for f in sorted(session.files, key=lambda f: f.number)
+            )
             newest = session.newest_mtime
             if newest > now:
                 result[session.id] = FUTURE

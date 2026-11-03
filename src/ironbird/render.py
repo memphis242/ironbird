@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import sys
 from collections.abc import Sequence
-from typing import Any, Final
+from typing import Any, Final, assert_never
 
 from ironbird.ccdd.model import FieldDef, MessageKind, TypeClass
 from ironbird.codec import DecodedPacket
@@ -102,7 +102,7 @@ def json_value(field: FieldDef, value: object) -> Any:
             assert isinstance(value, bytes)
             return value.hex()
         case _:
-            return field_text(field, value)
+            assert_never(field.type.type_class)
 
 
 def line(node: str, time_ns: int, packet: DecodedPacket) -> str:

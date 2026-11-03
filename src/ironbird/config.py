@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import ipaddress
 import math
 import os
 import re
@@ -814,7 +815,41 @@ def _parse_link_transport(
         command_endpoint=ctx.endpoint(raw["command_endpoint"], f"{lpath}.command_endpoint"),
         telemetry_endpoint=ctx.endpoint(raw["telemetry_endpoint"], f"{lpath}.telemetry_endpoint"),
     )
+    if udp.command_endpoint.port == udp.telemetry_endpoint.port and _same_host(
+        udp.command_endpoint.host, udp.telemetry_endpoint.host
+    ):
+        # One socket would carry both directions: a listener would read the commands it sends.
+        raise ctx.fail(
+            f"{lpath}.telemetry_endpoint",
+            f"is the same as command_endpoint ({udp.command_endpoint}); the two directions "
+            "need different endpoints",
+        )
     return transport, udp, None, None
+
+
+def _host_key(host: str) -> str:
+    """``host`` in a form where spellings of one address compare equal, without a DNS lookup:
+    a literal IP in its compressed form, ``localhost`` as loopback, else the lowercased name."""
+    name = host.strip("[]").lower()
+    if name == "localhost":
+        return "loopback"
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        return name
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    if address in (ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")):
+        return "loopback"
+    return address.compressed
+
+
+def _same_host(a: str, b: str) -> bool:
+    """True when ``a`` and ``b`` name one socket address on this machine: equal after
+    ``_host_key``, or a wildcard (``0.0.0.0``, ``::``, which binds every local address) against
+    loopback. A wildcard against another address is allowed: that address may be a remote peer."""
+    keys = {_host_key(a), _host_key(b)}
+    return len(keys) == 1 or keys in ({"loopback", "0.0.0.0"}, {"loopback", "::"})  # noqa: S104 - compared, not bound
 
 
 def _framing_for_line(

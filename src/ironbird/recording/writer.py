@@ -651,18 +651,35 @@ class Recorder:
 
     # -- the sink --
 
-    def append(self, frame: Frame) -> None:
+    def append(self, frame: Frame, mono_ns: int | None = None) -> None:
         """Encode ``frame`` into the recording. Cheap, synchronous, and never raises: a failure
-        stops the recorder (``IB-INT-001``) and the frame is counted as not recorded."""
+        stops the recorder (``IB-INT-001``) and the frame is counted as not recorded.
+
+        ``mono_ns`` is the monotonic clock read when the frame was ingested, for a frame that
+        reaches the recorder later than it was received (frames staged while the file is made);
+        left out, the clock is read now.
+        """
         encoded = self._frames
+        buf, mark = self._buf, len(self._buf)
+        buf_frames, buf_data = self._buf_frames, self._buf_data
         try:
-            self._append(frame)
+            self._append(frame, self._mono() if mono_ns is None else mono_ns)
         except Exception as exc:
+            # Cut back to the last complete record before this frame; if a flush ran inside
+            # this append, what followed it holds at most this frame and its head records.
+            if self._buf is buf:
+                del buf[mark:]
+                self._buf_frames, self._buf_data = buf_frames, buf_data
+            else:
+                self._buf = bytearray()
+                self._buf_frames = self._buf_data = 0
+            self._frames = encoded
             self._internal_failure(exc)
+            self._salvage()
             if self._frames == encoded:  # the frame itself never got into the buffer
                 self._after_stop += 1
 
-    def _append(self, frame: Frame) -> None:
+    def _append(self, frame: Frame, mono: int) -> None:
         if self._stopped:
             self._after_stop += 1
             return
@@ -681,7 +698,6 @@ class Recorder:
         size = len(data)
         bits = int(frame.flags)
         mid = frame.mid or 0
-        mono = self._mono()
         wall = frame.time_ns
         offset_now = wall - mono
         clock_offset = self._clock_offset
@@ -690,6 +706,9 @@ class Recorder:
         elif abs(offset_now - clock_offset) > CLOCK_STEP_NS:
             self._clock_step(wall, offset_now - clock_offset)
             self._clock_offset = offset_now
+        if self._stopped:  # a head record above closed a chunk and a rotation failed
+            self._after_stop += 1
+            return
         body_len = fmt.FRAME_FIXED_SIZE + size
         fixed = fmt.FRAME_FIXED.pack(seq, wall, sid, source, bits, 0, mid, frame.orig_len)
         head = fmt.ENVELOPE_HEAD.pack(body_len, _FRAME_TYPE, 0, 0)
@@ -800,6 +819,8 @@ class Recorder:
             return
         if self._chunk_frames:
             self._close_chunk()
+            if self._stopped:
+                return
         assert not self._chunk_frames, "a non-frame record never lands between a chunk's frames"
         record = fmt.encode_record(rtype, body, self._seed)
         self._buf += record
@@ -902,10 +923,11 @@ class Recorder:
         if final:
             return
         now = self._mono()
-        if now - self._last_redefine >= REDEFINE_NS:
+        if self._rotation_due(now):
+            self._rotate(now)  # the new part's head repeats every definition
+        elif now - self._last_redefine >= REDEFINE_NS:
             self._last_redefine = now
             self._redefine()
-        self._maybe_rotate(now)
 
     def _redefine(self) -> None:
         """Repeat every STREAM and SOURCE at the start of the chunk just begun."""
@@ -921,9 +943,20 @@ class Recorder:
             self._offset += len(record)
             self._file_bytes += len(record)
 
+    def _salvage(self) -> None:
+        """After an internal stop, hand the complete records still buffered to the disk."""
+        assert self._stopped
+        buf = self._buf
+        if not buf or self._fd < 0:
+            return
+        self._buf = bytearray()
+        self._enqueued += len(buf)
+        self._writer.jobs.put((self._fd, buf, True, self._buf_frames, self._buf_data))
+        self._buf_frames = self._buf_data = 0
+
     def _flush(self, *, sync: bool) -> None:
         buf = self._buf
-        if not buf:
+        if not buf or self._stopped:
             return
         assert not len(buf) & (fmt.ALIGN - 1), "the buffer holds whole aligned records"
         self._buf = bytearray()
@@ -1060,13 +1093,16 @@ class Recorder:
 
     # -- splitting --
 
-    def _maybe_rotate(self, now: int) -> None:
+    def _rotation_due(self, now: int) -> bool:
         opts = self._options
         due = (opts.split_bytes is not None and self._offset >= opts.split_bytes) or (
             opts.split_seconds is not None and now - self._part_started >= opts.split_seconds * 1e9
         )
-        if not due or self._part >= MAX_PARTS:
-            return
+        return due and self._part < MAX_PARTS
+
+    def _rotate(self, now: int) -> None:
+        """Close the part being written, right after a chunk, and start the next one."""
+        assert not self._buf and not self._stopped, "a rotation starts from a flushed chunk close"
         self._finish_part()
         old_fd = self._fd
         self._previous_last_seq = self._last_seq
@@ -1083,6 +1119,7 @@ class Recorder:
                 IronbirdError(Code.REC_CREATE, f"cannot start the next part: {exc}", cause=exc)
             )
             return
+        self._last_redefine = now
         if self._part == 2:
             self._held_fd = old_fd  # part 1 stays open and locked until the session ends
         else:
@@ -1181,7 +1218,10 @@ class Recorder:
         finish (the GAP for dropped frames and the trailer are behind it); it ends when the
         writer makes no progress for :data:`CLOSE_STALL_S`. A disk that stops answering then
         leaves a file without its trailer, readable up to the last record that reached it, and
-        the notice says how many frames were not written.
+        the notice says how many frames were not written. A cancellation of the caller (a
+        signal) does not cut the wait short, since the writer thread dies with the process: the
+        close ends as it would have, ledgered, and then the cancellation propagates; once
+        cancelled, the wait lasts at most :data:`CLOSE_STALL_S` more, even on a slow disk.
         """
         if self._closed:
             return self.stats()
@@ -1202,10 +1242,19 @@ class Recorder:
         if self._held_fd >= 0:
             jobs.put(("close", self._held_fd))
         jobs.put(None)
+        cancelled: asyncio.CancelledError | None = None
+        cancelled_at = 0.0
         seen, moved_at = self._writer.progress, time.monotonic()
         while self._writer.is_alive():
-            await asyncio.sleep(0.005)
+            try:
+                await asyncio.sleep(0.005)
+            except asyncio.CancelledError as exc:
+                if cancelled is None:
+                    cancelled_at = time.monotonic()
+                cancelled = cancelled or exc  # raised once the close is complete
             now = time.monotonic()
+            if cancelled is not None and now - cancelled_at >= CLOSE_STALL_S:
+                break  # a cancelled close waits at most this long, even on a disk still moving
             if self._writer.progress != seen:
                 seen, moved_at = self._writer.progress, now
             elif now - moved_at >= CLOSE_STALL_S:
@@ -1239,6 +1288,8 @@ class Recorder:
                 peak_pending_bytes=stats.peak_pending_bytes,
                 failed=self._failed.code.value if self._failed else None,
             )
+        if cancelled is not None:
+            raise cancelled
         return stats
 
     def _recheck_overrun_final(self) -> None:

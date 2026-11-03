@@ -225,6 +225,9 @@ class FieldDef:
     units: str = ""
     description: str = ""
     var: VarSpec | None = None
+    # An enum names the values a field normally takes; true lets an encoder send any other
+    # value in the type's range (the default refuses it).
+    allow_raw: bool = False
     # value -> label, built once from ``enum`` so lookups are O(1)
     enum_by_value: Mapping[int, str] = field(init=False, repr=False, compare=False)
 

@@ -131,11 +131,11 @@ class Resolved:
         return f"Resolved({self.message.name}, word=0x{self.word:08X}, counts={self.counts})"
 
 
-_SET_MESSAGE = Resolved.message.__set__  # type: ignore[attr-defined]
-_SET_WORD = Resolved.word.__set__  # type: ignore[attr-defined]
-_SET_COUNTS = Resolved.counts.__set__  # type: ignore[attr-defined]
-_SET_CODEC = Resolved.codec.__set__  # type: ignore[attr-defined]
-_SET_DATA = Resolved.data.__set__  # type: ignore[attr-defined]
+_SET_MESSAGE = Resolved.__dict__["message"].__set__
+_SET_WORD = Resolved.__dict__["word"].__set__
+_SET_COUNTS = Resolved.__dict__["counts"].__set__
+_SET_CODEC = Resolved.__dict__["codec"].__set__
+_SET_DATA = Resolved.__dict__["data"].__set__
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,9 +164,15 @@ class EncodedPacket:
     data: bytes
     message: Message
     mid: int
-    sequence: int
+    sequence: int | None  # the value in the packet's sequence field; None without such a field
     function_code: int | None
     count_faults: tuple[CountFault, ...] = ()  # injected with ``allow_count_mismatch``
+
+
+def _command_function_code_field(profile: HeaderProfile) -> str | None:
+    """The input field a command's function code fills; a telemetry profile has none, so a
+    function code field it names is an ordinary input that needs a default."""
+    return profile.function_code_field if profile.kind is ProfileKind.COMMAND else None
 
 
 def _compile_layout(message: Message) -> _Layout:
@@ -239,6 +245,7 @@ def _arg_error(message: Message, field: FieldDef, why: str) -> IronbirdError:
 
 
 _SPELLED_NON_FINITE: Final = re.compile(r"[+-]?(inf|infinity|nan)", re.IGNORECASE)
+_NONZERO_DIGIT: Final = re.compile(r"[1-9]")
 MAX_ENUM_HINT_NAMES: Final = 16
 MAX_LIST_TEXT: Final = 1 << 20  # characters of a spelled-out array or hex value a caller may pass
 
@@ -252,14 +259,26 @@ def _enum_hint(field: FieldDef) -> str:
     return f"; names: {', '.join(names)}{more}"
 
 
+def parse_ascii_int(text: str) -> int:
+    """``text`` as an integer in decimal, ``0x``, ``0o`` or ``0b`` spelling. Digits that are not
+    ASCII (Arabic-Indic, fullwidth, mathematical) are refused: ``int`` would read them as the
+    look-alike ASCII digit. Raises :class:`ValueError` for anything that is not an integer."""
+    if not text.isascii():
+        raise ValueError(f"not an integer: {text[:40]!r}")
+    return int(text, 0)
+
+
 def _text_bytes(message: Message, field: FieldDef, value: object, limit: int) -> bytes:
-    """ASCII text as bytes, at most ``limit`` of them."""
+    """ASCII text as bytes, at most ``limit`` of them, with no NUL: decode ends text at a NUL, so
+    the tail would not round-trip."""
     if not isinstance(value, str):
         raise _arg_error(message, field, f"unsupported value {value!r}")
     try:
         encoded = value.encode("ascii")
     except UnicodeEncodeError:
         raise _arg_error(message, field, "text must be ASCII") from None
+    if b"\x00" in encoded:
+        raise _arg_error(message, field, "text cannot contain a NUL character")
     if len(encoded) > limit:
         raise _arg_error(message, field, f"{len(encoded)} characters exceed {limit}")
     return encoded
@@ -290,7 +309,7 @@ def coerce_value(message: Message, field: FieldDef, value: object) -> object:
                     number = field.enum[value]
                 else:
                     try:
-                        number = int(value, 0)
+                        number = parse_ascii_int(value)
                     except ValueError:
                         hint = _enum_hint(field)
                         raise _arg_error(
@@ -303,16 +322,33 @@ def coerce_value(message: Message, field: FieldDef, value: object) -> object:
             lo, hi = ftype.bit_range
             if not lo <= number <= hi:
                 raise _arg_error(message, field, f"{number} is outside {lo}..{hi}")
+            if (
+                message.kind is MessageKind.COMMAND  # telemetry may carry any value a vehicle could
+                and field.enum is not None
+                and not field.allow_raw
+                and number not in field.enum_by_value
+            ):
+                raise _arg_error(
+                    message,
+                    field,
+                    f"{number} is not a named value{_enum_hint(field)}; the CCDD field needs "
+                    '"allow_raw": true to send others',
+                )
             return number
         case TypeClass.FLOAT:
             if isinstance(value, str):
                 try:
+                    if not value.isascii():
+                        raise ValueError("not ASCII")  # look-alike digits parse as ASCII ones
                     flt = float(value)
                 except ValueError:
                     raise _arg_error(message, field, f"{value[:40]!r} is not a number") from None
                 if not math.isfinite(flt) and not _SPELLED_NON_FINITE.fullmatch(value.strip()):
                     # Text such as "1e400" parses to inf; only the literal spellings are inf.
                     raise _arg_error(message, field, f"{value[:40]!r} overflows {ftype.text}")
+                if flt == 0.0 and _NONZERO_DIGIT.search(value.lower().partition("e")[0]):
+                    # Text such as "1e-400" parses to 0.0 in a double.
+                    raise _arg_error(message, field, f"{value[:40]!r} underflows {ftype.text}")
             elif isinstance(value, int | float) and not isinstance(value, bool):
                 try:
                     flt = float(value)
@@ -322,9 +358,11 @@ def coerce_value(message: Message, field: FieldDef, value: object) -> object:
                 raise _arg_error(message, field, f"unsupported value {value!r}")
             if ftype.size == 4 and math.isfinite(flt):
                 try:
-                    struct.pack("<f", flt)  # rounds to nearest float32; overflow raises
-                except OverflowError:
+                    narrowed: float = struct.unpack("<f", struct.pack("<f", flt))[0]
+                except OverflowError:  # the float32 nearest to flt does not exist
                     raise _arg_error(message, field, f"{flt} overflows float32") from None
+                if narrowed == 0.0 and flt != 0.0:
+                    raise _arg_error(message, field, f"{flt} underflows float32 to zero")
             return flt
         case TypeClass.CHAR:
             return _text_bytes(message, field, value, ftype.size)
@@ -341,7 +379,11 @@ def coerce_value(message: Message, field: FieldDef, value: object) -> object:
 
 
 def _split_list(message: Message, field: FieldDef, text: str) -> list[str]:
-    """The items of ``1,2,3``, ``[1, 2, 3]`` or ``1 2 3``; empty text is an empty array."""
+    """The items of ``1,2,3``, ``[1, 2, 3]`` or ``1 2 3``; empty text is an empty array.
+
+    With commas, every item between them must be present (one trailing comma is allowed): a
+    missing item is refused with its position rather than closed up, which would send a
+    different list than the one typed."""
     if len(text) > MAX_LIST_TEXT:
         raise _arg_error(message, field, f"the list is longer than {MAX_LIST_TEXT} characters")
     body = text.strip()
@@ -349,7 +391,19 @@ def _split_list(message: Message, field: FieldDef, text: str) -> list[str]:
         if not body.endswith("]"):
             raise _arg_error(message, field, "a list starting with [ must end with ]")
         body = body[1:-1]
-    return body.replace(",", " ").split()
+    if "," not in body:
+        return body.split()
+    pieces = body.split(",")
+    items: list[str] = []
+    for i, piece in enumerate(pieces):
+        words = piece.split()
+        if not words and i == len(pieces) - 1 and i > 0:
+            break  # one trailing comma
+        if not words:
+            indexed = replace(field, name=f"{field.name}[{len(items)}]")
+            raise _arg_error(message, indexed, "empty element between commas")
+        items.extend(words)
+    return items
 
 
 def coerce_variable(message: Message, field: FieldDef, value: object) -> tuple[int, bytes]:
@@ -362,8 +416,6 @@ def coerce_variable(message: Message, field: FieldDef, value: object) -> tuple[i
     match element.type_class:
         case TypeClass.CHAR:
             blob = _text_bytes(message, field, value, spec.max)
-            if b"\x00" in blob:  # decode ends text at a NUL, so the tail would not round-trip
-                raise _arg_error(message, field, "text cannot contain a NUL character")
             count = len(blob)
         case TypeClass.BYTES:
             blob = _hex_bytes(message, field, value)
@@ -397,6 +449,47 @@ def coerce_variable(message: Message, field: FieldDef, value: object) -> tuple[i
     return count, blob
 
 
+def _count_bounds(field: FieldDef) -> tuple[int, int]:
+    """The smallest and largest number of elements (characters, bytes) a text or array field
+    holds; a fixed-size text or bytes field holds up to its size, and text may be empty."""
+    if field.var is not None:
+        return field.var.min, field.var.max
+    if field.type.type_class is TypeClass.BYTES:
+        return field.type.size, field.type.size
+    return 0, field.type.size
+
+
+def echo_incompatibility(source: FieldDef, target: FieldDef) -> str | None:
+    """Why a decoded ``source`` field value cannot always be encoded into ``target``, or ``None``
+    when every value of the source fits the target: the same kind of data, and an integer range,
+    size or element count that contains the source's."""
+    s, t = source.type, target.type
+    if s.type_class is not t.type_class:
+        return f"{s.text} is not {t.type_class.value} data like {t.text}"
+    match s.type_class:
+        case TypeClass.INT:
+            (slo, shi), (tlo, thi) = s.bit_range, t.bit_range
+            if slo < tlo or shi > thi:
+                return f"{s.text} does not always fit {t.text}"
+        case TypeClass.FLOAT:
+            if s.size > t.size:
+                return f"{s.text} does not always fit {t.text}"
+        case TypeClass.ARRAY:
+            assert source.var is not None and target.var is not None
+            if source.var.element.text != target.var.element.text:
+                return f"elements of {s.text} differ from those of {t.text}"
+        case TypeClass.CHAR | TypeClass.BYTES:
+            pass
+    if s.type_class in (TypeClass.CHAR, TypeClass.BYTES, TypeClass.ARRAY):
+        (slo, shi), (tlo, thi) = _count_bounds(source), _count_bounds(target)
+        if slo < tlo or shi > thi:
+            return (
+                f"{s.text} does not always fit {t.text} "
+                f"({slo} to {shi} elements against {tlo} to {thi})"
+            )
+    return None
+
+
 def _element_packer(field: FieldDef) -> struct.Struct:
     assert field.var is not None and field.var.element.struct_code
     return struct.Struct(field.endian.struct_prefix + field.var.element.struct_code)
@@ -416,11 +509,11 @@ class Codec:
     ) -> None:
         if command_profile.kind is not ProfileKind.COMMAND:
             raise IronbirdError(
-                Code.ENC_FIT, f"{command_profile.source}: not a command header profile"
+                Code.HDR_SCHEMA, f"{command_profile.source}: not a command header profile"
             )
         if telemetry_profile.kind is not ProfileKind.TELEMETRY:
             raise IronbirdError(
-                Code.ENC_FIT, f"{telemetry_profile.source}: not a telemetry header profile"
+                Code.HDR_SCHEMA, f"{telemetry_profile.source}: not a telemetry header profile"
             )
         for profile in (command_profile, telemetry_profile):
             self._validate_profile(profile)
@@ -480,7 +573,7 @@ class Codec:
                 f"ID; at most {MAX_MID_BITS} bits are supported",
             )
         for f in profile.input_fields:
-            if f.value is None and f.name != profile.function_code_field:
+            if f.value is None and f.name != _command_function_code_field(profile):
                 raise IronbirdError(
                     Code.HDR_SCHEMA,
                     f"{profile.source}: input field {f.name} has no default and nothing "
@@ -556,7 +649,8 @@ class Codec:
                 f"not a {type(header_values).__name__}",
             )
         values = cast("Mapping[object, object]", header_values)
-        settable = [f.name for f in profile.input_fields if f.name != profile.function_code_field]
+        reserved = _command_function_code_field(profile)
+        settable = [f.name for f in profile.input_fields if f.name != reserved]
         for name, value in values.items():
             if type(name) is not str:
                 raise IronbirdError(
@@ -564,7 +658,7 @@ class Codec:
                     f"{what} field names must be strings, not {type(name).__name__}",
                 )
             f = profile.by_name.get(name)
-            if name == profile.function_code_field:
+            if name == reserved:
                 raise IronbirdError(
                     Code.HDR_PACK,
                     f"{what} {name[:40]!r}: the function code comes from the command definition",
@@ -697,19 +791,21 @@ class Codec:
             self._check_header_values(profile, header, "header")
             values.update(header)
         values.update(inputs)
-        sequence = self._next_sequence(msg.mid)
+        counter = self._next_sequence(msg.mid)
         data = hdr.pack(
             profile,
             payload,
             mid=msg.mid,
             inputs=values,
-            sequence=sequence,
+            sequence=counter,
             now=self._clock(),
             tamper=tamper,
         )
         assert (
             len(data) <= self.max_packet_bytes
         )  # guaranteed by _validate_fit (+ tamper keeps size)
+        field = profile.sequence_field
+        sequence = counter & field.mask if field is not None else None
         return EncodedPacket(data, msg, msg.mid, sequence, msg.function_code, faults)
 
     def encode_command(
@@ -959,7 +1055,7 @@ class Codec:
         always what ``decode(kind, data)`` gives, and this never raises.
         """
         if (
-            type(resolved) is not Resolved
+            type(resolved) is not Resolved  # type: ignore[redundant-expr]  # any object may arrive
             or resolved.codec is not self
             or resolved.data is not data
             or resolved.message.kind is not kind

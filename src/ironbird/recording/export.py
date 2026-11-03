@@ -68,9 +68,13 @@ from ironbird.sigmask import Hold, naming_replaced, signals_held
 #: A text cell is never cut: the longest field is a ``char[]`` of up to 65535 characters, each
 #: of which may escape to ten.
 MAX_CELL_CHARS: Final = 1 << 20
-#: What starts a formula in a spreadsheet: ``= + - @`` and their fullwidth forms (some importers
-#: fold those), and tab, CR and LF.
-FORMULA_LEAD: Final = frozenset("=+-@\t\r\n\uff1d\uff0b\uff0d\uff20")
+#: What starts a formula in a spreadsheet: ``= + - @`` and every character NFKC folds to one of
+#: them (fullwidth, small and superscript/subscript forms: some importers fold those), and tab,
+#: CR and LF.
+FORMULA_LEAD: Final = frozenset(
+    "=+-@\t\r\n\u207a\u207c\u208a\u208c\u2a75\u2a76\ufb29\ufe62\ufe63\ufe66\ufe6b"
+    "\uff1d\uff0b\uff0d\uff20"
+)
 FORMULA_PREFIX: Final = "'"
 #: Hex cells lead with it so a spreadsheet keeps them as text (``00123456`` would lose its zeros
 #: and ``1e300000`` would become a number); the digits themselves are always inert.
@@ -181,11 +185,13 @@ def _converter(field_def: FieldDef, raw_enums: bool) -> Callable[[object], objec
         case TypeClass.INT:
             if raw_enums or not field_def.enum_by_value:
                 return _int_cell
-            labels = {number: safe_cell(label) for number, label in field_def.enum_by_value.items()}
+            labels: dict[object, object] = {
+                number: safe_cell(label) for number, label in field_def.enum_by_value.items()
+            }
             get = labels.get
 
             def label_cell(value: object) -> object:
-                found = get(value)  # type: ignore[arg-type]
+                found = get(value)
                 return value if found is None else found
 
             return label_cell
@@ -209,7 +215,7 @@ class _LineOf:
 
 
 _WRITER: Final = csv.writer(
-    _LineOf(),  # type: ignore[arg-type]
+    _LineOf(),
     lineterminator="\n",
     quoting=csv.QUOTE_MINIMAL,
 )

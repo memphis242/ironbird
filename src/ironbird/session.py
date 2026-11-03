@@ -19,6 +19,7 @@ import traceback
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final
 
@@ -33,7 +34,14 @@ from ironbird.ccdd.model import (
     meets_floor,
 )
 from ironbird.coalesce import Coalescer
-from ironbird.codec import Codec, DecodedPacket, EncodedPacket
+from ironbird.codec import (
+    Codec,
+    DecodedPacket,
+    EncodedPacket,
+    coerce_value,
+    coerce_variable,
+    echo_incompatibility,
+)
 from ironbird.config import Link, Node, ResponseRule, SystemConfig
 from ironbird.engine import (
     Capture,
@@ -46,7 +54,7 @@ from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
 from ironbird.filter import Filter, FilterError, Matcher, compile_filter
 from ironbird.frame import SERIAL_TRANSPORT, Decoded, Frame, Stream
-from ironbird.header import parse_profile_file, read_profile
+from ironbird.header import HeaderProfile, ProfileKind, parse_profile_file, read_profile
 from ironbird.ledger import Ledger
 from ironbird.ledgertiers import Tier
 from ironbird.notice import Level, Notice, level_of
@@ -82,7 +90,7 @@ class SentCommand:
     command: str
     mid: int
     function_code: int
-    sequence: int
+    sequence: int | None  # as in the packet; None when its header has no sequence field
     size: int
     data: bytes
     endpoint: str
@@ -217,8 +225,12 @@ class Session:
                 task.cancel()
             # A task that died is already reported by its done-callback. Collecting the results
             # (rather than suppressing CancelledError around each await) lets a cancellation of
-            # this very task, such as a signal, propagate.
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            # this very task, such as a signal, propagate, once the engine is closed.
+            try:
+                await asyncio.gather(*self._tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                await self._close_engine_cancelled()
+                raise
             await self._engine.close()
         finally:
             try:
@@ -226,6 +238,23 @@ class Session:
             finally:
                 self.ledger.settle()
                 self.ledger.flush()
+
+    async def _close_engine_cancelled(self) -> None:
+        """Close the engine on the way out of a cancelled exit; a failure of the close is
+        reported, so it neither goes unseen nor takes the cancellation's place."""
+        try:
+            await self._engine.close()
+        except Exception as exc:
+            self.report(
+                exc
+                if isinstance(exc, IronbirdError)
+                else IronbirdError(
+                    Code.INTERNAL,
+                    f"closing the session's links failed: {type(exc).__name__}: {exc}",
+                    details="".join(traceback.format_exception(exc)),
+                    cause=exc,
+                )
+            )
 
     def _background_done(self, task: asyncio.Task[None]) -> None:
         """Report a background task that died instead of being cancelled."""
@@ -244,11 +273,33 @@ class Session:
         )
 
     async def _ticker(self) -> None:
+        """The once-a-second work: coalesced summaries, the ledger's timers, drop accounting.
+
+        A step that fails is reported (coalesced by step, so a failure every second is one
+        notice with a count) and the ticking goes on: one failure must not silence the drop
+        reports for the rest of the session."""
         while True:
             await asyncio.sleep(TICK_S)
-            self._coalescer.tick()
-            self.ledger.tick()
-            await self._engine.tick()
+            for name, step in (("coalescer", self._coalescer.tick), ("ledger", self.ledger.tick)):
+                try:
+                    step()
+                except Exception as exc:
+                    self._tick_failed(name, exc)
+            try:
+                await self._engine.tick()
+            except Exception as exc:
+                self._tick_failed("engine", exc)
+
+    def _tick_failed(self, step: str, exc: Exception) -> None:
+        self.report(
+            IronbirdError(
+                Code.INTERNAL,
+                f"periodic {step} work failed: {type(exc).__name__}: {exc}",
+                details="".join(traceback.format_exception(exc)),
+                cause=exc,
+            ),
+            context=f"tick {step}",
+        )
 
     # -- error reporting ---------------------------------------------------------------
 
@@ -344,11 +395,22 @@ class Session:
             read_profile(node.telemetry_header),
         )
         model = load_ccdd_bytes(definitions.ccdd, str(node.ccdd), node.ccdd_adapter)
+        command_profile = self._profile_of_kind(
+            node_name,
+            "command_header",
+            node.command_header,
+            definitions.command_header,
+            ProfileKind.COMMAND,
+        )
+        telemetry_profile = self._profile_of_kind(
+            node_name,
+            "telemetry_header",
+            node.telemetry_header,
+            definitions.telemetry_header,
+            ProfileKind.TELEMETRY,
+        )
         codec = Codec(
-            model,
-            parse_profile_file(definitions.command_header, node.command_header),
-            parse_profile_file(definitions.telemetry_header, node.telemetry_header),
-            max_packet_bytes=self.config.max_packet_bytes,
+            model, command_profile, telemetry_profile, max_packet_bytes=self.config.max_packet_bytes
         )
         self.ledger.record(
             "state",
@@ -360,6 +422,20 @@ class Session:
         self._codecs[node_name] = codec
         self._definitions[node_name] = definitions
         return codec
+
+    def _profile_of_kind(
+        self, node_name: str, key: str, path: Path, data: bytes, kind: ProfileKind
+    ) -> HeaderProfile:
+        """The profile in ``data``, which the configuration's ``nodes.<node>.<key>`` names; a
+        profile of the other kind is a configuration error that names the key."""
+        profile = parse_profile_file(data, path)
+        if profile.kind is not kind:
+            raise IronbirdError(
+                Code.CFG_SCHEMA,
+                f"{self.config.path}: nodes.{node_name}.{key}: {path} is a "
+                f"{profile.kind.value} header profile, not a {kind.value} one",
+            )
+        return profile
 
     def definitions_of(self, node_name: str) -> DefinitionBytes:
         """The definition files ``node_name``'s codec was built from (loading it if need be)."""
@@ -1032,7 +1108,10 @@ class EventStream:
         )
         self._event_mids = event_mids
         self._min_severity = min_severity
-        self._queue: asyncio.Queue[Event | BaseException] = asyncio.Queue(EVENT_QUEUE_SIZE)
+        # ``None`` is not an event: it wakes a consumer waiting on an empty queue at the end.
+        self._queue: asyncio.Queue[Event | None] = asyncio.Queue(EVENT_QUEUE_SIZE)
+        self._ended = False  # the pump is done: what is queued is all there will be
+        self._failure: Exception | None = None  # why it ended, raised after the queued events
         loop = asyncio.get_running_loop()
         self._pump_task = loop.create_task(self._pump(), name="events")
 
@@ -1045,11 +1124,17 @@ class EventStream:
         return self._iterate()
 
     async def _iterate(self) -> AsyncIterator[Event]:
+        """The queued events, then the end of the stream: the iteration ends once the capture
+        has ended (cleanly too, as when the engine closes) and the queue is empty, raising the
+        failure that ended it, if any."""
         while True:
+            if self._ended and self._queue.empty():
+                if self._failure is not None:
+                    raise self._failure
+                return
             item = await self._queue.get()
-            if isinstance(item, BaseException):
-                raise item
-            yield item
+            if item is not None:
+                yield item
 
     async def _pump(self) -> None:
         ledger = self._session.ledger
@@ -1076,10 +1161,12 @@ class EventStream:
                 if self._matcher is not None and not self._matcher(frame):
                     continue  # ledgered above; the filter only limits what is shown
                 await self._queue.put(event)
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:  # surfaced to the consumer, never lost with the task
-            await self._queue.put(exc)
+            self._failure = exc
+        finally:
+            self._ended = True
+            if not self._queue.full():  # a full queue has no consumer waiting on it
+                self._queue.put_nowait(None)
 
     async def close(self) -> None:
         self._pump_task.cancel()
@@ -1147,16 +1234,115 @@ def _validate_rules(node: Node, codec: Codec, config: SystemConfig) -> Mapping[s
         if command is None and rule.echo:
             raise IronbirdError(Code.CFG_SCHEMA, f"{where}.echo: not allowed on a '*' rule")
         if command is not None:
-            for arg in rule.echo.values():
-                if command.field(arg) is None:
+            for name, arg in rule.echo.items():
+                source = command.field(arg)
+                if source is None:
                     raise IronbirdError(
                         Code.CFG_REF,
                         f"{where}.echo: command {command.name} has no argument {arg!r}",
                     )
-        codec.encode_telemetry(rule.reply, rule.fields)  # surfaces bad literal values now
+                target = reply.field(name)
+                assert target is not None  # the names were checked above
+                problem = echo_incompatibility(source, target)
+                if problem is not None:
+                    raise IronbirdError(
+                        Code.CFG_SCHEMA,
+                        f"{where}.echo: reply field {name} from command argument {arg}: {problem}",
+                    )
+        _check_rule_writes(rule, reply, command, where)
+        try:
+            codec.encode_telemetry(rule.reply, rule.fields)  # surfaces bad literal values now
+        except IronbirdError as exc:
+            raise IronbirdError(
+                exc.code, f"{where}.fields: {exc.summary}", details=exc.details, cause=exc
+            ) from exc
         rules[rule.on] = rule
     codec.reset_sequences()
     return rules
+
+
+def _check_rule_writes(
+    rule: ResponseRule, reply: Message, command: Message | None, where: str
+) -> None:
+    """Every reply field gets its value from one place, and a count or length field is never
+    set apart from the data it sizes: two writers of one field would silently overwrite each
+    other, and a count that disagrees with its data fails every reply."""
+    sources: dict[str, str] = {}
+    for how, names in (
+        ("a literal in fields", rule.fields),
+        ("an echo", rule.echo),
+        ("accepted_counter", [rule.accepted_counter] if rule.accepted_counter else []),
+        ("rejected_counter", [rule.rejected_counter] if rule.rejected_counter else []),
+    ):
+        for name in names:
+            if name in sources:
+                raise IronbirdError(
+                    Code.CFG_SCHEMA,
+                    f"{where}: reply field {name} is set by {sources[name]} and by {how}; "
+                    "one source per field",
+                )
+            sources[name] = how
+    for holder in reply.fields:
+        sized = [f.name for f in reply.fields if f.var and f.var.count_field == holder.name]
+        if not sized or holder.name not in sources:
+            continue
+        if holder.name in rule.echo:
+            missing = [name for name in sized if name not in rule.echo]
+            if missing:
+                raise IronbirdError(
+                    Code.CFG_SCHEMA,
+                    f"{where}.echo: reply field {holder.name} sizes {', '.join(missing)}; echo "
+                    "it only together with that data, or leave it out to have it filled in",
+                )
+            assert command is not None  # an echo on a '*' rule was refused above
+            arg = rule.echo[holder.name]
+            for name in sized:
+                source = command.field(rule.echo[name])
+                if source is None or source.var is None or source.var.count_field != arg:
+                    raise IronbirdError(
+                        Code.CFG_SCHEMA,
+                        f"{where}.echo: reply field {holder.name} from command argument {arg} "
+                        f"sizes {name}, but {name} is not echoed from the data {arg} sizes; "
+                        "echo the matching pair, or leave the count out to have it filled in",
+                    )
+        elif holder.name not in rule.fields or any(name in rule.echo for name in sized):
+            raise IronbirdError(
+                Code.CFG_SCHEMA,
+                f"{where}: reply field {holder.name} sizes {', '.join(sized)} and is set by "
+                f"{sources[holder.name]}; leave it out to have it filled in",
+            )
+
+
+def _rule_failure(
+    codec: Codec, rule: ResponseRule, values: Mapping[str, Any], error: IronbirdError
+) -> IronbirdError:
+    """``error``, a reply that could not be encoded, worded for the user as a failure of
+    ``rule``: it names the rule, and the reply field and command argument whose echoed value
+    the reply refused when one did."""
+    reply = codec.model.by_name[rule.reply]
+    for name, arg in rule.echo.items():
+        field = reply.field(name)
+        if field is None or name not in values:
+            continue
+        try:
+            if field.var is not None:
+                coerce_variable(reply, field, values[name])
+            else:
+                coerce_value(reply, field, values[name])
+        except IronbirdError as exc:
+            return IronbirdError(
+                Code.RSP_RULE,
+                f"rule {rule.on!r}: reply field {name} from command argument {arg}: "
+                f"{exc.summary}; no reply sent",
+                details=error.details,
+                cause=error,
+            )
+    return IronbirdError(
+        Code.RSP_RULE,
+        f"rule {rule.on!r}: reply {rule.reply}: {error.summary}; no reply sent",
+        details=error.details,
+        cause=error,
+    )
 
 
 class Responder:
@@ -1257,6 +1443,10 @@ class Responder:
             return None  # on_full = "refuse_commands" and the ledger is stalled: counted, not sent
         try:
             encoded = self._codec.encode_telemetry(rule.reply, values)
+        except IronbirdError as exc:
+            session.report(_rule_failure(self._codec, rule, values, exc))
+            return None
+        try:
             await session._engine.send(self._route.link, link_end(self._route.side), encoded.data)
         except IronbirdError as exc:
             session.report(exc)
