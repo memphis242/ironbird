@@ -293,6 +293,9 @@ def test_a_fatal_receive_error_stops_receiving_and_is_surfaced_once(handler: str
             kwargs["report"] = reported.append
         transport = UdpTransport(local=LOOP, **kwargs)
         await transport.open(lambda *_a: None)
+        # The open may warn about a small kernel receive buffer (IB-TX-005) on some hosts.
+        failed.clear()
+        reported.clear()
         try:
             transport._receive_failed(OSError(errno.ENOTSOCK, "Socket operation on non-socket"))
             assert transport._rx_dead
@@ -315,6 +318,7 @@ def test_a_transient_receive_error_is_reported_but_keeps_receiving() -> None:
         clock = [0.0]
         transport = UdpTransport(local=LOOP, report=reported.append, clock=lambda: clock[0])
         await transport.open(lambda *_a: None)
+        reported.clear()  # drop a host-dependent IB-TX-005 receive-buffer warning from the open
         try:
             transport._receive_failed(OSError(errno.ENOBUFS, "No buffer space"))
             assert not transport._rx_dead
