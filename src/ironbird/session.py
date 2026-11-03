@@ -50,12 +50,14 @@ from ironbird.header import parse_profile_file, read_profile
 from ironbird.ledger import Ledger
 from ironbird.ledgertiers import Tier
 from ironbird.notice import Level, Notice, level_of
+from ironbird.sanitize import HEX_PREVIEW_BYTES, hex_preview
 from ironbird.transport import LinkEnd
 
 TICK_S: Final = 1.0
 EVENT_QUEUE_SIZE: Final = 1024
 LEDGER_FILTER_MIDS: Final = 32  # MIDs of a filter's candidate set a ledger record lists
 SHOWN_MIDS: Final = 4  # MIDs named in a one-line error
+SHOWN_NODES: Final = 4  # nodes named in a one-line hint
 
 
 class Side(StrEnum):
@@ -211,7 +213,7 @@ class Session:
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
-        self.ledger.record("action", "session.end", role=self.node.name)
+        self.ledger.record("action", "session.stop", role=self.node.name)
         try:
             for task in self._tasks:
                 task.cancel()
@@ -274,6 +276,8 @@ class Session:
         level: Level | None = None,
         evidence: bool = False,
         sample: str | None = None,
+        raw: bytes | None = None,
+        wire_len: int | None = None,
     ) -> None:
         """Ledger in full, notify the user coalesced (one notice per key per window).
 
@@ -282,7 +286,8 @@ class Session:
 
         ``evidence`` marks an error that untrusted wire input can produce at will; its ledger
         record then belongs to the evidence tier instead of the essential one, and ``sample``
-        names its evidence-sampling key.
+        names its evidence-sampling key. ``raw`` is the offending packet (``wire_len`` its size on
+        the wire when ``raw`` was cut): ``--verbose`` shows its first bytes in hex.
         """
         if isinstance(error, DecodeError):
             raw_mid = error.mid
@@ -322,6 +327,8 @@ class Session:
             group=err.code,
             ledger_part=self.ledger.part_number,
             ledger_file=self.ledger.part_file,
+            raw=raw[:HEX_PREVIEW_BYTES] if raw is not None else b"",
+            raw_len=(len(raw) if wire_len is None else wire_len) if raw is not None else None,
         )
 
     # -- loading -------------------------------------------------------------------
@@ -524,6 +531,9 @@ class Session:
             )
         except IronbirdError as exc:
             result = exc.code.value
+            exc.details += ("\n" if exc.details else "") + (
+                f"packet ({len(encoded.data)} bytes) hex: {hex_preview(encoded.data)}"
+            )
             raise
         except asyncio.CancelledError:
             result = "sent" if attempt.went_out else "cancelled"
@@ -880,10 +890,12 @@ class Session:
             and (link is None or lk.name == link)
         ]
         if not candidates:
+            receivers = list(dict.fromkeys(lk.destination for lk in self.config.links))
+            names = ", ".join(f"--as {name}" for name in receivers[:SHOWN_NODES])
             raise IronbirdError(
                 Code.CFG_LINK,
                 f"{me!r} is not the flight-side end of any matching link; "
-                f"use --as with a node that receives commands",
+                f"use --as with a node that receives commands" + (f" ({names})" if names else ""),
             )
         if len(candidates) > 1:
             raise IronbirdError(

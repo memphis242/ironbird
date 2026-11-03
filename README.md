@@ -7,7 +7,7 @@ later stage. See `docs/plan.md` for the design and `CLAUDE.md` for project rules
 ## Setup
 
 ```bash
-pyenv virtualenv 3.11 ironbird      # or: python3.11 -m venv <dir>
+pyenv virtualenv 3.11 ironbird      # or: python3.11 -m venv <dir>; Python 3.11 only (3.12 and later are refused by pip)
 pyenv activate ironbird
 pip install -e '.[dev]'
 ```
@@ -40,6 +40,9 @@ EL8 host before relying on kernel-dependent behaviour.
 
 ## Try it without hardware (ironbird as both ends)
 
+Run these from the repository root: the `examples/` paths are relative to it (the CCDD and header
+paths inside a config are relative to the config file, so a config works from any directory).
+
 ```bash
 ib -c examples/mock.toml nodes
 ib -c examples/mock.toml respond --as fc          # shell 1: act as the flight computer
@@ -58,10 +61,17 @@ ib -c examples/mock.toml send fc MOCK_RAISE_EVENT app=DEMO event_id=7 event_type
 
 `ib` is a short alias of `ironbird`. Global options: `--config/-c PATH` (or `$IRONBIRD_CONFIG`),
 `--as NODE`, `--verbose/-v`. Errors are one line, `error IB-XXX-NNN: summary`, on stderr; add
-`--verbose` for detail: it prints the ledger file path once at start and appends `[ledger n=N]`
+`--verbose` for detail: it prints the ledger file path once at start, shows the first 64 bytes in
+hex of every packet a notice is about (a received packet that fails to decode, a command that could
+not be sent; a good packet in `listen`; a line that stands for several packets shows the latest),
+and appends `[ledger n=N]`
 to every notice that has a ledger record, `N` being the record number (field `n`) in that file
 holding the full detail. Every action and error is recorded as JSON Lines in
-`$XDG_STATE_HOME/ironbird/` (override with `IRONBIRD_STATE_DIR`). When the ledger queue is full
+`$XDG_STATE_HOME/ironbird/` (override with `IRONBIRD_STATE_DIR`): a command line that fails to
+parse or validate leaves a short session too (the arguments, the error, no reserve and no retention
+scan), and a session ends with `session.end` holding the exit code and outcome, after every other
+record of it (the `ledger.*` lines that head a file are numbered when written, so their `n` can
+differ from file order; read the rest by `n`). When the ledger queue is full
 (by count, or by a 64 MiB estimate of its size; a flood faster than the disk) a new record is
 refused and counted, and queued records are never evicted; one `ledger.dropped` record in the
 ledger says how many. A packet's `raw` bytes are cut to `max_packet_bytes` when the record is
@@ -90,6 +100,12 @@ pointer names the part too: `[ledger n=1234 file=<stamp>-<session>.p0003]`.
 | `ib rec prune`, `ib ledger prune` | Delete old recordings or ledger sessions after confirmation | The ledger under load |
 | `ib replay FILE... [--where EXPR] [--from T] [--to T] [--follow]` | Play a recording back as `listen` shows it | Replay |
 | `ib export FILE... [-o OUT] [--format csv\|text\|jsonl] [--jobs N]` | Export a recording to tables, text or JSON Lines | Export |
+
+**Fault injection** (`ib send`): `--bad-checksum`, `--length-delta N` and `--allow-count-mismatch` send
+a deliberately broken packet. The confirmation line ends with `[fault injected: ...]` naming what was
+done, so a "sent" line is never mistaken for a clean send; the packet's ledger record says the same.
+`--length-delta` is refused (`IB-HDR-003`, exit 2, nothing sent) when the changed value would leave
+the length field's range, since it would wrap to an unrelated size.
 
 ## The ledger under load, a full disk, and retention
 
@@ -140,7 +156,9 @@ The ledger writes through one writer thread, so a slow or hung disk never blocks
 - **Pruning** is explicit: `ib ledger prune` and `ib rec prune [--older-than AGE] [--until-under SIZE]
   [--keep N] [--dry-run] [--yes] [--format line|json]` list exactly what they would delete and ask
   `delete 14 sessions (310 MiB)? [y/N]` (only `y` or `yes` confirms; without a terminal pass
-  `--yes`). They never touch a live session, one among the `keep_recent` (10) most recent, a
+  `--yes`). They never touch a live session (one that holds its lock, or whose newest file changed in the last
+  10 minutes, so a command that finished a moment ago is still listed as `protected: live`), one
+  among the `keep_recent` (10) most recent, a
   short session that ran inside a protected long one, an incomplete or hard-linked one, or a
   ledger whose recording is still present. Flags use the config grammars (sizes `64MiB`, ages `7d`).
   Stage 1 processes still running after an upgrade take no locks and write no heartbeat: end them
@@ -208,7 +226,8 @@ ib rec repair /data/run1.ibrec /data/run1.fixed.ibrec [--force]
   when the disk would fill within 10 minutes.
 - **Splitting.** `--split 1GiB` or `--split 1h` starts `NAME.p0002.ibrec`, ... each a complete file
   naming the session, its part number and the previous part's last sequence number; part 1 stays
-  open and locked until the session ends.
+  open and locked until the session ends. A part can be about 1% over a size limit: the embedded
+  definitions at its start do not count towards it. The closing line names how many parts there are.
 
 ## Replay
 
@@ -310,12 +329,21 @@ ib export run1.ibrec --format text --from +90s --to +2m -o minute.txt
   of `malformed.csv`), which keeps a spreadsheet from reading `00123456` as the number 123456 or
   `1e300000` as a number at all. `text` and `jsonl` keep exactly what `ib replay` prints. Lines end
   in LF and cells are quoted as RFC 4180 says.
+- **JSON.** `--format jsonl` (and `replay --format json`) write every field as a JSON value of its
+  type, except that a float that is NaN or an infinity is the string `"nan"`, `"inf"` or `"-inf"`,
+  so such a field is a string in one record and a number in the next; consumers that need one type
+  must handle both. 64-bit integers are JSON numbers: exact in the file, rounded by readers that
+  use doubles (JavaScript, `jq` before 1.7) above 2^53.
 - **Spreadsheets reinterpret numbers.** A CSV carries no types, and Excel or LibreOffice guess: a
   number with more than 15 significant digits (a `uint64`, a nanosecond time such as `rx_time_ns`)
   is rounded to 15 and shown as `1.7E+18`, a text of digits keeps no leading zeros, and `1e30` is a
   number. The file is exact; the application's guess is not. When the values matter, import the
   columns as text (Excel: Data > From Text/CSV, set the column type to Text; LibreOffice: the
   import dialog's column type "Text"), or read the CSV with a tool that keeps types.
+- **Default format.** Without `--format`, a bare `ib export FILE` prints the `ib replay` lines to
+  stdout; CSV is the default wherever it has a place to go: `-o`, one `--message`, `--header-fields`
+  or `--raw-enums`. `-o NAME.csv` for several tables is refused rather than made into a directory
+  called `NAME.csv`.
 - **Which files.** One `--message` is a single table, written to `-o FILE` or to stdout. Several
   `--message`s, or none, make a directory (`-o DIR`, required) with `<MESSAGE>.csv` for each message
   that occurs and `malformed.csv` for every frame that did not decode (`seq`, time, `node`, `link`,
@@ -391,12 +419,17 @@ ib export run1.ibrec --format text --from +90s --to +2m -o minute.txt
 
 ## Exit codes
 
+One rule: **2 means "fix the command line or your files", 1 means "something failed while it ran"**, so
+a script can tell a typo from an outage. Every exit, usage errors included, is a ledger session that
+ends with a `session.end` record holding `exit` (the code) and `outcome` (`ok`, `usage`, `error`,
+`count_not_reached`, `output_lost`, `input_damaged`, `unlogged` or `signal`, with `signal` named).
+
 | Code | Meaning |
 |------|---------|
 | 0 | Normal end: done, `--count` reached, `--timeout` elapsed without `--count` (`ib record --duration` elapsed), or the reader of stdout went away (`\| head -1`); `ib rec check` of a recording that is clean, or only torn at its tail |
-| 1 | Runtime error (`error IB-...`), `find` with no match; `ib rec check` found mid-file damage (or, with `--strict`, a recording not closed cleanly); a recording failed to write (`IB-REC-002`) |
-| 2 | Usage, configuration, CCDD or header-profile error |
-| 3 | `listen`, `events` or `respond` had `--count N` and `--timeout` elapsed first |
+| 1 | A failure while running: transport, ledger, recording or export I/O, `IB-INT-001`; `find` with no match; `ib rec check` found mid-file damage (or, with `--strict`, a recording not closed cleanly); a recording failed to write (`IB-REC-002`) |
+| 2 | The command line or a file you maintain is wrong, so the same invocation cannot succeed until it is changed: a usage error (unknown option, missing or repeated argument, a misspelled command, node or message name, a bad argument value or `--header` value, an invalid `--where`), or a configuration, CCDD or header-profile error (`IB-CLI-`, `IB-CFG-`, `IB-CCD-`, `IB-HDR-`, `IB-ENC-`, `IB-FLT-`, `IB-EVT-`) |
+| 3 | `listen`, `events` or `respond` had `--count N` and `--timeout` elapsed first (one line says how many arrived) |
 | 5 | The output was produced, but the input recording was damaged mid-file: `ib rec repair` left valid frames after the damage out of the copy; `ib replay` or `ib export` stopped at the damage (or, with `--skip-damage`, went past it) or a part of a split recording is missing |
 | 6 | A command or reply went out but its ledger record was never written, or may have been lost to a deferred sync or close error (`IB-LED-004`). Same tier as 4 and wins over 4 and 5; an error (1, 2), 3 or a signal takes precedence. A `respond` that withheld replies under `on_full = "refuse_commands"` exits 1 |
 | 4 | The command otherwise succeeded but stdout lines were lost (`IB-OUT-002`): dropped while stdout was not draining, abandoned when a signal cut the final drain short, or stdout is closed (`>&-`). An error (1, 2), 3, 5 or a signal (128+n) takes precedence. A `send` that exits 4 still went out |
@@ -490,7 +523,8 @@ device that resets on DTR needs that handled on its side.
 ## Events and telemetry categories
 
 cFS events are the most important telemetry. `ib events [--node X ...] [--min-type error]
-[--format line|json]` listens on every telemetry link of all (or the selected) nodes and
+[--format line|json]` (`--min-type` takes the spellings a CCDD uses for an event type, any case:
+`debug`, `info` or `information`, `warning` or `warn`, `error`, `critical`) listens on every telemetry link of all (or the selected) nodes and
 prints only events: time, node, app, type, id, message. They also show in `ib listen`. The
 ledger records every received event in full.
 

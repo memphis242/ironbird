@@ -29,8 +29,8 @@ fuzz = ["atheris>=2.3,<4"]
 # constraints-dev.txt pins the exact tool versions CI installs with (pip install -c ...).
 
 [project.scripts]
-ironbird = "ironbird.cli.main:main"
-ib = "ironbird.cli.main:main"
+ironbird = "ironbird.cli.launch:main"
+ib = "ironbird.cli.launch:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -56,7 +56,7 @@ MAX_RESERVE_BYTES: Final = 1 << 30
 READ_BLOCK: Final = MIB
 MAX_CLASS_READS: Final = 10_000  # head reads per scan; a session past it counts as long
 MAX_DAMAGED_CHECK_BYTES: Final = 256 * MIB  # bytes read per scan to tell whether a salvage ended
-FRESH_S: Final = 600.0  # a session whose newest file is younger than this is live
+FRESH_S: Final = 600.0  # a session whose newest file is younger than this is protected as live
 _N: Final = r"(?:[0-9]{4}|[1-9][0-9]{4,8})"
 _STAMP: Final = r"([0-9]{8}T[0-9]{6}Z)-([0-9a-f]{12})"
 LEDGER_RE: Final = re.compile(_STAMP + rf"(?:\.p({_N}))?\.jsonl")
@@ -91,6 +91,8 @@ HAS_RECORDING: Final = "recording present"
 REASON_GROUPS: Final = {
     INCOMPLETE: "incomplete or hard-linked",
     HARDLINKED: "incomplete or hard-linked",
+    # a session that ended a moment ago is protected like one still running (see liveness)
+    LIVE: f"live or changed in the last {FRESH_S / 60:.0f} min",
 }
 
 
