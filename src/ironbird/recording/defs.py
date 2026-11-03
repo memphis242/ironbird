@@ -81,11 +81,13 @@ def read_head(reader: RecordingReader) -> Head:
         if others > MAX_HEAD_RECORDS or sources > fmt.MAX_SOURCES or seen_bytes > MAX_HEAD_BYTES:
             # Streams and definitions past the limit are not known; say so rather than let
             # frames of those streams look like frames of nodes the recording never had.
-            problem = problem or (
-                f"its head holds more than {MAX_HEAD_RECORDS} records (or {fmt.MAX_SOURCES} "
-                f"sources) or {MAX_HEAD_BYTES // (1024 * 1024)} MiB, past what is read for "
-                "definitions"
-            )
+            if others > MAX_HEAD_RECORDS:
+                limit = f"more than {MAX_HEAD_RECORDS} records"
+            elif sources > fmt.MAX_SOURCES:
+                limit = f"more than {fmt.MAX_SOURCES} sources"
+            else:
+                limit = f"more than {MAX_HEAD_BYTES // (1024 * 1024)} MiB"
+            problem = problem or f"its head holds {limit}, past what is read for definitions"
             break
         if item.rtype == RecordType.STREAM:
             streams.setdefault(item.value.id, item.value)

@@ -413,3 +413,51 @@ def test_every_character_that_nfkc_folds_to_a_formula_leader_is_neutralised() ->
     for char in folded:
         assert char in FORMULA_LEAD, hex(ord(char))
         assert safe_cell(char + "1+1").startswith("'")
+
+
+# -- review of this PR: internal stop keeps buffered frames; probes do not fake a writer -------
+
+
+class _BadStruct:
+    size = fmt.FRAME_FIXED.size
+
+    def pack(self, *_args: object) -> bytes:
+        raise ValueError("encode failed for the test")
+
+
+def test_an_internal_stop_still_writes_the_frames_buffered_before_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "r.ibrec"
+    rec = Recorder.open(path, meta(), streams=(RX, TX), options=FAST)
+    for i in range(1, 6):
+        rec.append(frame(i))
+    with monkeypatch.context() as patch:
+        patch.setattr(fmt, "FRAME_FIXED", _BadStruct())
+        rec.append(frame(6))  # its encode raises: an internal failure
+    assert rec.stopped
+    stats = asyncio.run(rec.close())
+    with RecordingReader(path) as reader:
+        seqs = [
+            item.value.seq
+            for item in reader.items()
+            if not isinstance(item, Damage) and item.rtype == RecordType.FRAME
+        ]
+    assert seqs == [1, 2, 3, 4, 5]
+    assert stats.unwritten_frames == 0
+
+
+def test_a_brief_exclusive_probe_does_not_make_a_closed_part_look_live(tmp_path: Path) -> None:
+    import fcntl
+    import threading
+
+    rec = split_recording(tmp_path / "run1", split_s=10.0, frames=25)
+    fd = os.open(rec.parts[1], os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        threading.Timer(0.002, fcntl.flock, (fd, fcntl.LOCK_UN)).start()
+        with RecordingReader(rec.parts[1]) as reader:
+            assert not reader.writer_active
+    finally:
+        time.sleep(0.01)
+        os.close(fd)

@@ -659,10 +659,22 @@ class Recorder:
         left out, the clock is read now.
         """
         encoded = self._frames
+        buf, mark = self._buf, len(self._buf)
+        buf_frames, buf_data = self._buf_frames, self._buf_data
         try:
             self._append(frame, self._mono() if mono_ns is None else mono_ns)
         except Exception as exc:
+            # Cut back to the last complete record before this frame; if a flush ran inside
+            # this append, what followed it holds at most this frame and its head records.
+            if self._buf is buf:
+                del buf[mark:]
+                self._buf_frames, self._buf_data = buf_frames, buf_data
+            else:
+                self._buf = bytearray()
+                self._buf_frames = self._buf_data = 0
+            self._frames = encoded
             self._internal_failure(exc)
+            self._salvage()
             if self._frames == encoded:  # the frame itself never got into the buffer
                 self._after_stop += 1
 
@@ -926,6 +938,17 @@ class Recorder:
             self._buf += record
             self._offset += len(record)
             self._file_bytes += len(record)
+
+    def _salvage(self) -> None:
+        """After an internal stop, hand the complete records still buffered to the disk."""
+        assert self._stopped
+        buf = self._buf
+        if not buf or self._fd < 0:
+            return
+        self._buf = bytearray()
+        self._enqueued += len(buf)
+        self._writer.jobs.put((self._fd, buf, True, self._buf_frames, self._buf_data))
+        self._buf_frames = self._buf_data = 0
 
     def _flush(self, *, sync: bool) -> None:
         buf = self._buf

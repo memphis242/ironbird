@@ -2664,6 +2664,7 @@ As built (where the build differs from, or settles, the text above)
   `--where 'mid in [...]'`); the atheris target has not run on a real fuzzer. The `rpl-defs-*`
   corpus entries carry the META digests of their own content so each reaches its loader (the test
   asserts the loader's reason for every entry).
+- Deferred (PR 34 review): an internal failure outside `append` (chunk close, rotation, redefinition) still drops the records buffered since the last flush, because no record boundary is tracked there; the stop notice and `unwritten_frames` count them. A reader retries its shared lock 3 times 10 ms apart so a retention or prune probe does not read as a writer; a probe held longer than that still does.
 
 ### 2h - Export CSV and text
 

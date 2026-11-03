@@ -329,8 +329,8 @@ def _base_of(path: Path, part: int, session: object = None) -> Path | None:
 
 def _is_first_part(path: Path, session: object) -> bool:
     """Whether ``path`` is a readable recording that is part 1 of ``session``."""
-    if not os.path.lexists(path):
-        return False
+    if session is None or not os.path.lexists(path):
+        return False  # without a session id nothing ties a part 1 to this part
     try:
         with RecordingReader(path) as reader:
             return reader.meta.part == 1 and reader.meta.data.get("session") == session
