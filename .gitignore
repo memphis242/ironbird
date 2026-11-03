@@ -4,6 +4,9 @@ __pycache__/
 .hypothesis/
 .ruff_cache/
 .benchmarks/
+.coverage
+.coverage.*
+htmlcov/
 *.pyc
 
 # Claude Code per-user settings
