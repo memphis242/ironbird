@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]  # 77 adds the SPDX `license` string
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Terminal integrated/system test tool for cFS flight software vehicles"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "typer>=0.12,<1",
     "pyserial>=3.5,<4",  # opens and configures serial devices; the loop drives the descriptor
@@ -22,10 +23,20 @@ dev = [
     "pytest-benchmark>=4.0,<6",
     "ruff>=0.5,<0.18",  # lint and format rules change between minor releases
     "pyright[nodejs]>=1.1.370,<1.2",  # nodejs extra: the Node pyright runs on comes from PyPI
+    "mypy>=1.11,<3",  # second type checker: catches what pyright's inference lets through
+    "types-pyserial>=3.5,<4",  # mypy has no inline stubs for pyserial (pyright bundles typeshed's)
+    "bandit[toml]>=1.8,<2",  # security linter; configured under [tool.bandit]
     "pyyaml>=6,<7",  # tests/test_ci_el8.py parses the CI workflow
     "types-pyyaml>=6,<7",
 ]
 fuzz = ["atheris>=2.3,<4"]
+# Dependency-vulnerability audit (scheduled CI job) and the packaging check (tools/ci/check-package.sh).
+# Separate extras: neither is needed to develop, and pip-audit pulls a large dependency tree.
+audit = ["pip-audit>=2.7,<3"]
+package = [
+    "build>=1.2,<2",
+    "twine>=5,<8",
+]
 # constraints-dev.txt pins the exact tool versions CI installs with (pip install -c ...).
 
 [project.scripts]
@@ -80,3 +91,30 @@ reportUnknownParameterType = false
 reportUnknownLambdaType = false
 reportPrivateUsage = false
 reportMissingParameterType = false
+
+[tool.mypy]
+# src only: pyright (strict) already checks the tests, and mypy's stricter reading of test
+# idioms (monkeypatching module attributes, re-exported names) is left to a later pass.
+files = ["src"]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+enable_error_code = [
+    "ignore-without-code",
+    "redundant-expr",
+    "truthy-bool",
+    "possibly-undefined",
+    "unused-awaitable",
+]
+show_error_codes = true
+pretty = false
+
+[tool.bandit]
+# Bandit scans the shipped code only; tests and tools use asserts, subprocess and fixed
+# temp paths by design (ruff's "S" rules cover them with per-file ignores).
+targets = ["src"]
+# Every skip is justified inline next to the code it covers; nothing is disabled globally.
+# A skip is written `# nosec B301  # reason` (text after a second `#`; bandit
+# reads any words after the id as more test ids). B101 (assert) is the one exception: asserts are the project's
+# assertive-programming tool (see CLAUDE.md), so the test is excluded for the whole tree.
+skips = ["B101"]

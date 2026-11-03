@@ -11,7 +11,14 @@ pytest-benchmark==5.3.0
 hypothesis==6.170.13
 ruff==0.17.3
 pyright==1.1.414
+mypy==2.4.1
+bandit==1.9.4
+types-pyserial==3.5.0.20261030
 atheris==3.0.0
+# The audit and package extras (scheduled dependency audit; tools/ci/check-package.sh).
+pip-audit==2.10.1
+build==1.6.1
+twine==7.0.0
 # The Node.js runtime pyright runs on (pyright[nodejs]); a manylinux_2_28 wheel, so the same
 # Node 24 LTS runs on Ubuntu and on EL8 (glibc 2.28).
 nodejs-wheel-binaries==24.19.0

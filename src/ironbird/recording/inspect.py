@@ -286,6 +286,19 @@ def _scan(rd: RecordingReader) -> Report:
             if rtype != RecordType.TRAILER:
                 report.find(f"the INDEX at {index_offset} is followed by more records")
             index_offset = -1
+        if (
+            rtype in (RecordType.INDEX, RecordType.TRAILER)
+            and index_item is None
+            and report.trailer is None
+            and item.offset != tally.start
+            and not tally.tainted
+        ):
+            # The closing records follow the last CHUNK directly. Records between them are in no
+            # chunk, so the index would be refused and no chunk could be skipped.
+            report.find(
+                f"{item.offset - tally.start} bytes of records lie between the last chunk and "
+                f"the {'index' if rtype == RecordType.INDEX else 'trailer'} at {item.offset}"
+            )
         match rtype:
             case RecordType.FRAME:
                 seq = value.seq

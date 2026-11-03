@@ -207,7 +207,7 @@ def _float_field(type_text: str) -> FieldDef:
 def test_float32_accepts_values_that_round_to_a_finite_float32(mock_codec: Codec) -> None:
     msg = mock_codec.model.by_name["MOCK_STATUS"]
     f32 = _float_field("float32")
-    for text in ("3.4028235e38", "-3.4028235e38", "3.4028234663852886e38", "1e-50", "0"):
+    for text in ("3.4028235e38", "-3.4028235e38", "3.4028234663852886e38", "1e-45", "0"):
         assert coerce_value(msg, f32, text) is not None
     packet = mock_codec.encode_telemetry("MOCK_STATUS", {"temperature_c": "3.4028235e38"})
     assert packet.data

@@ -53,7 +53,8 @@ class TransportStats:
     tx_frames: int = 0
     tx_bytes: int = 0
     kernel_dropped: int = 0  # lost to the OS before the transport saw them (buffer overflow)
-    unread_at_close: int = 0  # still in the OS buffer when the transport closed, discarded
+    unread_at_close: int = 0  # datagrams still in the socket buffer at close, discarded
+    unread_bytes_at_close: int = 0  # stream bytes still in the device when it closed, discarded
     rx_errors: int = 0  # reads that failed with an error (see ``IB-TX-003``)
     ccdd_mismatched: int = 0  # frames whose MID or size the CCDD does not define (serial framer)
 
@@ -82,6 +83,13 @@ class Transport(Protocol):
     @property
     def local_address(self) -> tuple[str, int] | None:
         """Bound network address once receiving (UDP); ``None`` for other transports."""
+        ...
+
+    @property
+    def opening_step(self) -> str | None:
+        """While :meth:`open` waits, what it waits for, as a phrase that follows "cannot" (e.g.
+        ``resolve host of udp name:port``); ``None`` otherwise. Names the endpoint an open that
+        does not finish in time was stuck on, which need not be :attr:`description`'s."""
         ...
 
     async def open(self, receiver: Receiver | None) -> None:
