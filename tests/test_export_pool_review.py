@@ -88,7 +88,7 @@ def test_a_stretch_of_records_without_frames_leaves_the_sequence_check_alone(
 
 BUDGET_RECORDS = 149  # skippable records of BUDGET_BYTES, then one of BUDGET_LAST bytes
 BUDGET_BYTES = 30000
-BUDGET_LAST = 19472
+BUDGET_LAST = 19720  # tuned to the META record: the pass gives up only within ~200 bytes of this
 
 
 def budget_recording(path: Path) -> Path:
