@@ -130,7 +130,9 @@ def build_codec(command: Path = CMD_PROFILE, telemetry: Path = TLM_PROFILE, **ed
 def test_profiles_given_in_the_wrong_roles_are_refused() -> None:
     with pytest.raises(IronbirdError) as info:
         build_codec(command=TLM_PROFILE)
-    assert info.value.code is Code.HDR_SCHEMA and "not a command header profile" in info.value.summary
+    assert (
+        info.value.code is Code.HDR_SCHEMA and "not a command header profile" in info.value.summary
+    )
     with pytest.raises(IronbirdError) as info:
         build_codec(telemetry=CMD_PROFILE)
     assert info.value.code is Code.HDR_SCHEMA and "not a telemetry" in info.value.summary
