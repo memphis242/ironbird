@@ -4403,3 +4403,31 @@ Decided by the user (2026-10-30, later):
 - `ib events` against two mock flight nodes prints events from both (and honours
   `--min-type`); category/event-mapping validation errors are coded one-liners.
 - Ledger file inspected for a complete, timestamped trace of the session.
+
+## Static analysis, security and packaging gates
+
+CI gates beyond ruff, pyright and the tests (`.github/workflows/ci.yml`):
+
+- **mypy** (strict, `src/` only; `[tool.mypy]`) and **bandit** (`src/`; `[tool.bandit]`) run in the
+  `checks` job. Every bandit skip is inline with a reason (`# nosec B301  # reason`; the only global
+  skip is B101, because asserts are the assertive-programming tool).
+- **packaging** (`package` job, `tools/ci/check-package.sh`): sdist and wheel build from a copy of the
+  tree, `twine check --strict`, wheel contents match `src/ironbird` (plus `py.typed` and the entry
+  points), the sdist carries `examples/` (the code has no built-in header profiles; a config points at
+  TOML files), and the wheel installed in a clean venv runs `ib --help`, `ironbird --help` and
+  `ib -c examples/mock.toml nodes`.
+- **dependency audit** (weekly cron, `audit` and `el8-audit` jobs, `tools/ci/audit-deps.sh`): pip-audit on
+  the pinned dev set and on the runtime set floating inside the `pyproject.toml` ranges. Accepted
+  advisories live in `tools/ci/audit-ignore.txt`, each with a reason.
+- The nightly cron runs the ordinary jobs plus `fuzz`; the weekly cron runs only the audit jobs
+  (`tests/test_ci_schedules.py` keeps the cron strings and the job conditions in step).
+
+Deferred (decisions open):
+
+- pytest is held below 9 and so carries PYSEC-2026-1845 (fixed in 9.0.3; accepted in
+  `tools/ci/audit-ignore.txt`). Verify pytest-benchmark and xdist on pytest 9, bump, drop the entry.
+- mypy does not yet cover `tests/` (pyright strict does): about 85 findings, mostly monkeypatching of
+  module attributes and re-exported names, to be cleaned up in a dedicated pass.
+- `recording/pexport.py` unpickles the export worker's replies in the parent. The pipe is private and
+  the worker is the tool's own process, but a worker that a decoder bug compromised could then run
+  code in the parent. Replacing pickle with a fixed binary framing removes that class (design change).

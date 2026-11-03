@@ -521,8 +521,8 @@ class SerialTransport:
         delay, attempt = low, 0
         while not self._closed:
             await asyncio.sleep(delay)
-            if self._closed:
-                return
+            if self._closed:  # closed while asleep: close() runs on this loop during the await
+                return  # type: ignore[unreachable]
             attempt += 1
             try:
                 self._attach(self._open_port())

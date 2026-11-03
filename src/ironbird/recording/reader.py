@@ -46,6 +46,8 @@ from ironbird.frame import (
     FLAG_TRUNCATED,
     FLAGS_BY_BITS,
     KNOWN_FLAG_BITS,
+    MAX_FRAME_BYTES,
+    MAX_STREAM_ID,
     SERIAL_TRANSPORT,
     Frame,
     Stream,
@@ -61,7 +63,7 @@ WORK_FLOOR: Final = 4 * 1024 * 1024  # bytes of work a resync may do however sma
 WORK_FACTOR: Final = 4  # ... plus this many times the size of the file, over the whole pass
 CANDIDATE_COST: Final = 64  # work charged for looking at one candidate, however cheap
 MAX_DAMAGE_KEPT: Final = 1000  # Damage objects retained; the count and bytes cover them all
-MAX_STREAMS: Final = fmt.MAX_STREAM_ID + 1
+MAX_STREAMS: Final = MAX_STREAM_ID + 1
 
 # A record envelope's type byte followed by its flags and reserved bytes (all zero in v1) is the
 # cheap shape a resync scan looks for; only a match at an 8-byte aligned offset is a candidate.
@@ -251,7 +253,7 @@ class RecordingReader:
         self.version = (major, minor)
         self.nonce = nonce
         self._seed = fmt.seed_of(nonce)
-        self._max_packet = fmt.MAX_FRAME_BYTES  # until META says how large a packet may be
+        self._max_packet = MAX_FRAME_BYTES  # until META says how large a packet may be
         first = self._read_raw(fmt.PREAMBLE_SIZE)
         if isinstance(first, _Fail):
             if first.unsupported:

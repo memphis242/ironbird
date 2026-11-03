@@ -20,7 +20,9 @@ import yaml
 REPO = Path(__file__).resolve().parent.parent
 SETUP = REPO / "tools" / "ci" / "el8-setup.sh"
 CACHE_KEY = REPO / "tools" / "ci" / "cache-key.sh"
-CI_SCRIPTS = [SETUP, CACHE_KEY]
+CHECK_PACKAGE = REPO / "tools" / "ci" / "check-package.sh"
+AUDIT_DEPS = REPO / "tools" / "ci" / "audit-deps.sh"
+CI_SCRIPTS = [SETUP, CACHE_KEY, CHECK_PACKAGE, AUDIT_DEPS]
 CFS_SCRIPTS = sorted((REPO / "tools" / "cfs").glob("*.sh"))
 WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
 
@@ -289,7 +291,7 @@ def test_el8_setup_refuses_to_run_unprivileged() -> None:
 # id check that starts every unprivileged step and fails loudly if privileges ever come back.
 
 ID_CHECK = 'test "$(id -u)" -ne 0'
-EL8_JOBS = ("el8-checks", "el8-cfs")
+EL8_JOBS = ("el8-checks", "el8-cfs", "el8-audit")
 # Root steps (`shell: bash`) may only do bootstrap, ownership and key work; anything that
 # runs the project's code or tools belongs to the unprivileged user.
 _PROJECT_CODE = ("pytest", "tools/cfs/", "python -m pip", "pyright", "ruff", "-m venv")

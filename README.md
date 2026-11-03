@@ -660,7 +660,19 @@ Shipped files:
 pytest -n auto
 ruff check . && ruff format --check .
 pyright
+mypy                                   # strict, src/ only (config: [tool.mypy])
+bandit -c pyproject.toml -r src        # security lint; a skip is `# nosec B301  # reason`
 ```
+
+Packaging and dependency checks (the CI `package` job and the weekly `audit` / `el8-audit` jobs):
+
+```bash
+pip install -c constraints-dev.txt '.[package]' '.[audit]'
+tools/ci/check-package.sh      # sdist + wheel, twine check, clean-venv install, `ib --help`
+tools/ci/audit-deps.sh         # pip-audit on the pinned dev set and the floating runtime set
+```
+
+`tools/ci/audit-ignore.txt` lists the advisories the audit accepts, each with its reason.
 
 With no `node` on PATH, pyright downloads the official Node.js build, which needs
 `libatomic.so.1`: on RHEL 8 / Oracle Linux 8 run `dnf install libatomic` first.

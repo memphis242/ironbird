@@ -131,11 +131,11 @@ class Resolved:
         return f"Resolved({self.message.name}, word=0x{self.word:08X}, counts={self.counts})"
 
 
-_SET_MESSAGE = Resolved.message.__set__  # type: ignore[attr-defined]
-_SET_WORD = Resolved.word.__set__  # type: ignore[attr-defined]
-_SET_COUNTS = Resolved.counts.__set__  # type: ignore[attr-defined]
-_SET_CODEC = Resolved.codec.__set__  # type: ignore[attr-defined]
-_SET_DATA = Resolved.data.__set__  # type: ignore[attr-defined]
+_SET_MESSAGE = Resolved.__dict__["message"].__set__
+_SET_WORD = Resolved.__dict__["word"].__set__
+_SET_COUNTS = Resolved.__dict__["counts"].__set__
+_SET_CODEC = Resolved.__dict__["codec"].__set__
+_SET_DATA = Resolved.__dict__["data"].__set__
 
 
 @dataclass(frozen=True, slots=True)
@@ -954,7 +954,7 @@ class Codec:
         always what ``decode(kind, data)`` gives, and this never raises.
         """
         if (
-            type(resolved) is not Resolved
+            type(resolved) is not Resolved  # type: ignore[redundant-expr]  # any object may arrive
             or resolved.codec is not self
             or resolved.data is not data
             or resolved.message.kind is not kind
