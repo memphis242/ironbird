@@ -40,7 +40,7 @@ from ironbird.cli.output import (
     line_codec,
     write_within,
 )
-from ironbird.codec import Codec
+from ironbird.codec import Codec, parse_ascii_int
 from ironbird.config import (
     MAX_EXPORT_JOBS,
     ExportConfig,
@@ -976,7 +976,7 @@ def _parse_header_values(items: list[str] | None) -> dict[str, int]:
         if key in values:
             raise IronbirdError(Code.CLI_USAGE, f"--header {key[:40]!r} given more than once")
         try:
-            values[key] = int(text, 0)
+            values[key] = parse_ascii_int(text)
         except ValueError:
             raise IronbirdError(
                 Code.CLI_USAGE, f"--header {key[:40]}={text[:40]!r}: the value must be an integer"
@@ -1207,11 +1207,11 @@ def send(
             header=header_values,
             allow_count_mismatch=allow_count_mismatch,
         )
+        seq_text = "" if sent.sequence is None else f" seq {sent.sequence}"
         run.console.out(
             f"sent {term(sent.command)} to {term(sent.node)} via "
             f"{term(sent.transport)} {term(sent.endpoint)} "
-            f"(mid 0x{sent.mid:04X} fc {sent.function_code} seq {sent.sequence}, "
-            f"{sent.size} bytes)"
+            f"(mid 0x{sent.mid:04X} fc {sent.function_code}{seq_text}, {sent.size} bytes)"
         )
         if session_verbose(ctx, verbose):
             run.console.out(f"  hex: {sent.data.hex(' ')}")
@@ -1238,7 +1238,7 @@ def _parse_mids(
     mids: set[int] = set()
     for item in items:
         try:
-            value = int(item, 0)
+            value = parse_ascii_int(item)
         except ValueError:
             msg = codec.model.by_name.get(item)
             if msg is None or msg.kind is not kind:

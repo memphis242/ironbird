@@ -4218,6 +4218,50 @@ deferred sync or close error); same tier as 4, and 6 wins over 4 and over 5.
 | Ledger growth: sampling, tier allowances, rotation, retention warnings and prune, send policy | 2d |
 | Output and signals equivalence | Stage 3; Stage 2's new commands keep Stage 1's exit codes, bounded writer and signal path |
 
+### Encode and load boundary review (`fix/codec-review`)
+
+An antagonistic review of the encode side, the header-kind and rule checks, and the CLI integer
+parsing found the following; each is fixed and covered by `tests/test_codec_review.py` unless it is
+listed as deferred.
+
+- **Sequence in the ledger and the CLI.** `EncodedPacket.sequence`, `SentCommand.sequence` and the
+  ledger's `sequence` are the value in the packet's sequence field (`counter & mask`), and `None` for
+  a profile with no sequence field (the `send` line then omits `seq`). The unbounded counter stays
+  internal to the codec.
+- **List text** is split on commas first; an empty element is `IB-ENC-002` naming `Field[i]` (one
+  trailing comma is allowed); without commas it splits on whitespace. Nothing is closed up.
+- **Response rules are validated at load** (`_validate_rules`): an echo must fit its target (same kind of
+  data; an integer range, text size, byte size or array element count that contains the source's; a
+  float no wider than its target), a count or length field is echoed only together with the data it sizes,
+  and each reply field has one source (a literal, an echo, `accepted_counter`, `rejected_counter`).
+  Errors carry `nodes.<node>.responses[i]`, and a reply that still fails at run time on received data
+  is reported as `IB-RSP-001 rule 'X': reply field F from command argument A: ...`.
+- **A UDP link whose `command_endpoint` equals its `telemetry_endpoint`** (host compared
+  case-insensitively, port equal) is `IB-CFG-003`; `localhost` against `127.0.0.1` is not resolved at load.
+- **A telemetry profile may name `function_code_field`** only as an ordinary input: without a `default`
+  it is refused when the codec is built (`IB-HDR-002`), and with one `--header` may set it. Only a command
+  profile reserves it for the command definition.
+- **A header file of the wrong kind** under `nodes.<n>.command_header` or `telemetry_header` is
+  `IB-CFG-003` (exit 2) naming the key; the `Codec` constructor refuses it with `IB-HDR-002`.
+- **NUL in fixed `char[N]` text** is refused like `char[]` (decode ends text at a NUL).
+- **ASCII digits only** for integer and float arguments, `--header` and `--mid` (`parse_ascii_int`).
+- **Underflow.** A `float32` argument that is nonzero but rounds to zero is refused like overflow, and so
+  is float text such as `1e-400` that parses to 0.0 in a double.
+- **Integers outside an enum in a command** are refused (`IB-ENC-002`, with the names) unless the CCDD field sets
+  `"allow_raw": true` (valid only next to an `enum`; `IB-CCD-002` otherwise). Telemetry encoding (`ib respond`, tests) is not
+  restricted, since a vehicle can report any value, and out-of-enum values are decoded and shown as numbers. Fault injection of an unlisted value therefore needs the flag in the CCDD.
+- **Deferred, needs the user's decision: the CCSDS sequence count restarts at 0 in every `ib send`.**
+  Stock cFE ignores command sequence counts, but flight software that rejects duplicate or
+  non-advancing counts would drop every scripted command after the first, and a "sent seq 0" ledger
+  line on each command traces poorly. Options: (A) persist a per-(node, MID) command counter under
+  `$XDG_STATE_HOME/ironbird/` with a file lock, so counts advance across invocations (state to
+  manage, a lock to hold on every send, and a reset policy when the target reboots); (B) add
+  `ib send --sequence N` and state the per-process reset in `ib send --help` (stateless, the script
+  owns the count, nothing on disk). Not implemented until chosen.
+- **Also noted, not changed:** `--length-delta` computes the checksum over the bytes actually sent, but
+  cFE's `CFE_MSG_ComputeCheckSum` covers the declared length, so a length-fault packet also fails a
+  checksum-validating FSW; `ib send --help` should say the two faults are not independent.
+
 ### CI notes (EL8 jobs) and deferrals
 
 The EL8 container jobs (`.github/workflows/ci.yml`, `tools/ci/`) are guarded by

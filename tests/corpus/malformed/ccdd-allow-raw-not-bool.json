@@ -1,0 +1,22 @@
+{
+ "schema": "ironbird-ccdd/1",
+ "target": "t",
+ "messages": [
+  {
+   "name": "T",
+   "kind": "telemetry",
+   "mid": "0x0801",
+   "category": "status",
+   "fields": [
+    {
+     "name": "m",
+     "type": "uint8",
+     "enum": {
+      "A": 1
+     },
+     "allow_raw": "yes"
+    }
+   ]
+  }
+ ]
+}

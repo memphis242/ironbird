@@ -814,6 +814,16 @@ def _parse_link_transport(
         command_endpoint=ctx.endpoint(raw["command_endpoint"], f"{lpath}.command_endpoint"),
         telemetry_endpoint=ctx.endpoint(raw["telemetry_endpoint"], f"{lpath}.telemetry_endpoint"),
     )
+    if (udp.command_endpoint.host.lower(), udp.command_endpoint.port) == (
+        udp.telemetry_endpoint.host.lower(),
+        udp.telemetry_endpoint.port,
+    ):
+        # One socket would carry both directions: a listener would read the commands it sends.
+        raise ctx.fail(
+            f"{lpath}.telemetry_endpoint",
+            f"is the same as command_endpoint ({udp.command_endpoint}); the two directions "
+            "need different endpoints",
+        )
     return transport, udp, None, None
 
 

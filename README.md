@@ -532,6 +532,22 @@ usage error on a command with no count or length field); the ledger's `send.requ
 count that went out wrong (nothing when they agree). A number array cannot be used in a
 `--where` filter (`char[]` and `bytes[]` can).
 
+### Encoding rules for arguments
+
+Argument text is checked, never repaired, and every refusal is `IB-ENC-002` naming the argument.
+
+- Integers are ASCII digits in decimal, `0x`, `0o` or `0b` spelling; look-alike digits (Arabic-Indic,
+  fullwidth) are refused, also in `--header` and `--mid`. Floats follow the same rule. A float that
+  overflows its type, or a nonzero value that rounds to zero in it (`1e-50` for a `float32`), is refused.
+- A list is `1,2,3`, `[1, 2, 3]` or `1 2 3`. With commas every element must be present
+  (`1,,2` is refused as `Entries[1]`; one trailing comma is allowed).
+- `char[N]` and `char[]` text is ASCII and carries no NUL, because decode ends text at a NUL.
+- An integer that no name of a command field's `enum` gives is refused (telemetry from `ib respond` is not restricted). A CCDD field that is meant to carry
+  other values in its type's range says so with `"allow_raw": true` next to its `enum`.
+- `seq N` in the `send` line, the ledger's `sequence` and `SentCommand.sequence` are the value in the
+  packet's sequence field (wrapped at the field width); a profile with no sequence field reports none.
+  The sequence count starts at 0 in every process (see the plan's deferral on a persistent count).
+
 ## Filtering with --where
 
 `ib listen NODE --where EXPR` and `ib events --where EXPR` show only the frames the expression
