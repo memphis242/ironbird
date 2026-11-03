@@ -167,7 +167,7 @@ def test_help_paragraphs_are_not_cut_at_the_source_line_breaks(
     tmp_path: Path, env: dict[str, str]
 ) -> None:
     narrow = dict(env, COLUMNS="200")
-    helped = ib(tmp_path, narrow, "send", "--help").stdout
+    helped = re.sub(r"\x1b\[[0-9;]*m", "", ib(tmp_path, narrow, "send", "--help").stdout)
     assert "hex for bytes" in " ".join(helped.split())
     assert any("hex for bytes" in line for line in helped.splitlines()), helped
 

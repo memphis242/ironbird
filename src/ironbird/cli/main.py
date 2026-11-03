@@ -2899,7 +2899,7 @@ def _ledger_usage_error(message: str) -> None:
             _stderr_line(notice.line())
     except IronbirdError as exc:
         _stderr_line(exc.user_line())
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:  # RuntimeError: the writer thread cannot be started
         _stderr_line(f"warning {Code.LED_WRITE.value}: the usage error was not ledgered: {exc}")
 
 

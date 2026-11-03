@@ -184,7 +184,7 @@ def test_real_fsw_rejects_a_count_that_disagrees_with_the_packet_size(
     before = _hk(g)
     # Without the flag ironbird refuses to build the packet at all: nothing goes out.
     refused = g.send("IB_TEST_SET_DATA", "Count=9", "Entries=1,2", "Text=x", check=False)
-    assert refused.returncode == 1 and "IB-ENC-002" in refused.stderr
+    assert refused.returncode == 2 and "IB-ENC-002" in refused.stderr
     flags = ("--allow-count-mismatch",)
     # Count beyond the packet, then a count above the CCDD maximum: the app counts both as errors.
     for count in ("9", "200"):

@@ -239,10 +239,10 @@ def test_output_threads_block_the_shutdown_signals() -> None:
 SLOW_CLOSE = """
     import ironbird.ledger as _l
     _orig_close = _l.Ledger.close
-    def _slow_close(self):
+    def _slow_close(self, end=None):
         print("IN_CLOSE", file=sys.__stderr__, flush=True)
         time.sleep(1.5)
-        report = _orig_close(self)
+        report = _orig_close(self, end)
         print("CLOSE_DONE", file=sys.__stderr__, flush=True)
         return report
     _l.Ledger.close = _slow_close

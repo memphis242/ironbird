@@ -491,12 +491,16 @@ def test_length_delta_in_range_is_sent(mock_config_path: Path) -> None:
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     receiver.bind((command_ep.host, command_ep.port))
     try:
-        for delta in ("1", "-1", "65535"):
+        for delta in ("1", "-1", "65534"):  # the length field is 1: 65534 reaches its maximum
             result = CliRunner().invoke(
                 app,
                 ["-c", str(mock_config_path), "send", "fc", "MOCK_NOOP", f"--length-delta={delta}"],
             )
             assert result.exit_code == 0, result.output
+        wrapped = CliRunner().invoke(
+            app, ["-c", str(mock_config_path), "send", "fc", "MOCK_NOOP", "--length-delta=65535"]
+        )  # past the field's maximum: refused, not wrapped around
+        assert wrapped.exit_code == 2 and "IB-HDR-003" in wrapped.output, wrapped.output
     finally:
         receiver.close()
 

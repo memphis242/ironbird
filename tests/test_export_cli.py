@@ -131,8 +131,11 @@ def test_the_ledger_has_the_start_and_the_stop_with_the_counts(
     [
         (["--format", "text", "--header-fields"], "csv only"),
         (["--format", "jsonl", "--raw-enums"], "csv only"),
-        ([], "pass -o DIR"),  # several tables need a directory
-        (["--message", "MOCK_HK", "--message", "MOCK_STATUS"], "pass -o DIR"),
+        (["--format", "csv"], "pass -o DIR"),  # several tables need a directory
+        (
+            ["--format", "csv", "--message", "MOCK_HK", "--message", "MOCK_STATUS"],
+            "pass -o DIR",
+        ),
         (["--message", "MOCK_HK", "--force"], "--force needs -o"),
         (["--message", "MOCK_NOPE"], "no such message"),
         (["-o", "x", "--from", "+5s", "--to", "+1s"], "earlier"),
@@ -274,6 +277,8 @@ def test_nothing_may_be_exported_into_the_state_directory_under_any_name(
 ) -> None:
     out = tmp_path / "state" / name
     args = [str(rec), "-o", str(out)] if as_directory else [str(rec), "--format", "text"]
+    if as_directory and name.endswith(".csv"):
+        args += ["--message", "MOCK_HK"]  # a .csv name is a single file only for one message
     if not as_directory:
         args += ["-o", str(out)]
     before = sorted(p.name for p in (tmp_path / "state").iterdir())

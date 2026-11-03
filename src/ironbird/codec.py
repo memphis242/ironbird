@@ -242,6 +242,7 @@ def _arg_error(message: Message, field: FieldDef, why: str) -> IronbirdError:
 _SPELLED_NON_FINITE: Final = re.compile(r"[+-]?(inf|infinity|nan)", re.IGNORECASE)
 MAX_ENUM_HINT_NAMES: Final = 16
 MAX_SUGGEST_FROM: Final = 5000  # message names searched for a did-you-mean hint
+SUGGEST_CUTOFF: Final = 0.8  # similarity (0..1) a name needs to be offered as a suggestion
 MAX_LIST_TEXT: Final = 1 << 20  # characters of a spelled-out array or hex value a caller may pass
 
 
@@ -604,15 +605,20 @@ class Codec:
         msg = self.model.by_name.get(name)
         if msg is None or msg.kind is not kind:
             known = sorted(m.name for m in self.model.messages if m.kind is kind)
-            by_folded = {k.casefold(): k for k in known[:MAX_SUGGEST_FROM]}
-            close = [
-                by_folded[c]
-                for c in difflib.get_close_matches(name[:64].casefold(), list(by_folded), n=3)
-            ]
-            if close:
-                hint = f"; did you mean {', '.join(close)}?"
+            if msg is not None:  # a real message, but the other direction: say so, do not guess
+                hint = f"; {msg.name} is a {msg.kind.value} message, not a {kind.value}"
             else:
-                hint = f"; {len(known)} known (see: ib find)" if known else ""
+                by_folded = {k.casefold(): k for k in known[:MAX_SUGGEST_FROM]}
+                close = [
+                    by_folded[c]
+                    for c in difflib.get_close_matches(
+                        name[:64].casefold(), list(by_folded), n=3, cutoff=SUGGEST_CUTOFF
+                    )
+                ]
+                if close:
+                    hint = f"; did you mean {', '.join(close)}?"
+                else:
+                    hint = f"; {len(known)} known (see: ib find)" if known else ""
             raise IronbirdError(
                 Code.ENC_UNKNOWN,
                 f"unknown {kind.value} {name[:64]!r} for target {self.model.target}{hint}",
