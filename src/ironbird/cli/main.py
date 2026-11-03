@@ -2244,6 +2244,7 @@ def replay(
                 "state",
                 "replay.stop",
                 reason=ending,
+                live_end=stats.live_end,
                 shown=result.shown,
                 read=stats.frames_read,
                 in_range=stats.frames_in_range,
@@ -2654,6 +2655,11 @@ def export_command(
                 console.err(f"warning {Code.EXP_WRITE.value}: {warning}")
             _report_unclosed(replaying, ledger, console, "exported")
             stats = replaying.stats
+            if stats.live_end:
+                console.err(
+                    f"info {Code.REC_TORN.value}: the recording is still being written; the "
+                    "export holds the frames written so far (export again once it is closed)"
+                )
             console.err(_export_summary(replaying, result, target))
             if result.not_written:
                 console.err(
@@ -2670,6 +2676,7 @@ def export_command(
                 "state",
                 "export.stop",
                 reason=ending,
+                live_end=stats.live_end,
                 rows=result.rows,
                 committed=progress.committed,
                 output=output,

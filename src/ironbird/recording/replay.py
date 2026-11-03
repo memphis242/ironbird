@@ -308,14 +308,34 @@ class Follower:
 # -- the set of files --------------------------------------------------------------------------
 
 
-def _base_of(path: Path, part: int) -> Path | None:
-    """The first part's path for ``path``, which is part ``part`` of its recording."""
+def _base_of(path: Path, part: int, session: object = None) -> Path | None:
+    """The first part's path for ``path``, which is part ``part`` of the recording of ``session``.
+
+    The inverse of :func:`part_path`: a base named ``run1.ibrec`` and one named ``run1`` both
+    give parts ``run1.p0002.ibrec``, so both are candidates, and the one that exists and is
+    part 1 of the same session is the base. ``None`` when the name is not that of a later part or
+    no such first part is there."""
     if part == 1:
         return path
     found = _PART_NAME_RE.fullmatch(path.name)
     if found is None or int(found.group("part")) != part:
         return None
-    return path.with_name(found.group("stem") + ".ibrec")
+    stem = found.group("stem")
+    for candidate in (path.with_name(stem + ".ibrec"), path.with_name(stem)):
+        if _is_first_part(candidate, session):
+            return candidate
+    return None
+
+
+def _is_first_part(path: Path, session: object) -> bool:
+    """Whether ``path`` is a readable recording that is part 1 of ``session``."""
+    if session is None or not os.path.lexists(path):
+        return False  # without a session id nothing ties a part 1 to this part
+    try:
+        with RecordingReader(path) as reader:
+            return reader.meta.part == 1 and reader.meta.data.get("session") == session
+    except IronbirdError:
+        return False
 
 
 @dataclass(slots=True)
@@ -378,8 +398,12 @@ class Replay:
             self.label = label_of(first.path)
             self.writer_active = first.writer_active
             self._resolve_parts(list(paths), first)
-        finally:
+        except BaseException:
             first.close()
+            raise
+        # The first file stays open, and with it its shared lock, until :meth:`close`: the parts
+        # are opened one at a time, and retention must see the session in use between them.
+        self._guard: RecordingReader | None = first
         self._follower = follower
         if follow and self._follower is None:
             # The writer holds part 1 for the whole session, whichever part is being followed.
@@ -394,7 +418,7 @@ class Replay:
             and not self._follower.lockable
             and (follow_idle_s is None)
         ):
-            self._follower.close()
+            self.close()
             raise IronbirdError(
                 Code.CLI_USAGE,
                 "--follow cannot tell a recorder that died from one that is quiet here: "
@@ -408,14 +432,14 @@ class Replay:
         part = first.meta.part
         session = self._session = first.meta.data.get("session")
         if len(paths) == 1:
-            base = _base_of(paths[0], part)
+            base = _base_of(paths[0], part, session)
             self._base = base
             self.parts = [paths[0]]
             if part == 1 and base is not None:
                 self._scan_parts(base)
             self._check_set(self.parts[1:], part, session)
             return
-        self._base = _base_of(paths[0], part)
+        self._base = _base_of(paths[0], part, session)
         self.parts = list(paths)
         self._check_set(paths[1:], part, session)
 
@@ -768,6 +792,9 @@ class Replay:
     def close(self) -> None:
         if self._follower is not None:
             self._follower.close()
+        guard, self._guard = self._guard, None
+        if guard is not None:
+            guard.close()
 
 
 def gap_in_range(gap: fmt.Gap, start: int | None, end: int | None) -> bool:

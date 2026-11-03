@@ -4,8 +4,9 @@ a reserve or a recording, and only after an explicit confirmation.
 A prune proposes sessions of *one* directory - non-protected ones older than an age, plus (with
 ``--until-under``) the oldest until the directory is at or under a size - lists exactly what it
 would delete, and deletes exactly that. Per session it takes ``LOCK_EX | LOCK_NB`` on part 1,
-checks that every listed file still matches the listing (device, inode, size, mtime, one link,
-owner) with ``fstat`` relative to the directory descriptor and no symbolic link followed, then
+probes the lock of every other part (a reader of a split set may hold one), checks that every
+listed file still matches the listing (device, inode, size, mtime, one link, owner) with
+``fstat`` relative to the directory descriptor and no symbolic link followed, then
 ``unlink``\\s relative to that descriptor, higher parts first and part 1 last, under the lock. A
 session that became live or changed since the listing is skipped and reported.
 """
@@ -29,6 +30,7 @@ from ironbird.retention import (
     FileEntry,
     Session,
     describe_reasons,
+    probe_lock,
     protected_bytes_by_reason,
 )
 from ironbird.sigmask import checkpoint
@@ -231,6 +233,14 @@ def _delete_session(
                 return
             if not _matches(entry, st):
                 skip(f"{entry.name} changed since it was listed")
+                return
+            if (
+                entry is not part1
+                and (entry.is_part or entry.is_reserve)
+                and probe_lock(fs, dir_fd, entry.name) == "held"
+            ):
+                # A reader of a split set holds the part it is on, or the first one it was given.
+                skip(f"{entry.name} is in use (its lock is held)")
                 return
             present.append(entry)
         for entry in present:
