@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import re
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -570,7 +570,7 @@ def _parse_time(ctx: _Ctx, data: Mapping[str, Any], fields: list[HeaderField]) -
 
 
 def _mid_windows(
-    fields: list[HeaderField], names: tuple[str, ...], total_bits: int
+    fields: Sequence[HeaderField], names: tuple[str, ...], total_bits: int
 ) -> tuple[MidWindow, ...]:
     """Windows that read the MID (the fields' values joined in ``names`` order) from the wire."""
     by_name = {f.name: f for f in fields}

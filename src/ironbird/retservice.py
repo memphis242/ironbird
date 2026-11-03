@@ -58,7 +58,7 @@ def size_argument(size: int) -> str:
     return f"{mib}MiB"
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ScanResult:
     """What a scan thread hands back: the scans, or why there are none (not due, or it failed)."""
 

@@ -382,7 +382,7 @@ class Job:
     event_cap: int  # damage and gap notes after which the range is cut short
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Block:
     """The rows of one table from one range: ``key`` identifies the table (``None``: the malformed
     table, or the only stream of text and JSON Lines), ``text`` has no header row."""
@@ -1453,6 +1453,7 @@ class _Runner:
                 if outcome.first_seq is not None:  # a range without frames leaves the sequence
                     walk.last_seq = outcome.last_seq
                 walk.work += outcome.work
+                assert outcome.end >= walk.end, "the walk never moves back"
                 assert not outcome.partial or outcome.end > walk.end, "a cut range goes on"
                 walk.end = outcome.end
                 if not outcome.partial:
@@ -1567,7 +1568,8 @@ class _Runner:
         lines: list[list[str]] = []
         for block in blocks:
             block_lines = block.text.split("\n")
-            assert block_lines.pop() == ""
+            last = block_lines.pop()  # kept out of the assert: -O must not change the lines
+            assert last == "", "a block's text ends with a newline"
             lines.append(block_lines)
         index_of = {block.handle: i for i, block in enumerate(blocks)}
         order = outcome.order

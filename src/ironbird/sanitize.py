@@ -21,15 +21,16 @@ from __future__ import annotations
 
 import codecs
 import unicodedata
+from typing import Final
 
-DEFAULT_MAX_LEN = 256
+DEFAULT_MAX_LEN: Final = 256
 
 # Categories that are not safe to print raw: control, format (bidi overrides, zero-width),
 # surrogate, private use, unassigned, and line/paragraph separators.
-_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
+_UNSAFE_CATEGORIES: Final = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 # U+FFFD marks bytes that did not decode; showing it as an escape keeps the corruption visible
 # and keeps it from being mistaken for text.
-_REPLACEMENT_CHAR = "\ufffd"
+_REPLACEMENT_CHAR: Final = "\ufffd"
 
 
 def _escape_char(ch: str) -> str:

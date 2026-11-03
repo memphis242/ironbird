@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import sys
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Final
 
 from ironbird.ccdd.model import FieldDef, MessageKind, TypeClass
 from ironbird.codec import DecodedPacket
@@ -36,7 +36,7 @@ def _float_text(value: float) -> str:
     return repr(value) if math.isfinite(value) else str(value)
 
 
-MAX_ELEMENTS_SHOWN = 16  # elements of an array a line shows; the rest is counted
+MAX_ELEMENTS_SHOWN: Final = 16  # elements of an array a line shows; the rest is counted
 
 
 def _element_text(value: object) -> str:
@@ -206,8 +206,9 @@ def respond_line(node: str, command: str, sequence: int | None, reply: str | Non
 
 # -- frames that did not decode (replay shows what a live listener hides) ---------------------
 
-MAX_HEX_SHOWN = 256  # bytes of a frame a line shows; the JSON record carries up to MAX_HEX_JSON
-MAX_HEX_JSON = 1024
+# bytes of a frame a line shows; the JSON record carries up to MAX_HEX_JSON
+MAX_HEX_SHOWN: Final = 256
+MAX_HEX_JSON: Final = 1024
 
 
 def flag_names(frame: Frame) -> list[str]:

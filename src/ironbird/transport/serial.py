@@ -347,6 +347,7 @@ class SerialTransport:
         """Make ``port`` the live device: the loop watches its descriptor."""
         loop = self._loop
         assert loop is not None
+        assert self._port is None and self._fd < 0, "one device is live at a time"
         self._port, self._fd = port, port.fileno()
         self._register_device(port)
         try:
@@ -517,6 +518,7 @@ class SerialTransport:
 
     async def _reopen(self) -> None:
         """Retry opening the device until it works or the transport is closed."""
+        assert self._down, "only a lost link is reopened"
         low, high = self._backoff
         delay, attempt = low, 0
         while not self._closed:

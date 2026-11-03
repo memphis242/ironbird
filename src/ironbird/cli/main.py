@@ -19,7 +19,7 @@ import signal
 import sys
 import time
 import traceback
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -334,7 +334,7 @@ class _SignalState:
             deliver(signum)
 
 
-_STATE = _SignalState()
+_STATE: Final = _SignalState()
 
 
 # -- plumbing --------------------------------------------------------------------------
@@ -1002,8 +1002,8 @@ class _RecordingScope:
         target: str | None,
         command: str,
         *,
-        nodes: list[str],
-        routes: list[Route] | None = None,
+        nodes: Sequence[str],
+        routes: Sequence[Route] | None = None,
         split: tuple[int | None, float | None] = (None, None),
     ) -> None:
         self.recorder: Recorder | None = None

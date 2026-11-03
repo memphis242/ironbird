@@ -888,6 +888,7 @@ class Ledger:
             self._queued_tx += tx.count
         number = next(self._numbers)
         queue.append((time.time_ns(), number, kind, event, fields, tier, charge, tx))
+        assert len(queue) <= self._max_queue and self._queued_bytes <= self._max_queue_bytes
         return number
 
     def record_error(
@@ -1457,6 +1458,7 @@ class Ledger:
             lines.append(Line(number, tier, fmt(session, number, time_ns, kind, event, fields), tx))
         self._queued_bytes -= freed
         assert min(self._queued) >= 0 and self._queued_bytes >= 0
+        assert sum(self._tier_bytes_q) == self._queued_bytes, "the tiers share the queued bytes"
 
     def _prune_jobs(self) -> None:
         """Forget the batches the writer has finished with (what remains is in its hands)."""

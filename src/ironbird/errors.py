@@ -129,8 +129,8 @@ WARNING_CODES: Final[frozenset[Code]] = frozenset(
 )
 
 
-MAX_SUMMARY_LEN = 600
-_USAGE_PREFIXES = ("IB-CFG-", "IB-HDR-", "IB-CCD-", "IB-CLI-", "IB-EVT-", "IB-FLT-")
+MAX_SUMMARY_LEN: Final = 600
+_USAGE_PREFIXES: Final = ("IB-CFG-", "IB-HDR-", "IB-CCD-", "IB-CLI-", "IB-EVT-", "IB-FLT-")
 
 
 class IronbirdError(Exception):

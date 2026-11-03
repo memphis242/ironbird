@@ -75,7 +75,7 @@ class _Layout:
     count_names: frozenset[str] = frozenset()  # count and length fields their data determines
 
 
-_ISSUE = object()  # the key only :meth:`Codec.resolve` holds; a Resolved is built with it
+_ISSUE: Final = object()  # the key only :meth:`Codec.resolve` holds; a Resolved is built with it
 
 
 @final
@@ -808,6 +808,7 @@ class Codec:
         if isinstance(word, DecodeError):
             return word
         assert mid is not None  # a valid header means the size was in range
+        assert profile.min_bytes <= size <= self.max_packet_bytes, "the check bounds the size"
         msg: Message | None
         if kind is MessageKind.COMMAND:
             assert profile.function_code_field is not None
@@ -874,6 +875,9 @@ class Codec:
             else:
                 where = base + slot.count_offset
                 in_bytes = spec.unit is VarUnit.LENGTH
+                assert where + slot.count.size <= base + msg.fixed_extent, (
+                    "a count field lies inside the fixed part of the payload"
+                )
                 given = slot.count.unpack_from(data, where)[0]
                 assert isinstance(given, int)
             limit = spec.max_bytes if in_bytes else spec.max
@@ -919,6 +923,7 @@ class Codec:
                 f"{msg.name}: {end - cursor} bytes follow the last variable-length field",
                 msg.mid,
             )
+        assert len(counts) == len(layout.variables), "one count per variable-length field"
         return tuple(counts)
 
     def check(self, kind: MessageKind, data: bytes | bytearray | memoryview) -> DecodeError | None:

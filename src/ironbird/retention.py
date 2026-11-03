@@ -26,7 +26,7 @@ import stat
 import threading
 import time
 from bisect import bisect_right
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Final
@@ -601,7 +601,7 @@ def apply_protection(
     scan: DirScan,
     *,
     keep_recent: int,
-    live: dict[str, str],
+    live: Mapping[str, str],
     has_recording: Callable[[str], bool] | None = None,
 ) -> None:
     """Fill ``Session.protected`` for every session of the directory (see the module notes).
@@ -717,7 +717,7 @@ def describe_reasons(totals: dict[str, int]) -> str:
 # -- recovery of a crashed session's reserve ----
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class _Facts:
     size: int
     first_nul: int | None
@@ -820,7 +820,7 @@ def _unrecoverable(scan: DirScan, session: Session, name: str, why: str) -> None
 def recover_directory(
     fs: FileSystem,
     scan: DirScan,
-    live: dict[str, str],
+    live: Mapping[str, str],
     own_session: str | None,
     control: ScanControl | None = None,
     on_record: Callable[[str, dict[str, Any]], None] | None = None,

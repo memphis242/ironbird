@@ -182,6 +182,7 @@ class Pacer:
             return True
         self._elapsed += max(0, time_ns - self._last_rec)
         self._last_rec = time_ns
+        assert self._elapsed >= 0 and self._speed > 0
         due = self._anchor_wall + self._elapsed / 1e9 / self._speed
         while (remaining := due - self._clock()) > 0:
             if stop():
