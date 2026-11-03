@@ -706,7 +706,7 @@ class Recorder:
             self._clock_step(wall, offset_now - clock_offset)
             self._clock_offset = offset_now
         if self._stopped:  # a head record above closed a chunk and a rotation failed
-            self._after_stop += 1
+            self._after_stop += 1  # type: ignore[unreachable]  # _stopped can be set by the calls above
             return
         body_len = fmt.FRAME_FIXED_SIZE + size
         fixed = fmt.FRAME_FIXED.pack(seq, wall, sid, source, bits, 0, mid, frame.orig_len)
@@ -818,7 +818,7 @@ class Recorder:
         if self._chunk_frames:
             self._close_chunk()
             if self._stopped:
-                return
+                return  # type: ignore[unreachable]  # _close_chunk can stop the recorder
         record = fmt.encode_record(rtype, body, self._seed)
         self._buf += record
         self._offset += len(record)
