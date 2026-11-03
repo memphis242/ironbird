@@ -815,10 +815,11 @@ class Engine:
             async with asyncio.timeout(OPEN_TIMEOUT_S):
                 await task
         except TimeoutError as exc:
+            step = transport.opening_step or f"open {transport.description}"
             raise IronbirdError(
                 Code.TX_OPEN,
-                f"cannot open {transport.description}: no answer within {OPEN_TIMEOUT_S:g} s "
-                "(is the host name resolvable?)",
+                f"cannot {step}: no answer within {OPEN_TIMEOUT_S:g} s (is the host name "
+                "right and the DNS server reachable? an IP address needs no lookup)",
                 cause=exc,
             ) from exc
         except asyncio.CancelledError:
@@ -1196,11 +1197,30 @@ class Engine:
     # -- periodic work and drop accounting -----------------------------------------------
 
     async def tick(self) -> None:
-        """About once a second: refresh OS-side counters (off the loop) and report new drops."""
+        """About once a second: refresh OS-side counters (off the loop) and report new drops.
+
+        A transport whose refresh fails is reported (coalesced, ``IB-INT-001``) and the drops
+        known so far are still accounted for, on it and on every other link end."""
         receiving = [io for io in self._ios.values() if io.receiving and io.transport is not None]
         transports = [(io, io.transport) for io in receiving if io.transport is not None]
-        await asyncio.gather(*(transport.poll() for _, transport in transports))
-        for io, transport in transports:
+        outcomes = await asyncio.gather(
+            *(transport.poll() for _, transport in transports), return_exceptions=True
+        )
+        assert len(outcomes) == len(transports)
+        for (io, transport), outcome in zip(transports, outcomes, strict=True):
+            if isinstance(outcome, Exception):
+                self._report(
+                    IronbirdError(
+                        Code.INTERNAL,
+                        f"{io.description}: cannot refresh the drop counters: "
+                        f"{type(outcome).__name__}: {outcome}",
+                        details="".join(traceback.format_exception(outcome)),
+                        cause=outcome,
+                    ),
+                    context=f"poll {io.description}",
+                )
+            elif outcome is not None:  # a poll cancelled on its own, or a BaseException
+                raise outcome
             if io.transport is transport:  # a replaced transport was accounted for as it closed
                 self._poll_kernel(io, transport)
             for sub in io.subs:
@@ -1249,27 +1269,33 @@ class Engine:
 
     def _note_unread(self, io: _LinkIO, transport: Transport) -> None:
         """Ledger the packets a framing transport emitted although the CCDD disagrees with them,
-        and account for datagrams still in the socket buffer when ``transport`` stopped, beyond
-        the batch its close handed over (they are discarded unread). Always ledgered; reported
-        only on a link end that was already losing frames, where the count completes the picture
-        rather than adding noise."""
+        and account for what was still in the OS when ``transport`` stopped, beyond the batch
+        its close handed over (datagrams in the socket buffer, bytes in a serial device), which
+        is discarded unread. Always ledgered; reported only on a link end that was already
+        losing frames, where the count completes the picture rather than adding noise."""
         stats = transport.stats()
         label = io.description
         if stats.ccdd_mismatched:  # the decode reports each one; this is the total for the ledger
             self._ledger.record(
                 "state", "rx.ccdd_mismatch", label=label, packets=stats.ccdd_mismatched
             )
-        left = stats.unread_at_close
-        if not left:
+        left, left_bytes = stats.unread_at_close, stats.unread_bytes_at_close
+        if not left and not left_bytes:
             return
-        self._ledger.record("state", "rx.unread_at_close", label=label, datagrams=left)
-        # Datagrams the OS discards unread are lost before the transport read them, like a kernel
-        # drop: sinks that record gaps get one, bracketing the loss by the last poll and now.
+        if left:
+            self._ledger.record("state", "rx.unread_at_close", label=label, datagrams=left)
+            what = f"{left} more datagram(s) were still in the socket buffer"
+        else:
+            self._ledger.record("state", "rx.unread_at_close", label=label, bytes=left_bytes)
+            what = f"{left_bytes} more byte(s) were still in the device"
+        # What the OS discards unread is lost before the transport read it, like a kernel drop:
+        # sinks that record gaps get one, bracketing the loss by the last poll and now. How many
+        # packets a run of stream bytes held is unknown, so its GAP counts the run (1).
         watch, now_ns = io.kernel, time.time_ns()
         self._notify_gap(
             io.rx_stream,
             GapReason.KERNEL_DROP,
-            left,
+            left or 1,
             watch.last_ns,
             now_ns,
             watch.last_seq,
@@ -1277,11 +1303,7 @@ class Engine:
         )
         if io.lossy or stats.kernel_dropped:
             self._report(
-                IronbirdError(
-                    Code.TX_OVERRUN,
-                    f"{label}: {left} more datagram(s) were still in the socket buffer when it "
-                    "closed and were not read",
-                ),
+                IronbirdError(Code.TX_OVERRUN, f"{label}: {what} when it closed and were not read"),
                 context=f"close {label}",
             )
 

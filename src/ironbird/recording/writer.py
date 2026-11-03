@@ -1175,7 +1175,9 @@ class Recorder:
         finish (the GAP for dropped frames and the trailer are behind it); it ends when the
         writer makes no progress for :data:`CLOSE_STALL_S`. A disk that stops answering then
         leaves a file without its trailer, readable up to the last record that reached it, and
-        the notice says how many frames were not written.
+        the notice says how many frames were not written. A cancellation of the caller (a
+        signal) does not cut the wait short, since the writer thread dies with the process: the
+        close ends as it would have, ledgered, and then the cancellation propagates.
         """
         if self._closed:
             return self.stats()
@@ -1196,9 +1198,13 @@ class Recorder:
         if self._held_fd >= 0:
             jobs.put(("close", self._held_fd))
         jobs.put(None)
+        cancelled: asyncio.CancelledError | None = None
         seen, moved_at = self._writer.progress, time.monotonic()
         while self._writer.is_alive():
-            await asyncio.sleep(0.005)
+            try:
+                await asyncio.sleep(0.005)
+            except asyncio.CancelledError as exc:
+                cancelled = cancelled or exc  # raised once the close is complete
             now = time.monotonic()
             if self._writer.progress != seen:
                 seen, moved_at = self._writer.progress, now
@@ -1233,6 +1239,8 @@ class Recorder:
                 peak_pending_bytes=stats.peak_pending_bytes,
                 failed=self._failed.code.value if self._failed else None,
             )
+        if cancelled is not None:
+            raise cancelled
         return stats
 
     def _recheck_overrun_final(self) -> None:

@@ -140,6 +140,7 @@ def test_open_error_is_the_bind_failure_not_a_later_socket_failure(
 
     fake = types.SimpleNamespace(**{k: getattr(socket, k) for k in dir(socket) if k[:2] != "__"})
     fake.socket = make_socket
+    fake.getaddrinfo = getaddrinfo
     monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
     monkeypatch.setattr(udp, "socket", fake)
     try:

@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import functools
 import os
 import socket
 import struct
@@ -40,6 +41,7 @@ from ironbird.config import Endpoint, format_hostport
 from ironbird.errors import Code, IronbirdError
 from ironbird.frame import FLAG_TRUNCATED
 from ironbird.header import DEFAULT_MAX_PACKET_BYTES
+from ironbird.offloop import OffLoop, OffLoopBusy
 from ironbird.transport.base import (
     NO_FLAGS,
     FailureHandler,
@@ -68,6 +70,13 @@ UNREAD_COUNT_LIMIT: Final = 1 << 20  # datagrams counted at close before giving 
 PROC_TABLES: Final = ("/proc/net/udp", "/proc/net/udp6")
 PROC_INODE_COLUMN: Final = 9
 PROC_MIN_COLUMNS: Final = 13  # the last one is "drops"
+# Name lookups and /proc scans run in daemon threads, never on the loop's default executor, which
+# ``asyncio.run`` joins without a time limit: a resolver that does not answer must not hold the
+# process once its command is over. A lookup that never returns keeps its thread, so the threads
+# still running are bounded; past the bound an open is refused with a coded error.
+RESOLVER_THREADS: Final = 8
+_RESOLVER: Final[OffLoop[list[Any]]] = OffLoop("udp-resolve", RESOLVER_THREADS)
+_PROC_SCANNER: Final[OffLoop[dict[int, int]]] = OffLoop("udp-drop-scan", 4)
 # Not exported by Python's socket module on every version; the value is Linux ABI.
 SO_RXQ_OVFL: Final = getattr(socket, "SO_RXQ_OVFL", 40)
 _U32: Final = 0xFFFFFFFF
@@ -124,7 +133,7 @@ async def scan_kernel_drops(transports: Collection[UdpTransport]) -> None:
     inodes = {t.inode: t for t in transports if t.inode is not None}
     if not inodes:
         return
-    found = await asyncio.to_thread(read_proc_drops, tuple(inodes))
+    found = await _PROC_SCANNER.call(functools.partial(read_proc_drops, tuple(inodes)))
     for inode, transport in inodes.items():
         value = found.get(inode)
         if value is not None:
@@ -184,6 +193,7 @@ class UdpTransport:
         self._pending_error: OSError | None = None
         self._opened = False
         self._closed = False
+        self._opening_step: str | None = None
         self._tx_lock = asyncio.Lock()
         self.rcvbuf_requested: int = 0
         self.rcvbuf_effective: int = 0
@@ -191,6 +201,11 @@ class UdpTransport:
     @property
     def description(self) -> str:
         return f"udp {self._local or self._remote or self._reply_to}"
+
+    @property
+    def opening_step(self) -> str | None:
+        """What an open in progress waits for, e.g. ``resolve host of udp name:port``."""
+        return self._opening_step
 
     @property
     def kernel_dropped(self) -> int:
@@ -413,14 +428,49 @@ class UdpTransport:
             Code.TX_OPEN, f"cannot {what} udp {endpoint}: {reason}{suffix}", cause=exc
         )
 
+    async def _resolve(self, what: str, endpoint: Endpoint) -> list[Any]:
+        """``getaddrinfo`` for ``endpoint`` in a daemon thread (see ``RESOLVER_THREADS``). While it
+        runs, and after a cancel cut it short, :attr:`opening_step` names it."""
+        lookup = functools.partial(
+            socket.getaddrinfo, endpoint.host, endpoint.port, type=socket.SOCK_DGRAM
+        )
+        self._opening_step = f"{what} udp {endpoint}"
+        try:
+            infos = await _RESOLVER.call(lookup)
+        except asyncio.CancelledError:
+            raise  # the step stays named: the open's owner reports it (a timeout)
+        except BaseException:
+            self._opening_step = None
+            raise
+        self._opening_step = None
+        return infos
+
+    async def _lookup(self, what: str, endpoint: Endpoint) -> list[Any]:
+        """:meth:`_resolve`, its failures as a coded ``IB-TX-001``."""
+        try:
+            return await self._resolve(what, endpoint)
+        except (OSError, UnicodeError) as exc:
+            raise self._open_error(what, endpoint, exc) from exc
+        except OffLoopBusy as exc:
+            raise IronbirdError(
+                Code.TX_OPEN,
+                f"cannot {what} udp {endpoint}: {exc.running} earlier name lookup(s) never "
+                "answered; check the DNS servers in /etc/resolv.conf, or use an IP address",
+                cause=exc,
+            ) from exc
+        except RuntimeError as exc:  # the thread cannot start (process or user thread limit)
+            raise IronbirdError(
+                Code.TX_OPEN,
+                f"cannot {what} udp {endpoint}: no thread for the name lookup ({exc}); close "
+                "other programs or raise the process limit ('ulimit -u')",
+                cause=exc,
+            ) from exc
+
     async def _attach(
         self, loop: asyncio.AbstractEventLoop, endpoint: Endpoint, *, bind: bool
     ) -> socket.socket:
         """A non-blocking socket bound to (``bind``) or connected to ``endpoint``."""
-        try:
-            infos = await loop.getaddrinfo(endpoint.host, endpoint.port, type=socket.SOCK_DGRAM)
-        except (OSError, UnicodeError) as exc:
-            raise self._open_error("resolve host of", endpoint, exc) from exc
+        infos = await self._lookup("resolve host of", endpoint)
         # A socket() failure (this family is unsupported here) says less than a bind/connect
         # failure on an address that exists, so the latter is the error to report.
         socket_failure: OSError | None = None
@@ -460,13 +510,12 @@ class UdpTransport:
         try:
             reply_family: socket.AddressFamily | None = None
             if self._reply_to is not None:
-                try:
-                    reply_infos = await loop.getaddrinfo(
-                        self._reply_to.host, self._reply_to.port, type=socket.SOCK_DGRAM
+                reply_infos = await self._lookup("resolve reply host", self._reply_to)
+                if not reply_infos:
+                    raise self._open_error(
+                        "resolve reply host", self._reply_to, OSError("no usable address")
                     )
-                    reply_family, self._reply_addr = reply_infos[0][0], reply_infos[0][4]
-                except (OSError, UnicodeError) as exc:
-                    raise self._open_error("resolve reply host", self._reply_to, exc) from exc
+                reply_family, self._reply_addr = reply_infos[0][0], reply_infos[0][4]
             if receiver is not None:
                 assert self._local is not None
                 sock = await self._attach(loop, self._local, bind=True)

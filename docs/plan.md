@@ -888,7 +888,10 @@ As built (where the build differs from, or settles, the text above)
   end of a capture that failed) is counted per subscription (`CaptureStats.after_close`) and
   ledgered, coalesced per poll, as `rx.closed_drops`; it still reaches the sinks. Frames a serial
   close flushes (a partial packet cut by the close) now reach the consumer queue as well as the
-  sinks.
+  sinks. A serial close likewise first hands over what the device already holds (one wakeup's
+  reads) and counts the bytes left beyond that (`TransportStats.unread_bytes_at_close`, ledger
+  `rx.unread_at_close` with `bytes`, one `kernel_drop` GAP of 1, since how many packets they held
+  is unknown).
 - Per-MID statistics count only frames that pass `Codec.check`.
 - A link end's transport is opened, joined and closed under the end's lock: a capture subscribes
   inside the lock, the closer re-checks the subscribers inside it, and the end's state changes
@@ -897,7 +900,18 @@ As built (where the build differs from, or settles, the text above)
   it (`TransportClosed`, never reported as a link failure); a send after `Engine.close` is an
   `IB-TX-002` "not sent: the session is closing". `Engine.close` ends every capture's iteration. A transport open is bounded
   (`OPEN_TIMEOUT_S`, 5 s, `IB-TX-001`) and cut short by `Engine.close`, so a resolver that does
-  not answer cannot hold the link end's lock; `_attach` re-checks `closed` under the lock, so a
+  not answer cannot hold the link end's lock. The timeout text names the step it was stuck on
+  (`Transport.opening_step`, e.g. "resolve host of udp name:port", which for a send-only source
+  is the command endpoint, not the telemetry one). Name lookups and `/proc` drop scans run in
+  daemon threads (`ironbird.offloop`, signals blocked), never on the loop's default executor,
+  which Python 3.11's `asyncio.run` joins with no time limit: a lookup that never answers is
+  abandoned with its thread, so neither the exit nor a signal waits for it, and at most
+  `RESOLVER_THREADS` (8) such threads are kept (past that an open is refused, `IB-TX-001`). Every
+  step of the 1 Hz tick is guarded: one that fails is reported (`IB-INT-001`, coalesced per step)
+  and the ticking goes on, and one transport's failed `poll` does not skip the drop accounting of
+  the others. `Session.__aexit__` closes the engine even when it is cancelled while it collects
+  its background tasks. `EventStream` ends its iteration when its capture ends, cleanly or not,
+  once the queued events are read; `_attach` re-checks `closed` under the lock, so a
   capture opened across a close raises (`IB-INT-001`, "the session is closed") and its transport
   is closed, never an iteration that does not end. A send made twice on a closed transport says
   whether the session is closing or another consumer closed the end twice.
@@ -2297,7 +2311,9 @@ As built (where the build differs from, or settles, the text above)
   blocked. The close always syncs, even with `fsync = "never"`. A wall-clock step of 250 ms or more
   against the monotonic clock is a MARK. `Recorder.rate_bytes_per_s()` (bytes encoded over the last
   minute) is the hook for 2d's `IB-RET-002` projection; nothing consumes it yet. A split keeps part
-  1 open and locked, and every part repeats META, BLOBs and definitions. A second signal does not
+  1 open and locked, and every part repeats META, BLOBs and definitions. A signal that lands inside
+  the close (a cancellation of its caller) does not cut it short either: the close finishes, is ledgered
+  and its summary line is printed, then the cancellation goes on. A second signal does not
   abandon the close (the CLI ignores repeated signals); the close gives up only when the writer makes no
   progress for 5 s, writes the GAP for dropped frames and the trailer first when the disk is
   merely slow, and says how many frames were not written when it does give up.
@@ -3397,7 +3413,15 @@ Deliverables
   and non-blocking `os.read`/`os.write`, like UDP (this replaces the reader thread the
   execution model mentions; a thread remains the fallback for a device that cannot be
   polled). TX goes through a bounded 64 KiB buffer; `send(confirm=True)` awaits
-  `termios.tcdrain` in a thread with a timeout derived from bytes and baud.
+  `termios.tcdrain` in a thread with a timeout derived from bytes and baud. A packet any byte of
+  which reached the device is past the point of no return: a send cancelled after that (a
+  signal) is sent (`handed_off` runs, the tail follows from the buffer, and the close waits,
+  bounded by the drain time, for it); one cancelled before any byte went out is taken back out
+  of the buffer, so it really is not sent. A packet whose head went out and whose tail cannot
+  follow (a stall past the drain timeout, a lost device, a close that could not wait) fails with
+  `IB-TX-002` saying "N of M bytes ... went out ... torn packet" (reported when its sender no
+  longer waits), never "not sent" and never `TransportClosed`, so `Engine.send` does not send it
+  again.
 - `transport/framing.py`: `Framer` protocol (`feed(chunk, time_ns)`, `expire(now_ns)`,
   `stats()`) and `HeaderLengthFramer`:
   1. Strip to `sync` if configured; bytes before it are garbage.
@@ -3487,7 +3511,8 @@ As built (where the build differs from, or settles, the text above)
   loop reading the descriptor there is no such queue on the receive side (a read goes straight through the
   framer into ingest), and the TX buffer is not a loss of captured frames: a send that does not fit the 64 KiB
   buffer is refused up front (`IB-TX-002`, "refused: N byte(s) are still waiting"), one that waits longer than
-  the drain timeout for the device to take its bytes fails with the unsent bytes discarded. A consumer queue
+  the drain timeout for the device to take its bytes fails with the unsent bytes discarded (a torn packet when
+  its head had gone out, see above). A consumer queue
   overflow stays what 2e decided (not a recording gap). The reason stays defined for a transport that has a
   queue (the reader-thread fallback would). Kernel-side serial overruns (`TIOCGICOUNT` `overrun`/`buf_overrun`)
   are not counted: a pty has none and the real-hardware case is D7 (deferred).
