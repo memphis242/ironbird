@@ -32,7 +32,7 @@ from ironbird.recording.format import BlobKind, RecordType
 from ironbird.recording.reader import RecordingReader
 from ironbird.sanitize import clean
 
-MAX_HEAD_RECORDS: Final = 4096  # head records looked at before the definitions are taken as read
+MAX_HEAD_RECORDS: Final = 4096  # head records other than SOURCEs looked at before giving up
 MAX_HEAD_BYTES: Final = 64 * 1024 * 1024
 MAX_DEFINED_NODES: Final = 256
 PROFILE_ADAPTER: Final = "toml"
@@ -71,14 +71,20 @@ def read_head(reader: RecordingReader) -> Head:
     nodes: set[str] = set()
     problem = ""
     seen_bytes = 0
-    for count, item in enumerate(reader.head_records(reader.body_start, reader.size())):
+    others = sources = 0  # a later part's head repeats every SOURCE, up to fmt.MAX_SOURCES
+    for item in reader.head_records(reader.body_start, reader.size()):
         seen_bytes += item.end - item.offset
-        if count >= MAX_HEAD_RECORDS or seen_bytes > MAX_HEAD_BYTES:
+        if item.rtype == RecordType.SOURCE:
+            sources += 1
+        else:
+            others += 1
+        if others > MAX_HEAD_RECORDS or sources > fmt.MAX_SOURCES or seen_bytes > MAX_HEAD_BYTES:
             # Streams and definitions past the limit are not known; say so rather than let
             # frames of those streams look like frames of nodes the recording never had.
             problem = problem or (
-                f"its head holds more than {MAX_HEAD_RECORDS} records or "
-                f"{MAX_HEAD_BYTES // (1024 * 1024)} MiB, past what is read for definitions"
+                f"its head holds more than {MAX_HEAD_RECORDS} records (or {fmt.MAX_SOURCES} "
+                f"sources) or {MAX_HEAD_BYTES // (1024 * 1024)} MiB, past what is read for "
+                "definitions"
             )
             break
         if item.rtype == RecordType.STREAM:

@@ -2573,7 +2573,7 @@ As built (where the build differs from, or settles, the text above)
   lines, 1024 in JSON, which has `status`, `error`, `hex_truncated`); `--format hex` dumps every
   frame undecoded and, if the recording has no usable definitions, still works, with a `--where`
   made of frame-level names (a name it cannot check says `IB-REC-009` is why).
-- Definitions: the BLOBs at the head are read with `head_records` (at most 4096 records, 64 MiB,
+- Definitions: the BLOBs at the head are read with `head_records` (at most 4096 records besides SOURCEs, 4096 SOURCEs, 64 MiB,
   256 nodes), each digest must equal the one META names (`IB-REC-009` if not; a META digest that
   is not text is ignored), a repeated definition that differs, or a head longer than those limits,
   is a problem recorded in the head (so streams and definitions past a cut are never taken for
@@ -2699,7 +2699,7 @@ Deliverables
   exported in this one process.
 
 Untrusted input: string cells sanitized (control characters escaped) and formula-leading
-cells (`=`, `+`, `-`, `@`, their fullwidth forms, tab, CR, LF, behind any leading whitespace)
+cells (`=`, `+`, `-`, `@`, every character NFKC folds to one of them, tab, CR, LF, behind any leading whitespace)
 prefixed with `'`, string fields only (numbers are typed); `csv` module quoting (RFC 4180). Test: a telemetry string starting with `=` and
 holding a newline and an escape sequence exports inert.
 
@@ -2762,8 +2762,8 @@ As built (where the build differs from, or settles, the text above)
 - Cells are untrusted (decision on top of the plan text): `safe_cell` escapes with `sanitize.clean` (no
   truncation; an all-printable-ASCII string takes a fast path), then prefixes `'` when the first
   character that is not whitespace (`str.isspace`; NBSP, U+3000 and the like are escaped by `clean`
-  already, the ASCII space and the fullwidth forms are not) is `=`, `+`, `-`, `@`, the fullwidth
-  `\uff1d \uff0b \uff0d \uff20`, tab, CR or LF (the last three cannot survive the escaping; the rule
+  already, the ASCII space and the fullwidth forms are not) is `=`, `+`, `-`, `@`, a character NFKC folds to one of them (the fullwidth
+  `\uff1d \uff0b \uff0d \uff20`, the small `\ufe62 \ufe63 \ufe66 \ufe6b`, super/subscript and the like), tab, CR or LF (the last three cannot survive the escaping; the rule
   is kept anyway). A LibreOffice integration test (skipped without `soffice`) imports hostile cells
   with trimming and formula evaluation on and checks that none is evaluated. Every string cell goes through it: names, links, labels, text, hex, the code, reason
   and flags of the malformed table, and the column names. Hypothesis over arbitrary strings pins that a
