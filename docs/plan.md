@@ -4418,6 +4418,64 @@ Decided by the user (2026-10-30, later):
   worst case 3.26 GiB) fits several times over, so `IB-RET-002` warns after several
   overnight runs rather than after each one. Nothing is deleted automatically either way.
 
+### UX probe follow-ups
+
+Two user-probe passes over the Stage 2 CLI (a naive user and a detail-oriented one) found the
+items below. Everything that was a clear defect or a documentation mismatch is fixed in
+`tests/test_ux_probe.py` (one rule for exit codes, README table; `session.end` last with `exit` and
+`outcome`; usage errors ledgered as short sessions with no reserve and no scan, which replaces the
+"no ledger at all" behaviour of PR #10 round 2 and keeps its reason: a typo preallocates nothing;
+hex of received packets under `--verbose`; coalesced lines that name only what every packet had
+in common; a count that was not reached says so; `--min-type` takes the CCDD spellings; the
+README says the rest). What remains needs a product decision and is **deferred**, each with
+its options:
+
+- **Serial device shared by `listen` and `send`.** One process owns the device (`IB-TX-006`), so
+  the README's three-shell flow (`respond` / `listen` / `send`) works on UDP only. Options:
+  (a) `ib send` hands the command to a running `ib listen` over a local Unix socket (state
+  directory) and the listener writes it; (b) one long-lived `ib` session with an input prompt
+  (the Stage 3 TUI's send pane, pulled earlier); (c) a small mux process that owns the device and
+  re-exports it to several clients; (d) keep as is and state it in the serial README section and
+  the error text (the error already points at `listen --record`).
+- **JSON representation of non-finite floats and 64-bit integers.** `replay --format json` and
+  `export --format jsonl` write NaN and the infinities as the strings `"nan"`, `"inf"`, `"-inf"`
+  and finite values as numbers, so a float field can change JSON type between records; `uint64` and
+  `int64` are JSON numbers, which tools that read doubles round above 2^53. Options: (a) keep and
+  document (README now does); (b) `null` plus a sibling `<field>_special` key; (c) always write
+  floats as numbers and non-finite as `null`, losing which one it was; (d) per-message type
+  metadata line at the top of the output; (e) 64-bit integers as strings behind a flag.
+- **`seq` means two things.** In `listen`/`replay` lines `seq=` is the CCSDS sequence count (and
+  every `ib send` process starts it at 0); in CSV and `rec info` it is the recording's frame number.
+  Options: (a) rename the frame number to `frame` everywhere it is printed; (b) rename the CCSDS one
+  to `ccsds_seq`; (c) both; (d) a persistent per-MID sequence counter in the state directory so
+  successive `ib send` runs count on (a separate behaviour change for the receiving side's
+  sequence-gap checks).
+- **Ambiguous line output.** `s=` (empty) and `s==1+1` in `listen`/text export, and a string value
+  containing ` x=y`, cannot be told from a field. Options: (a) quote strings that are empty or hold
+  a space, `=` or a quote; (b) always quote strings; (c) leave and point to `--format json`.
+- **Flag and config names.** `ib ledger prune --keep` vs `[retention] keep_recent`; `ib record
+  --split` has no `[recording]` key. Options: rename the flag to `--keep-recent`; add
+  `split = "1GiB"` to `[recording]`; leave both.
+- **`ib record -o NAME` without `.ibrec`.** The file is written as named, and `ib replay NAME.`
+  without the extension is not found (the error now suggests `NAME.ibrec`). Options: append
+  `.ibrec` when `-o` has no extension; warn at the start; leave.
+- **File order vs `n` for `ledger.*` bookkeeping.** `ledger.open`, `ledger.reserve`, `ledger.part`
+  and `ledger.note` are numbered when the writer thread writes them, so their `n` can be out of
+  file order next to the records queued earlier (README says to read the others by `n`).
+  Options: number them from a reserved range per part; assign them a number at queue time like
+  every record; leave.
+- **The `exit` in `session.end` is the code when the ledger closed.** A sync error at close can
+  still change the process exit code to 6 afterwards. Options: record a second `session.exit`
+  line best effort after the final sync (it would follow `session.end`, the opposite of what the
+  probe asked for); leave.
+- **Python 3.12 and later.** `requires-python = ">=3.11,<3.12"`, so pip on 3.12 prints its own
+  incompatibility error. Options: test and allow 3.12 (the EL9 default); keep the pin (README now
+  says 3.11 only).
+- **PR #31 review: tests that still name output facts.** `tests/test_ux_probe.py` keeps
+  checks for CCDD level names (`information`, `critical`) and the help phrase `hex for bytes`:
+  the first are data, not wording, and the help-reflow test has no structural anchor. Deferred
+  until help text gets a structural test hook.
+
 ## Later stages (outline; each gets its own plan)
 
 2. Recording + replay with filters (CLI), serial transport, variable-length payloads,

@@ -1075,7 +1075,7 @@ def test_cli_send_takes_lists_and_the_fault_injection_flag(mock_config_path: Pat
         assert ok.exit_code == 0, ok.output
         assert len(sink.recv(2048)) == 8 + 2 + 12 + 11
         refused = runner.invoke(app, [*base, "Count=7", "Entries=1,2", "Text=x"])
-        assert refused.exit_code == 1 and "IB-ENC-002" in refused.output
+        assert refused.exit_code == 2 and "IB-ENC-002" in refused.output
         assert "--allow-count-mismatch" in refused.output
         injected = runner.invoke(
             app, [*base, "Count=7", "Entries=1,2", "Text=x", "--allow-count-mismatch"]
@@ -1084,7 +1084,7 @@ def test_cli_send_takes_lists_and_the_fault_injection_flag(mock_config_path: Pat
         wire = sink.recv(2048)  # only the injected one went out: the refused one sent nothing
         assert wire[8:10] == b"\x07\x00" and len(wire) == 8 + 2 + 8 + 1
         over = runner.invoke(app, [*base, "Entries=" + ",".join(["1"] * 65), "Text=x"])
-        assert over.exit_code == 1 and "65 elements exceed 64" in over.output
+        assert over.exit_code == 2 and "65 elements exceed 64" in over.output
         # the flag needs a count or length field to be wrong about
         none = runner.invoke(app, ["-c", str(mock_config_path), "send", "fc", "MOCK_NOOP"])
         assert none.exit_code == 0, none.output

@@ -14,6 +14,7 @@ from types import MappingProxyType
 from typing import Final
 
 from ironbird.errors import Code
+from ironbird.sanitize import hex_preview
 from ironbird.units import format_duration
 
 
@@ -52,19 +53,26 @@ class Notice:
     )
     ledger_part: int = 1  # the ledger part current when it was queued (2d rotation)
     ledger_file: str = ""  # that part's file name stem, set once the ledger has rotated
+    raw: bytes = b""  # the start of the latest offending packet, for ``--verbose``
+    raw_len: int | None = None  # that packet's full size (``raw`` may be a prefix); None: none
 
     def __post_init__(self) -> None:
         assert self.count >= 1
         assert self.window_s >= 0.0
         assert self.count > 1 or self.window_s == 0.0, "a first occurrence covers no window"
         assert "\n" not in self.summary and "\r" not in self.summary
+        assert self.raw_len is None or self.raw_len >= len(self.raw)
 
     def line(self, *, verbose: bool = False) -> str:
-        """``error IB-DEC-005: ... (x37 in 10 s)``; ``verbose`` appends ``[ledger n=1234]``, and
+        """``error IB-DEC-005: ... (x37 in 10 s)``; ``verbose`` appends the packet's bytes in hex
+        (the latest one when the line stands for several), then ``[ledger n=1234]``, and
         ``file=<name>`` once the ledger has rotated past part 1."""
         text = f"{self.level.label} {self.code.value}: {self.summary}"
         if self.count > 1:
             text += f" (x{self.count} in {format_duration(max(1, round(self.window_s)))})"
+        if verbose and self.raw_len is not None:
+            label = "hex" if self.count == 1 else "last hex"
+            text += f" {label}: {hex_preview(self.raw, self.raw_len)}"
         if verbose and self.ledger_n is not None:
             where = f" file={self.ledger_file}" if self.ledger_file and self.ledger_part > 1 else ""
             text += f" [ledger n={self.ledger_n}{where}]"

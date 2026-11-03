@@ -218,7 +218,10 @@ def test_a_usage_error_of_listen_or_events_is_reported_before_the_ledger_is_open
     state = tmp_path / "state"
     done = _ib(mock_config_path, state, *args)
     assert done.returncode == 2, done.stderr
-    assert not state.exists() or not list(state.iterdir())  # no ledger, reserve or scan
+    assert not list(state.glob("*.reserve"))  # a typo preallocates no reserve and runs no scan
+    rows = session_records(state)
+    assert [r["event"] for r in rows if r["event"] == "retention.scan"] == []
+    assert any(r["kind"] == "error" for r in rows) and rows[-1]["event"] == "session.end"
     lines = [x for x in done.stderr.splitlines() if x.strip()]
     assert len(lines) == 1 and lines[0].startswith("error IB-"), done.stderr
     assert "IB-LED" not in done.stderr

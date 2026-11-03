@@ -415,7 +415,7 @@ def test_rec_info_text_and_json(tmp_path: Path, env: dict[str, str], mock_codec:
     out = make_recording(tmp_path, env, mock_codec)
     text = run_ib(tmp_path, ["rec", "info", str(out)], env)
     assert text.returncode == 0 and "status:    closed" in text.stdout
-    assert "0x00000890  12" in text.stdout
+    assert "0x0890  12" in text.stdout
     data = json.loads(run_ib(tmp_path, ["rec", "info", str(out), "--format", "json"], env).stdout)
     assert data["frames"] == 12 and data["mids"] == [{"mid": 0x890, "count": 12}]
     assert data["streams"][0]["direction"] == "rx" and data["gaps"]["total"] == 0

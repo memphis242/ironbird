@@ -83,11 +83,11 @@ SIGNAL_IN_CLOSE = """
     import ironbird.ledger as _l
     _orig_close = _l.Ledger.close
     _calls = [0]
-    def _close(self):
+    def _close(self, end=None):
         _calls[0] += 1
         if _calls[0] == 1:
             os.kill(os.getpid(), signal.SIGTERM)  # arrives while the signals are held
-        return _orig_close(self)
+        return _orig_close(self, end)
     _l.Ledger.close = _close
 """
 

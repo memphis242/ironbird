@@ -139,7 +139,7 @@ def info_lines(report: Report) -> list[str]:
     if report.mids:
         lines.append("MIDs:")
         shown = sorted(report.mids.items())[:_MAX_MIDS_SHOWN]
-        lines += [f"  {mid:#010x}  {count}" for mid, count in shown]
+        lines += [f"  0x{mid:04X}  {count}" for mid, count in shown]
         if len(report.mids) > len(shown):
             lines.append(f"  ... {len(report.mids) - len(shown)} more MIDs")
         if report.mids_dropped:
