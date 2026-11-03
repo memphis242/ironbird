@@ -188,10 +188,13 @@ def encode_preamble(nonce: int) -> bytes:
 def encode_record(rtype: int, body: bytes | bytearray | memoryview, seed: int) -> bytes:
     """A whole record (envelope, body, padding) with its nonce-seeded CRC."""
     size = len(body)
+    assert size <= MAX_U32
     head = ENVELOPE_HEAD.pack(size, rtype, 0, 0)
     crc = zlib.crc32(body, zlib.crc32(head, seed))
     pad = -(ENVELOPE_SIZE + size) & (ALIGN - 1)
-    return b"".join((ENVELOPE.pack(size, rtype, 0, 0, crc), body, bytes(pad)))
+    record = b"".join((ENVELOPE.pack(size, rtype, 0, 0, crc), body, bytes(pad)))
+    assert len(record) == record_size(size)
+    return record
 
 
 # -- META --

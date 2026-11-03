@@ -136,7 +136,7 @@ class Damage:
         )
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Lookups:
     """What a read that began from a seeded state (see :meth:`RecordingReader.seed_state`) asked of
     the definitions it did not make itself: the stream and source ids a frame or GAP record found
@@ -465,6 +465,7 @@ class RecordingReader:
             return _Fail(f"{fmt.describe_type(rtype)} record padding is not zero")
         if rtype < fmt.CRITICAL_LIMIT and rtype not in fmt.KNOWN_TYPES:
             return _Fail(f"record type {rtype:#04x} is not known to this version", unsupported=True)
+        assert total == fmt.record_size(body_len) and not total & (fmt.ALIGN - 1)
         return _Raw(offset, offset + total, rtype, data[fmt.ENVELOPE_SIZE : end_body])
 
     # -- validation: the rules that need the records before this one --
@@ -807,6 +808,7 @@ class RecordingReader:
                     self._note_damage(damage)
                     yield damage
                     return
+                assert found > offset, "a resynchronisation moves the read forward"
                 damage = Damage(offset, found - offset, False, reason, found, False, incomplete)
                 self._note_damage(damage)
                 yield damage
@@ -815,6 +817,7 @@ class RecordingReader:
                 offset = found
                 continue
             assert isinstance(raw, _Raw)
+            assert raw.offset == offset and raw.end > offset, "a record moves the read forward"
             self._apply(effect)
             yield Item(raw.offset, raw.end, raw.rtype, value)
             offset = raw.end

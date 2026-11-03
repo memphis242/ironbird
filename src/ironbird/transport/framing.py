@@ -333,6 +333,7 @@ class HeaderLengthFramer:
         """Emit a run of skipped bytes in pieces of at most the cap: ``GARBAGE`` before
         ``stale_from`` and ``STALE`` from it (``-1``: all garbage)."""
         cap = self._cap
+        assert run and stale_from < len(run), "a run holds the bytes that were skipped"
         split = len(run) if stale_from < 0 else stale_from
         for start, stop, flag in ((0, split, FLAG_GARBAGE), (split, len(run), FLAG_STALE)):
             for at in range(start, stop, cap):
@@ -356,6 +357,7 @@ class HeaderLengthFramer:
             self._emit_run(out, bytes(buf[:cap]), -1, wall_ns)
             del buf[:cap]
             pos -= cap
+        assert 0 <= pos < cap, "less than one full piece is left undecided"
         return pos
 
     def _pump(self, wall_ns: int, *, final: bool) -> list[Emit]:
@@ -435,6 +437,7 @@ class HeaderLengthFramer:
                 if sure == 0:
                     self._cand = verdict  # the packet is not copied: it is the buffer's
                     break
+            assert 0 <= pos <= head < end <= n, "the candidate lies inside the held bytes"
             if pos:
                 self._emit_run(out, bytes(buf[:pos]), stale_from, wall_ns)
             packet = packet or bytes(buf[head:end])
@@ -452,6 +455,7 @@ class HeaderLengthFramer:
             self._cand = 0
         else:
             pos = self._split_garbage(out, buf, pos, wall_ns)
+        assert 0 <= pos <= len(buf), "the undecided bytes begin inside the buffer"
         self._garb = pos
         self._spent += spent
         self._credit = credit  # a debt of one candidate at most is carried to the next feed

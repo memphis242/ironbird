@@ -222,6 +222,10 @@ class _File:
     locked: bool = False
     number: int = 0  # part number (a reserve: the number it takes when it retires)
 
+    def __post_init__(self) -> None:
+        assert 0 <= self.header_len <= self.size, "a part holds at least its header"
+        assert self.number >= 0 and self.extent >= 0
+
 
 class LedgerStore:
     """Synchronous on-disk state of one ledger session. Not thread-safe: one thread drives it
@@ -573,6 +577,7 @@ class LedgerStore:
         )
 
     def _drain_into_part(self, part: _File) -> None:
+        assert not part.is_reserve and part.fd >= 0, "lines go to an open part"
         backlog, limit = self.backlog, self.cfg.max_file_bytes
         while backlog:
             if self._rotation_due(part, backlog[0]):
@@ -589,6 +594,7 @@ class LedgerStore:
                         break
                     taken.append(backlog.popleft())
                     total += size
+                assert taken, "a drain step takes at least one line"
                 self.inflight = taken
             data = b"".join(line.data for line in taken)
             try:

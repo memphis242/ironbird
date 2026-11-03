@@ -361,7 +361,7 @@ class DirDestination:
 TableKey = tuple[str, tuple[str, ...]]
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class _Plan:
     """How the packets of one message become rows."""
 
@@ -747,6 +747,9 @@ def make_pipeline(
             values = packet.header.values
             cells.extend(values.get(name, "") for name in plan.header_names)
         cells.extend(conv(v) for conv, v in zip(plan.converters, packet.values, strict=True))
+        assert plan.table.key is not None and len(cells) == len(plan.table.key[1]), (
+            "a row has one cell per column of its table"
+        )
         taken = dest.write(plan.table.handle, csv_line(cells))
         if taken:
             plan.table.rows += 1
@@ -783,6 +786,7 @@ def make_pipeline(
             safe_cell(",".join(render.flag_names(frame))),
             HEX_PREFIX + frame.data.hex(),
         ]
+        assert len(cells) == len(MALFORMED_COLUMNS), "a row has one cell per column"
         taken = dest.write(table.handle, csv_line(cells))
         if taken:
             table.rows += 1

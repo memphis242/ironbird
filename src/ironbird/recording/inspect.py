@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from bisect import bisect_left, bisect_right
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -435,7 +436,7 @@ class _Holes:
 
 def _cross_check(
     report: Report,
-    chunk_offsets: list[int],
+    chunk_offsets: Sequence[int],
     index_item: tuple[int, int, tuple[int, ...]] | None,
     trailer_offset: int,
 ) -> None:
@@ -720,7 +721,7 @@ def _valid_prefix(reader: RecordingReader) -> tuple[int, list[int], int, int, _T
 def _closing_records(
     reader: RecordingReader,
     prefix_end: int,
-    chunk_offsets: list[int],
+    chunk_offsets: Sequence[int],
     frames: int,
     last_seq: int,
     tail: _Tail,

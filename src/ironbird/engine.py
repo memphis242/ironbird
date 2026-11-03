@@ -213,6 +213,7 @@ class _FrameQueue:
         while excess:
             self._bytes -= charges.popleft()
             excess -= 1
+        assert self._bytes >= self._held >= 0, "the queue never releases more than it charged"
 
     def put(self, frame: Frame) -> bool:
         """Queue ``frame``; ``False`` (newest dropped, counted) when either bound would be passed
@@ -240,6 +241,8 @@ class _FrameQueue:
         items.append(frame)
         self._charges.append(size)
         self._bytes = total
+        assert len(items) <= self._limit and total <= self._limit_bytes, "a bound was passed"
+        assert len(self._charges) >= len(items), "every queued frame has its charge"
         if total > self.peak_bytes:  # noqa: PLR1730 - the hot path avoids a call
             self.peak_bytes = total
         waiter = self._waiter
@@ -251,7 +254,9 @@ class _FrameQueue:
         """Remove up to ``count`` oldest frames for the consumer to hold. Their charge stays on
         the queue until the consumer waits for more."""
         assert not self._held, "the previous batch is released by waiting for the next"
+        assert count >= 0
         self._release_taken()
+        assert len(self._charges) == len(self.items), "a release leaves one charge per frame"
         taken = min(count, len(self.items))
         popleft, charge = self.items.popleft, self._charges.popleft
         batch = [popleft() for _ in range(taken)]

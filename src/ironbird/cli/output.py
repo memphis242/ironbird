@@ -319,6 +319,7 @@ class BoundedWriter:
             else:
                 self._queue.append(data)
                 self._queued += len(data)
+                assert self._queued > 0 and len(self._queue) > 0
                 self._cond.notify()
 
     def write_wait(self, text: str) -> bool:
@@ -463,6 +464,10 @@ class BoundedWriter:
                 size += len(part)
                 ends.append(size)
             self._queued -= size
+            assert self._queued >= 0 and (self._queue or self._queued == 0), (
+                "the byte count is the sum of the queued lines"
+            )
+            assert parts and ends[-1] == size, "a chunk holds at least one whole line"
             self._chunk_ends = ends
             self._chunk_written = 0
             if self._room_waiters:

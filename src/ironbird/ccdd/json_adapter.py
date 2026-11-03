@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from itertools import pairwise
 from pathlib import Path
@@ -413,8 +413,8 @@ def _variable_payload(
     raw: Mapping[str, Any],
     path: str,
     extent: int,
-    fixed: list[FieldDef],
-    variable: list[FieldDef],
+    fixed: Sequence[FieldDef],
+    variable: Sequence[FieldDef],
 ) -> int:
     """The largest payload of a message with variable-length fields, after checking how its
     fields share count fields and where ``remaining`` may stand. ``min_payload`` and
