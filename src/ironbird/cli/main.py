@@ -19,16 +19,17 @@ import signal
 import sys
 import time
 import traceback
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Any, Final
 
 import typer
 
 from ironbird import render
-from ironbird.ccdd.model import EventSeverity, MessageKind
+from ironbird.ccdd.model import SEVERITY_LABELS, MessageKind
 from ironbird.cli import prunecmd
 from ironbird.cli.output import (
     CLOSE_WAIT_S,
@@ -107,6 +108,7 @@ from ironbird.recording.writer import Recorder, RecorderStats
 from ironbird.retention import LONG_COMMANDS
 from ironbird.retnotices import Notices
 from ironbird.retservice import Retention
+from ironbird.sanitize import hex_preview
 from ironbird.session import Route, Session, Side
 from ironbird.sigmask import (
     HANDLED_SIGNALS,
@@ -139,6 +141,7 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
     pretty_exceptions_enable=False,
+    rich_markup_mode="markdown",
 )
 rec_app = typer.Typer(
     name="rec",
@@ -146,6 +149,7 @@ rec_app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
     pretty_exceptions_enable=False,
+    rich_markup_mode="markdown",
 )
 app.add_typer(rec_app, name="rec")
 ledger_app = typer.Typer(
@@ -154,6 +158,7 @@ ledger_app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
     pretty_exceptions_enable=False,
+    rich_markup_mode="markdown",
 )
 app.add_typer(ledger_app, name="ledger")
 
@@ -168,16 +173,16 @@ class DefsSource(StrEnum):
     CONFIG = "config"
 
 
-class MinType(StrEnum):
-    DEBUG = "debug"
-    INFO = "info"
-    WARNING = "warning"
-    ERROR = "error"
-    CRITICAL = "critical"
+def _min_type_names() -> str:
+    return ", ".join(name.lower() for name in SEVERITY_LABELS)
 
-    @property
-    def severity(self) -> EventSeverity:
-        return EventSeverity[self.name]
+
+def _check_min_type(value: str | None) -> str | None:
+    """``--min-type`` takes every spelling an event type enum label may have in a CCDD (case
+    does not matter): the CCDD's own ``INFORMATION`` as well as ``info``."""
+    if value is not None and value.upper() not in SEVERITY_LABELS:
+        raise typer.BadParameter(f"{value[:40]!r} is not one of {_min_type_names()}")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +216,17 @@ RecordOption = Annotated[
 ]
 CountOption = Annotated[int | None, typer.Option("--count", min=1, help="Stop after N packets.")]
 WhereOption = Annotated[
+    str | None,
+    typer.Option(
+        "--where",
+        help=(
+            "Only frames matching this filter expression, e.g. "
+            "'msg == SAMPLE_APP_HK and CommandCounter > 0'. "
+            "Limits only what is shown: --record still records every frame."
+        ),
+    ),
+]
+ListenWhereOption = Annotated[
     str | None,
     typer.Option(
         "--where",
@@ -615,6 +631,30 @@ def _report_ledger(report: ExitReport, run: _Run, console: Console, code: int) -
     return _apply_ledger_report(code, report)
 
 
+_OUTCOMES: Final[Mapping[int, str]] = MappingProxyType(
+    {
+        0: "ok",
+        1: "error",
+        2: "usage",
+        EXIT_TIMEOUT: "count_not_reached",
+        EXIT_OUTPUT_LOST: "output_lost",
+        EXIT_DAMAGED_INPUT: "input_damaged",
+        EXIT_UNLOGGED: "unlogged",
+    }
+)
+
+
+def _session_end(code: int) -> dict[str, Any]:
+    """The fields of the ledger's closing ``session.end`` record: the exit code and what it
+    means, so the end of a session can be read without the terminal it ran in."""
+    if code > 128:
+        try:
+            return {"exit": code, "outcome": "signal", "signal": signal.Signals(code - 128).name}
+        except ValueError:
+            return {"exit": code, "outcome": "signal"}
+    return {"exit": code, "outcome": _OUTCOMES.get(code, "error")}
+
+
 def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -> int:
     """Write out everything still queued, close the ledger and return the exit code.
 
@@ -683,7 +723,7 @@ def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -
             unavailable=err.unavailable,
             reader_gone=err.reader_gone,
         )
-    closing = ledger.close()
+    closing = ledger.close(_session_end(code))
     ledger.set_notifier(None)
     code = _apply_ledger_report(code, closing)  # a sync error at close; the exit says so
     for notice in _closing_news(report, closing):  # and never without its line
@@ -808,9 +848,9 @@ def _run(
     code = 1
     try:
         usage = _usage_error(run, glob.role, precheck)
-        if usage is not None:  # nothing was opened for this invocation, so nothing else is said
+        if usage is not None:  # reported as it is found; the ledger gets it as a short session
             _print_error(console, usage, glob.verbose)
-            raise typer.Exit(usage.exit_code)
+            scan = False  # no reserve and no retention scan for a typo
         try:
             state_dir = default_state_dir()
             notices = Notices(state_dir, fs=fs)
@@ -818,7 +858,7 @@ def _run(
                 state_dir,
                 on_failure=lambda exc: _print_error(console, exc, glob.verbose),
                 config=run.config.ledger if run.config is not None else None,
-                session_class="long" if name in LONG_COMMANDS else "short",
+                session_class="long" if name in LONG_COMMANDS and usage is None else "short",
                 command=name,
                 warn_gate=lambda code: notices.allow(
                     code.value, state_dir, retention_cfg.warn_interval_s
@@ -855,7 +895,10 @@ def _run(
         try:
             _check_descriptors()
             checkpoint()  # a signal that came while the ledger opened ends the command here
-            if offline is not None:
+            if usage is not None:
+                ledger.record_error(usage)
+                code = usage.exit_code
+            elif offline is not None:
                 refused = _offline_config_error(run, ledger)
                 code = refused if refused is not None else offline(ledger, console, run)
             else:
@@ -919,9 +962,21 @@ def _offline_config_error(run: _Run, ledger: Ledger) -> int | None:
     return exc.exit_code
 
 
-def _exit_for(reason: str, count: int | None, got: int) -> int:
-    """0 normally; ``EXIT_TIMEOUT`` when ``--count`` was asked for and the timeout came first."""
-    return EXIT_TIMEOUT if reason == "timeout" and count is not None and got < count else 0
+def _exit_for(
+    reason: str,
+    count: int | None,
+    got: int,
+    console: Console,
+    noun: str,
+    timeout: float | None,
+) -> int:
+    """0 normally; ``EXIT_TIMEOUT`` (with one line saying so) when ``--count`` was asked for and
+    the timeout came first."""
+    if reason == "timeout" and count is not None and got < count:
+        assert timeout is not None, "only a timeout ends a run with the reason 'timeout'"
+        console.err(f"timeout: {got} of {count} {noun} in {timeout:g} s (exit {EXIT_TIMEOUT})")
+        return EXIT_TIMEOUT
+    return 0
 
 
 async def _run_until(
@@ -1054,7 +1109,10 @@ class _RecordingScope:
             )
         else:
             dropped = f", {stats.overrun_frames} dropped" if stats.overrun_frames else ""
-            self._run.console.err(f"recorded {stats.frames} frame(s) ({size}{dropped}) to {where}")
+            span = f"{len(recorder.parts)} parts from " if len(recorder.parts) > 1 else ""
+            self._run.console.err(
+                f"recorded {stats.frames} frame(s) ({size}{dropped}) to {span}{where}"
+            )
 
     def exit_code(self, code: int) -> int:
         failed = self.recorder is not None and self.recorder.failed is not None
@@ -1112,6 +1170,10 @@ def find(
     """Find commands/telemetry: exact name or MID, then name substring, then description."""
 
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
+        if not query.strip():
+            raise IronbirdError(
+                Code.CLI_USAGE, "find needs text to search for: a name, a MID (0x...) or words"
+            )
         matches = session.find(query)
         session.ledger.record("action", "find", query=query, results=len(matches))
         for match in matches[:limit]:
@@ -1215,11 +1277,21 @@ def send(
             header=header_values,
             allow_count_mismatch=allow_count_mismatch,
         )
+        faults = [
+            text
+            for text in (
+                "bad checksum" if bad_checksum else "",
+                f"length {length_delta:+d}" if length_delta is not None else "",
+                "count/length mismatch allowed" if allow_count_mismatch else "",
+            )
+            if text
+        ]
         seq_text = "" if sent.sequence is None else f" seq {sent.sequence}"
         run.console.out(
             f"sent {term(sent.command)} to {term(sent.node)} via "
             f"{term(sent.transport)} {term(sent.endpoint)} "
-            f"(mid 0x{sent.mid:04X} fc {sent.function_code}{seq_text}, {sent.size} bytes)"
+            f"(mid 0x{sent.mid:04X} fc {sent.function_code}{seq_text}, "
+            f"{sent.size} bytes)" + (f" [fault injected: {', '.join(faults)}]" if faults else "")
         )
         if session_verbose(ctx, verbose):
             run.console.out(f"  hex: {sent.data.hex(' ')}")
@@ -1278,7 +1350,7 @@ def listen(
     mid: Annotated[
         list[str] | None, typer.Option("--mid", help="Only these MIDs (number or name).")
     ] = None,
-    where: WhereOption = None,
+    where: ListenWhereOption = None,
     fmt: Annotated[Format, typer.Option("--format", help="Output format.")] = Format.LINE,
     count: CountOption = None,
     timeout: TimeoutOption = None,
@@ -1321,7 +1393,10 @@ def listen(
                 else:
                     io.out(render.line(node, time_ns, rx.packet))
                 if show_hex:
-                    io.err(f"  from {term(rx.frame.source, err=True)} size {rx.packet.size}")
+                    io.err(
+                        f"  from {term(rx.frame.source, err=True)} size {rx.packet.size} hex: "
+                        f"{hex_preview(rx.frame.data, rx.frame.orig_len)}"
+                    )
                 shown += 1
                 if count is not None and shown >= count:
                     return
@@ -1331,7 +1406,7 @@ def listen(
             reason = await _run_until(consume(), timeout, "listen", run)
         finally:
             await listener.close()
-        return _exit_for(reason, count, shown)
+        return _exit_for(reason, count, shown, io, "packets", timeout)
 
     def check(session: Session) -> None:
         mids = _parse_mids(session, node, mid, link)
@@ -1348,8 +1423,16 @@ def events(
         typer.Option("--node", help="Only this node's events; repeat for several (default: all)."),
     ] = None,
     min_type: Annotated[
-        MinType | None,
-        typer.Option("--min-type", case_sensitive=False, help="Hide events below this type."),
+        str | None,
+        typer.Option(
+            "--min-type",
+            callback=_check_min_type,
+            metavar="TYPE",
+            help=(
+                "Hide events below this type: debug, info (or information), warning (or warn), "
+                "error, critical; any case."
+            ),
+        ),
     ] = None,
     where: WhereOption = None,
     fmt: Annotated[Format, typer.Option("--format", help="Output format.")] = Format.LINE,
@@ -1382,7 +1465,7 @@ def events(
         io = run.console
         stream = await session.events(
             node,
-            min_severity=min_type.severity if min_type is not None else None,
+            min_severity=SEVERITY_LABELS[min_type.upper()] if min_type is not None else None,
             where=where,
         )
         io.err(render.events_banner(stream.endpoints))
@@ -1404,7 +1487,7 @@ def events(
             reason = await _run_until(consume(), timeout, "events", run)
         finally:
             await stream.close()
-        return _exit_for(reason, count, shown)
+        return _exit_for(reason, count, shown, io, "events", timeout)
 
     def check(session: Session) -> None:
         session.plan_events(node, where=where)
@@ -1467,7 +1550,7 @@ def respond(
             reason = await _run_until(consume(), timeout, "respond", run)
         finally:
             await responder.close()
-        return _exit_for(reason, count, handled)
+        return _exit_for(reason, count, handled, io, "commands", timeout)
 
     _run(ctx, as_node, verbose, body, "respond", transmits=True)
 
@@ -2009,7 +2092,7 @@ def _report_missing_parts(replay: Replay, ledger: Ledger, console: Console) -> N
         f"{'part' if len(numbers) == 1 else 'parts'} {listed} of the split recording "
         f"{'is' if len(numbers) == 1 else 'are'} missing"
         f"{f' ({len(numbers)} in all)' if len(numbers) > 1 else ''}; "
-        "the frames in them are not in the output",
+        f"{'its frames are' if len(numbers) == 1 else 'their frames are'} not in the output",
     )
     ledger.record_error(miss, parts=numbers[:64])
     console.err(miss.user_line())
@@ -2045,7 +2128,7 @@ def _replay_summary(
     if undecoded:
         parts.append(f"{undecoded} without definitions")
     if stats.chunks_skipped:
-        parts.append(f"{stats.chunks_skipped} chunk(s) skipped by the index and not checked")
+        parts.append(f"{stats.chunks_skipped} chunk(s) the index ruled out were not read")
     if stats.gaps:
         parts.append(
             f"{stats.gaps} gap(s)"
@@ -2277,6 +2360,23 @@ def replay(
 # -- export -------------------------------------------------------------------------------------
 
 
+def _default_export_format(
+    output: Path | None, message: list[str] | None, csv_only_option: bool
+) -> ExportFormat:
+    """The format when ``--format`` is not given: CSV wherever it has a place to go (a file or
+    directory, one message to stdout, or an option only CSV has), else the ``listen`` lines on
+    stdout, which is what a bare ``ib export FILE`` can always show. An ``-o`` ending in ``.txt``
+    or ``.jsonl`` picks that format."""
+    if output is not None and not csv_only_option:
+        by_suffix = {".txt": ExportFormat.TEXT, ".jsonl": ExportFormat.JSONL}
+        inferred = by_suffix.get(output.suffix.casefold())
+        if inferred is not None:
+            return inferred
+    if output is not None or csv_only_option or len(set(message or [])) == 1:
+        return ExportFormat.CSV
+    return ExportFormat.TEXT
+
+
 def _export_summary(replay: Replay, result: ExportResult, where: str) -> str:
     stats = replay.stats
     parts = [
@@ -2295,7 +2395,7 @@ def _export_summary(replay: Replay, result: ExportResult, where: str) -> str:
     if result.undecoded:
         parts.append(f"{result.undecoded} without definitions")
     if stats.chunks_skipped:
-        parts.append(f"{stats.chunks_skipped} chunk(s) skipped by the index and not checked")
+        parts.append(f"{stats.chunks_skipped} chunk(s) the index ruled out were not read")
     if stats.gaps:
         parts.append(
             f"{stats.gaps} gap(s)"
@@ -2349,16 +2449,17 @@ def export_command(
             ),
         ),
     ],
-    fmt: Annotated[
-        ExportFormat,
+    fmt_option: Annotated[
+        ExportFormat | None,
         typer.Option(
             "--format",
             help=(
                 "csv (one table per message), text (the `listen` lines) or jsonl (the "
-                "`listen --format json` records)."
+                "`listen --format json` records). Default: csv when -o, one --message, "
+                "--header-fields or --raw-enums is given, else text on stdout."
             ),
         ),
-    ] = ExportFormat.CSV,
+    ] = None,
     output: Annotated[
         Path | None,
         typer.Option(
@@ -2458,6 +2559,11 @@ def export_command(
     --skip-damage goes past it) or a part of a split recording is missing.
     """
     base: Globals = ctx.obj
+    fmt = (
+        fmt_option
+        if fmt_option is not None
+        else _default_export_format(output, message, header_fields or raw_enums)
+    )
 
     def work(ledger: Ledger, console: Console, run: _Run) -> int:
         # Begun by the publish of the output and released as this block ends, after the export
@@ -2488,7 +2594,15 @@ def export_command(
                 raise IronbirdError(
                     Code.CLI_USAGE,
                     "a CSV export of several messages is a directory of files: pass -o DIR, "
-                    "or name exactly one --message to write one table to stdout or a file",
+                    "name exactly one --message to write one table to stdout or a file, "
+                    "or use --format text",
+                )
+            if directory and output is not None and output.suffix.lower() == ".csv":
+                raise IronbirdError(
+                    Code.CLI_USAGE,
+                    f"-o {term(output.name, 80, err=True)} would be a directory of tables, one "
+                    "CSV per message: name exactly one --message to write one CSV file, or "
+                    "give -o a directory name",
                 )
             if force and output is None:
                 raise IronbirdError(Code.CLI_USAGE, "--force needs -o")
@@ -2791,6 +2905,28 @@ def _fill_standard_descriptors() -> None:
             os.close(opened)
 
 
+def _ledger_usage_error(message: str) -> None:
+    """Ledger a command line that failed to parse (no command ran, so no ledger was open): a
+    short session with the arguments, the error and the closing ``session.end``. Whatever goes
+    wrong here is said on stderr; it never changes the exit code."""
+    try:
+        # No config: the command line did not parse, so which config it names is unknown, and a
+        # session of three records cannot reach any [ledger] size limit.
+        ledger = Ledger(
+            default_state_dir(), session_class="short", command="usage", **LEDGER_OPTIONS
+        )
+        ledger.open()
+        ledger.record("action", "cli.invoke", command="usage", argv=sys.argv[1:])
+        ledger.record_error(IronbirdError(Code.CLI_USAGE, message))
+        closing = ledger.close(_session_end(2))
+        for notice in closing.notices:
+            _stderr_line(notice.line())
+    except IronbirdError as exc:
+        _stderr_line(exc.user_line())
+    except (OSError, RuntimeError) as exc:  # RuntimeError: the writer thread cannot be started
+        _stderr_line(f"warning {Code.LED_WRITE.value}: the usage error was not ledgered: {exc}")
+
+
 def main() -> int:
     """Console-script entry. Usage errors become coded one-liners (exit 2).
 
@@ -2822,7 +2958,10 @@ def main() -> int:
     except Exception as exc:
         format_message = getattr(exc, "format_message", None)
         if callable(format_message):
-            _stderr_line(f"error {Code.CLI_USAGE.value}: {format_message()}")
+            message = str(format_message())
+            if message:  # no message: the help was shown instead (a group without a subcommand)
+                _stderr_line(f"error {Code.CLI_USAGE.value}: {message}")
+                _ledger_usage_error(message)
             result = 2
         else:
             _stderr_line(f"error {Code.INTERNAL.value}: unexpected {type(exc).__name__}: {exc}")

@@ -38,6 +38,37 @@ class _Entry:
     window_s: float = DEFAULT_WINDOW_S
     ledger_part: int = 1
     ledger_file: str = ""
+    raw: bytes = b""  # of the latest occurrence
+    raw_len: int | None = None
+    shared: str | None = None  # the words every occurrence had in common, once they differed
+
+
+VARY: Final = " (details vary)"  # marks a summary that stands for several differing ones
+
+
+def _shared_words(left: str, right: str) -> str:
+    """``left`` and ``right`` with the words that differ replaced by ``...``, so a line that
+    stands for several different occurrences (``packet of ... bytes``) states nothing that only
+    some of them had. When they share too little for that to say what failed (under a third of
+    the words), it is ``left`` as first seen with a ``(details vary)`` suffix."""
+    if left.endswith(VARY):
+        return left
+    a, b = left.split(" "), right.split(" ")
+    if len(a) == len(b):
+        words = [x if x == y else "..." for x, y in zip(a, b, strict=True)]
+    else:
+        head = 0
+        while head < min(len(a), len(b)) and a[head] == b[head]:
+            head += 1
+        tail = 0
+        while tail < min(len(a), len(b)) - head and a[-1 - tail] == b[-1 - tail]:
+            tail += 1
+        words = [*a[:head], "...", *a[len(a) - tail :]]
+    collapsed = [w for i, w in enumerate(words) if not (w == "..." and i and words[i - 1] == "...")]
+    kept = sum(1 for w in collapsed if w != "...")
+    if kept == 0 or 3 * kept < len(a):
+        return left + VARY
+    return " ".join(collapsed)
 
 
 class Coalescer:
@@ -65,12 +96,14 @@ class Coalescer:
                     entry.code,
                     entry.level,
                     entry.key,
-                    entry.summary,
+                    entry.summary if entry.shared is None else entry.shared,
                     count=entry.suppressed + 1,
                     window_s=max(0.0, now - entry.started),
                     ledger_n=entry.ledger_n,
                     ledger_part=entry.ledger_part,
                     ledger_file=entry.ledger_file,
+                    raw=entry.raw,
+                    raw_len=entry.raw_len,
                 )
             )
 
@@ -86,6 +119,8 @@ class Coalescer:
         window_s: float | None = None,
         ledger_part: int = 1,
         ledger_file: str = "",
+        raw: bytes = b"",
+        raw_len: int | None = None,
     ) -> None:
         """Report one occurrence.
 
@@ -93,6 +128,8 @@ class Coalescer:
         distinct keys: after ``MAX_NEW_PER_GROUP`` new keys per window the rest fold into one
         "more distinct occurrences" notice, so unique-garbage floods cannot spam the user.
         ``window_s`` overrides the window for this key (the ledger's slow warnings use 10 min).
+        ``raw`` is the start of the offending packet and ``raw_len`` its full size; a summary
+        carries those of the latest occurrence.
         """
         now = self._clock()
         entry = self._entries.get(key)
@@ -103,16 +140,22 @@ class Coalescer:
             if count >= MAX_NEW_PER_GROUP:
                 key = f"{group.value}/other"
                 code, summary = group, "more distinct occurrences"
+                raw, raw_len = b"", None
                 entry = self._entries.get(key)
             else:
                 self._groups[group] = (started, count + 1)
         if entry is not None:
             if now - entry.started < entry.window_s:
                 entry.suppressed += 1
+                if summary != entry.summary:  # a count says "the same again": keep what is true
+                    entry.shared = _shared_words(
+                        entry.summary if entry.shared is None else entry.shared, summary
+                    )
                 entry.summary = summary
                 if ledger_n is not None:  # a later occurrence without a record keeps the pointer
                     entry.ledger_n = ledger_n
                     entry.ledger_part, entry.ledger_file = ledger_part, ledger_file
+                entry.raw, entry.raw_len = raw, raw_len
                 return
             self._summary(entry, now)
             del self._entries[key]
@@ -130,6 +173,8 @@ class Coalescer:
                 ledger_n=ledger_n,
                 ledger_part=ledger_part,
                 ledger_file=ledger_file,
+                raw=raw,
+                raw_len=raw_len,
             )
         )
         self._entries[key] = _Entry(
@@ -143,6 +188,8 @@ class Coalescer:
             window_s or self._window,
             ledger_part,
             ledger_file,
+            raw,
+            raw_len,
         )
         assert len(self._entries) <= self._max_keys, "the table of open windows is bounded"
 

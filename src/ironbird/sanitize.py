@@ -108,3 +108,17 @@ def clean_json(text: str) -> str:
     except UnicodeEncodeError:
         return text.encode("utf-8", "replace").decode("utf-8")
     return text
+
+
+HEX_PREVIEW_BYTES = 64  # bytes of a packet that a verbose line shows in hex
+
+
+def hex_preview(data: bytes, total: int | None = None) -> str:
+    """Spaced hex of the first :data:`HEX_PREVIEW_BYTES` of ``data``, for a one-line display.
+    ``total`` is the packet's full size when ``data`` is only a prefix of it; a cut preview says
+    how much of the packet it shows."""
+    full = len(data) if total is None else total
+    assert full >= len(data)
+    shown = data[:HEX_PREVIEW_BYTES]
+    text = shown.hex(" ") or "(no bytes)"
+    return text if len(shown) == full else f"{text} ... ({len(shown)} of {full} bytes)"

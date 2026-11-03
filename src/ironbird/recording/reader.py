@@ -199,7 +199,8 @@ class RecordingReader:
         except OSError as exc:
             raise IronbirdError(
                 Code.REC_FORMAT,
-                f"cannot open recording {_shown(self.path)}: {exc.strerror or exc}",
+                f"cannot open recording {_shown(self.path)}: {exc.strerror or exc}"
+                + self._missing_hint(exc),
                 cause=exc,
             ) from exc
         try:
@@ -209,6 +210,17 @@ class RecordingReader:
             raise
 
     # -- opening --
+
+    def _missing_hint(self, exc: OSError) -> str:
+        """``; did you mean X.ibrec?`` when the name lacks the extension recordings are given."""
+        if exc.errno != errno.ENOENT or self.path.suffix.casefold() == ".ibrec":
+            return ""
+        with_extension = self.path.with_name(self.path.name + ".ibrec")
+        try:
+            found = with_extension.is_file()
+        except OSError:
+            return ""
+        return f"; did you mean {_shown(with_extension)}?" if found else ""
 
     def _open(self) -> None:
         shown = _shown(self.path)

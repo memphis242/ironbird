@@ -72,7 +72,11 @@ def parse_flags(
     if older_than is not None:
         age = parse_duration(older_than)
         if age is None:
-            raise bad("--older-than", older_than, "a duration such as '90s', '10min', '24h', '7d'")
+            raise bad(
+                "--older-than",
+                older_than,
+                "a duration such as '90s', '10min', '24h', '7d' (more than zero)",
+            )
     if until_under is not None:
         size = parse_size(until_under)
         if size is None:

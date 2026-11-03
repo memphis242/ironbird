@@ -194,7 +194,7 @@ def test_reader_exiting_during_the_final_drain_is_a_normal_end_without_a_traceba
         wait_for_text(proc, "listening")
         send_burst(mock_config_path, 1500)
         deadline = time.monotonic() + 15
-        while not events_named(state_dir, "session.end") and time.monotonic() < deadline:
+        while not events_named(state_dir, "session.stop") and time.monotonic() < deadline:
             time.sleep(0.05)
         time.sleep(0.3)  # the event loop is closed; the process is draining a full pipe
         assert proc.stdout is not None
@@ -239,10 +239,10 @@ def test_output_threads_block_the_shutdown_signals() -> None:
 SLOW_CLOSE = """
     import ironbird.ledger as _l
     _orig_close = _l.Ledger.close
-    def _slow_close(self):
+    def _slow_close(self, end=None):
         print("IN_CLOSE", file=sys.__stderr__, flush=True)
         time.sleep(1.5)
-        report = _orig_close(self)
+        report = _orig_close(self, end)
         print("CLOSE_DONE", file=sys.__stderr__, flush=True)
         return report
     _l.Ledger.close = _slow_close

@@ -1098,7 +1098,14 @@ class Engine:
             source=frame.source,
             seq=frame.seq,
         )
-        self._report(error, context=f"from {label}", evidence=True, sample=f"{key}|error")
+        self._report(
+            error,
+            context=f"from {label}",
+            evidence=True,
+            sample=f"{key}|error",
+            raw=frame.data,
+            wire_len=frame.orig_len,
+        )
 
     def _ingest(
         self,

@@ -89,6 +89,27 @@ def test_encode_errors_are_coded(
     assert "\n" not in info.value.user_line()
 
 
+def test_unknown_name_hint_never_suggests_a_wrong_command(mock_codec: Codec) -> None:
+    # a telemetry message named where a command is wanted: say what it is, suggest nothing
+    for name in ("MOCK_HK", "MOCK_STATUS"):
+        with pytest.raises(IronbirdError) as info:
+            mock_codec.encode_command(name)
+        line = info.value.user_line()
+        assert "telemetry" in line and "did you mean" not in line, line
+    # and a command named where telemetry is wanted
+    with pytest.raises(IronbirdError) as info:
+        mock_codec.encode_telemetry("MOCK_NOOP", {})
+    assert "command" in info.value.user_line() and "did you mean" not in info.value.user_line()
+    # a name that is not a message at all: only a genuinely close command is suggested
+    with pytest.raises(IronbirdError) as info:
+        mock_codec.encode_command("MOCK_NOP")
+    assert "MOCK_NOOP" in info.value.user_line()
+    with pytest.raises(IronbirdError) as info:
+        mock_codec.encode_command("TOTALLY_UNRELATED")
+    assert "did you mean" not in info.value.user_line()
+    assert "ib find" in info.value.user_line()
+
+
 def test_decode_unknown_mid_and_function_code(mock_codec: Codec) -> None:
     other_mid = mock_codec.encode_command("MOCK_NOOP").data
     # same bytes, different MID: needs a valid checksum, so rebuild with the header module

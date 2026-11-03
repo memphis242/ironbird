@@ -1055,7 +1055,15 @@ def pack(
                     case _:  # pragma: no cover - validated at profile load
                         raise AssertionError(f"unvalidated computed kind {f.computed!r}")
                 if f.computed != "checksum" and f.name in tampered:
-                    value = (value + tampered[f.name]) & f.mask
+                    moved = value + tampered[f.name]
+                    if not 0 <= moved <= f.mask:
+                        raise IronbirdError(
+                            Code.HDR_PACK,
+                            f"profile {profile.name}: field {f.name!r} is {value}; changing it by "
+                            f"{tampered[f.name]:+d} gives {moved}, outside the field's 0 to "
+                            f"{f.mask}",
+                        )
+                    value = moved
         words[f.trailer] |= (f.swapped(value) if f.swap else value) << f.shift
 
     packet = bytearray(words[0].to_bytes(profile.size_bytes, "big"))
