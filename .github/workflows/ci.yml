@@ -387,7 +387,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/fuzz-corpus
-          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
       - name: Fuzz ${{ matrix.target }}
         env:
@@ -397,12 +397,26 @@ jobs:
           mkdir -p "$RUNNER_TEMP/fuzz-crashes"
           python tools/fuzz/fuzz_${{ matrix.target }}.py -max_total_time=${{ matrix.seconds }} \
             -artifact_prefix="$RUNNER_TEMP/fuzz-crashes/"
+      # Keep only the inputs that add coverage, so the corpus (and each night's start-up) stays
+      # bounded instead of growing every night.
+      - name: Minimize the corpus
+        if: always()
+        env:
+          IRONBIRD_FUZZ_CORPUS: ${{ runner.temp }}/fuzz-corpus
+        run: |
+          old="$RUNNER_TEMP/fuzz-corpus-old"
+          rm -rf "$old"
+          mkdir -p "$IRONBIRD_FUZZ_CORPUS/fuzz_${{ matrix.target }}"
+          mv "$IRONBIRD_FUZZ_CORPUS" "$old"
+          python tools/fuzz/fuzz_${{ matrix.target }}.py -merge=1 \
+            -artifact_prefix="$RUNNER_TEMP/fuzz-crashes/" "$old/fuzz_${{ matrix.target }}" \
+            || cp -a "$old" "$IRONBIRD_FUZZ_CORPUS"
       - name: Save the corpus
         if: always()
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/fuzz-corpus
-          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Keep crash inputs
         if: failure()
         uses: actions/upload-artifact@v4

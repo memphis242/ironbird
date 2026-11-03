@@ -96,7 +96,8 @@ def scan_dir(state: Path) -> None:
         if kwargs != {"recover": True}:
             assert after == before, f"{kwargs} changed the directory"
         else:
-            assert len(after) >= min(1, len(before)), "a scan deleted every file"
+            foreign = {n for n in before if not is_managed_name(os.fsdecode(n))}
+            assert foreign <= after.keys(), "a recovering scan deleted a file that is not ours"
 
 
 def ledger_head(data: bytes) -> None:

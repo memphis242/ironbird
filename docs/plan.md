@@ -300,6 +300,10 @@ Tests:
   into `tests/corpus/malformed` with a regression test; `tests/test_parser_properties.py` holds the
   matching quick Hypothesis properties for PR CI and `tests/test_fuzz_harnesses.py` smoke-runs every
   harness.
+  - Deferred: deleting superseded `fuzz-corpus-*` cache keys (`gh cache delete`) - the nightly merge
+    keeps each key small and GitHub evicts least-recently-used keys; revisit if pip caches get evicted.
+  - Deferred: a `keep_recent` survival invariant in `fuzz_retention.py`'s recovering scan - which parts
+    recovery may legitimately remove (reserves, damaged parts) needs a retention-owner decision first.
 - E2E: the mock flight node is sent malformed commands, and the ground side is sent
   malformed telemetry, at rate, asserting the engine keeps capturing and the errors
   coalesce.

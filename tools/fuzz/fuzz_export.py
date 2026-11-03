@@ -59,6 +59,9 @@ def written(fmt: ExportFormat) -> None:
                 assert all(inert(cell) for cell in row), row
 
 
+_EXPORT_PREFIXES = ("IB-REC-", "IB-EXP-", "IB-CCD-", "IB-HDR-", "IB-FLT-", "IB-OUT-")
+
+
 def one_input(data: bytes) -> None:
     """The first byte picks one variant (format, damage policy, filter, to disk or not): a
     whole matrix per input would cost a hundred times the coverage-guided search it buys."""
@@ -74,8 +77,10 @@ def one_input(data: bytes) -> None:
             written(fmt)
         else:
             dry(fmt, skip=skip, where=where, messages=())
-    except IronbirdError:
-        pass
+    except IronbirdError as err:
+        # Recording damage, a bad export target, or the definitions/filter a recording embeds.
+        assert err.code.value.startswith(_EXPORT_PREFIXES), err.code
+        assert "\n" not in err.user_line(), err.user_line()
 
 
 def main() -> None:

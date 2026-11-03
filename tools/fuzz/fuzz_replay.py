@@ -13,11 +13,10 @@ from __future__ import annotations
 
 import contextlib
 import sys
-import tempfile
 from pathlib import Path
 
 import atheris
-from fuzzcommon import run
+from fuzzcommon import run, scratch_dir
 
 with atheris.instrument_imports():
     from ironbird.errors import IronbirdError
@@ -25,7 +24,7 @@ with atheris.instrument_imports():
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tests"))
-SCRATCH = Path(tempfile.mkdtemp(prefix="ironbird-fuzz-replay-"))
+SCRATCH = scratch_dir("replay")
 TARGET = SCRATCH / "input.ibrec"
 WHERES = (None, "status != ok", "cmd_counter > 3 or msg == MOCK_HK")
 

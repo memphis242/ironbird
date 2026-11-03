@@ -8,6 +8,7 @@ and the workflow is parsed to prove that the scheduled job names each of them.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -33,21 +34,26 @@ def test_there_are_harnesses() -> None:
 @pytest.mark.parametrize("path", HARNESSES, ids=lambda p: p.stem)
 def test_harness_runs_its_seeds_without_a_finding(path: Path, tmp_path: Path) -> None:
     pytest.importorskip("atheris")
+    crashes = tmp_path / "crashes"
+    crashes.mkdir()
+    scratch = tmp_path / "scratch"  # libFuzzer exits from C, past atexit: keep the scratch here
     done = subprocess.run(
         [
             sys.executable,
             str(path),
             f"-runs={RUNS.get(path.stem, DEFAULT_RUNS)}",
-            f"-artifact_prefix={tmp_path}/",
+            "-timeout=5",
+            f"-artifact_prefix={crashes}/",
         ],
         cwd=tmp_path,
+        env={**os.environ, "IRONBIRD_FUZZ_SCRATCH": str(scratch)},
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=90,
         check=False,
     )
     assert done.returncode == 0, done.stderr[-3000:]
-    assert list(tmp_path.iterdir()) == [], "the harness wrote a crash input"
+    assert list(crashes.iterdir()) == [], "the harness wrote a crash input"
 
 
 def test_the_nightly_job_runs_every_harness() -> None:
