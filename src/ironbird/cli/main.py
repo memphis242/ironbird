@@ -40,7 +40,7 @@ from ironbird.cli.output import (
     line_codec,
     write_within,
 )
-from ironbird.codec import Codec
+from ironbird.codec import Codec, parse_ascii_int
 from ironbird.config import (
     MAX_EXPORT_JOBS,
     ExportConfig,
@@ -103,7 +103,7 @@ from ironbird.recording.session import (
     default_recording_dir,
     parse_split,
 )
-from ironbird.recording.writer import Recorder
+from ironbird.recording.writer import Recorder, RecorderStats
 from ironbird.retention import LONG_COMMANDS
 from ironbird.retnotices import Notices
 from ironbird.retservice import Retention
@@ -976,7 +976,7 @@ def _parse_header_values(items: list[str] | None) -> dict[str, int]:
         if key in values:
             raise IronbirdError(Code.CLI_USAGE, f"--header {key[:40]!r} given more than once")
         try:
-            values[key] = int(text, 0)
+            values[key] = parse_ascii_int(text)
         except ValueError:
             raise IronbirdError(
                 Code.CLI_USAGE, f"--header {key[:40]}={text[:40]!r}: the value must be an integer"
@@ -1033,10 +1033,18 @@ class _RecordingScope:
         pending = self._pending
         if pending is None:
             return
-        stats = await pending.finish(interrupted=isinstance(exc, asyncio.CancelledError))
-        recorder = self.recorder
-        if stats is None or recorder is None:
-            return
+        try:
+            stats = await pending.finish(interrupted=isinstance(exc, asyncio.CancelledError))
+        except asyncio.CancelledError:
+            # A signal while the recording closed: the close still completed (it finishes
+            # before a cancellation goes on), so what it wrote is still said.
+            if self.recorder is not None:
+                self._summarize(self.recorder, self.recorder.stats())
+            raise
+        if stats is not None and self.recorder is not None:
+            self._summarize(self.recorder, stats)
+
+    def _summarize(self, recorder: Recorder, stats: RecorderStats) -> None:
         where = term(str(recorder.path), 1000, err=True)
         size = size_text(stats.file_bytes)
         if recorder.failed is not None:
@@ -1207,11 +1215,11 @@ def send(
             header=header_values,
             allow_count_mismatch=allow_count_mismatch,
         )
+        seq_text = "" if sent.sequence is None else f" seq {sent.sequence}"
         run.console.out(
             f"sent {term(sent.command)} to {term(sent.node)} via "
             f"{term(sent.transport)} {term(sent.endpoint)} "
-            f"(mid 0x{sent.mid:04X} fc {sent.function_code} seq {sent.sequence}, "
-            f"{sent.size} bytes)"
+            f"(mid 0x{sent.mid:04X} fc {sent.function_code}{seq_text}, {sent.size} bytes)"
         )
         if session_verbose(ctx, verbose):
             run.console.out(f"  hex: {sent.data.hex(' ')}")
@@ -1238,7 +1246,7 @@ def _parse_mids(
     mids: set[int] = set()
     for item in items:
         try:
-            value = int(item, 0)
+            value = parse_ascii_int(item)
         except ValueError:
             msg = codec.model.by_name.get(item)
             if msg is None or msg.kind is not kind:
@@ -2236,6 +2244,7 @@ def replay(
                 "state",
                 "replay.stop",
                 reason=ending,
+                live_end=stats.live_end,
                 shown=result.shown,
                 read=stats.frames_read,
                 in_range=stats.frames_in_range,
@@ -2646,6 +2655,11 @@ def export_command(
                 console.err(f"warning {Code.EXP_WRITE.value}: {warning}")
             _report_unclosed(replaying, ledger, console, "exported")
             stats = replaying.stats
+            if stats.live_end:
+                console.err(
+                    f"info {Code.REC_TORN.value}: the recording is still being written; the "
+                    "export holds the frames written so far (export again once it is closed)"
+                )
             console.err(_export_summary(replaying, result, target))
             if result.not_written:
                 console.err(
@@ -2662,6 +2676,7 @@ def export_command(
                 "state",
                 "export.stop",
                 reason=ending,
+                live_end=stats.live_end,
                 rows=result.rows,
                 committed=progress.committed,
                 output=output,

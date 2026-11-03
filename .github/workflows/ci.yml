@@ -13,22 +13,36 @@ name: ci
 # /proc/net/udp, SO_RXQ_OVFL, flock, SysV IPC limits) is NOT EL8's; see README "Supported
 # platforms".
 
+# Schedules (github.event.schedule carries the cron string that fired; the `if:` conditions below
+# repeat these two strings, and tests/test_ci_schedules.py fails if they drift apart):
+#   "17 4 * * *"   nightly: the full push/PR jobs plus `fuzz`
+#   "43 5 * * 1"   weekly (Monday): `audit` and `el8-audit` only, nothing else
+# A manual workflow_dispatch runs the ordinary jobs plus `audit` and `el8-audit`, so an edit to the
+# audit scripts can be exercised before merge instead of first failing on the next weekly run.
+# A new advisory can land at any time, so the dependency audit must not gate a push or PR on
+# something unrelated to the change; it runs on its own clock and fails loudly there.
+
 on:
   push:
   pull_request:
+  workflow_dispatch:  # manual run: the ordinary jobs plus the audit jobs
   schedule:
     - cron: "17 4 * * *"  # nightly fuzzing
+    - cron: "43 5 * * 1"  # weekly dependency-vulnerability audit
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # The schedule is part of the key: the weekly audit must not cancel a running nightly (or the
+  # reverse); on a push or PR the schedule is empty and the key is just the ref.
+  group: ci-${{ github.ref }}-${{ github.event.schedule }}
   cancel-in-progress: true
 
 jobs:
   checks:
     name: lint, types, tests
+    if: github.event.schedule != '43 5 * * 1'  # not the weekly audit
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -50,6 +64,9 @@ jobs:
         run: |
           PYRIGHT_PYTHON_DEBUG=1 pyright --version  # logs which Node pyright runs on
           pyright
+          mypy
+      - name: Security lint (bandit)
+        run: bandit -c pyproject.toml -r src
       - name: Tests (real-cFS tests are opt-in and skipped here)
         run: pytest -n auto
       # pytest-benchmark disables itself under xdist, so the ceilings above are only enforced
@@ -61,8 +78,31 @@ jobs:
       - name: Throughput gate (serial, 1k packets/s floor)
         run: pytest tests/bench -n0 -s
 
+  package:
+    name: packaging (sdist, wheel, clean install)
+    if: github.event.schedule != '43 5 * * 1'  # not the weekly audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            constraints-dev.txt
+      - name: Install the build tools
+        run: python -m pip install -c constraints-dev.txt '.[package]'
+      # Builds the sdist and wheel from a copy of the tree, runs `twine check --strict`, checks
+      # the wheel and sdist contents (modules, py.typed, entry points, examples), installs the
+      # wheel into a clean venv and smoke-runs `ib` and `ironbird` from there.
+      - name: Packaging check
+        run: tools/ci/check-package.sh
+
   cfs:
     name: real cFS acceptance
+    if: github.event.schedule != '43 5 * * 1'  # not the weekly audit
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -141,6 +181,7 @@ jobs:
   # the container the setup step prints the release package and toolchain versions.
   el8-checks:
     name: EL8 ${{ matrix.name }} - lint, types, tests
+    if: github.event.schedule != '43 5 * * 1'  # not the weekly audit
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -206,6 +247,12 @@ jobs:
           test "$(id -u)" -ne 0
           PYRIGHT_PYTHON_DEBUG=1 pyright --version  # logs which Node pyright runs on
           pyright
+          mypy
+      - name: Security lint (bandit)
+        if: steps.setup.outputs.ready == 'true'
+        run: |
+          test "$(id -u)" -ne 0
+          bandit -c pyproject.toml -r src
       - name: Tests as a non-root user (real-cFS tests are opt-in and skipped here)
         if: steps.setup.outputs.ready == 'true'
         run: |
@@ -226,8 +273,80 @@ jobs:
         shell: bash
         run: chown -R root:root "$GITHUB_WORKSPACE"
 
+  audit:
+    name: dependency vulnerability audit
+    # The weekly schedule only (see the comment at the top): fails the run, and so notifies the
+    # repository's watchers, when a pinned dev dependency or a runtime dependency (floating
+    # inside the pyproject ranges) has a known advisory. Accepted advisories, each with its
+    # reason, live in tools/ci/audit-ignore.txt.
+    if: github.event.schedule == '43 5 * * 1' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pip-audit
+        run: python -m pip install -c constraints-dev.txt '.[audit]'
+      - name: Audit the dev and runtime dependency sets
+        run: tools/ci/audit-deps.sh
+
+  # The same audit on the EL8 distro Python 3.11 (same container, user and privilege rules as
+  # el8-checks): the runtime set resolves under EL8's pip, glibc and platform tags, which can
+  # select different wheels than the Ubuntu runner does.
+  el8-audit:
+    name: EL8 oraclelinux8 - dependency vulnerability audit
+    if: github.event.schedule == '43 5 * * 1' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: oraclelinux:8
+      options: --ulimit nofile=1024:524288
+    env:
+      LANG: en_US.UTF-8
+    defaults:
+      run:
+        shell: >-
+          setpriv --reuid=ci --regid=ci --init-groups --no-new-privs
+          env HOME=/home/ci USER=ci LOGNAME=ci
+          PATH=/home/ci/venv/bin:/usr/local/bin:/usr/bin:/bin
+          bash --noprofile --norc -eo pipefail {0}
+    steps:
+      - name: Bootstrap for checkout (root)
+        shell: bash
+        run: dnf -y --setopt=install_weak_deps=False --nodocs install git tar gzip
+      - uses: actions/checkout@v4
+      - name: Install EL8 toolchain and create the CI user (root)
+        id: setup
+        shell: bash
+        run: |
+          tools/ci/el8-setup.sh
+          chown -R ci:ci "$GITHUB_WORKSPACE"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - name: Create venv (EL8 python3.11)
+        if: steps.setup.outputs.ready == 'true'
+        run: |
+          test "$(id -u)" -ne 0
+          python3.11 -m venv "$HOME/venv"
+      - name: Install pip-audit
+        if: steps.setup.outputs.ready == 'true'
+        run: |
+          test "$(id -u)" -ne 0
+          python -m pip install -c constraints-dev.txt '.[audit]'
+      - name: Audit the dev and runtime dependency sets
+        if: steps.setup.outputs.ready == 'true'
+        run: |
+          test "$(id -u)" -ne 0
+          tools/ci/audit-deps.sh
+      - name: Hand the workspace back to root (root)
+        if: always()
+        shell: bash
+        run: chown -R root:root "$GITHUB_WORKSPACE"
+
   el8-cfs:
     name: EL8 ${{ matrix.name }} - real cFS acceptance
+    if: github.event.schedule != '43 5 * * 1'  # not the weekly audit
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -347,7 +466,7 @@ jobs:
     name: fuzz ${{ matrix.target }}
     # Scheduled only: coverage-guided fuzzing is too slow for every push. One runner per harness,
     # in parallel; every harness in tools/fuzz must be listed (tests/test_fuzz_harnesses.py).
-    if: github.event_name == 'schedule'
+    if: github.event.schedule == '17 4 * * *'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:

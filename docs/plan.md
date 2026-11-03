@@ -904,7 +904,10 @@ As built (where the build differs from, or settles, the text above)
   end of a capture that failed) is counted per subscription (`CaptureStats.after_close`) and
   ledgered, coalesced per poll, as `rx.closed_drops`; it still reaches the sinks. Frames a serial
   close flushes (a partial packet cut by the close) now reach the consumer queue as well as the
-  sinks.
+  sinks. A serial close likewise first hands over what the device already holds (one wakeup's
+  reads) and counts the bytes left beyond that (`TransportStats.unread_bytes_at_close`, ledger
+  `rx.unread_at_close` with `bytes`, one `kernel_drop` GAP of 1, since how many packets they held
+  is unknown).
 - Per-MID statistics count only frames that pass `Codec.check`.
 - A link end's transport is opened, joined and closed under the end's lock: a capture subscribes
   inside the lock, the closer re-checks the subscribers inside it, and the end's state changes
@@ -913,7 +916,22 @@ As built (where the build differs from, or settles, the text above)
   it (`TransportClosed`, never reported as a link failure); a send after `Engine.close` is an
   `IB-TX-002` "not sent: the session is closing". `Engine.close` ends every capture's iteration. A transport open is bounded
   (`OPEN_TIMEOUT_S`, 5 s, `IB-TX-001`) and cut short by `Engine.close`, so a resolver that does
-  not answer cannot hold the link end's lock; `_attach` re-checks `closed` under the lock, so a
+  not answer cannot hold the link end's lock. The timeout text names the step it was stuck on
+  (`Transport.opening_step`, e.g. "resolve host of udp name:port", which for a send-only source
+  is the command endpoint, not the telemetry one). Name lookups and `/proc` drop scans run in
+  daemon threads (`ironbird.offloop`, signals blocked), never on the loop's default executor,
+  which Python 3.11's `asyncio.run` joins with no time limit: a lookup that never answers is
+  abandoned with its thread, so neither the exit nor a signal waits for it, and at most
+  `RESOLVER_THREADS` (8) such threads are kept (past that an open of a name is refused,
+  `IB-TX-001`; a numeric host is resolved on the loop with `AI_NUMERICHOST` and never waits). Every
+  step of the 1 Hz tick is guarded: one that fails is reported (`IB-INT-001`, coalesced per step)
+  and the ticking goes on, and one transport's failed `poll` does not skip the drop accounting of
+  the others. `Session.__aexit__` closes the engine even when it is cancelled while it collects
+  its background tasks. Deferred (PR #35 review): `/proc` scans start one short daemon thread per
+  tick (about 100 us/s); a long-lived scanner worker is not worth its lifecycle code yet.
+  Declined: clearing `opening_step` at `open()` start, since a transport is opened at most once
+  (asserted). `EventStream` ends its iteration when its capture ends, cleanly or not,
+  once the queued events are read; `_attach` re-checks `closed` under the lock, so a
   capture opened across a close raises (`IB-INT-001`, "the session is closed") and its transport
   is closed, never an iteration that does not end. A send made twice on a closed transport says
   whether the session is closing or another consumer closed the end twice.
@@ -2313,7 +2331,10 @@ As built (where the build differs from, or settles, the text above)
   blocked. The close always syncs, even with `fsync = "never"`. A wall-clock step of 250 ms or more
   against the monotonic clock is a MARK. `Recorder.rate_bytes_per_s()` (bytes encoded over the last
   minute) is the hook for 2d's `IB-RET-002` projection; nothing consumes it yet. A split keeps part
-  1 open and locked, and every part repeats META, BLOBs and definitions. A second signal does not
+  1 open and locked, and every part repeats META, BLOBs and definitions. A signal that lands inside
+  the close (a cancellation of its caller) does not cut it short either, though it then waits at most
+  `CLOSE_STALL_S` more even on a disk still making progress: the close finishes, is ledgered
+  and its summary line is printed, then the cancellation goes on. A second signal does not
   abandon the close (the CLI ignores repeated signals); the close gives up only when the writer makes no
   progress for 5 s, writes the GAP for dropped frames and the trailer first when the disk is
   merely slow, and says how many frames were not written when it does give up.
@@ -2589,7 +2610,7 @@ As built (where the build differs from, or settles, the text above)
   lines, 1024 in JSON, which has `status`, `error`, `hex_truncated`); `--format hex` dumps every
   frame undecoded and, if the recording has no usable definitions, still works, with a `--where`
   made of frame-level names (a name it cannot check says `IB-REC-009` is why).
-- Definitions: the BLOBs at the head are read with `head_records` (at most 4096 records, 64 MiB,
+- Definitions: the BLOBs at the head are read with `head_records` (at most 4096 records besides SOURCEs, 4096 SOURCEs, 64 MiB,
   256 nodes), each digest must equal the one META names (`IB-REC-009` if not; a META digest that
   is not text is ignored), a repeated definition that differs, or a head longer than those limits,
   is a problem recorded in the head (so streams and definitions past a cut are never taken for
@@ -2680,6 +2701,7 @@ As built (where the build differs from, or settles, the text above)
   `--where 'mid in [...]'`); the atheris target has not run on a real fuzzer. The `rpl-defs-*`
   corpus entries carry the META digests of their own content so each reaches its loader (the test
   asserts the loader's reason for every entry).
+- Deferred (PR 34 review): an internal failure outside `append` (chunk close, rotation, redefinition) still drops the records buffered since the last flush, because no record boundary is tracked there; the stop notice and `unwritten_frames` count them. A reader retries its shared lock 3 times 10 ms apart so a retention or prune probe does not read as a writer; a probe held longer than that still does.
 
 ### 2h - Export CSV and text
 
@@ -2715,7 +2737,7 @@ Deliverables
   exported in this one process.
 
 Untrusted input: string cells sanitized (control characters escaped) and formula-leading
-cells (`=`, `+`, `-`, `@`, their fullwidth forms, tab, CR, LF, behind any leading whitespace)
+cells (`=`, `+`, `-`, `@`, every character NFKC folds to one of them, tab, CR, LF, behind any leading whitespace)
 prefixed with `'`, string fields only (numbers are typed); `csv` module quoting (RFC 4180). Test: a telemetry string starting with `=` and
 holding a newline and an escape sequence exports inert.
 
@@ -2778,8 +2800,8 @@ As built (where the build differs from, or settles, the text above)
 - Cells are untrusted (decision on top of the plan text): `safe_cell` escapes with `sanitize.clean` (no
   truncation; an all-printable-ASCII string takes a fast path), then prefixes `'` when the first
   character that is not whitespace (`str.isspace`; NBSP, U+3000 and the like are escaped by `clean`
-  already, the ASCII space and the fullwidth forms are not) is `=`, `+`, `-`, `@`, the fullwidth
-  `\uff1d \uff0b \uff0d \uff20`, tab, CR or LF (the last three cannot survive the escaping; the rule
+  already, the ASCII space and the fullwidth forms are not) is `=`, `+`, `-`, `@`, a character NFKC folds to one of them (the fullwidth
+  `\uff1d \uff0b \uff0d \uff20`, the small `\ufe62 \ufe63 \ufe66 \ufe6b`, super/subscript and the like), tab, CR or LF (the last three cannot survive the escaping; the rule
   is kept anyway). A LibreOffice integration test (skipped without `soffice`) imports hostile cells
   with trimming and formula evaluation on and checks that none is evaluated. Every string cell goes through it: names, links, labels, text, hex, the code, reason
   and flags of the malformed table, and the column names. Hypothesis over arbitrary strings pins that a
@@ -3413,7 +3435,15 @@ Deliverables
   and non-blocking `os.read`/`os.write`, like UDP (this replaces the reader thread the
   execution model mentions; a thread remains the fallback for a device that cannot be
   polled). TX goes through a bounded 64 KiB buffer; `send(confirm=True)` awaits
-  `termios.tcdrain` in a thread with a timeout derived from bytes and baud.
+  `termios.tcdrain` in a thread with a timeout derived from bytes and baud. A packet any byte of
+  which reached the device is past the point of no return: a send cancelled after that (a
+  signal) is sent (`handed_off` runs, the tail follows from the buffer, and the close waits,
+  bounded by the drain time, for it); one cancelled before any byte went out is taken back out
+  of the buffer, so it really is not sent. A packet whose head went out and whose tail cannot
+  follow (a stall past the drain timeout, a lost device, a close that could not wait) fails with
+  `IB-TX-002` saying "N of M bytes ... went out ... torn packet" (reported when its sender no
+  longer waits), never "not sent" and never `TransportClosed`, so `Engine.send` does not send it
+  again.
 - `transport/framing.py`: `Framer` protocol (`feed(chunk, time_ns)`, `expire(now_ns)`,
   `stats()`) and `HeaderLengthFramer`:
   1. Strip to `sync` if configured; bytes before it are garbage.
@@ -3503,7 +3533,8 @@ As built (where the build differs from, or settles, the text above)
   loop reading the descriptor there is no such queue on the receive side (a read goes straight through the
   framer into ingest), and the TX buffer is not a loss of captured frames: a send that does not fit the 64 KiB
   buffer is refused up front (`IB-TX-002`, "refused: N byte(s) are still waiting"), one that waits longer than
-  the drain timeout for the device to take its bytes fails with the unsent bytes discarded. A consumer queue
+  the drain timeout for the device to take its bytes fails with the unsent bytes discarded (a torn packet when
+  its head had gone out, see above). A consumer queue
   overflow stays what 2e decided (not a recording gap). The reason stays defined for a transport that has a
   queue (the reader-thread fallback would). Kernel-side serial overruns (`TIOCGICOUNT` `overrun`/`buf_overrun`)
   are not counted: a pty has none and the real-hardware case is D7 (deferred).
@@ -4234,6 +4265,59 @@ deferred sync or close error); same tier as 4, and 6 wins over 4 and over 5.
 | Ledger growth: sampling, tier allowances, rotation, retention warnings and prune, send policy | 2d |
 | Output and signals equivalence | Stage 3; Stage 2's new commands keep Stage 1's exit codes, bounded writer and signal path |
 
+### Encode and load boundary review (`fix/codec-review`)
+
+An antagonistic review of the encode side, the header-kind and rule checks, and the CLI integer
+parsing found the following; each is fixed and covered by `tests/test_codec_review.py` unless it is
+listed as deferred.
+
+- **Sequence in the ledger and the CLI.** `EncodedPacket.sequence`, `SentCommand.sequence` and the
+  ledger's `sequence` are the value in the packet's sequence field (`counter & mask`), and `None` for
+  a profile with no sequence field (the `send` line then omits `seq`). The unbounded counter stays
+  internal to the codec.
+- **List text** is split on commas first; an empty element is `IB-ENC-002` naming `Field[i]` (one
+  trailing comma is allowed); without commas it splits on whitespace. Nothing is closed up.
+- **Response rules are validated at load** (`_validate_rules`): an echo must fit its target (same kind of
+  data; an integer range, text size, byte size or array element count that contains the source's; a
+  float no wider than its target), a count or length field is echoed only together with the data it sizes
+  and only from the command argument that sizes the data echoed beside it,
+  and each reply field has one source (a literal, an echo, `accepted_counter`, `rejected_counter`).
+  Errors carry `nodes.<node>.responses[i]`, and a reply that still fails at run time on received data
+  is reported as `IB-RSP-001 rule 'X': reply field F from command argument A: ...`.
+- **A UDP link whose `command_endpoint` equals its `telemetry_endpoint`** (host compared
+  after normalisation, port equal) is `IB-CFG-003`: literal IPs compare in compressed form (an IPv4-mapped
+  IPv6 address as IPv4), `localhost`, `127.0.0.1` and `::1` are one loopback, and a wildcard (`0.0.0.0`, `::`)
+  equals loopback. No DNS lookup is made, so other names for this host are not caught (best effort).
+- **A telemetry profile may name `function_code_field`** only as an ordinary input: without a `default`
+  it is refused when the codec is built (`IB-HDR-002`), and with one `--header` may set it. Only a command
+  profile reserves it for the command definition.
+- **A header file of the wrong kind** under `nodes.<n>.command_header` or `telemetry_header` is
+  `IB-CFG-003` (exit 2) naming the key; the `Codec` constructor refuses it with `IB-HDR-002`.
+- **NUL in fixed `char[N]` text** is refused like `char[]` (decode ends text at a NUL).
+- **ASCII digits only** for integer and float arguments, `--header` and `--mid` (`parse_ascii_int`).
+- **Underflow.** A `float32` argument that is nonzero but rounds to zero is refused like overflow, and so
+  is float text such as `1e-400` that parses to 0.0 in a double.
+- **Integers outside an enum in a command** are refused (`IB-ENC-002`, with the names) unless the CCDD field sets
+  `"allow_raw": true` (valid only next to an `enum`; `IB-CCD-002` otherwise). Telemetry encoding (`ib respond`, tests) is not
+  restricted, since a vehicle can report any value, and out-of-enum values are decoded and shown as numbers. Fault injection of an unlisted value therefore needs the flag in the CCDD.
+- **Deferred, needs the user's decision: the CCSDS sequence count restarts at 0 in every `ib send`.**
+  Stock cFE ignores command sequence counts, but flight software that rejects duplicate or
+  non-advancing counts would drop every scripted command after the first, and a "sent seq 0" ledger
+  line on each command traces poorly. Options: (A) persist a per-(node, MID) command counter under
+  `$XDG_STATE_HOME/ironbird/` with a file lock, so counts advance across invocations (state to
+  manage, a lock to hold on every send, and a reset policy when the target reboots); (B) add
+  `ib send --sequence N` and state the per-process reset in `ib send --help` (stateless, the script
+  owns the count, nothing on disk). Not implemented until chosen.
+- **Deferred, needs the user's decision: no `ib send --allow-raw`.** Off-nominal enum values need
+  `allow_raw` in the CCDD; a per-invocation CLI override would bypass the CCDD as source of truth.
+- **Deferred: an integer echoed into a float field is refused.** Conservative; allowing it needs a
+  rule for exact representability (integer bits against the float's mantissa) and is not yet needed.
+- **Not changed: `_rule_failure` names the first echo whose value fails to coerce.** Literals are
+  encoded at load, so at run time only an echoed value can fail coerce; the attribution holds.
+- **Also noted, not changed:** `--length-delta` computes the checksum over the bytes actually sent, but
+  cFE's `CFE_MSG_ComputeCheckSum` covers the declared length, so a length-fault packet also fails a
+  checksum-validating FSW; `ib send --help` should say the two faults are not independent.
+
 ### CI notes (EL8 jobs) and deferrals
 
 The EL8 container jobs (`.github/workflows/ci.yml`, `tools/ci/`) are guarded by
@@ -4419,3 +4503,33 @@ Decided by the user (2026-10-30, later):
 - `ib events` against two mock flight nodes prints events from both (and honours
   `--min-type`); category/event-mapping validation errors are coded one-liners.
 - Ledger file inspected for a complete, timestamped trace of the session.
+
+## Static analysis, security and packaging gates
+
+CI gates beyond ruff, pyright and the tests (`.github/workflows/ci.yml`):
+
+- **mypy** (strict, `src/` only; `[tool.mypy]`) and **bandit** (`src/`; `[tool.bandit]`) run in the
+  `checks` job. Every bandit skip is inline with a reason (`# nosec B301  # reason`; the only global
+  skip is B101, because asserts are the assertive-programming tool).
+- **packaging** (`package` job, `tools/ci/check-package.sh`): sdist and wheel build from a copy of the
+  tree, `twine check --strict`, wheel contents match `src/ironbird` (plus `py.typed` and the entry
+  points), the sdist carries `examples/` (the code has no built-in header profiles; a config points at
+  TOML files), and the wheel installed in a clean venv runs `ib --help`, `ironbird --help` and
+  `ib -c examples/mock.toml nodes`.
+- **dependency audit** (weekly cron, `audit` and `el8-audit` jobs, `tools/ci/audit-deps.sh`): pip-audit on
+  the pinned dev set and on the runtime set floating inside the `pyproject.toml` ranges. Accepted
+  advisories live in `tools/ci/audit-ignore.txt`, each with a reason.
+- The nightly cron runs the ordinary jobs plus `fuzz`; the weekly cron runs only the audit jobs
+  (`tests/test_ci_schedules.py` keeps the cron strings and the job conditions in step).
+
+Deferred (decisions open):
+
+- pytest is held below 9 and so carries PYSEC-2026-1845 (fixed in 9.0.3; accepted in
+  `tools/ci/audit-ignore.txt`). Verify pytest-benchmark and xdist on pytest 9, bump, drop the entry.
+- mypy does not yet cover `tests/` (pyright strict does): about 85 findings, mostly monkeypatching of
+  module attributes and re-exported names, to be cleaned up in a dedicated pass.
+- `recording/pexport.py` unpickles the export worker's replies in the parent. The pipe is private and
+  the worker is the tool's own process, but a worker that a decoder bug compromised could then run
+  code in the parent. Replacing pickle with a fixed binary framing removes that class (design change).
+- The audit jobs do not run (even non-gating) on PRs that touch `tools/ci/audit-*`; a manual
+  `workflow_dispatch` run covers them instead, and one must be triggered on this branch before merge.

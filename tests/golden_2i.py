@@ -25,6 +25,7 @@ from ironbird.ccdd.loader import load_ccdd
 from ironbird.ccdd.model import CcddModel, MessageKind
 from ironbird.codec import Codec, DecodedPacket
 from ironbird.errors import DecodeError
+from rawenums import allow_raw_enums
 
 REPO = Path(__file__).resolve().parent.parent
 EXAMPLES = REPO / "examples"
@@ -40,14 +41,14 @@ def _recorded(name: str, model: CcddModel) -> CcddModel:
     to the shipped files later (Stage 2j's variable-length ones) are not part of the proof: they
     would also shift the seeded mutants of every message after them."""
     if not GOLDEN.exists():
-        return model
+        return allow_raw_enums(model)
     keep = {
         key.split("/", 1)[1]
         for key in json.loads(GOLDEN.read_text())["encodes"]
         if key.startswith(f"{name}/")
     }
     kept = tuple(m for m in model.messages if m.name in keep)
-    return CcddModel.build(model.target, model.source, kept)
+    return allow_raw_enums(CcddModel.build(model.target, model.source, kept))
 
 
 def codecs() -> dict[str, Codec]:

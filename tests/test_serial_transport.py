@@ -233,7 +233,7 @@ def test_a_peer_that_never_reads_makes_a_waiting_send_fail_not_hang(
             await line.transport.close()
         failures = [r for r in results if isinstance(r, IronbirdError)]
         assert failures and all(f.code is Code.TX_SEND for f in failures)
-        assert any("accepted no bytes" in str(f) for f in failures)
+        assert any(f.summary.startswith("not sent:") for f in failures)
 
     run(body())
 

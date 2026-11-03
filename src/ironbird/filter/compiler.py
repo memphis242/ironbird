@@ -170,13 +170,17 @@ def _float_literal(lit: Literal, width: int = 8) -> float:
 
 def _text_literal(lit: Literal) -> str:
     if lit.kind is Tok.STRING:
-        return lit.value
+        text: str = lit.value
+        assert isinstance(text, str)
+        return text
     raise _Reject(f"expected quoted text, found {_found(lit)}")
 
 
 def _time_literal(lit: Literal) -> int:
     if lit.kind is Tok.TIME:
-        return lit.value
+        time_ns: int = lit.value
+        assert isinstance(time_ns, int)
+        return time_ns
     raise _Reject(f"expected a time such as 2026-10-29T12:00:00Z, found {_found(lit)}")
 
 
@@ -581,13 +585,14 @@ class _Compiler:
                 return _Node(parts[-1].cost, mids, _all_of([p.fn for p in parts]), nodes)
             case Or(children=children):
                 parts = sorted((self.compile(c) for c in children), key=lambda n: n.cost)
-                every_node: set[str] | None = set()
+                every_node: set[str] = set()
+                any_node = False
                 for part in parts:
                     if part.nodes is None:
-                        every_node = None
+                        any_node = True
                         break
                     every_node |= part.nodes
-                nodes_of_or = None if every_node is None else frozenset(every_node)
+                nodes_of_or = None if any_node else frozenset(every_node)
                 united: set[int] = set()
                 for part in parts:
                     if part.mids is None:
@@ -922,8 +927,10 @@ class _Compiler:
             if links is None or op == "contains":
                 if lit.kind not in (Tok.IDENT, Tok.STRING):
                     raise _Reject(f"expected a name, found {_found(lit)}")
-                return lit.value
-            return _word_literal(lit, {name: name for name in links}, fold=False)
+                name_text: str = lit.value
+                return name_text
+            linked: str = _word_literal(lit, {name: name for name in links}, fold=False)
+            return linked
 
         return self._scalar(p, "link", _WORD_OPS, convert, operator.attrgetter("stream.link"))[0]
 
