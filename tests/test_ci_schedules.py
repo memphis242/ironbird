@@ -22,25 +22,41 @@ def _workflow() -> dict[Any, Any]:
     return document
 
 
-def _crons() -> list[str]:
+def _triggers() -> dict[Any, Any]:
     # PyYAML (YAML 1.1) reads the key `on` as the boolean True.
     triggers = _workflow().get("on", _workflow().get(True))
     assert isinstance(triggers, dict)
-    return [entry["cron"] for entry in triggers["schedule"]]
+    return triggers
+
+
+def _crons() -> list[str]:
+    return [entry["cron"] for entry in _triggers()["schedule"]]
+
+
+def _cron_of(jobs: set[str]) -> str:
+    """The one cron that starts every job in ``jobs``, found by evaluation, not list order."""
+    found = [c for c in _crons() if jobs <= _jobs_run(event="schedule", schedule=c)]
+    assert len(found) == 1, (jobs, found)
+    return found[0]
 
 
 def _runs(condition: object, *, event: str, schedule: str) -> bool:
-    """Evaluate the small ``if:`` grammar the workflow uses: ``a == 'x'``, ``a != 'x'``, ``&&``."""
+    """Evaluate the small ``if:`` grammar the workflow uses: ``a == 'x'``, ``a != 'x'``, ``&&``
+    and ``||`` (``&&`` binds tighter, no parentheses)."""
     if condition is None:
         return True
     assert isinstance(condition, str)
     context = {"github.event_name": event, "github.event.schedule": schedule}
-    for clause in condition.split("&&"):
-        match = re.fullmatch(r"\s*([\w.]+)\s*(==|!=)\s*'([^']*)'\s*(#.*)?", clause)
+    body = condition.split("#", 1)[0]
+    return any(_all_hold(group, context) for group in body.split("||"))
+
+
+def _all_hold(group: str, context: dict[str, str]) -> bool:
+    for clause in group.split("&&"):
+        match = re.fullmatch(r"\s*([\w.]+)\s*(==|!=)\s*'([^']*)'\s*", clause)
         assert match is not None, f"unsupported if: clause {clause!r}"
         key, operator, literal = match.group(1), match.group(2), match.group(3)
-        equal = context[key] == literal
-        if equal != (operator == "=="):
+        if (context[key] == literal) != (operator == "=="):
             return False
     return True
 
@@ -59,7 +75,8 @@ def test_there_are_two_distinct_crons() -> None:
 
 
 def test_each_cron_runs_only_its_own_jobs() -> None:
-    nightly, weekly = _crons()
+    nightly, weekly = _cron_of(NIGHTLY_JOBS), _cron_of(WEEKLY_JOBS)
+    assert nightly != weekly
     every = set(_workflow()["jobs"])
     ordinary = every - NIGHTLY_JOBS - WEEKLY_JOBS
     assert _jobs_run(event="schedule", schedule=nightly) == ordinary | NIGHTLY_JOBS
@@ -71,3 +88,9 @@ def test_push_and_pull_request_run_neither_scheduled_family() -> None:
     for event in ("push", "pull_request"):
         ran = _jobs_run(event=event, schedule="")
         assert ran == every - NIGHTLY_JOBS - WEEKLY_JOBS, event
+
+
+def test_manual_dispatch_runs_the_audit_jobs_but_not_fuzzing() -> None:
+    assert "workflow_dispatch" in _triggers()
+    every = set(_workflow()["jobs"])
+    assert _jobs_run(event="workflow_dispatch", schedule="") == every - NIGHTLY_JOBS

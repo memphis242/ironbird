@@ -294,7 +294,19 @@ ID_CHECK = 'test "$(id -u)" -ne 0'
 EL8_JOBS = ("el8-checks", "el8-cfs", "el8-audit")
 # Root steps (`shell: bash`) may only do bootstrap, ownership and key work; anything that
 # runs the project's code or tools belongs to the unprivileged user.
-_PROJECT_CODE = ("pytest", "tools/cfs/", "python -m pip", "pyright", "ruff", "-m venv")
+_PROJECT_CODE = (
+    "pytest",
+    "tools/cfs/",
+    "tools/ci/audit-deps.sh",
+    "tools/ci/check-package.sh",
+    "python -m pip",
+    "pyright",
+    "ruff",
+    "mypy",
+    "bandit",
+    "pip-audit",
+    "-m venv",
+)
 
 
 def _load(text: str) -> dict[str, Any]:

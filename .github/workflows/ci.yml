@@ -17,12 +17,15 @@ name: ci
 # repeat these two strings, and tests/test_ci_schedules.py fails if they drift apart):
 #   "17 4 * * *"   nightly: the full push/PR jobs plus `fuzz`
 #   "43 5 * * 1"   weekly (Monday): `audit` and `el8-audit` only, nothing else
+# A manual workflow_dispatch runs the ordinary jobs plus `audit` and `el8-audit`, so an edit to the
+# audit scripts can be exercised before merge instead of first failing on the next weekly run.
 # A new advisory can land at any time, so the dependency audit must not gate a push or PR on
 # something unrelated to the change; it runs on its own clock and fails loudly there.
 
 on:
   push:
   pull_request:
+  workflow_dispatch:  # manual run: the ordinary jobs plus the audit jobs
   schedule:
     - cron: "17 4 * * *"  # nightly fuzzing
     - cron: "43 5 * * 1"  # weekly dependency-vulnerability audit
@@ -276,7 +279,7 @@ jobs:
     # repository's watchers, when a pinned dev dependency or a runtime dependency (floating
     # inside the pyproject ranges) has a known advisory. Accepted advisories, each with its
     # reason, live in tools/ci/audit-ignore.txt.
-    if: github.event.schedule == '43 5 * * 1'
+    if: github.event.schedule == '43 5 * * 1' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -294,7 +297,7 @@ jobs:
   # select different wheels than the Ubuntu runner does.
   el8-audit:
     name: EL8 oraclelinux8 - dependency vulnerability audit
-    if: github.event.schedule == '43 5 * * 1'
+    if: github.event.schedule == '43 5 * * 1' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container:

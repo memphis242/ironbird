@@ -77,13 +77,14 @@ fi
 (( missing == 0 )) || die "the wheel does not match src/ironbird"
 
 step "sdist contents"
-sdist_files="$(tar -tzf "$sdist")"
+# Paths relative to the sdist's top directory, matched as whole fixed strings (not regexes).
+sdist_files="$(tar -tzf "$sdist" | sed 's|^[^/]*/||')"
 for need in LICENSE README.md pyproject.toml examples/mock.toml examples/ironbird.toml \
             examples/ccdd/mock.json examples/headers/ccsds_v1_cfs_tlm.toml; do
-    grep -qE "^[^/]+/$need\$" <<<"$sdist_files" || die "the sdist lacks $need"
+    grep -qxF -- "$need" <<<"$sdist_files" || die "the sdist lacks $need"
 done
 for header in "$REPO_ROOT"/examples/headers/*.toml; do
-    grep -qE "^[^/]+/examples/headers/$(basename "$header")\$" <<<"$sdist_files" \
+    grep -qxF -- "examples/headers/$(basename "$header")" <<<"$sdist_files" \
         || die "the sdist lacks examples/headers/$(basename "$header")"
 done
 unpacked="$work/sdist"

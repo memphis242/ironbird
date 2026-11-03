@@ -4431,3 +4431,5 @@ Deferred (decisions open):
 - `recording/pexport.py` unpickles the export worker's replies in the parent. The pipe is private and
   the worker is the tool's own process, but a worker that a decoder bug compromised could then run
   code in the parent. Replacing pickle with a fixed binary framing removes that class (design change).
+- The audit jobs do not run (even non-gating) on PRs that touch `tools/ci/audit-*`; a manual
+  `workflow_dispatch` run covers them instead, and one must be triggered on this branch before merge.
