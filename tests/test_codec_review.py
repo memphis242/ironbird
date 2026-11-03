@@ -22,11 +22,13 @@ from typer.testing import CliRunner
 from conftest import EXAMPLES
 from ironbird import header as hdr
 from ironbird.ccdd.json_adapter import parse_model
+from ironbird.ccdd.loader import load_ccdd
 from ironbird.ccdd.model import MessageKind
 from ironbird.cli.main import _parse_header_values, _parse_mids, app
 from ironbird.codec import Codec, DecodedPacket, parse_ascii_int
 from ironbird.config import ResponseRule, SystemConfig, load_config
 from ironbird.errors import Code, IronbirdError
+from ironbird.header import load_profile
 from ironbird.ledger import Ledger
 from ironbird.session import Session, _rule_failure, _validate_rules
 
@@ -255,6 +257,92 @@ def test_identical_endpoints_are_compared_after_normalisation(tmp_path: Path) ->
         )
     )
     _refused(lambda: load_config(path), Code.CFG_SCHEMA)
+
+
+@pytest.mark.parametrize(
+    ("command_host", "telemetry_host"),
+    [
+        ("localhost", "127.0.0.1"),
+        ("[::1]", "[0:0:0:0:0:0:0:1]"),
+        ("0.0.0.0", "127.0.0.1"),
+        ("[::]", "localhost"),
+        ("[::ffff:127.0.0.1]", "127.0.0.1"),
+    ],
+)
+def test_spellings_of_one_local_endpoint_are_a_config_error(
+    tmp_path: Path, command_host: str, telemetry_host: str
+) -> None:
+    path = tmp_path / "c.toml"
+    text = _CONFIG.format(ex=EXAMPLES, rule="", command_port=47203, telemetry_port=47203)
+    path.write_text(
+        text.replace(
+            'command_endpoint = "127.0.0.1', f'command_endpoint = "{command_host}'
+        ).replace('telemetry_endpoint = "127.0.0.1', f'telemetry_endpoint = "{telemetry_host}')
+    )
+    _refused(lambda: load_config(path), Code.CFG_SCHEMA)
+
+
+def test_wildcard_against_a_remote_host_on_one_port_loads(tmp_path: Path) -> None:
+    path = tmp_path / "c.toml"
+    text = _CONFIG.format(ex=EXAMPLES, rule="", command_port=47203, telemetry_port=47203)
+    path.write_text(
+        text.replace('command_endpoint = "127.0.0.1', 'command_endpoint = "10.0.0.5').replace(
+            'telemetry_endpoint = "127.0.0.1', 'telemetry_endpoint = "0.0.0.0'
+        )
+    )
+    load_config(path)
+
+
+_TWO_COUNTS = {
+    "name": "MOCK_LOAD_PAIR",
+    "kind": "command",
+    "mid": "0x1891",
+    "function_code": 9,
+    "description": "Two counted arrays",
+    "fields": [
+        {"name": "a_n", "type": "uint16", "description": "Number of a"},
+        {"name": "b_n", "type": "uint16", "description": "Number of b"},
+        {"name": "a", "type": "uint32[]", "count": "a_n", "max": 8, "description": "a"},
+        {"name": "b", "type": "uint32[]", "count": "b_n", "max": 8, "description": "b"},
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    ("echo", "ok"),
+    [
+        ('{ Count = "a_n", Entries = "b" }', False),  # a count of a beside the data of b
+        ('{ Count = "a_n", Entries = "a" }', True),
+        ('{ Entries = "b" }', True),  # the count is filled in
+    ],
+)
+def test_echoed_count_must_size_the_data_echoed_beside_it(
+    tmp_path: Path, echo: str, ok: bool
+) -> None:
+    ccdd = json.loads((EXAMPLES / "ccdd" / "mock.json").read_text())
+    ccdd["messages"].append(_TWO_COUNTS)
+    ccdd_path = tmp_path / "pair.json"
+    ccdd_path.write_text(json.dumps(ccdd))
+    codec = Codec(
+        load_ccdd(ccdd_path),
+        load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_cmd.toml"),
+        load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_tlm.toml"),
+    )
+    rule = f'on = "MOCK_LOAD_PAIR"\nreply = "MOCK_DATA"\necho = {echo}'
+    path = tmp_path / "c.toml"
+    path.write_text(
+        _CONFIG.format(
+            ex=EXAMPLES, rule=f"[[nodes.fc.responses]]\n{rule}", command_port=1, telemetry_port=2
+        ).replace(f"{EXAMPLES}/ccdd/mock.json", str(ccdd_path))
+    )
+    config = load_config(path)
+    if ok:
+        _validate_rules(config.nodes["fc"], codec, config)
+        return
+    with pytest.raises(IronbirdError) as info:
+        _validate_rules(config.nodes["fc"], codec, config)
+    assert info.value.code is Code.CFG_SCHEMA
+    assert "nodes.fc.responses[0]" in info.value.summary
 
 
 def test_udp_link_with_different_ports_or_hosts_loads(tmp_path: Path) -> None:

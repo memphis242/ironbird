@@ -1195,7 +1195,7 @@ def _validate_rules(node: Node, codec: Codec, config: SystemConfig) -> Mapping[s
                         Code.CFG_SCHEMA,
                         f"{where}.echo: reply field {name} from command argument {arg}: {problem}",
                     )
-        _check_rule_writes(rule, reply, where)
+        _check_rule_writes(rule, reply, command, where)
         try:
             codec.encode_telemetry(rule.reply, rule.fields)  # surfaces bad literal values now
         except IronbirdError as exc:
@@ -1207,7 +1207,9 @@ def _validate_rules(node: Node, codec: Codec, config: SystemConfig) -> Mapping[s
     return rules
 
 
-def _check_rule_writes(rule: ResponseRule, reply: Message, where: str) -> None:
+def _check_rule_writes(
+    rule: ResponseRule, reply: Message, command: Message | None, where: str
+) -> None:
     """Every reply field gets its value from one place, and a count or length field is never
     set apart from the data it sizes: two writers of one field would silently overwrite each
     other, and a count that disagrees with its data fails every reply."""
@@ -1238,6 +1240,17 @@ def _check_rule_writes(rule: ResponseRule, reply: Message, where: str) -> None:
                     f"{where}.echo: reply field {holder.name} sizes {', '.join(missing)}; echo "
                     "it only together with that data, or leave it out to have it filled in",
                 )
+            assert command is not None  # an echo on a '*' rule was refused above
+            arg = rule.echo[holder.name]
+            for name in sized:
+                source = command.field(rule.echo[name])
+                if source is None or source.var is None or source.var.count_field != arg:
+                    raise IronbirdError(
+                        Code.CFG_SCHEMA,
+                        f"{where}.echo: reply field {holder.name} from command argument {arg} "
+                        f"sizes {name}, but {name} is not echoed from the data {arg} sizes; "
+                        "echo the matching pair, or leave the count out to have it filled in",
+                    )
         elif holder.name not in rule.fields or any(name in rule.echo for name in sized):
             raise IronbirdError(
                 Code.CFG_SCHEMA,

@@ -4232,12 +4232,15 @@ listed as deferred.
   trailing comma is allowed); without commas it splits on whitespace. Nothing is closed up.
 - **Response rules are validated at load** (`_validate_rules`): an echo must fit its target (same kind of
   data; an integer range, text size, byte size or array element count that contains the source's; a
-  float no wider than its target), a count or length field is echoed only together with the data it sizes,
+  float no wider than its target), a count or length field is echoed only together with the data it sizes
+  and only from the command argument that sizes the data echoed beside it,
   and each reply field has one source (a literal, an echo, `accepted_counter`, `rejected_counter`).
   Errors carry `nodes.<node>.responses[i]`, and a reply that still fails at run time on received data
   is reported as `IB-RSP-001 rule 'X': reply field F from command argument A: ...`.
 - **A UDP link whose `command_endpoint` equals its `telemetry_endpoint`** (host compared
-  case-insensitively, port equal) is `IB-CFG-003`; `localhost` against `127.0.0.1` is not resolved at load.
+  after normalisation, port equal) is `IB-CFG-003`: literal IPs compare in compressed form (an IPv4-mapped
+  IPv6 address as IPv4), `localhost`, `127.0.0.1` and `::1` are one loopback, and a wildcard (`0.0.0.0`, `::`)
+  equals loopback. No DNS lookup is made, so other names for this host are not caught (best effort).
 - **A telemetry profile may name `function_code_field`** only as an ordinary input: without a `default`
   it is refused when the codec is built (`IB-HDR-002`), and with one `--header` may set it. Only a command
   profile reserves it for the command definition.
@@ -4258,6 +4261,12 @@ listed as deferred.
   manage, a lock to hold on every send, and a reset policy when the target reboots); (B) add
   `ib send --sequence N` and state the per-process reset in `ib send --help` (stateless, the script
   owns the count, nothing on disk). Not implemented until chosen.
+- **Deferred, needs the user's decision: no `ib send --allow-raw`.** Off-nominal enum values need
+  `allow_raw` in the CCDD; a per-invocation CLI override would bypass the CCDD as source of truth.
+- **Deferred: an integer echoed into a float field is refused.** Conservative; allowing it needs a
+  rule for exact representability (integer bits against the float's mantissa) and is not yet needed.
+- **Not changed: `_rule_failure` names the first echo whose value fails to coerce.** Literals are
+  encoded at load, so at run time only an echoed value can fail coerce; the attribution holds.
 - **Also noted, not changed:** `--length-delta` computes the checksum over the bytes actually sent, but
   cFE's `CFE_MSG_ComputeCheckSum` covers the declared length, so a length-fault packet also fails a
   checksum-validating FSW; `ib send --help` should say the two faults are not independent.
