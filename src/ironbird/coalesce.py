@@ -163,6 +163,7 @@ class Coalescer:
             old_key, old = self._entries.popitem(last=False)
             self._summary(old, now)
             assert old_key not in self._entries
+            assert len(self._entries) < self._max_keys, "an eviction makes room for one key"
         self._emit(
             Notice(
                 code,
@@ -190,6 +191,7 @@ class Coalescer:
             raw,
             raw_len,
         )
+        assert len(self._entries) <= self._max_keys, "the table of open windows is bounded"
 
     def tick(self) -> None:
         """Close expired windows; call about once a second from the owning loop."""

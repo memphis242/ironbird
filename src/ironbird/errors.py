@@ -129,8 +129,8 @@ WARNING_CODES: Final[frozenset[Code]] = frozenset(
 )
 
 
-MAX_SUMMARY_LEN = 600
-_USAGE_PREFIXES = (
+MAX_SUMMARY_LEN: Final = 600
+_USAGE_PREFIXES: Final = (
     "IB-CFG-",
     "IB-HDR-",
     "IB-CCD-",

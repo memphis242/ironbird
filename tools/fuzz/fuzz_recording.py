@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import contextlib
 import sys
-import tempfile
 from pathlib import Path
 
 import atheris
+from fuzzcommon import run, scratch_dir
 
 with atheris.instrument_imports():
     from ironbird.errors import IronbirdError
@@ -24,7 +24,7 @@ with atheris.instrument_imports():
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tests"))
-SCRATCH = Path(tempfile.mkdtemp(prefix="ironbird-fuzz-rec-"))
+SCRATCH = scratch_dir("rec")
 TARGET = SCRATCH / "input.ibrec"
 
 
@@ -49,9 +49,7 @@ def main() -> None:
         (seeds / f"seed{i}").write_bytes(path.read_bytes())
     sample(SCRATCH / "valid.ibrec", 20)
     (seeds / "valid").write_bytes((SCRATCH / "valid.ibrec").read_bytes())
-    args = [a for a in sys.argv if a.startswith("-") or a == sys.argv[0]]
-    atheris.Setup([*args, str(seeds)], one_input)
-    atheris.Fuzz()
+    run(one_input, seeds, max_len=65536)
 
 
 if __name__ == "__main__":

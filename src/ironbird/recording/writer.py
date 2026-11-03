@@ -78,6 +78,7 @@ MAX_PARTS: Final = 9999
 _PADS: Final = tuple(bytes(n) for n in range(fmt.ALIGN))
 _FRAME_TYPE: Final = int(RecordType.FRAME)
 _HAS_MID: Final = 0x01
+_ALIGN_MASK: Final = fmt.ALIGN - 1
 assert FLUSH_BYTES < CHUNK_BYTES
 
 Report = Callable[..., None]  # Session.report: (error, *, context, level, evidence)
@@ -721,6 +722,7 @@ class Recorder:
         if pad:
             buf += _PADS[pad]
         record = fmt.ENVELOPE_SIZE + body_len + pad
+        assert not (record | self._offset) & _ALIGN_MASK, "records stay aligned"
         self._offset += record
         # chunk summary
         if self._chunk_frames == 0:
@@ -819,6 +821,7 @@ class Recorder:
             self._close_chunk()
             if self._stopped:
                 return  # type: ignore[unreachable]  # _close_chunk can stop the recorder
+        assert not self._chunk_frames, "a non-frame record never lands between a chunk's frames"
         record = fmt.encode_record(rtype, body, self._seed)
         self._buf += record
         self._offset += len(record)
@@ -892,6 +895,7 @@ class Recorder:
         """Write the CHUNK summary of the records since the chunk start and flush with a sync."""
         if self._stopped:
             return
+        assert self._chunk_start <= self._offset, "a chunk begins before it ends"
         mids = sorted(self._chunk_mids.items())
         chunk = fmt.Chunk(
             self._chunk_start,
@@ -954,12 +958,14 @@ class Recorder:
         buf = self._buf
         if not buf or self._stopped:
             return
+        assert not len(buf) & (fmt.ALIGN - 1), "the buffer holds whole aligned records"
         self._buf = bytearray()
         self._buf_since = self._mono()
         self._enqueued += len(buf)
         self._writer.jobs.put((self._fd, buf, sync, self._buf_frames, self._buf_data))
         self._buf_frames = self._buf_data = 0
         pending = self._enqueued - self._writer.written
+        assert pending >= 0, "the writer thread never writes more than was handed over"
         self._peak_pending = max(self._peak_pending, pending)
         if pending >= self._options.max_buffer_bytes and not self._overrun and not self._closing:
             self._begin_overrun(pending)

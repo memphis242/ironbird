@@ -61,6 +61,7 @@ class TokenBucket:
 
     def take(self, amount: float = 1.0) -> bool:
         """Take ``amount`` tokens if the bucket has them; ``False`` leaves it untouched."""
+        assert amount >= 0.0
         now = self._clock()
         elapsed = now - self._last
         if elapsed > 0:
@@ -68,6 +69,7 @@ class TokenBucket:
         self._last = max(self._last, now)
         if self._tokens >= amount:
             self._tokens -= amount
+            assert 0.0 <= self._tokens <= self._burst, "the bucket stays between empty and full"
             return True
         return False
 
@@ -101,6 +103,7 @@ class TierBudget:
 
     def update(self, written: int, now: float) -> bool:
         """Re-judge the tier against its bytes on disk; returns whether it is counted only."""
+        assert written >= 0
         allowance = self.allowance(now)
         if allowance is None:
             self.over = False
@@ -231,6 +234,8 @@ class EvidenceSampler:
                     self._families[family] = self._families.get(family, 0) + 1
                 state = self._keys[key] = _KeyState(event, first_ns=time_ns, first_seq=seq)
         state.count += 1
+        assert state.kept + state.skipped + 1 == state.count, "every occurrence is kept or skipped"
+        assert size >= 0 and raw_len >= 0
         state.bytes += size
         state.last_ns = time_ns
         if seq is not None:
@@ -244,6 +249,7 @@ class EvidenceSampler:
         state.kept += 1
         state.last_kept = now
         self.admitted += 1
+        assert len(self._families) <= self._max_keys, "the key table is bounded"
         if raw_len and not self._raw.take(float(raw_len)):
             self.raw_dropped += 1
             return Admit.NO_RAW
