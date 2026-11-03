@@ -456,18 +456,19 @@ async def _take(capture: Any, count: int) -> AsyncIterator[Frame]:
 
 
 def test_a_slow_transport_open_is_bounded_and_close_does_not_wait_for_it(
-    mock_config_path: Path, tmp_path: Path
+    mock_config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def main() -> tuple[float, str, str]:
         ground = _ground(mock_config_path, tmp_path)
-        loop = asyncio.get_running_loop()
-        real = loop.getaddrinfo
+        real = socket.getaddrinfo
 
-        async def slow(*args: Any, **kwargs: Any) -> Any:
-            await asyncio.sleep(3)  # a resolver that does not answer in time
-            return await real(*args, **kwargs)
+        def slow(*args: Any, **kwargs: Any) -> Any:
+            time.sleep(3)  # a resolver that does not answer in time
+            return real(*args, **kwargs)
 
-        loop.getaddrinfo = slow  # type: ignore[method-assign,assignment]
+        monkeypatch.setattr(socket, "getaddrinfo", slow)
+        # The mock endpoints are IP literals, which skip the resolver; treat them as names.
+        monkeypatch.setattr(udp, "_is_ip_literal", lambda _host: False)
         route = ground.route("fc")
         data = ground.codec_for("fc").encode_command("MOCK_NOOP").data
         sending = asyncio.ensure_future(ground._engine.send(route.link, LinkEnd.SOURCE, data))

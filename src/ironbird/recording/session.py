@@ -211,11 +211,12 @@ class _Staging:
     def __init__(self, limit: int = MAX_STAGED_EVENTS) -> None:
         self.events: list[tuple[str, Any]] = []
         self._limit = limit
+        self._mono = time.monotonic_ns
         self._lost: dict[int, list[Any]] = {}  # stream id -> [stream, count, first, last frames]
 
     def append(self, frame: Frame) -> None:
         if len(self.events) < self._limit:
-            self.events.append(("frame", frame))
+            self.events.append(("frame", (frame, self._mono())))
             return
         entry = self._lost.get(frame.stream.id)
         if entry is None:
@@ -235,7 +236,7 @@ class _Staging:
     def replay(self, recorder: Recorder) -> None:
         for kind, payload in self.events:
             if kind == "frame":
-                recorder.append(payload)
+                recorder.append(*payload)  # (frame, the monotonic clock when it was ingested)
             elif kind == "link":
                 recorder.link_event(*payload)
             else:

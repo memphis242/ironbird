@@ -31,6 +31,7 @@ import hashlib
 import os
 import re
 import stat
+import time
 import zlib
 from collections import ChainMap
 from collections.abc import Callable, Iterator, Mapping
@@ -46,6 +47,8 @@ from ironbird.frame import (
     FLAG_TRUNCATED,
     FLAGS_BY_BITS,
     KNOWN_FLAG_BITS,
+    MAX_FRAME_BYTES,
+    MAX_STREAM_ID,
     SERIAL_TRANSPORT,
     Frame,
     Stream,
@@ -58,10 +61,12 @@ from ironbird.sigmask import checkpoint
 READ_BLOCK: Final = 1 << 20
 SMALL_BLOCK: Final = 16 * 1024  # random access (index, chunk heads) reads this much, not a MiB
 WORK_FLOOR: Final = 4 * 1024 * 1024  # bytes of work a resync may do however small the file
+LOCK_ATTEMPTS: Final = 3  # tries for the shared lock before a refusal means a writer holds it
+LOCK_RETRY_S: Final = 0.01  # pause between those tries; a retention probe holds its lock for less
 WORK_FACTOR: Final = 4  # ... plus this many times the size of the file, over the whole pass
 CANDIDATE_COST: Final = 64  # work charged for looking at one candidate, however cheap
 MAX_DAMAGE_KEPT: Final = 1000  # Damage objects retained; the count and bytes cover them all
-MAX_STREAMS: Final = fmt.MAX_STREAM_ID + 1
+MAX_STREAMS: Final = MAX_STREAM_ID + 1
 
 # A record envelope's type byte followed by its flags and reserved bytes (all zero in v1) is the
 # cheap shape a resync scan looks for; only a match at an 8-byte aligned offset is a candidate.
@@ -218,11 +223,18 @@ class RecordingReader:
         self.identity = (info.st_dev, info.st_ino)
         # A reader takes a shared lock where it can, so retention sees the session as in use; a
         # writer's exclusive lock refuses it, which says the recording is still being written.
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            self.locked = True
-        except OSError as exc:
-            self.writer_active = exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN)
+        # Retention and prune take a brief exclusive probe on every part, so one refusal is
+        # retried: a writer's lock lasts, a probe's is released at once.
+        for attempt in range(LOCK_ATTEMPTS):
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                self.locked, self.writer_active = True, False
+                break
+            except OSError as exc:
+                self.writer_active = exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN)
+                if not self.writer_active or attempt == LOCK_ATTEMPTS - 1:
+                    break
+                time.sleep(LOCK_RETRY_S)
         head = os.pread(self._fd, fmt.PREAMBLE_SIZE, 0)
         if len(head) < fmt.PREAMBLE_SIZE:
             if _is_magic_prefix(head):
@@ -251,7 +263,7 @@ class RecordingReader:
         self.version = (major, minor)
         self.nonce = nonce
         self._seed = fmt.seed_of(nonce)
-        self._max_packet = fmt.MAX_FRAME_BYTES  # until META says how large a packet may be
+        self._max_packet = MAX_FRAME_BYTES  # until META says how large a packet may be
         first = self._read_raw(fmt.PREAMBLE_SIZE)
         if isinstance(first, _Fail):
             if first.unsupported:

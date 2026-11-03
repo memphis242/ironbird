@@ -252,7 +252,7 @@ def _parse_field(
             ctx,
             raw,
             path,
-            {"name", "type", "offset", "endian", "enum", "units", "description"},
+            {"name", "type", "offset", "endian", "enum", "allow_raw", "units", "description"},
             {"name", "type"},
         )
     if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
@@ -276,12 +276,18 @@ def _parse_field(
     except ValueError:
         raise ctx.fail(f"{path}.endian", "must be 'little' or 'big'") from None
     enum = _parse_enum(ctx, raw["enum"], f"{path}.enum", parsed) if "enum" in raw else None
+    allow_raw = raw.get("allow_raw", False)
+    if type(allow_raw) is not bool:
+        raise ctx.fail(f"{path}.allow_raw", "must be true or false")
+    if allow_raw and enum is None:
+        raise ctx.fail(f"{path}.allow_raw", "is only valid on a field with an enum")
     return FieldDef(
         name=name,
         type=parsed,
         offset=offset,
         endian=endian,
         enum=enum,
+        allow_raw=allow_raw,
         units=_text(ctx, raw, "units", path),
         description=_text(ctx, raw, "description", path),
     )

@@ -20,6 +20,7 @@ from ironbird.filter.lexer import Tok
 from ironbird.filter.parser import And, Expr, Literal, Not, Or, Predicate
 from ironbird.frame import Decoded, Direction, Frame, FrameFlag, Stream, garbage_error
 from ironbird.header import load_profile
+from rawenums import allow_raw_enums
 
 EVENT_TYPES: Final = {"DEBUG": 1, "INFORMATION": 2, "ERROR": 3, "CRITICAL": 4}
 
@@ -140,7 +141,9 @@ def build_codecs(directory: Path) -> dict[str, Codec]:
     for node, ccdd in (("n1", CCDD_N1), ("n2", CCDD_N2)):
         path = directory / f"{node}.json"
         path.write_text(json.dumps(ccdd))
-        codecs[node] = Codec(load_ccdd(path), command, telemetry, clock=lambda: 1_000_000.25)
+        codecs[node] = Codec(
+            allow_raw_enums(load_ccdd(path)), command, telemetry, clock=lambda: 1_000_000.25
+        )
     return codecs
 
 

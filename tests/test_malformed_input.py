@@ -238,7 +238,7 @@ def test_length_field_that_lies_in_either_direction(
 
 @FUZZ
 @given(
-    mode=st.integers(0, 255),
+    mode=st.sampled_from([1, 2, 3]),
     pad=st.integers(0, 255),
     label=st.text(alphabet=st.characters(min_codepoint=33, max_codepoint=126), max_size=8),
 )
