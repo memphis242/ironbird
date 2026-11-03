@@ -304,6 +304,7 @@ Tests:
     keeps each key small and GitHub evicts least-recently-used keys; revisit if pip caches get evicted.
   - Deferred: a `keep_recent` survival invariant in `fuzz_retention.py`'s recovering scan - which parts
     recovery may legitimately remove (reserves, damaged parts) needs a retention-owner decision first.
+- tools/coverage.sh is not run in CI yet, so `fail_under` is advisory: deferred because a measured full-suite run in CI needs its own job budget and a user decision on gating merges on it.
 - E2E: the mock flight node is sent malformed commands, and the ground side is sent
   malformed telemetry, at rate, asserting the engine keeps capturing and the errors
   coalesce.
