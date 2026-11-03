@@ -57,7 +57,9 @@ def test_a_bad_invocation_ends_with_its_stable_code_and_exit_status(
     status, codes, text = invoke(env, *args)
     assert codes[:1] == [code.value], text
     expected = (
-        2 if code.value.startswith(("IB-CLI-", "IB-CFG-", "IB-HDR-", "IB-CCD-", "IB-FLT-")) else 1
+        2
+        if code.value.startswith(("IB-CLI-", "IB-CFG-", "IB-HDR-", "IB-CCD-", "IB-ENC-", "IB-FLT-"))
+        else 1
     )
     assert status == expected, text
 
