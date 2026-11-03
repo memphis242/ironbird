@@ -1105,8 +1105,9 @@ class Ledger:
         what, key = _TIER_WORDS[tier]
         self.warn(
             Code.LED_TIER,
-            f"{what} logging paused: {format_size(written)} written, over ledger.{key} "
-            f"({format_size(budget.bytes_per_hour)}); counts continue and logging resumes when "
+            f"{what} logging paused: {format_size(written)} written, over its allowance of "
+            f"{format_size(int(allowance or 0))} so far (ledger.{key} = "
+            f"{format_size(budget.bytes_per_hour)}/h); counts continue and logging resumes when "
             "it is back under",
             slow=True,
             key=f"{Code.LED_TIER.value}:{tier.label}",
@@ -1299,7 +1300,7 @@ class Ledger:
                 self.warn(
                     Code.LED_NOLOCK,
                     f"{directory} has no file locks ({data['text']}, e.g. NFS): prune may treat "
-                    "sessions quiet for 10 min as finished; use a local disk",
+                    "sessions quiet for {format_duration(FRESH_S)} as finished; use a local disk",
                     slow=True,
                     gated=True,
                 )

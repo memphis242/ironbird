@@ -535,7 +535,7 @@ them without breaking old readers.
 
 | Type | Name | Body | Max body |
 |------|------|------|----------|
-| 0x01 | META | JSON (`ironbird-rec-meta/1`): created UTC, session id, ironbird version, host, user, pid, sanitized command line, acts-as node, config path + SHA-256, `max_packet_bytes`, per-node adapter and definition hashes, part number | 1 MiB |
+| 0x01 | META | JSON (`ironbird-rec-meta/1`): created UTC, session id, ironbird version, host, user, pid, sanitized command line, acts-as node, config path + SHA-256, `max_packet_bytes`, per-node adapter, whether its definitions are embedded (`embedded`), and definition hashes, part number | 1 MiB |
 | 0x02 | BLOB | embedded definition: `u8 kind` (1 CCDD, 2 command profile, 3 telemetry profile), node name, adapter name, SHA-256, content | 8 MiB + 1 KiB |
 | 0x03 | STREAM | stream definition (S1 fields), before the stream's first frame | 4 KiB |
 | 0x04 | SOURCE | `u16 id` + peer text, before first use; table capped at 4096, overflow uses id 0xFFFF "(other)" | 256 B |
@@ -2653,7 +2653,7 @@ As built (where the build differs from, or settles, the text above)
   recording never closed: `warning IB-REC-007`; a file a recorder holds open is not torn, it says
   `--follow` keeps reading); 5 mid-file damage seen (`IB-REC-006`, at most 3 lines printed and 100
   ledgered, the stop record and the summary count all) or a missing part (not when `--count` ended
-  the run first); 1 `IB-REC-004..009`; 2 usage and `IB-FLT-*`; 4 stdout closed from the start or
+  the run first); 1 `IB-REC-004..009` and `IB-REC-014`; 2 usage and `IB-FLT-*`; 4 stdout closed from the start or
   failing (a reader that goes away, as `| head` does, is a normal end: 0); 128+n a signal. 5 wins
   over 4 (4 only replaces an exit of 0; the `IB-OUT-002` line still reports the loss). 6 (2d) is
   not produced here. "Shown" (the summary, `--count`) means accepted by the output queue.
@@ -3652,13 +3652,12 @@ As built (where the build differs from, or settles, the text above)
   `/etc/group` already lists the user), "your user is already in group G, check ACLs" when the process has it,
   and for a device whose mode gives its group no read and write (0600, 0640) that group membership cannot
   help and the permissions need changing. A device that another link of the same process holds is refused
-  as `IB-TX-006` too, but as "the same device as ..., fix the device paths in the config": the `flock` would
-  say another program holds it. The check compares device numbers (`st_rdev`), so a `/dev/serial/by-id/...`
+  as `IB-CFG-005` (a configuration error, not `IB-TX-006`): "the same device as ..., fix the device paths in
+  the config" - the `flock` would say another program holds it. The check compares device numbers (`st_rdev`), so a `/dev/serial/by-id/...`
   symlink and the `/dev/ttyUSB0` it points to are one device; the config check normalises the path text
   (`//`, `/./`, trailing `/`, `..`) and cannot follow symlinks. A device that cannot be opened is raised and
   nothing is retried: the reconnect loop is only for
-  a link that was up. `IB-TX-007` and `IB-TX-008` are errors by default (`WARNING_CODES` is unchanged) and
-  evidence-tier in the ledger (`EVIDENCE_ERRORS`: the line, not ironbird, drives their rate). The reconnect
+  a link that was up. `IB-TX-007` and `IB-TX-008` are evidence-tier in the ledger (`EVIDENCE_ERRORS`: the line, not ironbird, drives their rate). The reconnect
   backoff constants are read when a transport is built (not bound as default arguments at import), so a test
   that patches `RECONNECT_MIN_S`/`RECONNECT_MAX_S` really shortens it.
 - Send then capture. A serial device is locked by whoever opened it, so when a capture subscribes to a link
@@ -3675,8 +3674,8 @@ As built (where the build differs from, or settles, the text above)
   (raised, so `ib send` exits 1). Send-only transports reconnect the same way (they have no reader, so a loss
   is noticed by a write).
 - Engine side. `_link_state` ledgers `link.down` / `link.up` (evidence tier: a flapping cable drives the rate)
-  and `link.down_at_close` (essential), shows the down as the `IB-TX-008` error notice and the return as an
-  info notice (`Session.report` accepts `Level.INFO` and ledgers it as a `notice.info` state record, since an
+  and `link.down_at_close` (essential), shows the down as the `IB-TX-008` warning notice and the return as an
+  `IB-TX-009` info notice (`Session.report` accepts `Level.INFO` and ledgers it as a `notice.info` state record, since an
   error record is a warning or an error), tells sinks that have `link_event` (the `LinkSink` protocol; the
   recorder turns it into a `link_down` / `link_up` MARK at the event time, the staging sink replays it in
   order), and, when the link is back, tells gap sinks about one `GapReason.LINK_DOWN` GAP on the receive
@@ -4606,23 +4605,40 @@ the total, and config errors that did not say what was written. What changed, ea
 `tests/test_error_messages.py` (codes, exit status and key facts only, never exact wording):
 
 - **False or silent outcomes.** `IB-OUT-001` said the dropped lines were "still in the ledger";
-  they are not (the ledger keeps `rx.first`, not output). It now says they are not saved and the
-  total of the window is shown. `ib rec info` of a closed file reads the index and chunk summaries,
-  so it no longer says "closed cleanly" (it says the contents are not verified and names `ib rec
-  check`). `ib rec repair` that kept fewer frames than exist is reported as a partial repair
-  ("kept 0 of 11") and a new warning `IB-REC-013` names `ib replay --skip-damage IN`. A closing
-  cut short (a trailer or index torn) is the same torn tail (`IB-REC-007`, exit 0) for `check` and
-  `repair` (`repair` used to call it mid-file damage, exit 5). `replay --skip-damage` after damage
-  to the embedded definitions: the head walk now resynchronises past the damage (`read_head(...,
-  skip_damage=True)`), so the streams after it are found; with `--defs config` it decodes with the
-  configuration and says so (`info IB-REC-009`), with the embedded definitions it fails with
-  `IB-REC-009` saying the definitions are damaged (it used to say every frame had "no
-  definitions"). An ordering filter that no value of a field's type satisfies (`cmd_counter >
-  300` on a `uint8`), and a set filter that is unreachable for only some messages, is a `warning
-  IB-FLT-003` (`Filter.warnings`); the filter is still usable. `IB-RET-002` only recommends
-  `prune --until-under` when pruning everything that is not protected would get under the cap;
-  otherwise it says how much is protected and to raise `retention.max_total_bytes`. `IB-TX-008`
-  recovery no longer says "a gap is recorded" unless a recording takes the gap.
+  they are not (the ledger keeps `rx.first`, not output). It now says only a recording still holds
+  their data, and the total of the window is shown. `ib rec info` of a closed file reads the index
+  and chunk summaries, so it no longer says "closed cleanly" (it says the contents are not verified
+  and names `ib rec check`). `ib rec repair` is a "partial repair" only when valid frames after the
+  damage are left in the original ("kept 5 frames, 5 more valid frames are only in the original")
+  and then warns `IB-REC-013` with a copy-pasteable `ib replay --skip-damage IN`; damage with
+  nothing valid after it still exits 5 (data was lost to the damage) but is reported as a repair.
+  A closing cut short (a trailer or index torn) is the same torn tail (`IB-REC-007`, exit 0) for
+  `check` and `repair` (`repair` used to call it mid-file damage, exit 5); a recording a writer
+  still holds is "still being written" (`info IB-REC-007`) to `check`, with no repair advice.
+  `replay --skip-damage` after damage to the embedded definitions: the head walk resynchronises
+  past the damage (`read_head(..., skip_damage=True)`), so the streams after it are found; damage
+  that is followed by a FRAME ends the walk without being counted as head damage, and a record a
+  writer is still on is left alone. Whether definitions were lost to damage or never embedded is
+  decided from META, whose per-node entry now carries `embedded` (true when the recorder wrote
+  the BLOBs, false under `embed_definitions = false`; absent in older files, which then get a
+  neutral wording): with `--defs config` it decodes with the configuration and says so (`info
+  IB-REC-009`) only when an embedded definition is really lost; with the embedded definitions and
+  `--skip-damage` the frames are shown undecoded (hex, as before) with one `warning IB-REC-009`
+  line and exit 5, so the evidence is kept; without `--skip-damage` the replay stops at the damage;
+  `export` has nothing to write without definitions and is refused with `IB-REC-009`. A filter
+  part that no value of a field's type can satisfy (`cmd_counter == 300` or `cmd_counter > 300`
+  on a `uint8`) is refused with `IB-FLT-003` when no message can match, alike for equality and
+  ordering; when only some messages cannot match it is a `warning IB-FLT-003` naming the field,
+  type and message, written with the bound as the user typed it and skipped for messages the
+  filter already excludes (`msg ==`, `--mid`, `node ==`, or under a `not`); `!=` outside a range
+  is true of every value and says nothing; past 8 warnings one line says how many more. `IB-RET-002` only
+  recommends `prune --until-under` when pruning everything that is not protected would get under
+  the cap; otherwise it says how much is protected and to raise `retention.max_total_bytes`.
+  `IB-TX-008` recovery no longer says "a gap is recorded" unless a sink would write it
+  (`Recorder.accepts_gap`). `IB-ENG-001` names its consumer: the display (warning), the event
+  stream or the responder ("commands not answered", error), and says nothing for the recorder's
+  queue (its sink saw every frame). A usable-ledger failure on a transmitting command keeps its
+  cause chain for `-v`, and `(more: -v)` is offered whenever `-v` would show more.
 - **Split codes.** `IB-TX-009` (link restored; `IB-TX-008` is only "lost"), `IB-REC-013` (valid
   frames after damage exist only in the original; `IB-REC-006` is only "damaged"), `IB-REC-014`
   (the recording file cannot be opened or read; `IB-REC-004` is only "not a recording"),
@@ -4633,17 +4649,21 @@ the total, and config errors that did not say what was written. What changed, ea
   (`nodes.fc.responses[4].fields.mode`), not `IB-ENC-002` "argument".
 - **Totals.** `IronbirdError.tally` / `counted()` carry an amount with a `{n}` template; a
   coalesced line shows the total of its occurrences (`IB-OUT-001`, `IB-TX-007`). The group fold
-  ("more distinct occurrences") is one line shown when its window closes, with the count.
+  ("more occurrences of other problems") is one line shown when its window closes, with the number
+  of occurrences it stands for (not of distinct problems). A key is either counted or plain,
+  asserted per entry.
 - **Wording.** Config errors echo the bad value and suggest the nearest key or spelling (`'1GB' is
   not a size; write '1GiB'`, `'30 days' ... write '30d'`, `unknown key; did you mean 'alias'?`,
   `unknown node 'fcx'; did you mean 'fc'?`); CCDD and header-profile unknown keys suggest too. A
-  message over the packet cap names `ironbird.max_packet_bytes`. A definition file that cannot be
+  message over the packet cap names `ironbird.max_packet_bytes` (and says a recording keeps its
+  own limit). A duration whose unit can mean minutes or months (`6M`, `2 months`) gets no guessed
+  suggestion: the error says it is ambiguous and lists the `min` and `d` forms. A definition file that cannot be
   read names the config key that pulled it in. Decode errors end with whose fault it likely is
   (`vehicle and CCDD disagree`, `wrong length bias`, `update the CCDD or check the sender`). Ledger
   notices lost their internal vocabulary (tiers, reserve, liveness, link end). A fatal error that
   has detail ends in `(more: -v)`. Labels follow the outcome: `IB-TX-007`, `IB-TX-008`,
-  `IB-OUT-001`, `IB-ENG-001` are warnings (the run goes on), `IB-LED-002` is a warning on a command
-  that only reads, `IB-RET-006` under `--dry-run` is a warning.
+  `IB-OUT-001`, `IB-ENG-001` (display only) are warnings (the run goes on), `IB-LED-002` is a
+  warning on a command that only reads, `IB-RET-006` under `--dry-run` is a warning.
 - **Deferred (needs a product decision).** (1) Decode errors (`IB-DEC-*`) stay `error`: they
   are the vehicle's fault, not ours, but CI and the ledger count them as errors; whether a
   malformed-packet flood should be a warning level is a decision. (2) CCDD errors name the JSON
@@ -4656,3 +4676,11 @@ the total, and config errors that did not say what was written. What changed, ea
   parsers' positions. (6) The ad-hoc `info`/`warning` lines in `cli/main.py` and `prunecmd.py` that
   bypass `Notice` (so skip coalescing) are moved to `_coded_line` only where this pass touched
   them. (7) Error text says `target mock` (the CCDD's name) where the user typed a node name.
+  (8) Declined from the PR review: the longer decode reasons (advice appended at construction)
+  were measured against building them lazily and cost nothing visible (an f-string with the
+  advice is the same 0.25 us as one without, and the unknown-MID decode is 2.2-3.0 us either way
+  on a noisy host, dominated by the error object), so they stay as they are. (9) `IB-REC-007` is
+  also the code of the "still being written" info line, as in `replay --follow`; a separate
+  code for it is not worth a table row. (10) A negated never-true part (`not x > 300`) is not
+  warned about, and `not x == 300` on a field no message can hold is still refused; the
+  analysis is per leaf, not over the whole boolean expression.

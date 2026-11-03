@@ -117,7 +117,9 @@ class Damage:
     def to_error(self) -> IronbirdError:
         """The coded error for this damage (not raised; the caller decides how loud to be)."""
         where = f"at offset {self.offset}"
-        reason = self.reason.replace("BLOB record", "embedded-definitions record")
+        reason = self.reason.replace("a BLOB record", "an embedded-definitions record").replace(
+            "BLOB record", "embedded-definitions record"
+        )
         if self.torn:
             what = "an incomplete record" if self.incomplete else "a damaged record"
             return IronbirdError(
@@ -922,23 +924,21 @@ class RecordingReader:
             and raw.end == self.size()
         )
 
-    def head_records(
-        self, start: int, stop: int, *, resync: Callable[[], None] | None = None
-    ) -> Iterator[Item]:
+    def head_records(self, start: int, stop: int, *, skip_damage: bool = False) -> Iterator[Item]:
         """The leading non-frame records of a chunk (``start`` up to its first FRAME or ``stop``),
         read without the stream state; for tools that summarise a chunk without reading it.
 
-        Damage ends the walk, unless ``resync`` is given: it is called once for each stretch of
-        damage and the walk goes on at the next valid record, so definitions that follow damage
-        are found (a read that skips damage needs them)."""
+        Damage ends the walk, unless ``skip_damage``: the walk then goes on at the next valid
+        record, so definitions that follow damage are found (a read that skips damage needs
+        them). Damage that is followed by a FRAME ends the walk like any other end of the head.
+        A record that is only incomplete (a writer is still on it) is not damage: the walk ends."""
         offset = start
         while offset < stop:
             raw = self._read_raw(offset, SMALL_BLOCK)
-            if isinstance(raw, _Fail) and not raw.eof and resync is not None:
+            if isinstance(raw, _Fail) and skip_damage and not raw.eof and not raw.incomplete:
                 found, _ = self._resync(offset)
                 if found is None:
                     return
-                resync()
                 offset = found
                 continue
             if isinstance(raw, _Fail) or raw.rtype not in fmt.HEAD_TYPES:
@@ -958,12 +958,11 @@ class RecordingReader:
                     case _:
                         value = None
             except fmt.FormatError:
-                if resync is None:
+                if not skip_damage:
                     return
                 found, _ = self._resync(offset)
                 if found is None:
                     return
-                resync()
                 offset = found
                 continue
             yield Item(raw.offset, raw.end, raw.rtype, value)

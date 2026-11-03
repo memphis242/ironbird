@@ -23,7 +23,7 @@ class Code(StrEnum):
     CFG_SYNTAX = "IB-CFG-002"  # config TOML syntax error
     CFG_SCHEMA = "IB-CFG-003"  # config schema violation (unknown key, wrong type, ...)
     CFG_REF = "IB-CFG-004"  # unknown node / alias / message referenced
-    CFG_LINK = "IB-CFG-005"  # no usable link between nodes, or wrong role for the action
+    CFG_LINK = "IB-CFG-005"  # no usable link between nodes, wrong role, or two links on one device
     # Header profiles
     HDR_FILE = "IB-HDR-001"  # profile unreadable or TOML syntax error
     HDR_SCHEMA = "IB-HDR-002"  # profile schema violation
@@ -106,9 +106,9 @@ class Code(StrEnum):
     EXP_WORKER = "IB-EXP-003"  # an export worker process failed (died, or could not decode)
     EXP_OMITTED = "IB-EXP-004"  # frames left out of the export (they have no place in the format)
     # Engine
-    ENG_LAG = "IB-ENG-001"  # a consumer fell behind: frames not shown to it (sinks still saw them)
+    ENG_LAG = "IB-ENG-001"  # a consumer fell behind: frames it never got (sinks still saw them)
     # System resources
-    SYS_RESOURCE = "IB-SYS-001"  # the OS refused a resource needed to start (file descriptors)
+    SYS_RESOURCE = "IB-SYS-001"  # a resource needed ran out (OS file descriptors, stream ids)
     # Filter expressions (--where)
     FLT_SYNTAX = "IB-FLT-001"  # filter syntax error (column, excerpt)
     FLT_NAME = "IB-FLT-002"  # unknown name in a filter, or a reserved name misused

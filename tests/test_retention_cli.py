@@ -280,7 +280,8 @@ def test_a_group_writable_directory_without_the_sticky_bit_is_refused(state: Pat
     before = digest(state)
     done = run(state, *PRUNE, "--yes")
     assert done.returncode == 1 and "error IB-RET-006" in done.stderr
-    assert "chmod go-w" in done.stderr  # the one-line remedy
+    assert "chmod go-w" in done.stderr and "chmod +t" in done.stderr  # the remedies
+    assert "<" not in done.stderr  # a command to run, not a placeholder to fill in
     assert {k: v for k, v in digest(state).items() if k in before} == before
     listed = run(state, *PRUNE, "--dry-run")
     # a dry run deletes nothing either way, so it only warns that a real prune is refused

@@ -29,6 +29,7 @@ from ironbird.units import (
     MIB,
     SIZE_FORMS,
     TIB,
+    ambiguous_duration,
     compact_duration,
     format_size,
     parse_duration,
@@ -618,7 +619,8 @@ def _config_duration(
     seconds = parse_duration(value) if isinstance(value, str) else None
     if seconds is None:
         better = suggest_duration(value) if isinstance(value, str) else None
-        advice = f"write {better!r}" if better else f"use {forms}"
+        unclear = ambiguous_duration(value) if isinstance(value, str) else None
+        advice = unclear or (f"write {better!r}" if better else f"use {forms}")
         raise ctx.reject(f"{path}.{key}", value, f"is not a duration; {advice}")
     if not low <= seconds <= high:
         raise ctx.fail(

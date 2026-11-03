@@ -36,7 +36,7 @@ from ironbird.ccdd.model import (
     TypeClass,
 )
 from ironbird.codec import Codec
-from ironbird.errors import Code, DecodeError
+from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.filter.diag import MAX_DEPTH, FilterError, suggest
 from ironbird.filter.lexer import Tok
 from ironbird.filter.matcher import Cost, Filter, Matcher, MatchFn
@@ -85,6 +85,7 @@ _ALL_OPS: Final = COMPARISON_OPS | {"in"}
 _NUMBER_OPS: Final = _ALL_OPS
 _WORD_OPS: Final = EQUALITY_OPS | {"in", "contains"}
 _SET_OPS: Final = EQUALITY_OPS | {"in"}
+_MEMBER_OPS: Final = frozenset({"==", "in"})
 
 _FOUND: Final[Mapping[Tok, str]] = {
     Tok.INT: "the integer",
@@ -142,24 +143,12 @@ def _int_literal(lit: Literal, op: str) -> Any:
 
 def _out_of_range(op: str, values: Sequence[Any], lo: int, hi: int) -> str | None:
     """Why no value of ``lo..hi`` can equal any of ``values`` (``None``: some can, or ``op`` is
-    an ordering, where any bound is meaningful)."""
-    if op not in _SET_OPS or not values or any(lo <= v <= hi for v in values):
+    not ``==`` or ``in``: ``!=`` outside the range is true of every value, and an ordering is
+    judged by :func:`_ordering_unmatched`)."""
+    if op not in _MEMBER_OPS or not values or any(lo <= v <= hi for v in values):
         return None
     shown = values[0] if len(values) == 1 else "any listed value"
     return f"{shown} is outside {lo}..{hi}"
-
-
-def _ordering_unmatched(op: str, values: Sequence[Any], lo: int, hi: int) -> str | None:
-    """Why no value of ``lo..hi`` satisfies the ordering ``op`` against ``values[0]`` (``None``:
-    some does, or ``op`` is not an ordering)."""
-    if op not in _ORDERING_REACH or len(values) != 1:
-        return None
-    bound = values[0]
-    return (
-        None
-        if _ORDERING_REACH[op](lo, hi, bound)
-        else f"'{op} {bound}' never matches (the values are {lo}..{hi})"
-    )
 
 
 _ORDERING_REACH: Final[Mapping[str, Callable[[int, int, Any], bool]]] = MappingProxyType(
@@ -170,6 +159,19 @@ _ORDERING_REACH: Final[Mapping[str, Callable[[int, int, Any], bool]]] = MappingP
         "<=": lambda lo, hi, v: lo <= v,
     }
 )
+
+
+def _ordering_unmatched(
+    op: str, values: Sequence[Any], lo: int, hi: int, written: Any
+) -> str | None:
+    """Why no value of ``lo..hi`` satisfies the ordering ``op`` against ``values[0]`` (``None``:
+    some does, or ``op`` is not an ordering). ``written`` is the bound as the user wrote it."""
+    if op not in _ORDERING_REACH or len(values) != 1:
+        return None
+    if _ORDERING_REACH[op](lo, hi, values[0]):
+        return None
+    return f"no value in {lo}..{hi} is {op} {written}"
+
 
 _FLOAT32: Final = struct.Struct("<f")
 MAX_WARNINGS: Final = 8  # never-true warnings kept per filter; a wide CCDD repeats one
@@ -405,6 +407,22 @@ class _Group:
         return cls(members[0], frozenset().union(*mids.values()), by_node)
 
 
+class _Never(NamedTuple):
+    """A warning that a part of the filter never matches the messages in ``by_node`` (node to
+    their MIDs)."""
+
+    by_node: Mapping[str, tuple[frozenset[int], Mapping[str, int]]]
+    warning: FilterError
+
+    def reaches(self, mids: frozenset[int] | None, nodes: frozenset[str] | None) -> bool:
+        """Whether one of the messages can get past a filter's candidate ``mids`` and ``nodes``
+        (``None``: any), so the warning is about something the filter would otherwise show."""
+        return any(
+            (nodes is None or node in nodes) and (mids is None or not mids.isdisjoint(found))
+            for node, (found, _) in self.by_node.items()
+        )
+
+
 def _union(sets: Iterable[frozenset[int]]) -> frozenset[int]:
     found = list(sets)
     return found[0] if len(found) == 1 else frozenset().union(*found)
@@ -443,14 +461,14 @@ def _always(value: Any) -> bool:
 
 class _Plan(NamedTuple):
     """One predicate against one field type: its test (``None``: the field never matches), why
-    the test can never be true (a range), and per literal why the field cannot hold it (``None``:
-    it can). ``op_reject`` is set when the operator is not defined for the type."""
+    the test can never be true (an equality or an ordering the field's range cannot satisfy), and
+    per literal why the field cannot hold it (``None``: it can). ``op_reject`` is set when the
+    operator is not defined for the type."""
 
     test: Test | None
     problem: str | None
     rejects: tuple[_Reject | None, ...]
     op_reject: _Reject | None
-    unmatched: str | None = None  # an ordering no value of the field's range satisfies
 
 
 def _enum_key(enum: Mapping[str, int] | None) -> Any:
@@ -558,7 +576,8 @@ class _Compiler:
     ) -> None:
         self.text = text
         self.env = _Env(codecs, links, aliases)
-        self.warnings: list[FilterError] = []  # parts that can never be true for some message
+        self.warnings: list[_Never] = []  # parts that can never be true for some messages
+        self._negations = 0  # `not`s around the predicate being compiled
         self._group_memo: dict[str, list[_Group]] = {}
         self._fields_memo: dict[tuple[Any, ...], _Node] = {}
         self._scalars: Mapping[str, Callable[[Predicate], _Node]] = {
@@ -588,7 +607,11 @@ class _Compiler:
             case Predicate():
                 return self._predicate(tree)
             case Not(child=child):
-                inner = self.compile(child)
+                self._negations += 1
+                try:
+                    inner = self.compile(child)
+                finally:
+                    self._negations -= 1
                 return _Node(inner.cost, None, _negated(inner.fn))
             case And(children=children):
                 parts = sorted((self.compile(c) for c in children), key=lambda n: n.cost)
@@ -753,7 +776,8 @@ class _Compiler:
         Fields of one type and enum mean the same thing to a predicate, so the work is done once
         per such group, however many messages a CCDD has.
         """
-        key = (name, p.op, tuple((lit.kind, lit.value) for lit in p.values))
+        negated = self._negations % 2 == 1
+        key = (name, p.op, negated, tuple((lit.kind, lit.value) for lit in p.values))
         cached = self._fields_memo.get(key)
         if cached is not None:
             return cached
@@ -763,7 +787,7 @@ class _Compiler:
         taken = [False] * len(p.values)
         first_reject: dict[int, tuple[_Group, _Reject]] = {}
         first_range: tuple[_Group, str] | None = None
-        unreachable: list[tuple[_Group, str]] = []
+        never: list[tuple[_Group, str]] = []
         reachable = False
         for group in groups:
             plan = self._plan(p, group.sample.field)
@@ -780,12 +804,9 @@ class _Compiler:
             chosen.append((group, plan.test))
             if plan.problem is None:
                 reachable = True
-            elif first_range is None:
-                first_range = (group, plan.problem)
-            if plan.unmatched is not None or plan.problem is not None:
-                unreachable.append(
-                    (group, plan.unmatched or f"{plan.problem}, so it never matches")
-                )
+            else:
+                never.append((group, plan.problem))
+                first_range = first_range or (group, plan.problem)
         if not chosen and not first_reject and first_op is not None:  # no field takes the operator
             group, reject = first_op
             where = self._where(name, group)
@@ -803,12 +824,15 @@ class _Compiler:
                 p.values[0].pos,
                 f"{self._where(name, group)}: {problem}",
             )
-        for group, why in unreachable:
-            self.warnings.append(
-                FilterError(
-                    Code.FLT_TYPE, self.text, p.values[0].pos, f"{self._where(name, group)}: {why}"
+        if not negated:  # under a `not`, a part that never matches makes the whole true
+            for group, why in never:
+                warning = FilterError(
+                    Code.FLT_TYPE,
+                    self.text,
+                    p.values[0].pos,
+                    f"{self._where(name, group)}: {why}, so it never matches",
                 )
-            )
+                self.warnings.append(_Never(group.by_node, warning))
         node = _Node(Cost.DECODE, _union(g.mids for g, _ in chosen), _group_fn(chosen))
         self._fields_memo[key] = node
         return node
@@ -853,13 +877,14 @@ class _Compiler:
                 rejects.append(None)
             except _Reject as reject:
                 rejects.append(reject)
-        problem = unmatched = None
+        problem = None
         if klass is TypeClass.INT and values:
             lo, hi = fld.type.bit_range
-            problem = _out_of_range(op, values, lo, hi)
-            unmatched = _ordering_unmatched(op, values, lo, hi)
+            problem = _out_of_range(op, values, lo, hi) or _ordering_unmatched(
+                op, values, lo, hi, p.values[0].value
+            )
         if values:
-            return _Plan(_make_test(op, values), problem, tuple(rejects), None, unmatched)
+            return _Plan(_make_test(op, values), problem, tuple(rejects), None)
         if op == "!=":  # not ==: the field cannot hold the value, so it is never equal to it
             return _Plan(_always, None, tuple(rejects), None)
         return _Plan(None, None, tuple(rejects), None)
@@ -1249,13 +1274,17 @@ def compile_filter(
     *,
     links: Iterable[str] | None = None,
     aliases: Mapping[str, str] | None = None,
+    restrict_mids: frozenset[int] | None = None,
 ) -> Filter:
     """Compile ``text`` against the codecs of the nodes a run uses (node name to codec).
 
     ``links`` are the link names ``link == ...`` may name (``None``: any); ``aliases`` maps a
     node alias to its node name, so ``node == flight`` works as ``node == fc`` (an alias of a
     node not in ``codecs`` is unknown, and a node name wins over an alias spelled the same).
-    The returned :class:`Filter` is valid for frames decoded with these same codecs. Raises
+    ``restrict_mids`` is a set of MIDs the caller shows regardless of the filter (``None``: any):
+    a never-matching part is only reported for messages that pass it and the filter's own
+    candidate MIDs and nodes. The returned :class:`Filter` is valid for frames decoded with
+    these same codecs. Raises
     :class:`FilterError` (``IB-FLT-001..004``) and nothing else.
     """
     tree = parse(text)
@@ -1266,6 +1295,17 @@ def compile_filter(
         raise FilterError(
             Code.FLT_LIMIT, text, 0, f"nesting deeper than {MAX_DEPTH} levels"
         ) from None
+    mids = root.mids
+    if restrict_mids is not None:
+        mids = restrict_mids if mids is None else mids & restrict_mids
+    seen: list[IronbirdError] = [
+        n.warning for n in compiler.warnings if n.reaches(mids, root.nodes)
+    ]
+    if len(seen) > MAX_WARNINGS:
+        more = IronbirdError(
+            Code.FLT_TYPE, f"{len(seen) - MAX_WARNINGS} more parts that never match are not listed"
+        )
+        seen = [*seen[:MAX_WARNINGS], more]
     return Filter(
         text,
         root.mids,
@@ -1273,7 +1313,7 @@ def compile_filter(
         _root(root),
         root.cost,
         root.nodes,
-        tuple(compiler.warnings[:MAX_WARNINGS]),
+        tuple(seen),
     )
 
 

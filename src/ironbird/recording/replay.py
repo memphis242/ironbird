@@ -607,7 +607,9 @@ class Replay:
         if not follower.wait_for_file(path):
             return
         # The part is created before its head is written: a head that is not there yet is awaited
-        # for a moment, and one that stays unreadable is reported like any other.
+        # for a moment, and one that stays unreadable is reported like any other. A file that
+        # cannot be opened (IB-REC-014: permission, not a regular file) does not change by
+        # waiting, so only the codes of a head not yet written are retried.
         for attempt in range(HEAD_WAIT_POLLS + 1):
             try:
                 self._check_set([path], closed, self._session)

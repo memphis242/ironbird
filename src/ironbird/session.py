@@ -45,7 +45,11 @@ from ironbird.codec import (
 )
 from ironbird.config import Link, Node, ResponseRule, SystemConfig
 from ironbird.engine import (
+    DISPLAY,
+    EVENT_STREAM,
+    RESPONDER,
     Capture,
+    Consumer,
     Engine,
     FrameDecoder,
     FrameSink,
@@ -670,6 +674,7 @@ class Session:
         sinks: Sequence[FrameSink] = (),
         queue_frames: int | None = None,
         queue_bytes: int | None = None,
+        consumer: Consumer = DISPLAY,
     ) -> Capture:
         """Start receiving on ``routes``: an async iterator of every frame they carry.
 
@@ -681,7 +686,7 @@ class Session:
         """
         ends = [(route.link, link_end(route.side)) for route in routes]
         return await self._engine.open_capture(
-            ends, sinks=sinks, queue_frames=queue_frames, queue_bytes=queue_bytes
+            ends, sinks=sinks, queue_frames=queue_frames, queue_bytes=queue_bytes, consumer=consumer
         )
 
     def streams_for(self, routes: Sequence[Route]) -> tuple[Stream, ...]:
@@ -752,16 +757,20 @@ class Session:
         """
         return self._engine.decoder(report_checked=report_checked)
 
-    def compile_filter(self, text: str, nodes: Sequence[str]) -> Filter:
+    def compile_filter(
+        self, text: str, nodes: Sequence[str], *, mids: frozenset[int] | None = None
+    ) -> Filter:
         """Compile the ``--where`` expression ``text`` against the definitions of ``nodes`` (the
-        nodes whose frames it will test) and this configuration's link names. Raises
-        ``IB-FLT-*`` (exit 2) before anything is opened."""
+        nodes whose frames it will test) and this configuration's link names; ``mids`` is the
+        set of MIDs the run is limited to (``None``: any), which the never-matching warnings
+        respect. Raises ``IB-FLT-*`` (exit 2) before anything is opened."""
         codecs = {name: self.codec_for(name) for name in dict.fromkeys(nodes)}
         flt = compile_filter(
             text,
             codecs,
             links=[link.name for link in self.config.links],
             aliases={node.alias: node.name for node in self.config.nodes.values()},
+            restrict_mids=mids,
         )
         for warning in flt.warnings:  # a part that matches nothing: the run is not refused
             self.report(warning, context="filter", level=Level.WARNING)
@@ -813,7 +822,11 @@ class Session:
         filter. Raises the usage errors (``IB-CFG-*``, ``IB-FLT-*``) without opening anything or
         writing a ledger record, so a front end can refuse a bad invocation up front."""
         route = self.route(peer, link_name=link)
-        flt = self.compile_filter(where, [route.server.name]) if where is not None else None
+        flt = (
+            self.compile_filter(where, [route.server.name], mids=mids)
+            if where is not None
+            else None
+        )
         if flt is not None:
             self._require_overlap(flt, mids, "--mid allows")
         return route, flt
@@ -934,7 +947,11 @@ class Session:
                 '"category": "event" and an "event" mapping in the CCDD',
             )
         flt = (
-            self.compile_filter(where, [route.server.name for route in routes])
+            self.compile_filter(
+                where,
+                [route.server.name for route in routes],
+                mids=frozenset().union(*event_mids.values()),
+            )
             if where is not None
             else None
         )
@@ -957,7 +974,7 @@ class Session:
         is an error.
         """
         routes, event_mids, flt = self.plan_events(nodes, where=where)
-        capture = await self.capture(routes)
+        capture = await self.capture(routes, consumer=EVENT_STREAM)
         for route in routes:
             self._record_listen_start(route, event_mids[route.server.name], flt)
         recorded: dict[str, Any] = {"where": flt.source} if flt is not None else {}
@@ -1005,7 +1022,7 @@ class Session:
         chosen = route.link
         codec = self.codec_for(self.node.name)
         rules = _validate_rules(self.node, codec, self.config)
-        capture = await self.capture([route])
+        capture = await self.capture([route], consumer=RESPONDER)
         self.ledger.record(
             "action",
             "respond.start",

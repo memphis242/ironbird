@@ -82,6 +82,28 @@ def test_corpus_files_end_in_a_coded_error_and_hex_still_shows_the_frames(
     assert hexed.returncode == expect.hex_exit, hexed.stderr
 
 
+# name -> (exit status, frames shown, shown undecoded) of `replay --skip-damage` on head damage
+SKIP_DAMAGE_HEAD = {
+    "rpl-head-blob-damaged.ibrec": (5, 4, True),  # the definitions are gone, the frames are not
+    "rpl-head-frame-damaged.ibrec": (5, 3, False),  # the head is whole: damage to a frame only
+    "rpl-head-record-incomplete-at-eof.ibrec": (0, 0, False),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SKIP_DAMAGE_HEAD))
+def test_skipping_damage_in_the_head_keeps_every_frame_and_names_the_loss_once(
+    name: str, tmp_path: Path
+) -> None:
+    exit_code, shown, undecoded = SKIP_DAMAGE_HEAD[name]
+    done = run_ib(tmp_path, ["replay", "--skip-damage", str(CORPUS / name)], child_env(tmp_path))
+    assert "Traceback" not in done.stderr and "IB-INT-001" not in done.stderr, done.stderr
+    assert done.returncode == exit_code, done.stderr
+    assert len(done.stdout.splitlines()) == shown, done.stdout
+    assert ("UNDECODED" in done.stdout) is undecoded
+    # One line says why frames are undecoded; a head that is whole says nothing about definitions.
+    assert done.stderr.count("IB-REC-009") == (1 if undecoded else 0), done.stderr
+
+
 # -- definitions: arbitrary content never gets past IB-REC-009 --
 
 

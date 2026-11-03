@@ -1102,8 +1102,9 @@ def oversize_error(profile: HeaderProfile, data: Buffer, size: int, max_size: in
     return DecodeError(
         Code.DEC_OVERSIZE,
         max_size,
-        f"packet of {size} bytes is over ironbird.max_packet_bytes ({max_size}); raise it if "
-        "packets this large are expected",
+        f"packet of {size} bytes is over the {max_size}-byte limit; raise "
+        "ironbird.max_packet_bytes if packets this large are expected (a recording keeps the "
+        "limit it was made with)",
         peek_mid(profile, data),
     )
 

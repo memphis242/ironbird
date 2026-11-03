@@ -86,8 +86,8 @@ _LEGACY_REASONS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
     (re.compile(pattern), replacement)
     for pattern, replacement in (
         (
-            r"is over ironbird\.max_packet_bytes \((\d+)\); raise it if packets this large are "
-            r"expected$",
+            r"is over the (\d+)-byte limit; raise ironbird\.max_packet_bytes if packets this "
+            r"large are expected \(a recording keeps the limit it was made with\)$",
             r"exceeds cap \1",
         ),
         (r" \(a sender fault, or the wrong header profile\)$", ""),

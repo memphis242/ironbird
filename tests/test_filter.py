@@ -932,16 +932,15 @@ def test_decimals_compare_exactly_with_integer_fields(codecs: dict[str, Codec]) 
     frame = tlm(codecs, "TLM_B", big=top)
     for text, expected in {
         f"big > {top - 1}.5": True,
-        f"big > {top}.5": False,
         f"big >= {top}.0": True,
-        f"big > {top}.0": False,
         f"big < {top}.5": True,
         f"big <= {top - 1}.99999": False,
         f"big <= {top}.00000": True,
-        f"big >= {top}.5": False,
         "big > -0.5": True,
     }.items():
         assert verdicts_of(codecs, text, [frame]) == [expected], text
+    for beyond in (f"big > {top}.5", f"big > {top}.0", f"big >= {top}.5", "big < 0", "big < -0.5"):
+        assert error_of(codecs, beyond).code is Code.FLT_TYPE, beyond  # no value can satisfy it
     zero = tlm(codecs, "TLM_B", big=0)
     assert verdicts_of(codecs, "big < 0.1", [zero]) == [True]
     assert verdicts_of(codecs, "big > -0.1", [zero]) == [True]

@@ -15,6 +15,7 @@ import json
 import math
 import os
 import resource
+import shlex
 import signal
 import sys
 import time
@@ -51,6 +52,7 @@ from ironbird.config import (
     find_config,
     load_config,
 )
+from ironbird.engine import RECORDER
 from ironbird.errors import Code, IronbirdError, counted
 from ironbird.filter import Filter
 from ironbird.fsops import REAL_FS
@@ -63,6 +65,7 @@ from ironbird.recording.defs import (
     config_codecs,
     differences_from_config,
     embedded_codecs,
+    lost_definitions,
 )
 from ironbird.recording.export import (
     Destination,
@@ -379,7 +382,7 @@ OfflineBody = Callable[[Ledger, Console, "_Run"], int]
 def _print_error(console: Console, exc: IronbirdError, verbose: bool) -> None:
     assert not exc.code.is_warning, "a warning code is reported, never raised"
     line = exc.user_line()
-    if not verbose and exc.details:  # the pointer is only worth a word when there is more
+    if not verbose and exc.detail_text():  # the pointer is only worth a word when there is more
         line += " (more: -v)"
     console.err(term(line, 1000, err=True))
     if verbose:
@@ -394,7 +397,10 @@ def _print_ledger_unusable(
     error: nothing was sent); a command that only reads goes on, so it is a warning that the run
     is not logged."""
     if transmits:
-        _print_error(console, IronbirdError(exc.code, f"nothing sent: {exc.summary}"), verbose)
+        refused = IronbirdError(
+            exc.code, f"nothing sent: {exc.summary}", details=exc.details, cause=exc.cause
+        )
+        _print_error(console, refused, verbose)
         return
     line = f"warning {exc.code.value}: this run is not logged: {exc.summary}"
     console.err(term(line, 1000, err=True))
@@ -427,8 +433,8 @@ def _report_output_drops(session: Session, console: Console) -> None:
             session.report(
                 counted(
                     Code.OUT_DROPPED,
-                    f"{name} is not keeping up: {{n}} line(s) were dropped and are not saved "
-                    "anywhere; read it faster or redirect it to a file",
+                    f"{name} is not keeping up: {{n}} line(s) were dropped; only a recording "
+                    "(--record) still holds their data; read it faster or redirect it to a file",
                     count,
                 ),
                 context=name,
@@ -1670,7 +1676,7 @@ def record(
             split=parts,
         )
         async with scope:
-            capture = await session.capture(routes)
+            capture = await session.capture(routes, consumer=RECORDER)
             try:
                 await scope.commit()
             except BaseException:
@@ -1722,7 +1728,13 @@ def _damage_lines(report: rec_inspect.Report, *, verbose: bool = False) -> list[
     """The problems ``rec check`` reports: all the damage in one line (``verbose`` lists the
     stretches kept; the ledger has the same detail), then findings and unexplained holes."""
     lines: list[str] = []
-    if report.damage_total:
+    live = report.status == "recording"  # a writer holds it: an end without a trailer is not damage
+    if report.damage_total and live:
+        lines.append(
+            f"info {Code.REC_TORN.value}: the recording is still being written, so its last "
+            "record may be incomplete for now; check it again after it closes"
+        )
+    elif report.damage_total:
         code = Code.REC_DAMAGED if report.mid_file_damage else Code.REC_TORN
         severity = "error" if report.mid_file_damage else "warning"
         next_step = (
@@ -1750,7 +1762,10 @@ def _damage_lines(report: rec_inspect.Report, *, verbose: bool = False) -> list[
         )
     if report.trailer is None and not report.damage:
         lines.append(
-            f"warning {Code.REC_TORN.value}: the recording ends without a trailer (not closed "
+            f"info {Code.REC_TORN.value}: the recording is still being written; check it again "
+            "after it closes"
+            if live
+            else f"warning {Code.REC_TORN.value}: the recording ends without a trailer (not closed "
             "cleanly); every record before the end is readable; 'ib rec repair' makes a clean copy"
         )
     return lines
@@ -1784,13 +1799,17 @@ def rec_info(
             for line in info_lines(report):
                 console.out(line)
         if report.source == "scan" and report.index != "ok":
+            fix = (
+                ""  # a recording being written has no index yet
+                if report.status == "recording"
+                else " ('ib rec repair' writes a fresh index)"
+            )
             _coded_line(
                 ledger,
                 console,
                 Level.INFO,
                 Code.REC_INDEX,
-                f"no usable index ({report.index_note}); every record was read instead "
-                "('ib rec repair' writes a fresh index)",
+                f"no usable index ({report.index_note}); every record was read instead{fix}",
             )
         return 0
 
@@ -1886,15 +1905,14 @@ def rec_repair(
             damage=result.damage.reason if result.damage else None,
             frames_beyond_damage=result.frames_beyond,
         )
-        partial = result.damage is not None and not result.damage.torn
-        total = result.frames + result.frames_beyond
+        partial = result.frames_beyond > 0  # valid frames exist that the copy does not hold
         console.out(
             f"{'partial repair' if partial else 'repaired'} {term(str(source), 400)} -> "
-            f"{term(str(result.output), 400)}: "
+            f"{term(str(result.output), 400)}: kept {result.frames} frame(s)"
             + (
-                f"kept {result.frames} of {total} frame(s)"
+                f", {result.frames_beyond} more valid frame(s) are only in the original"
                 if partial
-                else f"{result.frames} frame(s)"
+                else ""
             )
             + f", {size_text(result.size)}; the original is unchanged"
         )
@@ -1929,7 +1947,7 @@ def rec_repair(
                 Code.REC_UNCOPIED,
                 f"{result.frames_beyond} valid frame(s) after the damage are in the original "
                 "only; read them with 'ib replay --skip-damage "
-                f"{term(str(source), 200, err=True)}'",
+                f"{term(shlex.quote(str(source)), 200, err=True)}'",
             )
             ledger.record_error(left, source=source, frames=result.frames_beyond)
             console.err(left.user_line())
@@ -2061,6 +2079,7 @@ def _replay_definitions(
     command: str = "replay",
     records: tuple[str, str, str] = _REPLAY_DEFS_RECORDS,
     config: SystemConfig | None = None,
+    undecoded_ok: bool = False,
 ) -> tuple[dict[str, Codec], dict[str, str] | None, IronbirdError | None]:
     """The codecs frames are decoded with, the node aliases a filter may use, and why there are
     no codecs when ``lenient`` let that pass.
@@ -2070,20 +2089,23 @@ def _replay_definitions(
     configuration's files differ; ``--defs config`` uses the configuration's files with the
     recording's packet cap. Nothing is built when ``needed`` is false (hex output, no filter);
     ``lenient`` (hex output) carries on without codecs when they cannot be had. ``config`` is the
-    configuration ``--defs config`` uses when the caller has loaded it already."""
+    configuration ``--defs config`` uses when the caller has loaded it already. With
+    ``undecoded_ok`` (a read that skips damage), definitions that damage took do not end the
+    command: the frames are shown undecoded, with one line that says why."""
     if not needed:
         return {}, None, None
     try:
         if defs is DefsSource.CONFIG:
             config = config if config is not None else _config_for_defs(glob)
             codecs = config_codecs(config, replay.nodes, replay.max_packet_bytes, command)
-            if replay.head.damaged:
+            lost = lost_definitions(replay.head, replay.nodes, replay.meta.data)
+            if lost:
                 console.err(
                     f"info {Code.REC_DEFS.value}: the recording's embedded definitions are "
                     f"damaged; decoding with {term(str(config.path), 200, err=True)} "
                     "(--defs config)"
                 )
-                ledger.record("state", records[2], damaged=True, config=str(config.path))
+                ledger.record("state", records[2], lost=lost[:64], config=str(config.path))
             return codecs, {n.alias: n.name for n in config.nodes.values()}, None
         codecs = embedded_codecs(
             replay.parts[0],
@@ -2094,9 +2116,17 @@ def _replay_definitions(
             REPLAY_HINT if command == "replay" else EXPORT_HINT,
         )
     except IronbirdError as exc:
-        if not lenient:
+        lost = lost_definitions(replay.head, replay.nodes, replay.meta.data)
+        salvage = undecoded_ok and exc.code is Code.REC_DEFS and bool(lost)
+        if not lenient and not salvage:
             raise
-        ledger.record("state", records[0], code=exc.code.value, summary=exc.summary)
+        ledger.record("state", records[0], code=exc.code.value, summary=exc.summary, lost=lost[:64])
+        if salvage and not lenient:
+            console.err(
+                f"warning {Code.REC_DEFS.value}: damage took the recording's embedded "
+                "definitions, so its frames are shown undecoded (hex); "
+                "--defs config decodes them with the current configuration"
+            )
         return {}, None, exc
     try:
         current = load_config(find_config(glob.config))
@@ -2355,7 +2385,14 @@ def replay(
             _report_missing_parts(replaying, ledger, console)
             needed = fmt is not OutputFormat.HEX or where is not None
             codecs, aliases, degraded = _replay_definitions(
-                base, replaying, defs, needed, fmt is OutputFormat.HEX, ledger, console
+                base,
+                replaying,
+                defs,
+                needed,
+                fmt is OutputFormat.HEX,
+                ledger,
+                console,
+                undecoded_ok=skip_damage,
             )
             flt: Filter | None = None
             if where is not None:

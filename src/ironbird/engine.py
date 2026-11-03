@@ -29,7 +29,7 @@ import traceback
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Final, Protocol
+from typing import Any, Final, NamedTuple, Protocol
 
 from ironbird.ccdd.model import MessageKind
 from ironbird.codec import Codec, Resolved
@@ -295,12 +295,29 @@ class _FrameQueue:
             raise self.error
 
 
+class Consumer(NamedTuple):
+    """What a capture's consumer is, as the user is told when its queue refuses frames: ``name``
+    the consumer, ``lost`` what the refused frames were, ``level`` how serious losing them is
+    (``None``: nothing is lost, the frames are only ledgered)."""
+
+    name: str
+    lost: str
+    level: Level | None
+
+
+DISPLAY: Final = Consumer("the display", "frame(s) not shown", Level.WARNING)
+EVENT_STREAM: Final = Consumer("the event stream", "frame(s) not checked for events", Level.ERROR)
+RESPONDER: Final = Consumer("the responder", "command(s) not answered", Level.ERROR)
+RECORDER: Final = Consumer("the recorder's queue", "frame(s) not queued", None)  # its sink saw them
+
+
 @dataclass(slots=True, eq=False)
 class _Subscription:
     """One consumer queue attached to one link end's receive stream."""
 
     queue: _FrameQueue
     io: _LinkIO
+    consumer: Consumer = DISPLAY
     dropped: int = 0  # frames the queue refused
     dropped_to_sinks: int = 0  # of those, frames a sink had already received
     reported: int = 0
@@ -750,7 +767,7 @@ class Engine:
         )
         self._notify_link(io, True, time_ns, f"{label}: link restored after {seconds:.1f} s")
         self._link_down_gap(io, started, time_ns)
-        marked = io.receiving and any(getattr(sink, "gap", None) for sink in self._sinks)
+        marked = io.receiving and self._gap_taken(io.rx_stream)
         self._report(
             IronbirdError(
                 Code.TX_UP,
@@ -760,6 +777,17 @@ class Engine:
             context=f"link up {label}",
             level=Level.INFO,
         )
+
+    def _gap_taken(self, stream: Stream) -> bool:
+        """Whether a sink that takes gaps would write one for ``stream`` (a sink that cannot say
+        is assumed to)."""
+        for sink in self._sinks:
+            if getattr(sink, "gap", None) is None:
+                continue
+            accepts = getattr(sink, "accepts_gap", None)
+            if accepts is None or accepts(stream):
+                return True
+        return False
 
     def _link_down_gap(self, io: _LinkIO, started: tuple[int, int], end_ns: int) -> None:
         """Tell the gap sinks the receive stream of ``io`` was down from ``started`` until
@@ -918,9 +946,11 @@ class Engine:
         sinks: Sequence[FrameSink] = (),
         queue_frames: int | None = None,
         queue_bytes: int | None = None,
+        consumer: Consumer = DISPLAY,
     ) -> Capture:
         """Start receiving on ``ends``; every frame they receive reaches ``sinks`` and the
         returned capture. ``sinks`` stay attached to the whole engine until the capture closes.
+        ``consumer`` says what drains the capture, for the report of a queue that overflows.
 
         The capture's queue holds at most ``queue_frames`` frames and ``queue_bytes`` bytes
         (frame data plus ``FRAME_OVERHEAD_BYTES`` each); frames past either are not shown to this
@@ -942,7 +972,7 @@ class Engine:
         try:
             for link, end in ends:
                 io = self._io(link, end)
-                sub = _Subscription(queue, io)
+                sub = _Subscription(queue, io, consumer)
                 capture._subs.append(sub)
                 await self._attach(io, sub)
         except BaseException:
@@ -1285,14 +1315,17 @@ class Engine:
             queue_dropped_bytes=queue.dropped_bytes,
             queue_peak_bytes=queue.peak_bytes,
         )
+        consumer = sub.consumer
+        if consumer.level is None:
+            return
         tail = f"; {kept} of them were still recorded" if kept else ""
         self._report(
             IronbirdError(
                 Code.ENG_LAG,
-                f"{label}: the display fell behind, {total} frame(s) not shown so far{tail}",
+                f"{label}: {consumer.name} fell behind, {total} {consumer.lost} so far{tail}",
             ),
             context=f"queue {label}",
-            level=Level.WARNING,
+            level=consumer.level,
         )
 
     def _note_unread(self, io: _LinkIO, transport: Transport) -> None:
@@ -1382,10 +1415,15 @@ class Engine:
 __all__ = [
     "CONSUMER_QUEUE_BYTES",
     "CONSUMER_QUEUE_FRAMES",
+    "DISPLAY",
+    "EVENT_STREAM",
     "FRAME_OVERHEAD_BYTES",
     "MAX_TRACKED_MIDS",
+    "RECORDER",
+    "RESPONDER",
     "Capture",
     "CaptureStats",
+    "Consumer",
     "Engine",
     "FrameDecoder",
     "FrameSink",

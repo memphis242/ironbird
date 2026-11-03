@@ -47,7 +47,7 @@ class _Entry:
 
 
 FOLD_SUMMARY: Final = (
-    "more distinct problems of this kind, not listed one by one; all are in the ledger"
+    "more occurrences of other problems of this kind, not listed one by one; all are in the ledger"
 )
 VARY: Final = " (details vary)"  # marks a summary that stands for several differing ones
 
@@ -166,6 +166,9 @@ class Coalescer:
                 self._groups[group] = (started, count + 1)
         if entry is not None:
             if now - entry.started < entry.window_s:
+                assert (template is None) == (entry.template is None), (
+                    "one key is either counted or plain, or its total would miss occurrences"
+                )
                 entry.suppressed += 1
                 if template is not None and amount is not None:
                     entry.amount += amount

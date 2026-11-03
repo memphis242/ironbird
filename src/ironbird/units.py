@@ -92,13 +92,33 @@ def suggest_size(text: str) -> str | None:
 
 
 def suggest_duration(text: str) -> str | None:
-    """The duration grammar's spelling of a common near miss (``"30 days"``, ``"2 hours"``)."""
+    """The duration grammar's spelling of a common near miss (``"30 days"``, ``"2 hours"``).
+    Never a guess between readings: see :func:`ambiguous_duration`."""
     match = _LOOSE_DURATION_RE.fullmatch(text)
-    if match is None:
+    if match is None or ambiguous_duration(text) is not None:
         return None
     unit = _DURATION_SPELLINGS.get(match.group(2).lower())
     candidate = f"{int(match.group(1))}{unit}" if unit else ""
     return candidate if candidate != text and parse_duration(candidate) is not None else None
+
+
+_AMBIGUOUS_DURATION_UNITS: Final = frozenset({"mo", "month", "months"})
+
+
+def ambiguous_duration(text: str) -> str | None:
+    """Advice for a duration whose unit can mean minutes or months (``"6M"``, ``"2 months"``):
+    a wrong guess would keep data for minutes instead of months, so none is made."""
+    match = _LOOSE_DURATION_RE.fullmatch(text)
+    if match is None:
+        return None
+    unit = match.group(2)
+    if unit != "M" and unit.lower() not in _AMBIGUOUS_DURATION_UNITS:
+        return None
+    count = int(match.group(1))
+    return (
+        f"{unit!r} is ambiguous (minutes or months); "
+        f"write '{count}min' for minutes or '{count}d' for days"
+    )
 
 
 def parse_count(text: str, high: int = 1000) -> int | None:

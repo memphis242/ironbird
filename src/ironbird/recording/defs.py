@@ -53,7 +53,6 @@ class Head:
     streams: Mapping[int, Stream]
     blobs: Blobs
     problem: str = ""  # why the definitions cannot be trusted as a set (empty: nothing wrong)
-    damaged: bool = False  # damage lies among the head records: some definitions may be lost
 
 
 def label_of(path: Path) -> str:
@@ -64,26 +63,18 @@ def label_of(path: Path) -> str:
 def read_head(reader: RecordingReader, *, skip_damage: bool = False) -> Head:
     """The streams and embedded definitions at the head of the file (the records before the first
     frame), without moving ``reader``. With ``skip_damage`` the walk goes on past damage (the
-    caller reads past it too) and :attr:`Head.damaged` says there was some. It does not raise
-    for what the file contains: a repeated
-    definition keeps the first and a contradiction, or more nodes than are allowed, is recorded
-    in :attr:`Head.problem` for :func:`embedded_codecs` to refuse, so output that needs no
-    definitions (hex) still works."""
+    caller reads past it too); what the damage took is :func:`lost_definitions`. It does not
+    raise for what the file contains: a repeated definition keeps the first and a contradiction,
+    or more nodes than are allowed, is recorded in :attr:`Head.problem` for
+    :func:`embedded_codecs` to refuse, so output that needs no definitions (hex) still works."""
     streams: dict[int, Stream] = {}
     blobs: dict[tuple[str, BlobKind], fmt.Blob] = {}
     nodes: set[str] = set()
     problem = ""
     seen_bytes = 0
     others = sources = 0  # a later part's head repeats every SOURCE, up to fmt.MAX_SOURCES
-    damaged = False
 
-    def note_damage() -> None:
-        nonlocal damaged
-        damaged = True
-
-    for item in reader.head_records(
-        reader.body_start, reader.size(), resync=note_damage if skip_damage else None
-    ):
+    for item in reader.head_records(reader.body_start, reader.size(), skip_damage=skip_damage):
         seen_bytes += item.end - item.offset
         if item.rtype == RecordType.SOURCE:
             sources += 1
@@ -119,7 +110,7 @@ def read_head(reader: RecordingReader, *, skip_damage: bool = False) -> Head:
             else:
                 nodes.add(blob.node)
                 blobs[key] = blob
-    return Head(streams, blobs, problem, damaged)
+    return Head(streams, blobs, problem)
 
 
 def _meta_digest(meta: Mapping[str, Any], node: str, kind: BlobKind) -> str | None:
@@ -128,6 +119,28 @@ def _meta_digest(meta: Mapping[str, Any], node: str, kind: BlobKind) -> str | No
     entry = nodes.get(node) if isinstance(nodes, dict) else None
     value = entry.get(f"{_KIND_NAMES[kind]}_sha256") if isinstance(entry, dict) else None
     return value.lower() if isinstance(value, str) else None
+
+
+def _meta_embedded(meta: Mapping[str, Any], node: str) -> bool | None:
+    """Whether META says the recording embeds the node's definitions (``None``: it does not
+    say, as in a recording made before META carried the flag)."""
+    nodes = meta.get("nodes")
+    entry = nodes.get(node) if isinstance(nodes, dict) else None
+    value = entry.get("embedded") if isinstance(entry, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+def lost_definitions(head: Head, nodes: Sequence[str], meta: Mapping[str, Any]) -> list[str]:
+    """``node:kind`` of each definition of ``nodes`` that META says the recording embeds and the
+    head does not hold: damage took it (a recording made without them, or one that does not say,
+    has none lost)."""
+    return [
+        f"{node}:{_KIND_NAMES[kind]}"
+        for node in dict.fromkeys(nodes)
+        if _meta_embedded(meta, node) is True
+        for kind in _ALL_KINDS
+        if (node, kind) not in head.blobs
+    ]
 
 
 REPLAY_HINT: Final = (
@@ -164,11 +177,12 @@ def embedded_codecs(
         found = {kind: head.blobs.get((node, kind)) for kind in _ALL_KINDS}
         missing = [_KIND_NAMES[kind] for kind, blob in found.items() if blob is None]
         if missing:
-            why = (
-                "(the part of the file that held it is damaged)"
-                if head.damaged
-                else "(recorded with embed_definitions = false, or by a node without them)"
-            )
+            why = {
+                True: "(the part of the file that held it is damaged)",
+                False: "(recorded with embed_definitions = false)",
+                None: "(recorded with embed_definitions = false, or the part that held it is "
+                "damaged)",
+            }[_meta_embedded(meta, node)]
             raise _unusable(
                 label, f"it embeds no {', '.join(missing)} for node {clean(node, 64)} {why}", hint
             )

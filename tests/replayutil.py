@@ -68,6 +68,7 @@ def nodes_table(node: str = "fc") -> dict[str, Any]:
     return {
         node: {
             "adapter": "json",
+            "embedded": True,
             "ccdd_sha256": hashlib.sha256(ccdd).hexdigest(),
             "command_profile_sha256": hashlib.sha256(command).hexdigest(),
             "telemetry_profile_sha256": hashlib.sha256(telemetry).hexdigest(),
@@ -147,7 +148,7 @@ def write_recording(
 ) -> Recorder:
     """Write ``frames`` to ``path`` through a real recorder, with the mock definitions embedded."""
     meta = meta_data(**(meta_extra or {}))
-    if not blobs:
+    if not blobs and not (meta_extra and "nodes" in meta_extra):
         meta["nodes"] = {}
     recorder = Recorder.open(
         path, meta, blobs=blob_specs() if blobs else [], streams=streams, options=options

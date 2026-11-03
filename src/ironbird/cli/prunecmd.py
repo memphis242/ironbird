@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import sys
 import time
 from collections.abc import Callable
@@ -239,12 +240,14 @@ def work(
         )
     if scan.unsafe:
         where = term(str(directory), 400, err=True)
+        quoted = term(shlex.quote(str(directory)), 400, err=True)
         # a dry run deletes nothing either way: it only warns that a real prune is refused
         severity = "warning" if flags.dry_run else "error"
         console.err(
             f"{severity} {Code.RET_UNSAFE.value}: prune "
             f"{'would be refused' if flags.dry_run else 'refused'}: {where} is writable by "
-            "others, so another user could swap names under it; run: chmod go-w <that directory>"
+            "others without the sticky bit, so another user could swap names under it; "
+            f"run 'chmod go-w {quoted}', or 'chmod +t {quoted}' if the directory is shared"
         )
         if not flags.dry_run:
             return 1

@@ -148,7 +148,7 @@ def collect_definitions(
     table: dict[str, Any] = {}
     for name in nodes:
         node = session.config.nodes[name]
-        entry: dict[str, Any] = {"adapter": node.ccdd_adapter}
+        entry: dict[str, Any] = {"adapter": node.ccdd_adapter, "embedded": embed}
         table[name] = entry
         assert (
             node.ccdd is not None

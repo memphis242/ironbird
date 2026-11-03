@@ -218,7 +218,8 @@ ib rec repair /data/run1.ibrec /data/run1.fixed.ibrec [--force]
   damage (`IB-REC-006`). `ib rec repair IN OUT` writes the valid prefix plus a fresh index and
   trailer to a new file and never modifies `IN`; it exits 5 if frames after mid-file damage were
   left out, and says so (`IB-REC-013`, with the `ib replay --skip-damage` command that reads them; a
-  `repair` that kept none of the frames is reported as a partial repair, not as success). A
+  `repair` that left valid frames behind is reported as a partial repair, not as success; damage with
+  no valid frame after it also exits 5, since data inside it is gone). A
   recording whose closing records were cut short is a torn tail to `check`, `repair` and `replay`
   alike. `ib rec info` reads the trailer, index and chunk summaries, not frames (a missing or
   bad index falls back to a full read, `IB-REC-008`), so for a closed file it says the contents
@@ -288,9 +289,11 @@ ib replay run1.ibrec --follow                                 # a recording stil
   everything before it was replayed (exit 0); a recording a recorder still holds open is not called
   torn. Mid-file damage is `IB-REC-006` with its offset and span: replay stops there (exit 5), or
   with `--skip-damage` goes on at the next valid record (still exit 5; the lost frames show as a
-  sequence gap). Damage that took the embedded definitions leaves nothing to decode with: replay
-  says so (`IB-REC-009`) and `--defs config` decodes with the configuration's files, with an info
-  line that names the file. The end-of-run summary on stderr counts frames read, in range, shown, malformed,
+  sequence gap). Damage that took the embedded definitions leaves nothing to decode with: with
+  `--skip-damage` replay still prints the frames, undecoded (hex), with one `IB-REC-009` line that
+  says why (exit 5); `--defs config` decodes them with the configuration's files, with an info line
+  that names the file. Damage to a frame is not damage to the definitions, and a recording made
+  with `embed_definitions = false` is never said to have lost them. The end-of-run summary on stderr counts frames read, in range, shown, malformed,
   unknown and garbage, skipped chunks, GAP records (and the frames they say were lost) and damage.
 - **Following.** `--follow` keeps reading a recording that is being written: at the end of the file
   it polls every 100 ms, treats a partly written last record as pending, and ends at the trailer
@@ -447,7 +450,7 @@ ends with a `session.end` record holding `exit` (the code) and `outcome` (`ok`, 
 
 Output never blocks the tool while it runs: a stalled stdout (unread pipe, paused pager) drops
 lines with one coalesced `IB-OUT-001` warning (the total of the lines dropped in its window) instead
-of freezing signals and `--timeout`; those lines are not saved anywhere, so redirect the output to a
+of freezing signals and `--timeout`; only a recording (`--record`) still holds their data, so redirect the output to a
 file when it must be complete. When the command ends normally it then waits, with no deadline, for a
 slow reader to take the lines already queued (one `IB-OUT-003` warning line, also in the ledger, says so
 after 2 s; a signal abandons them), so `--timeout` bounds the run, not the output: lines may keep
@@ -480,9 +483,9 @@ survives (a dropped line, a link that is down and retried, a filter part that ma
 `info` for state (a link back, an index rebuilt). A fatal error that has more to say ends in
 `(more: -v)`; `--verbose` and the ledger hold the full detail. A line that stands for repeats
 carries the total, not the latest figure: `serial /dev/ttyUSB0: 140 byte(s) of noise skipped ...
-(x5 in 4 s)`; distinct occurrences past five per code and window are folded into one line, shown
-when the window closes, and all of them are in the ledger. Configuration errors give the file, the
-key and the value that was written (`ledger.max_file_bytes: '1GB' is not a size; write '1GiB'`) and
+(x5 in 4 s)`; occurrences of further problems past five per code and window are folded into one
+line with their count, shown when the window closes, and all of them are in the ledger.
+Configuration errors give the file, the key and the value that was written (`ledger.max_file_bytes: '1GB' is not a size; write '1GiB'`) and
 name the nearest known key for an unknown one.
 
 Codes added by the error-message pass: `IB-TX-009` (link restored; `IB-TX-008` is only "lost"),
@@ -651,10 +654,13 @@ never equal there), and `x != L` is `not x == L` for every message that has `x`.
 rounded to the field's width (`ratio == 0.1` matches a stored float32 0.1) and a decimal compared
 with an integer is exact. `node ==` accepts a node's alias. `event.type >= error` shows what
 `--min-type error` shows, including events whose type has no severity. A filter that can never
-match (`msg == A and msg == B`, or MIDs outside `--mid`) is refused with `IB-FLT-003`. A part that
-can never be true for one message (`cmd_counter > 300` on a `uint8`, `x == 300` where only some
-messages have a narrow `x`) does not refuse the filter: it is a `warning IB-FLT-003` that names the
-field, the type and the message, since the filter is then still right for the other messages. Limits: 4096
+match (`msg == A and msg == B`, or MIDs outside `--mid`) is refused with `IB-FLT-003`. A comparison no
+value of the field's type can satisfy (`cmd_counter == 300` or `cmd_counter > 300` on a `uint8`) is
+refused alike when no message can match; when only some messages cannot (a narrower `x` in one
+message), the filter is still right for the others, so it is a `warning IB-FLT-003` that names the
+field, the type and the message, written with the bound as you typed it, and left out for messages
+the rest of the filter or `--mid` already excludes. `x != 300` on a `uint8` is true of every value
+and says nothing. Limits: 4096
 characters, 1024 tokens outside `in` lists, 32 levels of `not` and parentheses, 1024 `in` items,
 numbers of at most 40 characters. A frame whose MID cannot match is never decoded for the filter,
 and neither is a serial garbage frame (it is malformed whatever its bytes say). Malformed frames
