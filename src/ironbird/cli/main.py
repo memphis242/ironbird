@@ -2355,7 +2355,13 @@ def _default_export_format(
 ) -> ExportFormat:
     """The format when ``--format`` is not given: CSV wherever it has a place to go (a file or
     directory, one message to stdout, or an option only CSV has), else the ``listen`` lines on
-    stdout, which is what a bare ``ib export FILE`` can always show."""
+    stdout, which is what a bare ``ib export FILE`` can always show. An ``-o`` ending in ``.txt``
+    or ``.jsonl`` picks that format."""
+    if output is not None and not csv_only_option:
+        by_suffix = {".txt": ExportFormat.TEXT, ".jsonl": ExportFormat.JSONL}
+        inferred = by_suffix.get(output.suffix.casefold())
+        if inferred is not None:
+            return inferred
     if output is not None or csv_only_option or len(set(message or [])) == 1:
         return ExportFormat.CSV
     return ExportFormat.TEXT
@@ -2888,6 +2894,8 @@ def _ledger_usage_error(message: str) -> None:
     short session with the arguments, the error and the closing ``session.end``. Whatever goes
     wrong here is said on stderr; it never changes the exit code."""
     try:
+        # No config: the command line did not parse, so which config it names is unknown, and a
+        # session of three records cannot reach any [ledger] size limit.
         ledger = Ledger(
             default_state_dir(), session_class="short", command="usage", **LEDGER_OPTIONS
         )

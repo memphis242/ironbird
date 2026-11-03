@@ -15,10 +15,11 @@ import sys
 def main() -> int:
     try:
         from ironbird.cli.main import main as run  # noqa: PLC0415 - the point of this module
-    except KeyboardInterrupt:
+
+        return run()
+    except KeyboardInterrupt:  # before main() has its own handling in place
         sys.stderr.write(f"interrupted ({signal.Signals(signal.SIGINT).name})\n")
         return 128 + int(signal.SIGINT)
-    return run()
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -4371,6 +4371,10 @@ its options:
 - **Python 3.12 and later.** `requires-python = ">=3.11,<3.12"`, so pip on 3.12 prints its own
   incompatibility error. Options: test and allow 3.12 (the EL9 default); keep the pin (README now
   says 3.11 only).
+- **PR #31 review: tests that still name output facts.** `tests/test_ux_probe.py` keeps
+  checks for CCDD level names (`information`, `critical`) and the help phrase `hex for bytes`:
+  the first are data, not wording, and the help-reflow test has no structural anchor. Deferred
+  until help text gets a structural test hook.
 
 ## Later stages (outline; each gets its own plan)
 

@@ -608,13 +608,24 @@ class Codec:
             if msg is not None:  # a real message, but the other direction: say so, do not guess
                 hint = f"; {msg.name} is a {msg.kind.value} message, not a {kind.value}"
             else:
-                by_folded = {k.casefold(): k for k in known[:MAX_SUGGEST_FROM]}
+                wanted = name[:64].casefold()
+                # difflib's ratio is at most 2*min(len)/(len sum), so names too short or too long
+                # to reach the cutoff are dropped before the bound, not names late in the sort.
+                by_folded: dict[str, list[str]] = {}
+                for k in known:
+                    folded = k.casefold()
+                    lo, hi = sorted((len(folded), len(wanted)))
+                    if 2 * lo >= SUGGEST_CUTOFF * (lo + hi):
+                        by_folded.setdefault(folded, []).append(k)
+                    if len(by_folded) >= MAX_SUGGEST_FROM:
+                        break
                 close = [
-                    by_folded[c]
+                    original
                     for c in difflib.get_close_matches(
-                        name[:64].casefold(), list(by_folded), n=3, cutoff=SUGGEST_CUTOFF
+                        wanted, list(by_folded), n=3, cutoff=SUGGEST_CUTOFF
                     )
-                ]
+                    for original in by_folded[c]
+                ][:3]
                 if close:
                     hint = f"; did you mean {', '.join(close)}?"
                 else:

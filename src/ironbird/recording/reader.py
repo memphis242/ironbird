@@ -208,7 +208,7 @@ class RecordingReader:
 
     def _missing_hint(self, exc: OSError) -> str:
         """``; did you mean X.ibrec?`` when the name lacks the extension recordings are given."""
-        if exc.errno != errno.ENOENT or self.path.suffix == ".ibrec":
+        if exc.errno != errno.ENOENT or self.path.suffix.casefold() == ".ibrec":
             return ""
         with_extension = self.path.with_name(self.path.name + ".ibrec")
         try:

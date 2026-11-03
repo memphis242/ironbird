@@ -43,20 +43,32 @@ class _Entry:
     shared: str | None = None  # the words every occurrence had in common, once they differed
 
 
+VARY: Final = " (details vary)"  # marks a summary that stands for several differing ones
+
+
 def _shared_words(left: str, right: str) -> str:
     """``left`` and ``right`` with the words that differ replaced by ``...``, so a line that
     stands for several different occurrences (``packet of ... bytes``) states nothing that only
-    some of them had."""
+    some of them had. When they share too little for that to say what failed (under a third of
+    the words), it is ``left`` as first seen with a ``(details vary)`` suffix."""
+    if left.endswith(VARY):
+        return left
     a, b = left.split(" "), right.split(" ")
     if len(a) == len(b):
-        return " ".join(x if x == y else "..." for x, y in zip(a, b, strict=True))
-    head = 0
-    while head < min(len(a), len(b)) and a[head] == b[head]:
-        head += 1
-    tail = 0
-    while tail < min(len(a), len(b)) - head and a[-1 - tail] == b[-1 - tail]:
-        tail += 1
-    return " ".join([*a[:head], "...", *a[len(a) - tail :]])
+        words = [x if x == y else "..." for x, y in zip(a, b, strict=True)]
+    else:
+        head = 0
+        while head < min(len(a), len(b)) and a[head] == b[head]:
+            head += 1
+        tail = 0
+        while tail < min(len(a), len(b)) - head and a[-1 - tail] == b[-1 - tail]:
+            tail += 1
+        words = [*a[:head], "...", *a[len(a) - tail :]]
+    collapsed = [w for i, w in enumerate(words) if not (w == "..." and i and words[i - 1] == "...")]
+    kept = sum(1 for w in collapsed if w != "...")
+    if kept == 0 or 3 * kept < len(a):
+        return left + VARY
+    return " ".join(collapsed)
 
 
 class Coalescer:
