@@ -194,7 +194,7 @@ def test_reader_exiting_during_the_final_drain_is_a_normal_end_without_a_traceba
         wait_for_text(proc, "listening")
         send_burst(mock_config_path, 1500)
         deadline = time.monotonic() + 15
-        while not events_named(state_dir, "session.end") and time.monotonic() < deadline:
+        while not events_named(state_dir, "session.stop") and time.monotonic() < deadline:
             time.sleep(0.05)
         time.sleep(0.3)  # the event loop is closed; the process is draining a full pipe
         assert proc.stdout is not None
