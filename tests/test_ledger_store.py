@@ -392,7 +392,9 @@ def test_fifty_transmissions_while_stalled_give_bounded_lines_then_one_summary(
     rig.ledger.flush_notices()
     folded = [n for n in rig.notices if n.code is Code.LED_UNLOGGED and n.count > 1]
     assert len(folded) == 1 and folded[0].count == 50
-    assert folded[0].summary.startswith("CMD49 sent to fc but not logged")
+    # the commands differ, so the folded line keeps the words they share; the close summary
+    # below names the first and the last
+    assert "sent to fc but not logged" in folded[0].summary and "CMD" not in folded[0].summary
     report = rig.ledger.close()
     (summary,) = report.notices
     assert summary.summary.startswith("50 commands sent but not logged (first CMD00 to fc at ")

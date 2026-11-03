@@ -11,6 +11,7 @@ with no slicing copies.
 
 from __future__ import annotations
 
+import difflib
 import math
 import re
 import struct
@@ -247,6 +248,8 @@ def _arg_error(message: Message, field: FieldDef, why: str) -> IronbirdError:
 _SPELLED_NON_FINITE: Final = re.compile(r"[+-]?(inf|infinity|nan)", re.IGNORECASE)
 _NONZERO_DIGIT: Final = re.compile(r"[1-9]")
 MAX_ENUM_HINT_NAMES: Final = 16
+MAX_SUGGEST_FROM: Final = 5000  # message names searched for a did-you-mean hint
+SUGGEST_CUTOFF: Final = 0.8  # similarity (0..1) a name needs to be offered as a suggestion
 MAX_LIST_TEXT: Final = 1 << 20  # characters of a spelled-out array or hex value a caller may pass
 
 
@@ -696,7 +699,31 @@ class Codec:
         msg = self.model.by_name.get(name)
         if msg is None or msg.kind is not kind:
             known = sorted(m.name for m in self.model.messages if m.kind is kind)
-            hint = f"; {len(known)} known" if known else ""
+            if msg is not None:  # a real message, but the other direction: say so, do not guess
+                hint = f"; {msg.name} is a {msg.kind.value} message, not a {kind.value}"
+            else:
+                wanted = name[:64].casefold()
+                # difflib's ratio is at most 2*min(len)/(len sum), so names too short or too long
+                # to reach the cutoff are dropped before the bound, not names late in the sort.
+                by_folded: dict[str, list[str]] = {}
+                for k in known:
+                    folded = k.casefold()
+                    lo, hi = sorted((len(folded), len(wanted)))
+                    if 2 * lo >= SUGGEST_CUTOFF * (lo + hi):
+                        by_folded.setdefault(folded, []).append(k)
+                    if len(by_folded) >= MAX_SUGGEST_FROM:
+                        break
+                close = [
+                    original
+                    for c in difflib.get_close_matches(
+                        wanted, list(by_folded), n=3, cutoff=SUGGEST_CUTOFF
+                    )
+                    for original in by_folded[c]
+                ][:3]
+                if close:
+                    hint = f"; did you mean {', '.join(close)}?"
+                else:
+                    hint = f"; {len(known)} known (see: ib find)" if known else ""
             raise IronbirdError(
                 Code.ENC_UNKNOWN,
                 f"unknown {kind.value} {name[:64]!r} for target {self.model.target}{hint}",

@@ -142,6 +142,7 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "cli.signal": Tier.ESSENTIAL,
         "session.start": Tier.ESSENTIAL,
         "session.end": Tier.ESSENTIAL,
+        "session.stop": Tier.ESSENTIAL,
         "find": Tier.ESSENTIAL,
         "send.request": Tier.ESSENTIAL,
         "send.fault": Tier.ESSENTIAL,
@@ -1640,9 +1641,13 @@ class Ledger:
         self._pump_events()
         return self._build_report(finished=finished)
 
-    def close(self) -> ExitReport:
+    def close(self, end: Mapping[str, Any] | None = None) -> ExitReport:
         """Write the rest, sync (a deferred error surfaces here), let an unused reserve hold
         the closing records and retire as the final part, and close the files.
+
+        ``end`` (the fields of the ``session.end`` record: exit code, outcome) is recorded after
+        every other record of the session, the closing summaries included, so ``session.end`` is
+        the last record of a session that closes normally.
 
         The writer is joined for at most ``join_timeout_s``; a writer still blocked then is left
         to die with the process and everything it had not confirmed counts as not written.
@@ -1663,6 +1668,8 @@ class Ledger:
         self._tick_records(final=True)
         for tier in (Tier.EVIDENCE, Tier.EVENTS):
             self._close_gap(Tier(tier))
+        if end is not None:
+            self.record("action", "session.end", **end)
         lines: list[Line] = []
         self._drain_into(lines, len(self._queue))
         self._queue_dropped_marker(lines)

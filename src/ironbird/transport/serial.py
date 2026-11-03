@@ -180,7 +180,8 @@ def open_error(device: str, exc: BaseException) -> IronbirdError:
         return IronbirdError(
             Code.TX_BUSY,
             f"serial {device} is locked by another process (another ib command or a terminal "
-            "program); close it, then retry",
+            "program); close it, then retry ('listen --record' watches and records on one "
+            "connection)",
             cause=exc,
         )
     if code in _DENIED_ERRNOS:
