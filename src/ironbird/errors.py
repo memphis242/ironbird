@@ -130,7 +130,15 @@ WARNING_CODES: Final[frozenset[Code]] = frozenset(
 
 
 MAX_SUMMARY_LEN = 600
-_USAGE_PREFIXES = ("IB-CFG-", "IB-HDR-", "IB-CCD-", "IB-CLI-", "IB-EVT-", "IB-FLT-")
+_USAGE_PREFIXES = (
+    "IB-CFG-",
+    "IB-HDR-",
+    "IB-CCD-",
+    "IB-ENC-",
+    "IB-CLI-",
+    "IB-EVT-",
+    "IB-FLT-",
+)
 
 
 class IronbirdError(Exception):
@@ -184,7 +192,9 @@ class IronbirdError(Exception):
 
     @property
     def exit_code(self) -> int:
-        """2 for configuration/usage problems the user fixes in files, 1 otherwise."""
+        """2 when the command line or a file the user maintains is wrong (usage, configuration,
+        CCDD, header profile, an unknown command or a bad argument value): the same invocation
+        cannot succeed until that is changed. 1 for a failure while running."""
         return 2 if self.code.value.startswith(_USAGE_PREFIXES) else 1
 
 

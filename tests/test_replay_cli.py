@@ -329,7 +329,7 @@ def test_from_and_to_select_a_range_and_the_index_skips_chunks(
     assert [r["fields"]["cmd_counter"] for r in lines_of(done)] == [
         (i % 256) for i in range(101, 151)
     ]
-    assert "chunk(s) skipped by the index" in done.stderr
+    assert "chunk(s) the index ruled out" in done.stderr
     absolute = run_ib(
         tmp_path,
         [

@@ -507,7 +507,9 @@ def test_a_failed_read_is_reported_once_and_the_listener_keeps_listening(
     _run(main())
     recv = [n for n in notices if n.code is Code.TX_RECV]
     assert len(recv) == 2, recv  # the first occurrence, then one summary of the other four
-    assert recv[1].count == 5 and "5 read error" in recv[1].summary
+    # the count carries the number; the words differ per occurrence (the running total), so the
+    # summary keeps only what every one of them said
+    assert recv[1].count == 5 and "read error" in recv[1].summary
 
 
 def test_a_dead_socket_ends_the_capture_with_the_error_after_what_it_received(

@@ -408,8 +408,8 @@ import os, signal
 import ironbird.cli.main as m
 import ironbird.ledger as ledger
 _orig = ledger.Ledger.close
-def close(self):
-    result = _orig(self)
+def close(self, end=None):
+    result = _orig(self, end)
     if not getattr(self, "_sent", False):
         self._sent = True
         os.kill(os.getpid(), signal.SIGTERM)

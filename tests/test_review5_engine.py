@@ -37,7 +37,7 @@ r, w = os.pipe()
 os.dup2(w, 2)
 original = Ledger.close
 fired = []
-def close(self):
+def close(self, end=None):
     if not fired:
         fired.append(1)
         cap = fcntl.fcntl(w, fcntl.F_GETPIPE_SZ)
@@ -50,7 +50,7 @@ def close(self):
             pass
         os.set_blocking(w, True)
         os.kill(os.getpid(), signal.SIGTERM)
-    return original(self)
+    return original(self, end)
 Ledger.close = close
 sys.argv = ["ib", "-c", sys.argv[1], "listen", "fc", "--timeout", "0.3"]
 sys.exit(m.main())

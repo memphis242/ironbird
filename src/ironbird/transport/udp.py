@@ -93,8 +93,9 @@ _OPEN_REMEDY: Final[Mapping[int, str]] = MappingProxyType(
         errno.ENOBUFS: "the system is out of socket buffer memory - free memory, then retry",
         errno.ENOMEM: "the system is out of memory - free memory, then retry",
         errno.EADDRINUSE: (
-            "another listener (ib listen/respond, cFS) may own the port - stop it or change "
-            "the port in the config"
+            "another listener (ib listen/record/events/respond, cFS) may own the port - stop "
+            "it or change the port in the config; 'listen --record' watches and records on "
+            "one port"
         ),
         errno.EADDRNOTAVAIL: "that address is not on this host - fix the host in the config",
         errno.EACCES: "ports below 1024 need privileges - use a higher port in the config",
@@ -670,7 +671,10 @@ class UdpTransport:
     @staticmethod
     def _send_error(target: Endpoint, exc: OSError) -> IronbirdError:
         if isinstance(exc, ConnectionRefusedError):
-            summary = f"nothing is listening at udp {target} (connection refused)"
+            summary = (
+                f"nothing is listening at udp {target} (connection refused); start the "
+                "receiver (ib respond, or the flight software) or check the endpoint in the config"
+            )
         else:
             summary = f"send to udp {target} failed: {exc.strerror or exc}"
         return IronbirdError(Code.TX_SEND, summary, cause=exc)
