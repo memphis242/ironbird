@@ -120,7 +120,7 @@ def main() -> None:
         "app": "\x1b[2J\x07",
         "event_id": 7,
         "event_type": 3,
-        "message": "=cmd|\x00\nl2\x1b[31m",
+        "message": "=cmd|\x7f\nl2\x1b[31m",  # the encoder refuses NUL in text
     }
     valid = [
         b"\x00" + b"=1+1\x1b[31m\xe2\x80\xae\xff\xfe \t-x",
