@@ -287,7 +287,19 @@ Tests:
   never a hang, decode/encode round-trips for valid input.
 - A checked-in corpus `tests/corpus/malformed/` of minimized bad inputs; every bug
   found adds one (the E2E regression rule).
-- Coverage-guided fuzzing (`atheris`) of the decode boundary as a scheduled CI job.
+- Coverage-guided fuzzing (`atheris`) of every parser of untrusted input as a scheduled CI job, one
+  runner per harness (`tools/fuzz/fuzz_<name>.py`, a matrix in `.github/workflows/ci.yml`; a test
+  fails if a harness is missing from it): packets (`decode`, `framer`), recordings (`recording`,
+  `replay`, `export`), the filter language (`filter`), config TOML (`config`), header-profile TOML
+  (`header_profile`), the CCDD loader and the codec built from it (`ccdd`), structure-aware edits of
+  parsed CCDD/config/profile documents (`schema`), what retention reads from
+  disk (`retention`: notices file, ledger heads, reserves, names), the ledger's record formatting
+  (`ledger`), terminal/JSON/spreadsheet output (`render`) and the CLI text grammars (`grammar`).
+  Each has a timeout (a hang is a finding) and an RSS limit (unbounded memory is a finding), seeds
+  from `tests/corpus/malformed`, and a corpus that persists between nights. A crash is minimized
+  into `tests/corpus/malformed` with a regression test; `tests/test_parser_properties.py` holds the
+  matching quick Hypothesis properties for PR CI and `tests/test_fuzz_harnesses.py` smoke-runs every
+  harness.
 - E2E: the mock flight node is sent malformed commands, and the ground side is sent
   malformed telemetry, at rate, asserting the engine keeps capturing and the errors
   coalesce.

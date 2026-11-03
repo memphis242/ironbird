@@ -41,7 +41,7 @@ jobs:
             pyproject.toml
             constraints-dev.txt
       - name: Install
-        run: python -m pip install -c constraints-dev.txt -e '.[dev]'
+        run: python -m pip install -c constraints-dev.txt -e '.[dev,fuzz]'
       - name: Lint
         run: |
           ruff check .
@@ -344,11 +344,31 @@ jobs:
         run: chown -R root:root "$GITHUB_WORKSPACE"
 
   fuzz:
-    name: fuzz decode boundary
-    # Scheduled only: coverage-guided fuzzing is too slow for every push.
+    name: fuzz ${{ matrix.target }}
+    # Scheduled only: coverage-guided fuzzing is too slow for every push. One runner per harness,
+    # in parallel; every harness in tools/fuzz must be listed (tests/test_fuzz_harnesses.py).
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
-    timeout-minutes: 55
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # target: tools/fuzz/fuzz_<target>.py; seconds: its fuzzing time
+          - {target: decode, seconds: 1200}      # Codec.decode and header.unpack, 3 header sets
+          - {target: framer, seconds: 900}       # the serial stream framer
+          - {target: recording, seconds: 900}    # the recording reader, scan and info
+          - {target: replay, seconds: 900}       # replay and the definitions a recording embeds
+          - {target: export, seconds: 900}       # export to CSV, text and JSONL
+          - {target: filter, seconds: 600}       # the filter language
+          - {target: config, seconds: 600}       # config TOML
+          - {target: header_profile, seconds: 600}  # header-profile TOML
+          - {target: ccdd, seconds: 900}         # the CCDD JSON loader and the codec built from it
+          - {target: retention, seconds: 600}    # notices file, ledger heads and reserves, names
+          - {target: ledger, seconds: 600}       # ledger record formatting
+          - {target: render, seconds: 600}       # terminal text, JSON records, spreadsheet cells
+          - {target: schema, seconds: 900}       # structure-aware edits of CCDD, config and profile docs
+          - {target: grammar, seconds: 300}      # sizes, durations, --split, --from/--to, types
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -358,30 +378,35 @@ jobs:
           cache-dependency-path: |
             pyproject.toml
             constraints-dev.txt
+      # The harnesses build their seeds from tests/ (recordings, corpus files), which needs the
+      # test dependencies as well as atheris.
       - name: Install
-        run: python -m pip install -c constraints-dev.txt -e '.[fuzz]'
-      - name: Fuzz Codec.decode and header.unpack
+        run: python -m pip install -c constraints-dev.txt -e '.[dev,fuzz]'
+      # Inputs that found new coverage on earlier nights: each night starts from them.
+      - name: Restore the corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/fuzz-corpus
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz ${{ matrix.target }}
+        env:
+          IRONBIRD_FUZZ_CORPUS: ${{ runner.temp }}/fuzz-corpus
         # libFuzzer writes the failing input (crash-*, timeout-*, oom-*) under the artifact prefix.
         run: |
           mkdir -p "$RUNNER_TEMP/fuzz-crashes"
-          python tools/fuzz/fuzz_decode.py -max_total_time=900 \
+          python tools/fuzz/fuzz_${{ matrix.target }}.py -max_total_time=${{ matrix.seconds }} \
             -artifact_prefix="$RUNNER_TEMP/fuzz-crashes/"
-      - name: Fuzz the recording reader
-        run: |
-          python tools/fuzz/fuzz_recording.py -max_total_time=600 \
-            -artifact_prefix="$RUNNER_TEMP/fuzz-crashes/"
-      - name: Fuzz replay and the definitions a recording embeds
-        run: |
-          python tools/fuzz/fuzz_replay.py -max_total_time=600 \
-            -artifact_prefix="$RUNNER_TEMP/fuzz-crashes/"
-      - name: Fuzz the serial stream framer
-        run: |
-          python tools/fuzz/fuzz_framer.py -max_total_time=600 \
-            -artifact_prefix="$RUNNER_TEMP/fuzz-crashes/"
+      - name: Save the corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/fuzz-corpus
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
       - name: Keep crash inputs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-crashes
+          name: fuzz-crashes-${{ matrix.target }}
           path: ${{ runner.temp }}/fuzz-crashes
           if-no-files-found: ignore

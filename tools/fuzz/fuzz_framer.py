@@ -21,10 +21,10 @@ claim limit that refused a real packet, or a false header that swallowed one, fa
 from __future__ import annotations
 
 import sys
-import tempfile
 from pathlib import Path
 
 import atheris
+from fuzzcommon import run, scratch_dir, seed_corpus
 
 with atheris.instrument_imports():
     from ironbird import header
@@ -169,13 +169,8 @@ def one_input(data: bytes) -> None:
 
 def main() -> None:
     """Fuzz in a scratch corpus seeded from the checked-in streams (the repo stays clean)."""
-    scratch = Path(tempfile.mkdtemp(prefix="ironbird-fuzz-framer-"))
-    corpus = REPO / "tests" / "corpus" / "malformed"
-    for i, path in enumerate(sorted(corpus.glob("ser-*.bin"))):
-        (scratch / f"seed{i}").write_bytes(b"\x00\x07" + path.read_bytes())
-    args = [a for a in sys.argv if a.startswith("-") or a == sys.argv[0]]
-    atheris.Setup([*args, str(scratch)], one_input)
-    atheris.Fuzz()
+    seeds = seed_corpus(scratch_dir("framer"), ["ser-*.bin"], prefixes=[b"\x00\x07"])
+    run(one_input, seeds, max_len=2048)
 
 
 if __name__ == "__main__":

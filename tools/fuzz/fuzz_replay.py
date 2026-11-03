@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 import atheris
+from fuzzcommon import run
 
 with atheris.instrument_imports():
     from ironbird.errors import IronbirdError
@@ -52,9 +53,7 @@ def main() -> None:
         (seeds / f"seed{i}").write_bytes(path.read_bytes())
     mixed_recording(SCRATCH / "valid.ibrec")
     (seeds / "valid").write_bytes((SCRATCH / "valid.ibrec").read_bytes())
-    args = [a for a in sys.argv if a.startswith("-") or a == sys.argv[0]]
-    atheris.Setup([*args, str(seeds)], one_input)
-    atheris.Fuzz()
+    run(one_input, seeds, max_len=65536)
 
 
 if __name__ == "__main__":

@@ -9,11 +9,10 @@ a frame without raising. Seeds are the checked-in ``flt-*`` corpus files plus va
 
 from __future__ import annotations
 
-import sys
-import tempfile
 from pathlib import Path
 
 import atheris
+from fuzzcommon import CORPUS, run, scratch_dir, seed_corpus
 
 with atheris.instrument_imports():
     from ironbird import header
@@ -70,14 +69,10 @@ def one_input(data: bytes) -> None:
 
 def main() -> None:
     """Fuzz in a scratch corpus seeded from the checked-in filters (the repo stays clean)."""
-    scratch = Path(tempfile.mkdtemp(prefix="ironbird-fuzz-"))
-    for i, path in enumerate((REPO / "tests" / "corpus" / "malformed").glob("flt-*.txt")):
-        (scratch / f"seed{i}").write_bytes(path.read_bytes())
-    for i, text in enumerate(VALID):
-        (scratch / f"valid{i}").write_bytes(text.encode())
-    args = [a for a in sys.argv if a.startswith("-") or a == sys.argv[0]]
-    atheris.Setup([*args, str(scratch)], one_input)
-    atheris.Fuzz()
+    seeds = seed_corpus(
+        scratch_dir("filter"), ["flt-*.txt"], [text.encode() for text in VALID], root=CORPUS
+    )
+    run(one_input, seeds, max_len=2048)
 
 
 if __name__ == "__main__":
