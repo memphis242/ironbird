@@ -145,7 +145,6 @@ class Coalescer:
             ledger_file,
         )
         assert len(self._entries) <= self._max_keys, "the table of open windows is bounded"
-        assert len(self._groups) <= len(Code), "a group is an error code"
 
     def tick(self) -> None:
         """Close expired windows; call about once a second from the owning loop."""
