@@ -288,6 +288,7 @@ Tests:
 - A checked-in corpus `tests/corpus/malformed/` of minimized bad inputs; every bug
   found adds one (the E2E regression rule).
 - Coverage-guided fuzzing (`atheris`) of the decode boundary as a scheduled CI job.
+- tools/coverage.sh is not run in CI yet, so `fail_under` is advisory: deferred because a measured full-suite run in CI needs its own job budget and a user decision on gating merges on it.
 - E2E: the mock flight node is sent malformed commands, and the ground side is sent
   malformed telemetry, at rate, asserting the engine keeps capturing and the errors
   coalesce.

@@ -99,7 +99,7 @@ ironbird = ["src/ironbird", "*/site-packages/ironbird"]
 show_missing = true
 skip_empty = true
 precision = 2
-fail_under = 94  # measured 95.2 (branch, with the exclusions below); the margin absorbs timing-skipped paths
+fail_under = 94  # branch, with the exclusions below; the margin under the measured total absorbs timing-skipped paths
 exclude_also = [
     "if TYPE_CHECKING:",
     "raise AssertionError\\(",  # unreachable-by-construction guards
