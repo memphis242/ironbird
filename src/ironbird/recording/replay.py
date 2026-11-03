@@ -383,7 +383,11 @@ class Replay:
         self._follower = follower
         if follow and self._follower is None:
             # The writer holds part 1 for the whole session, whichever part is being followed.
-            self._follower = Follower(self._base or self.parts[0], follow_idle_s, stop=stop)
+            self._follower = Follower(
+                self._base or self.parts[0],  # type: ignore[redundant-expr]  # _resolve_parts sets _base
+                follow_idle_s,
+                stop=stop,
+            )
         if (
             follow
             and self._follower is not None

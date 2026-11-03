@@ -515,7 +515,7 @@ class Ledger:
             self._long,
             command,
             ironbird.__version__,
-            **dict(store_options or {}),  # type: ignore[arg-type]
+            **dict(store_options or {}),
         )
         self._store = LedgerStore(
             scfg,
@@ -1170,7 +1170,7 @@ class Ledger:
     ) -> int | None:
         """The ledger record of a warning; ``shown`` is whether it is displayed, ``None`` when
         that is up to a rate limit that has not answered."""
-        decided = {} if shown is None else {"shown": shown}
+        decided: dict[str, Any] = {} if shown is None else {"shown": shown}
         return self.record(
             "warning",
             event,
@@ -1431,8 +1431,8 @@ class Ledger:
         ):
             return 0
         self._ensure_opened()
-        if self._dead:
-            return 0
+        if self._dead:  # _ensure_opened() can set _dead; mypy keeps the check above's narrowing
+            return 0  # type: ignore[unreachable]
         lines: list[Line] = []
         count = min(limit, len(self._queue))
         self._drain_into(lines, count)

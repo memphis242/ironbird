@@ -171,7 +171,7 @@ class Frame(_FrameFields):
         return self.__class__(*self[:IDENTITY_FIELDS])
 
     @classmethod
-    def _make(cls, iterable: Iterable[Any]) -> Self:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def _make(cls, iterable: Iterable[Any]) -> Self:  # type: ignore[override]  # pyright: ignore[reportIncompatibleMethodOverride]
         """A frame from its fields, through the same checks as the constructor. Takes the eight
         packet fields (a ninth, the check token, is accepted and dropped)."""
         fields = tuple(iterable)

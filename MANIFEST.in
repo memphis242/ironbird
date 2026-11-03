@@ -1,0 +1,5 @@
+# setuptools ships LICENSE, README.md and pyproject.toml on its own. The sample configs, CCDD
+# JSON and header profiles are documentation users copy from: the sdist carries them, the
+# wheel (importable code and py.typed) does not.
+graft examples
+include constraints-dev.txt

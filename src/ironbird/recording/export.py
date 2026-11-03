@@ -181,11 +181,13 @@ def _converter(field_def: FieldDef, raw_enums: bool) -> Callable[[object], objec
         case TypeClass.INT:
             if raw_enums or not field_def.enum_by_value:
                 return _int_cell
-            labels = {number: safe_cell(label) for number, label in field_def.enum_by_value.items()}
+            labels: dict[object, object] = {
+                number: safe_cell(label) for number, label in field_def.enum_by_value.items()
+            }
             get = labels.get
 
             def label_cell(value: object) -> object:
-                found = get(value)  # type: ignore[arg-type]
+                found = get(value)
                 return value if found is None else found
 
             return label_cell
@@ -209,7 +211,7 @@ class _LineOf:
 
 
 _WRITER: Final = csv.writer(
-    _LineOf(),  # type: ignore[arg-type]
+    _LineOf(),
     lineterminator="\n",
     quoting=csv.QUOTE_MINIMAL,
 )
