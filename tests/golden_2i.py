@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -81,10 +82,42 @@ def _zero_args(model: CcddModel, name: str) -> dict[str, object]:
     return out
 
 
+_LEGACY_REASONS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(pattern), replacement)
+    for pattern, replacement in (
+        (
+            r"is over ironbird\.max_packet_bytes \((\d+)\); raise it if packets this large are "
+            r"expected$",
+            r"exceeds cap \1",
+        ),
+        (r" \(a sender fault, or the wrong header profile\)$", ""),
+        (r" \((packet cut short|extra bytes), or the profile's length bias is wrong\)$", ""),
+        (
+            r"^(?:header|trailer) field (\w+) is (-?\d+), but the profile fixes it at (-?\d+)$",
+            r"\1 is \2, expected \3",
+        ),
+        (r": vehicle and CCDD disagree \(check the CCDD version\)$", ""),
+        (
+            r"^MID (0x[0-9A-F]{4}) is not in the CCDD \((\w+)\); update the CCDD or check "
+            r"the sender$",
+            r"unknown \2 MID \1",
+        ),
+    )
+)
+
+
+def legacy_reason(reason: str) -> str:
+    """``reason`` as it read before the error-message pass added advice to it, so the golden
+    vectors (which pin behaviour, not wording) hold."""
+    for pattern, replacement in _LEGACY_REASONS:
+        reason = pattern.sub(replacement, reason)
+    return reason
+
+
 def canonical(result: object) -> str:
     """One line that determines what a decode result says, without anything added in 2i."""
     if isinstance(result, DecodeError):
-        return f"E {result.code.value} {result.offset} {result.reason} {result.mid}"
+        return f"E {result.code.value} {result.offset} {legacy_reason(result.reason)} {result.mid}"
     if isinstance(result, DecodedPacket):
         h = result.header
         values = sorted(h.values.items())

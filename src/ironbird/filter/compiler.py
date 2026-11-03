@@ -23,6 +23,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import partial
+from types import MappingProxyType
 from typing import Any, Final, NamedTuple
 
 from ironbird.ccdd.model import (
@@ -148,7 +149,30 @@ def _out_of_range(op: str, values: Sequence[Any], lo: int, hi: int) -> str | Non
     return f"{shown} is outside {lo}..{hi}"
 
 
+def _ordering_unmatched(op: str, values: Sequence[Any], lo: int, hi: int) -> str | None:
+    """Why no value of ``lo..hi`` satisfies the ordering ``op`` against ``values[0]`` (``None``:
+    some does, or ``op`` is not an ordering)."""
+    if op not in _ORDERING_REACH or len(values) != 1:
+        return None
+    bound = values[0]
+    return (
+        None
+        if _ORDERING_REACH[op](lo, hi, bound)
+        else f"'{op} {bound}' never matches (the values are {lo}..{hi})"
+    )
+
+
+_ORDERING_REACH: Final[Mapping[str, Callable[[int, int, Any], bool]]] = MappingProxyType(
+    {
+        ">": lambda lo, hi, v: hi > v,
+        ">=": lambda lo, hi, v: hi >= v,
+        "<": lambda lo, hi, v: lo < v,
+        "<=": lambda lo, hi, v: lo <= v,
+    }
+)
+
 _FLOAT32: Final = struct.Struct("<f")
+MAX_WARNINGS: Final = 8  # never-true warnings kept per filter; a wide CCDD repeats one
 
 
 def _float_literal(lit: Literal, width: int = 8) -> float:
@@ -426,6 +450,7 @@ class _Plan(NamedTuple):
     problem: str | None
     rejects: tuple[_Reject | None, ...]
     op_reject: _Reject | None
+    unmatched: str | None = None  # an ordering no value of the field's range satisfies
 
 
 def _enum_key(enum: Mapping[str, int] | None) -> Any:
@@ -533,6 +558,7 @@ class _Compiler:
     ) -> None:
         self.text = text
         self.env = _Env(codecs, links, aliases)
+        self.warnings: list[FilterError] = []  # parts that can never be true for some message
         self._group_memo: dict[str, list[_Group]] = {}
         self._fields_memo: dict[tuple[Any, ...], _Node] = {}
         self._scalars: Mapping[str, Callable[[Predicate], _Node]] = {
@@ -737,6 +763,7 @@ class _Compiler:
         taken = [False] * len(p.values)
         first_reject: dict[int, tuple[_Group, _Reject]] = {}
         first_range: tuple[_Group, str] | None = None
+        unreachable: list[tuple[_Group, str]] = []
         reachable = False
         for group in groups:
             plan = self._plan(p, group.sample.field)
@@ -755,6 +782,10 @@ class _Compiler:
                 reachable = True
             elif first_range is None:
                 first_range = (group, plan.problem)
+            if plan.unmatched is not None or plan.problem is not None:
+                unreachable.append(
+                    (group, plan.unmatched or f"{plan.problem}, so it never matches")
+                )
         if not chosen and not first_reject and first_op is not None:  # no field takes the operator
             group, reject = first_op
             where = self._where(name, group)
@@ -771,6 +802,12 @@ class _Compiler:
                 self.text,
                 p.values[0].pos,
                 f"{self._where(name, group)}: {problem}",
+            )
+        for group, why in unreachable:
+            self.warnings.append(
+                FilterError(
+                    Code.FLT_TYPE, self.text, p.values[0].pos, f"{self._where(name, group)}: {why}"
+                )
             )
         node = _Node(Cost.DECODE, _union(g.mids for g, _ in chosen), _group_fn(chosen))
         self._fields_memo[key] = node
@@ -816,12 +853,13 @@ class _Compiler:
                 rejects.append(None)
             except _Reject as reject:
                 rejects.append(reject)
-        problem = None
+        problem = unmatched = None
         if klass is TypeClass.INT and values:
             lo, hi = fld.type.bit_range
             problem = _out_of_range(op, values, lo, hi)
+            unmatched = _ordering_unmatched(op, values, lo, hi)
         if values:
-            return _Plan(_make_test(op, values), problem, tuple(rejects), None)
+            return _Plan(_make_test(op, values), problem, tuple(rejects), None, unmatched)
         if op == "!=":  # not ==: the field cannot hold the value, so it is never equal to it
             return _Plan(_always, None, tuple(rejects), None)
         return _Plan(None, None, tuple(rejects), None)
@@ -1221,13 +1259,22 @@ def compile_filter(
     :class:`FilterError` (``IB-FLT-001..004``) and nothing else.
     """
     tree = parse(text)
+    compiler = _Compiler(text, codecs, links, aliases)
     try:
-        root = _Compiler(text, codecs, links, aliases).compile(tree)
+        root = compiler.compile(tree)
     except RecursionError:
         raise FilterError(
             Code.FLT_LIMIT, text, 0, f"nesting deeper than {MAX_DEPTH} levels"
         ) from None
-    return Filter(text, root.mids, root.cost is Cost.DECODE, _root(root), root.cost, root.nodes)
+    return Filter(
+        text,
+        root.mids,
+        root.cost is Cost.DECODE,
+        _root(root),
+        root.cost,
+        root.nodes,
+        tuple(compiler.warnings[:MAX_WARNINGS]),
+    )
 
 
 def _root(root: _Node) -> MatchFn:

@@ -244,6 +244,15 @@ EVIDENCE_ERRORS: Final = frozenset(
     }
 )
 
+#: How a tier is named in a notice and in the configuration ("ledger.<key>").
+_TIER_WORDS: Final[Mapping[Tier, tuple[str, str]]] = MappingProxyType(
+    {
+        Tier.ESSENTIAL: ("command and error", "essential_reserve_bytes"),
+        Tier.EVIDENCE: ("malformed-packet", "evidence_bytes_per_hour"),
+        Tier.EVENTS: ("event", "event_bytes_per_hour"),
+    }
+)
+
 # (time_ns, number, kind, event, fields, tier, bytes charged against the queue, transmission)
 _Entry = tuple[int, int, str, str, Mapping[str, Any], int, int, "TxInfo | None"]
 
@@ -534,8 +543,8 @@ class Ledger:
         if cfg.evidence_bytes_per_hour is None:
             self.warn(
                 Code.LED_UNBOUNDED,
-                'evidence_bytes_per_hour = "unlimited": a flood of malformed packets can fill '
-                "the disk",
+                'ledger.evidence_bytes_per_hour is "unlimited", so a flood of malformed packets '
+                "can fill the disk; set a size (the default is 32MiB)",
                 slow=True,
                 gated=True,
             )
@@ -1093,11 +1102,12 @@ class Ledger:
             allowance_bytes=int(allowance or 0),
             bytes_per_hour=budget.bytes_per_hour,
         )
+        what, key = _TIER_WORDS[tier]
         self.warn(
             Code.LED_TIER,
-            f"{tier.label} records are over their allowance "
-            f"({format_size(budget.bytes_per_hour)}/h, {format_size(written)} written): counted "
-            "only until they are back under it",
+            f"{what} logging paused: {format_size(written)} written, over ledger.{key} "
+            f"({format_size(budget.bytes_per_hour)}); counts continue and logging resumes when "
+            "it is back under",
             slow=True,
             key=f"{Code.LED_TIER.value}:{tier.label}",
         )
@@ -1266,30 +1276,30 @@ class Ledger:
             case "disk_full":
                 self.warn(
                     Code.LED_DISK,
-                    f"disk or quota full ({data['text']}): essential records now go to the "
-                    "reserve, event and evidence records are counted only",
+                    f"disk or quota full ({data['text']}): only commands and errors are logged "
+                    "now (into reserved space); free space soon",
                     slow=True,
                 )
             case "reserve_problem":
                 self.warn(
                     Code.LED_RESERVE,
-                    f"essential reserve not available: {data['text']}; a full disk will stall "
-                    "the ledger at once",
+                    f"no reserved ledger space ({data['text']}): if the disk fills, logging stops "
+                    "at once; put the state directory on a local disk",
                     slow=True,
                     gated=True,
                 )
             case "rotation_blocked":
                 self.warn(
                     Code.LED_ROTATE,
-                    f"ledger rotation blocked ({data['text']}): the current part keeps growing "
-                    "past max_file_bytes",
+                    f"the ledger file cannot be split ({data['text']}) and keeps growing past "
+                    "ledger.max_file_bytes; remove the stray files named in the ledger",
                     slow=True,
                 )
             case "no_lock":
                 self.warn(
                     Code.LED_NOLOCK,
-                    f"file locks are unavailable in {directory} ({data['text']}): this session "
-                    "runs unlocked and its liveness rests on freshness",
+                    f"{directory} has no file locks ({data['text']}, e.g. NFS): prune may treat "
+                    "sessions quiet for 10 min as finished; use a local disk",
                     slow=True,
                     gated=True,
                 )

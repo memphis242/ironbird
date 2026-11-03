@@ -156,7 +156,8 @@ def test_a_configuration_failure_refuses_the_send_and_nothing_goes_out(
         env={"IRONBIRD_STATE_DIR": str(blocker / "sub"), "PATH": "/usr/bin:/bin"},
     )
     assert done.returncode == 1 and "IB-LED-002" in done.stderr
-    assert "nothing was sent" in done.stderr and wire.count() == 0
+    assert "nothing sent" in done.stderr and wire.count() == 0
+    assert len(done.stderr.splitlines()) == 1  # one line says both
 
 
 def test_a_transient_open_failure_no_longer_refuses_a_send(

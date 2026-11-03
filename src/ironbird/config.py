@@ -19,7 +19,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final
 
-from ironbird.errors import Code, IronbirdError
+from ironbird.errors import Code, IronbirdError, close_names
 from ironbird.fsops import read_capped
 from ironbird.header import DEFAULT_MAX_PACKET_BYTES
 from ironbird.units import (
@@ -29,8 +29,12 @@ from ironbird.units import (
     MIB,
     SIZE_FORMS,
     TIB,
+    compact_duration,
+    format_size,
     parse_duration,
     parse_size,
+    suggest_duration,
+    suggest_size,
 )
 
 MAX_CONFIG_BYTES: Final = 1024 * 1024
@@ -315,6 +319,22 @@ class SystemConfig:
         return tuple(link for link in self.links if node in (link.source, link.destination))
 
 
+def _got(value: object) -> str:
+    """The value a user wrote, as a short quoted form for an error line (a table or list is
+    named, not printed)."""
+    match value:
+        case str():
+            return repr(value[:40]) + ("..." if len(value) > 40 else "")
+        case bool() | int() | float():
+            return repr(value)
+        case dict():
+            return "a table"
+        case list():
+            return "a list"
+        case _:
+            return "that value"
+
+
 class _Ctx:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -323,12 +343,21 @@ class _Ctx:
     def fail(self, key_path: str, message: str, code: Code = Code.CFG_SCHEMA) -> IronbirdError:
         return IronbirdError(code, f"{self.path}: {key_path}: {message}")
 
+    def reject(
+        self, key_path: str, value: object, message: str, code: Code = Code.CFG_SCHEMA
+    ) -> IronbirdError:
+        """:meth:`fail` for a value the user wrote: the line says what was written."""
+        return self.fail(key_path, f"{_got(value)} {message}", code)
+
     def keys(
         self, table: Mapping[str, Any], path: str, allowed: set[str], required: set[str]
     ) -> None:
         for key in table:
             if key not in allowed:
-                raise self.fail(f"{path}.{key}" if path else key, "unknown key")
+                raise self.fail(
+                    f"{path}.{key}" if path else key,
+                    "unknown key" + close_names(str(key), allowed),
+                )
         for key in sorted(required - table.keys()):
             raise self.fail(f"{path}.{key}" if path else key, "required key is missing")
 
@@ -340,12 +369,14 @@ class _Ctx:
 
     def name(self, value: object, path: str) -> str:
         if not isinstance(value, str) or not _NAME_RE.fullmatch(value):
-            raise self.fail(path, "must start with a letter; letters, digits, '-' and '_' only")
+            raise self.reject(
+                path, value, "is not a name: start with a letter; letters, digits, '-' and '_' only"
+            )
         return value
 
     def ident(self, value: object, path: str) -> str:
         if not isinstance(value, str) or not _IDENT_RE.fullmatch(value):
-            raise self.fail(path, "must be a CCDD identifier (letters, digits, underscore)")
+            raise self.reject(path, value, "is not a CCDD identifier (letters, digits, underscore)")
         return value
 
     def file(self, table: Mapping[str, Any], key: str, path: str) -> Path | None:
@@ -359,7 +390,7 @@ class _Ctx:
 
     def endpoint(self, value: object, path: str) -> Endpoint:
         if not isinstance(value, str) or ":" not in value:
-            raise self.fail(path, 'must be a string "host:port"')
+            raise self.reject(path, value, 'is not a "host:port" string')
         host, _, port_text = value.rpartition(":")
         if (
             not _HOST_RE.fullmatch(host)
@@ -367,10 +398,10 @@ class _Ctx:
             or not port_text.isdigit()
             or len(port_text) > MAX_PORT_DIGITS
         ):
-            raise self.fail(path, 'must be a string "host:port" with a port in 1..65535')
+            raise self.reject(path, value, 'is not a "host:port" with a port in 1..65535')
         port = int(port_text)
         if not 1 <= port <= 65535:
-            raise self.fail(path, f"port must be 1..65535, got {port}")
+            raise self.fail(path, f"port {port} is outside 1..65535")
         return Endpoint(host.strip("[]"), port)
 
     def device(self, value: object, path: str) -> str:
@@ -380,7 +411,9 @@ class _Ctx:
             or len(value) > 1024
             or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value)
         ):
-            raise self.fail(path, "must be an absolute device path without control characters")
+            raise self.reject(
+                path, value, "is not an absolute device path without control characters"
+            )
         return value
 
 
@@ -475,12 +508,16 @@ MAX_FREE_BYTES: Final = 1 << 50
 FSYNC_POLICIES: Final = ("chunk", "always", "never")
 
 
+def _near_node(value: object, claimed: Mapping[str, str]) -> str:
+    return close_names(value, claimed) if isinstance(value, str) else ""
+
+
 def _config_int(
     ctx: _Ctx, table: Mapping[str, Any], key: str, path: str, low: int, high: int
 ) -> int:
     value = table[key]
     if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
-        raise ctx.fail(f"{path}.{key}", f"must be an integer in {low}..{high}")
+        raise ctx.reject(f"{path}.{key}", value, f"is not an integer in {low}..{high}")
     return value
 
 
@@ -496,7 +533,11 @@ def _parse_recording(ctx: _Ctx, raw: object) -> RecordingConfig:
     defaults = RecordingConfig()
     fsync = ctx.string(raw, "fsync", "recording", defaults.fsync)
     if fsync not in FSYNC_POLICIES:
-        raise ctx.fail("recording.fsync", f"must be one of {', '.join(FSYNC_POLICIES)}")
+        raise ctx.reject(
+            "recording.fsync",
+            fsync,
+            f"is not one of {', '.join(FSYNC_POLICIES)}{close_names(fsync, FSYNC_POLICIES)}",
+        )
     embed = raw.get("embed_definitions", defaults.embed_definitions)
     if not isinstance(embed, bool):
         raise ctx.fail("recording.embed_definitions", "must be true or false")
@@ -540,16 +581,20 @@ def _config_size(
     value = table[key]
     forms = SIZE_FORMS + (" or exactly 'unlimited'" if unlimited else "")
     if isinstance(value, bool):
-        raise ctx.fail(f"{path}.{key}", f"must be {forms}")
+        raise ctx.reject(f"{path}.{key}", value, f"is not a size; use {forms}")
     if isinstance(value, str) and unlimited and value == UNLIMITED:
         return None
     size = (
         value if isinstance(value, int) else parse_size(value) if isinstance(value, str) else None
     )
     if size is None:
-        raise ctx.fail(f"{path}.{key}", f"must be {forms}")
+        better = suggest_size(value) if isinstance(value, str) else None
+        advice = f"write {better!r}" if better else f"use {forms}"
+        raise ctx.reject(f"{path}.{key}", value, f"is not a size; {advice}")
     if not low <= size <= high:
-        raise ctx.fail(f"{path}.{key}", f"must be from {low} to {high} bytes")
+        raise ctx.fail(
+            f"{path}.{key}", f"{_got(value)} is outside {format_size(low)}..{format_size(high)}"
+        )
     return size
 
 
@@ -572,9 +617,14 @@ def _config_duration(
         return None
     seconds = parse_duration(value) if isinstance(value, str) else None
     if seconds is None:
-        raise ctx.fail(f"{path}.{key}", f"must be {forms}")
+        better = suggest_duration(value) if isinstance(value, str) else None
+        advice = f"write {better!r}" if better else f"use {forms}"
+        raise ctx.reject(f"{path}.{key}", value, f"is not a duration; {advice}")
     if not low <= seconds <= high:
-        raise ctx.fail(f"{path}.{key}", f"must be from {low} to {high} seconds")
+        raise ctx.fail(
+            f"{path}.{key}",
+            f"{_got(value)} is outside {compact_duration(low)}..{compact_duration(high)}",
+        )
     return seconds
 
 
@@ -597,7 +647,11 @@ def _parse_ledger(ctx: _Ctx, raw: object) -> LedgerConfig:
     d = LedgerConfig()
     on_full = ctx.string(raw, "on_full", "ledger", d.on_full)
     if on_full not in ON_FULL_POLICIES:
-        raise ctx.fail("ledger.on_full", f"must be one of {', '.join(ON_FULL_POLICIES)}")
+        raise ctx.reject(
+            "ledger.on_full",
+            on_full,
+            f"is not one of {', '.join(ON_FULL_POLICIES)}{close_names(on_full, ON_FULL_POLICIES)}",
+        )
     reserve = _config_size(
         ctx, raw, "essential_reserve_bytes", "ledger", MIB, GIB, d.essential_reserve_bytes
     )
@@ -719,19 +773,26 @@ def _parse_serial(ctx: _Ctx, raw: object, path: str) -> SerialLinkSpec:
     def word(key: str, allowed: tuple[str, ...], default: str) -> str:
         value = raw.get(key, default)
         if not isinstance(value, str) or value not in allowed:
-            raise ctx.fail(f"{path}.{key}", f"must be one of {', '.join(allowed)}")
+            raise ctx.reject(
+                f"{path}.{key}",
+                value,
+                f"is not one of {', '.join(allowed)}"
+                + (close_names(value, allowed) if isinstance(value, str) else ""),
+            )
         return value
 
     data_bits = raw.get("data_bits", defaults.data_bits)
     if isinstance(data_bits, bool) or not isinstance(data_bits, int) or data_bits not in DATA_BITS:
-        raise ctx.fail(f"{path}.data_bits", f"must be one of {', '.join(map(str, DATA_BITS))}")
+        raise ctx.reject(
+            f"{path}.data_bits", data_bits, f"is not one of {', '.join(map(str, DATA_BITS))}"
+        )
     stop_bits = raw.get("stop_bits", defaults.stop_bits)
     if (
         isinstance(stop_bits, bool)
         or not isinstance(stop_bits, int | float)
         or float(stop_bits) not in STOP_BITS
     ):
-        raise ctx.fail(f"{path}.stop_bits", "must be one of 1, 1.5, 2")
+        raise ctx.reject(f"{path}.stop_bits", stop_bits, "is not one of 1, 1.5, 2")
     return SerialLinkSpec(
         device=ctx.device(raw["device"], f"{path}.device"),
         baud=_config_int(ctx, raw, "baud", path, MIN_BAUD, MAX_BAUD),
@@ -766,7 +827,12 @@ def _parse_framing(ctx: _Ctx, raw: object, path: str) -> FramingSpec:
     defaults = FramingSpec()
     kind = raw.get("kind", defaults.kind)
     if not isinstance(kind, str) or kind not in FRAMING_KINDS:
-        raise ctx.fail(f"{path}.kind", f"must be one of {', '.join(FRAMING_KINDS)}")
+        raise ctx.reject(
+            f"{path}.kind",
+            kind,
+            f"is not one of {', '.join(FRAMING_KINDS)}"
+            + (close_names(kind, FRAMING_KINDS) if isinstance(kind, str) else ""),
+        )
     require = raw.get("require_known_mid", defaults.require_known_mid)
     if not isinstance(require, bool):
         raise ctx.fail(f"{path}.require_known_mid", "must be true or false")
@@ -894,7 +960,7 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
         or not isinstance(max_bytes, int)
         or not 64 <= max_bytes <= 65535
     ):
-        raise ctx.fail("ironbird.max_packet_bytes", "must be an integer in 64..65535")
+        raise ctx.reject("ironbird.max_packet_bytes", max_bytes, "is not an integer in 64..65535")
 
     raw_nodes = data["nodes"]
     if not isinstance(raw_nodes, dict) or not raw_nodes:
@@ -917,9 +983,11 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
         acts_as = next(iter(nodes))
     else:
         if not isinstance(acts_as_text, str) or acts_as_text not in claimed:
-            raise ctx.fail(
+            raise ctx.reject(
                 "ironbird.acts_as",
-                f"must name a configured node or alias; known: {', '.join(nodes)}",
+                acts_as_text,
+                f"is not a configured node or alias{_near_node(acts_as_text, claimed)}; "
+                f"known: {', '.join(nodes)}",
                 Code.CFG_REF,
             )
         acts_as = claimed[acts_as_text]
@@ -939,9 +1007,11 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
         for key in ("from", "to"):
             value = raw[key]
             if not isinstance(value, str) or value not in claimed:
-                raise ctx.fail(
+                raise ctx.reject(
                     f"{lpath}.{key}",
-                    f"must name a configured node or alias; known: {', '.join(nodes)}",
+                    value,
+                    f"is not a configured node or alias{_near_node(value, claimed)}; "
+                    f"known: {', '.join(nodes)}",
                     Code.CFG_REF,
                 )
             ends.append(claimed[value])

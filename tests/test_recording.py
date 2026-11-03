@@ -698,7 +698,7 @@ def test_a_directory_or_missing_file_is_a_coded_error(tmp_path: Path) -> None:
     for target in (tmp_path, tmp_path / "missing.ibrec"):
         with pytest.raises(IronbirdError) as caught:
             RecordingReader(target)
-        assert caught.value.code is Code.REC_FORMAT
+        assert caught.value.code is Code.REC_OPEN  # cannot be opened, as against "not a recording"
 
 
 # -- index: a hint, never trusted --

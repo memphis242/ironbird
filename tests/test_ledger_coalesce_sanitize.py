@@ -14,7 +14,7 @@ import pytest
 from conftest import EXAMPLES
 from ironbird import render
 from ironbird.ccdd.model import MessageKind
-from ironbird.coalesce import MAX_NEW_PER_GROUP, Coalescer
+from ironbird.coalesce import FOLD_SUMMARY, MAX_NEW_PER_GROUP, Coalescer
 from ironbird.codec import Codec, DecodedPacket
 from ironbird.errors import Code, IronbirdError
 from ironbird.ledger import Ledger, default_state_dir, format_ts
@@ -90,10 +90,10 @@ def test_coalescer_rate_limits_distinct_keys_per_group_and_bounds_memory() -> No
     assert len(shown) == MAX_NEW_PER_GROUP
     assert len(co._entries) <= 8
     co.flush()
-    folded = [n for n in notices if n.summary == "more distinct occurrences"]
-    assert [n.count for n in folded] == [1, 995]  # announced once, then summarised
+    folded = [n for n in notices if n.summary == FOLD_SUMMARY]
+    assert [n.count for n in folded] == [995]  # one line, when the window closes, with the total
     assert all(n.code is Code.DEC_UNKNOWN for n in folded)
-    assert folded[1].line().startswith("error IB-DEC-006: more distinct occurrences (x995")
+    assert folded[0].line().startswith("error IB-DEC-006: ") and "(x995" in folded[0].line()
 
 
 def test_notice_line_uses_its_level_and_rejects_inconsistent_values() -> None:

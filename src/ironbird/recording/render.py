@@ -43,7 +43,11 @@ def _duration_s(report: Report) -> float:
 def _status_text(report: Report) -> str:
     status = report.status
     detail = {
-        "closed": "closed cleanly",
+        "closed": (
+            "closed cleanly"
+            if report.source == "scan"
+            else "closed (contents not verified; 'ib rec check' reads every record)"
+        ),
         "recording": "still being written (a recorder holds it)",
         "torn": "not closed cleanly: it ends in an incomplete record (readable up to there)",
         "unclosed": "not closed cleanly: it ends without a trailer",

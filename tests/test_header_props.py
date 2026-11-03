@@ -6,6 +6,7 @@ agree with the pre-2i implementation packet for packet."""
 from __future__ import annotations
 
 import random
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -14,6 +15,7 @@ from hypothesis import strategies as st
 
 import header_ref_pre2i as ref
 from conftest import EXAMPLES
+from golden_2i import legacy_reason
 from headergen import (
     EPOCH_SECONDS,
     Spec,
@@ -280,6 +282,8 @@ def test_a_pre_2i_profile_packs_and_checks_exactly_as_before(data: st.DataObject
     for candidate in _variants(data, packet):
         got = header.check_word(profile, candidate, max_size=60)
         want = ref.check_word(profile, candidate, 60)
+        if isinstance(got, DecodeError):  # the wording gained advice since the reference
+            got = replace(got, reason=legacy_reason(got.reason))
         assert got == want, (candidate.hex(), spec.doc())
         assert header.peek_mid(profile, candidate) == ref.peek_mid(profile, candidate)
         if isinstance(got, int):

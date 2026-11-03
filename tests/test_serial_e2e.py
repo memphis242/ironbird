@@ -229,7 +229,7 @@ def test_unplugging_and_replugging_the_device_records_a_link_down_gap(
         wait_until(lambda: Code.TX_DOWN.value in recorder.stderr, "the link down notice")
         assert "reconnecting" in recorder.stderr
         bridge.plug("a")
-        wait_until(lambda: "link restored" in recorder.stderr, "the link restored notice")
+        wait_until(lambda: Code.TX_UP.value in recorder.stderr, "the link restored notice")
         bridge.inject("a", hk(4) + hk(5))
         wait_until(lambda: len(frames_of(out)) >= 5, "the packets after the replug", proc=recorder)
     finally:
@@ -273,12 +273,15 @@ def test_listen_keeps_decoding_after_the_device_comes_back(
         bridge.unplug("a")
         wait_until(lambda: Code.TX_DOWN.value in listener.stderr, "the link down notice")
         bridge.plug("a")
-        wait_until(lambda: "link restored" in listener.stderr, "the link restored notice")
+        wait_until(lambda: Code.TX_UP.value in listener.stderr, "the link restored notice")
         bridge.inject("a", hk(2))
         wait_until(lambda: "cmd_counter=2" in listener.stdout, "the packet after", proc=listener)
     finally:
         stop(listener)
-    assert listener.stderr.count(f"error {Code.TX_DOWN.value}: ") >= 1
+    assert listener.stderr.count(f"warning {Code.TX_DOWN.value}: ") >= 1
+    assert (
+        "gap" not in listener.stderr.split(Code.TX_UP.value, 1)[1].splitlines()[0]
+    )  # nothing records
     down_notices = [ln for ln in listener.stderr.splitlines() if "link lost" in ln]
     assert len(down_notices) == 1  # one notice for the outage, however long the reconnect took
 

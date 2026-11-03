@@ -51,11 +51,11 @@ from ironbird.config import (
     find_config,
     load_config,
 )
-from ironbird.errors import Code, IronbirdError
+from ironbird.errors import Code, IronbirdError, counted
 from ironbird.filter import Filter
 from ironbird.fsops import REAL_FS
 from ironbird.ledger import ExitReport, Ledger, default_state_dir
-from ironbird.notice import Notice
+from ironbird.notice import Level, Notice
 from ironbird.recording import inspect as rec_inspect
 from ironbird.recording.defs import (
     EXPORT_HINT,
@@ -378,10 +378,46 @@ OfflineBody = Callable[[Ledger, Console, "_Run"], int]
 
 def _print_error(console: Console, exc: IronbirdError, verbose: bool) -> None:
     assert not exc.code.is_warning, "a warning code is reported, never raised"
-    console.err(term(exc.user_line(), 1000, err=True))
+    line = exc.user_line()
+    if not verbose and exc.details:  # the pointer is only worth a word when there is more
+        line += " (more: -v)"
+    console.err(term(line, 1000, err=True))
     if verbose:
         for line in exc.detail_text().splitlines():
             console.err(f"  {term(line, 2000, err=True)}")
+
+
+def _print_ledger_unusable(
+    console: Console, exc: IronbirdError, verbose: bool, *, transmits: bool
+) -> None:
+    """The one line for a state directory the ledger cannot use. A transmission is refused (an
+    error: nothing was sent); a command that only reads goes on, so it is a warning that the run
+    is not logged."""
+    if transmits:
+        _print_error(console, IronbirdError(exc.code, f"nothing sent: {exc.summary}"), verbose)
+        return
+    line = f"warning {exc.code.value}: this run is not logged: {exc.summary}"
+    console.err(term(line, 1000, err=True))
+    if verbose:
+        for detail in exc.detail_text().splitlines():
+            console.err(f"  {term(detail, 2000, err=True)}")
+
+
+def _coded_line(ledger: Ledger, console: Console, level: Level, code: Code, summary: str) -> None:
+    """Ledger and print one coded line of an offline command (which has no session to coalesce
+    through); the ledger keeps what the terminal shows."""
+    shown = term(summary, 1000, err=True)
+    if level is Level.INFO:
+        ledger.record("state", "notice.info", code=code.value, summary=summary)
+    else:
+        ledger.record(level.label, code.value, summary=summary)
+    console.err(f"{level.label} {code.value}: {shown}")
+
+
+def _filter_warnings(flt: Filter, ledger: Ledger, console: Console) -> None:
+    """One warning for each part of a ``--where`` that can never be true for some message."""
+    for warning in flt.warnings:
+        _coded_line(ledger, console, Level.WARNING, warning.code, warning.summary)
 
 
 def _report_output_drops(session: Session, console: Console) -> None:
@@ -389,11 +425,14 @@ def _report_output_drops(session: Session, console: Console) -> None:
     for name, count in (("stdout", stdout), ("stderr", stderr)):
         if count:
             session.report(
-                IronbirdError(
+                counted(
                     Code.OUT_DROPPED,
-                    f"{name} is not draining: {count} line(s) dropped (still in the ledger)",
+                    f"{name} is not keeping up: {{n}} line(s) were dropped and are not saved "
+                    "anywhere; read it faster or redirect it to a file",
+                    count,
                 ),
                 context=name,
+                level=Level.WARNING,
             )
 
 
@@ -583,7 +622,7 @@ def _stdout_loss(console: Console, name: str, run: _Run) -> IronbirdError | None
         parts = [
             f"{count} {what}"
             for count, what in (
-                (out.dropped_total, "dropped while it was not draining"),
+                (out.dropped_total, "dropped while it was not being read"),
                 (out.abandoned_total, "abandoned at exit"),
                 (out.undelivered_total, "undeliverable"),
             )
@@ -591,8 +630,8 @@ def _stdout_loss(console: Console, name: str, run: _Run) -> IronbirdError | None
         ]
         cause = f" ({os.strerror(out.error.errno)})" if out.error and out.error.errno else ""
         summary = (
-            f"stdout lost {out.lost} line(s) - {', '.join(parts)}{cause}; output is incomplete, "
-            f"read it faster or write it to a file{sent}"
+            f"output incomplete: {out.lost} line(s) lost ({', '.join(parts)}){cause}; "
+            f"redirect it to a file (> out.txt) or read it faster{sent}"
         )
     return IronbirdError(Code.OUT_LOST, summary)
 
@@ -680,7 +719,7 @@ def _finish(name: str, run: _Run, ledger: Ledger, console: Console, code: int) -
         queued = out.queued_lines
         summary = (
             f"stdout is not being read: {queued} line(s) still queued; "
-            "waiting for the reader (send a signal to abandon them)"
+            "waiting for the reader (Ctrl-C quits without them)"
         )
         # A wait, not a failure: nothing is lost unless a signal cuts it short. Ledgered and
         # on disk first, because the wait has no deadline and may end in SIGKILL.
@@ -856,7 +895,12 @@ def _run(
             notices = Notices(state_dir, fs=fs)
             ledger = Ledger(
                 state_dir,
-                on_failure=lambda exc: _print_error(console, exc, glob.verbose),
+                # found while the command runs: whether anything went out is not this line's to say
+                on_failure=lambda exc: (
+                    _print_error(console, exc, glob.verbose)
+                    if transmits
+                    else _print_ledger_unusable(console, exc, glob.verbose, transmits=False)
+                ),
                 config=run.config.ledger if run.config is not None else None,
                 session_class="long" if name in LONG_COMMANDS and usage is None else "short",
                 command=name,
@@ -885,9 +929,8 @@ def _run(
             if glob.verbose:  # the `[ledger n=N]` pointers on notices refer to this file
                 console.err(f"ledger: {term(str(ledger.path), 1000, err=True)}")
         except IronbirdError as exc:
-            _print_error(console, exc, glob.verbose)
+            _print_ledger_unusable(console, exc, glob.verbose, transmits=transmits)
             if transmits:
-                console.err("nothing was sent: the action ledger is required")
                 raise typer.Exit(exc.exit_code) from exc
             ledger.disable()
         ledger.record("action", "cli.invoke", command=name, argv=sys.argv[1:])
@@ -1682,7 +1725,13 @@ def _damage_lines(report: rec_inspect.Report, *, verbose: bool = False) -> list[
     if report.damage_total:
         code = Code.REC_DAMAGED if report.mid_file_damage else Code.REC_TORN
         severity = "error" if report.mid_file_damage else "warning"
-        lines.append(f"{severity} {code.value}: {damage_summary(report)}")
+        next_step = (
+            "read past it with --skip-damage (replay, export) or copy the valid part with "
+            "'ib rec repair'"
+            if report.mid_file_damage
+            else "'ib rec repair' makes a clean copy"
+        )
+        lines.append(f"{severity} {code.value}: {damage_summary(report)}; {next_step}")
         if verbose and report.damage_total > 1:
             lines += [f"  {d.offset}+{d.span}: {d.reason}" for d in report.damage]
     for finding in report.findings:
@@ -1702,7 +1751,7 @@ def _damage_lines(report: rec_inspect.Report, *, verbose: bool = False) -> list[
     if report.trailer is None and not report.damage:
         lines.append(
             f"warning {Code.REC_TORN.value}: the recording ends without a trailer (not closed "
-            "cleanly); every record before the end is readable"
+            "cleanly); every record before the end is readable; 'ib rec repair' makes a clean copy"
         )
     return lines
 
@@ -1735,10 +1784,13 @@ def rec_info(
             for line in info_lines(report):
                 console.out(line)
         if report.source == "scan" and report.index != "ok":
-            note = term(report.index_note, 200, err=True)
-            console.err(
-                f"info {Code.REC_INDEX.value}: no usable index ({note}); "
-                "every record was read instead (ib rec repair writes a fresh index)"
+            _coded_line(
+                ledger,
+                console,
+                Level.INFO,
+                Code.REC_INDEX,
+                f"no usable index ({report.index_note}); every record was read instead "
+                "('ib rec repair' writes a fresh index)",
             )
         return 0
 
@@ -1784,8 +1836,13 @@ def rec_check(
         for line in _damage_lines(report, verbose=run.verbose):
             console.err(term(line, 1000, err=True))
         if report.index != "ok" and report.trailer is not None:
-            note = term(report.index_note, 200, err=True)
-            console.err(f"info {Code.REC_INDEX.value}: the index is unusable ({note})")
+            _coded_line(
+                ledger,
+                console,
+                Level.INFO,
+                Code.REC_INDEX,
+                f"the index is unusable ({report.index_note}); 'ib rec repair' writes a fresh one",
+            )
         return 1 if failed else 0
 
     _run(ctx, None, verbose, None, "rec.check", offline=work)
@@ -1829,9 +1886,17 @@ def rec_repair(
             damage=result.damage.reason if result.damage else None,
             frames_beyond_damage=result.frames_beyond,
         )
+        partial = result.damage is not None and not result.damage.torn
+        total = result.frames + result.frames_beyond
         console.out(
-            f"repaired {term(str(source), 400)} -> {term(str(result.output), 400)}: "
-            f"{result.frames} frame(s), {size_text(result.size)}; the original is unchanged"
+            f"{'partial repair' if partial else 'repaired'} {term(str(source), 400)} -> "
+            f"{term(str(result.output), 400)}: "
+            + (
+                f"kept {result.frames} of {total} frame(s)"
+                if partial
+                else f"{result.frames} frame(s)"
+            )
+            + f", {size_text(result.size)}; the original is unchanged"
         )
         if result.sync_warning is not None:
             warning = (
@@ -1860,10 +1925,14 @@ def rec_repair(
             f"{term(error.summary, 600, err=True)}; {result.dropped_bytes} byte(s) were not copied"
         )
         if result.frames_beyond:
-            console.err(
-                f"warning {Code.REC_DAMAGED.value}: {result.frames_beyond} valid frame(s) after "
-                "the damage are in the original only"
+            left = IronbirdError(
+                Code.REC_UNCOPIED,
+                f"{result.frames_beyond} valid frame(s) after the damage are in the original "
+                "only; read them with 'ib replay --skip-damage "
+                f"{term(str(source), 200, err=True)}'",
             )
+            ledger.record_error(left, source=source, frames=result.frames_beyond)
+            console.err(left.user_line())
         return 0 if damage.torn else EXIT_DAMAGED_INPUT
 
     _run(ctx, None, verbose, None, "rec.repair", offline=work)
@@ -2008,6 +2077,13 @@ def _replay_definitions(
         if defs is DefsSource.CONFIG:
             config = config if config is not None else _config_for_defs(glob)
             codecs = config_codecs(config, replay.nodes, replay.max_packet_bytes, command)
+            if replay.head.damaged:
+                console.err(
+                    f"info {Code.REC_DEFS.value}: the recording's embedded definitions are "
+                    f"damaged; decoding with {term(str(config.path), 200, err=True)} "
+                    "(--defs config)"
+                )
+                ledger.record("state", records[2], damaged=True, config=str(config.path))
             return codecs, {n.alias: n.name for n in config.nodes.values()}, None
         codecs = embedded_codecs(
             replay.parts[0],
@@ -2284,6 +2360,7 @@ def replay(
             flt: Filter | None = None
             if where is not None:
                 flt = compile_where(replaying, where, codecs, aliases=aliases, degraded=degraded)
+                _filter_warnings(flt, ledger, console)
             pacer = Pacer(speed) if speed > 0 else None
             result = play(
                 replaying,
@@ -2673,6 +2750,7 @@ def export_command(
             flt: Filter | None = None
             if where is not None:
                 flt = compile_where(replaying, where, codecs, aliases=aliases)
+                _filter_warnings(flt, ledger, console)
             selection: Selection | None = None
             if names:
                 check_messages(names, codecs)
@@ -2776,10 +2854,14 @@ def export_command(
                 )
             console.err(_export_summary(replaying, result, target))
             if result.not_written:
-                console.err(
-                    f"warning {Code.EXP_WRITE.value}: {result.not_written} frame(s) that did not "
-                    "decode were not written (a single-file CSV has no place for them; export "
-                    "to a directory to get malformed.csv, or use --format text)"
+                _coded_line(
+                    ledger,
+                    console,
+                    Level.WARNING,
+                    Code.EXP_OMITTED,
+                    f"{result.not_written} frame(s) that did not decode were left out of "
+                    f"{target} (a single-file CSV has no place for them); export to a directory "
+                    "to get malformed.csv, or use --format text",
                 )
             if result.skipped_no_definitions:
                 console.err(

@@ -390,14 +390,14 @@ def test_overflow_does_not_claim_capture_when_no_sink_received_the_frames(
     mock_config_path: Path, tmp_path: Path
 ) -> None:
     text = _overflow_notice(mock_config_path, tmp_path, sinks=[])
-    assert "captured" not in text and "sink" not in text and "10" in text
+    assert "captured" not in text and "recorded" not in text and "10" in text
 
 
 def test_overflow_says_a_sink_received_the_frames_when_one_did(
     mock_config_path: Path, tmp_path: Path
 ) -> None:
     text = _overflow_notice(mock_config_path, tmp_path / "s", sinks=[_Collects()])
-    assert "sink" in text
+    assert "recorded" in text and "10" in text
 
 
 # -- F6: concurrent readers and send racing close --

@@ -4236,6 +4236,10 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
 | `IB-REC-010` | `REC_SPACE` | low disk space for the recording | 2e |
 | `IB-REC-011` | `REC_DIRSYNC` | the recording's directory cannot be synced; its name may not survive a power loss (warning) | 2e |
 | `IB-REC-012` | `REC_LEFTOVER` | `rec repair`: the repaired copy is complete under its name, but its temporary name beside it could not be removed (a hard-link commit, as on NFS); remove it by hand (warning) | 2j |
+| `IB-REC-013` | `REC_UNCOPIED` | **warning**: valid frames after mid-file damage are only in the original (`rec repair`); names `ib replay --skip-damage` | error-messages |
+| `IB-REC-014` | `REC_OPEN` | the recording file cannot be opened or read (missing, permission, not a regular file); `IB-REC-004` is only "opens, but is not a recording" | error-messages |
+| `IB-TX-009` | `TX_UP` | info: a serial link is back after `IB-TX-008` | error-messages |
+| `IB-EXP-004` | `EXP_OMITTED` | **warning**: frames left out of an export because the format has no place for them (a single-file CSV) | error-messages |
 | `IB-FLT-001` | `FLT_SYNTAX` | filter syntax error (column, excerpt) | 2f |
 | `IB-FLT-002` | `FLT_NAME` | unknown name in a filter, or a reserved name misused | 2f |
 | `IB-FLT-003` | `FLT_TYPE` | literal does not fit the name's type, or the filter can never match | 2f |
@@ -4591,3 +4595,63 @@ Deferred (decisions open):
   code in the parent. Replacing pickle with a fixed binary framing removes that class (design change).
 - The audit jobs do not run (even non-gating) on PRs that touch `tools/ci/audit-*`; a manual
   `workflow_dispatch` run covers them instead, and one must be triggered on this branch before merge.
+
+### Error-message pass (`quality/error-messages`)
+
+An audit of every user-facing error (85 codes, about 400 sites; three axes: does the user
+understand what failed, know the next action, and read one plain line) found false or silent
+outcomes, codes reused for opposite situations, coalesced lines that showed the latest figure as
+the total, and config errors that did not say what was written. What changed, each with a test in
+`tests/test_error_messages.py` (codes, exit status and key facts only, never exact wording):
+
+- **False or silent outcomes.** `IB-OUT-001` said the dropped lines were "still in the ledger";
+  they are not (the ledger keeps `rx.first`, not output). It now says they are not saved and the
+  total of the window is shown. `ib rec info` of a closed file reads the index and chunk summaries,
+  so it no longer says "closed cleanly" (it says the contents are not verified and names `ib rec
+  check`). `ib rec repair` that kept fewer frames than exist is reported as a partial repair
+  ("kept 0 of 11") and a new warning `IB-REC-013` names `ib replay --skip-damage IN`. A closing
+  cut short (a trailer or index torn) is the same torn tail (`IB-REC-007`, exit 0) for `check` and
+  `repair` (`repair` used to call it mid-file damage, exit 5). `replay --skip-damage` after damage
+  to the embedded definitions: the head walk now resynchronises past the damage (`read_head(...,
+  skip_damage=True)`), so the streams after it are found; with `--defs config` it decodes with the
+  configuration and says so (`info IB-REC-009`), with the embedded definitions it fails with
+  `IB-REC-009` saying the definitions are damaged (it used to say every frame had "no
+  definitions"). An ordering filter that no value of a field's type satisfies (`cmd_counter >
+  300` on a `uint8`), and a set filter that is unreachable for only some messages, is a `warning
+  IB-FLT-003` (`Filter.warnings`); the filter is still usable. `IB-RET-002` only recommends
+  `prune --until-under` when pruning everything that is not protected would get under the cap;
+  otherwise it says how much is protected and to raise `retention.max_total_bytes`. `IB-TX-008`
+  recovery no longer says "a gap is recorded" unless a recording takes the gap.
+- **Split codes.** `IB-TX-009` (link restored; `IB-TX-008` is only "lost"), `IB-REC-013` (valid
+  frames after damage exist only in the original; `IB-REC-006` is only "damaged"), `IB-REC-014`
+  (the recording file cannot be opened or read; `IB-REC-004` is only "not a recording"),
+  `IB-EXP-004` (frames left out of an export; `IB-EXP-001` is only a write failure). Two links
+  naming one serial device is `IB-CFG-005` (a configuration error), not `IB-TX-006` (locked by
+  another process). The engine's "too many links open" is `IB-SYS-001`, not a link config error.
+  Responder `fields` values that the encoder refuses are `IB-CFG-003` with the key
+  (`nodes.fc.responses[4].fields.mode`), not `IB-ENC-002` "argument".
+- **Totals.** `IronbirdError.tally` / `counted()` carry an amount with a `{n}` template; a
+  coalesced line shows the total of its occurrences (`IB-OUT-001`, `IB-TX-007`). The group fold
+  ("more distinct occurrences") is one line shown when its window closes, with the count.
+- **Wording.** Config errors echo the bad value and suggest the nearest key or spelling (`'1GB' is
+  not a size; write '1GiB'`, `'30 days' ... write '30d'`, `unknown key; did you mean 'alias'?`,
+  `unknown node 'fcx'; did you mean 'fc'?`); CCDD and header-profile unknown keys suggest too. A
+  message over the packet cap names `ironbird.max_packet_bytes`. A definition file that cannot be
+  read names the config key that pulled it in. Decode errors end with whose fault it likely is
+  (`vehicle and CCDD disagree`, `wrong length bias`, `update the CCDD or check the sender`). Ledger
+  notices lost their internal vocabulary (tiers, reserve, liveness, link end). A fatal error that
+  has detail ends in `(more: -v)`. Labels follow the outcome: `IB-TX-007`, `IB-TX-008`,
+  `IB-OUT-001`, `IB-ENG-001` are warnings (the run goes on), `IB-LED-002` is a warning on a command
+  that only reads, `IB-RET-006` under `--dry-run` is a warning.
+- **Deferred (needs a product decision).** (1) Decode errors (`IB-DEC-*`) stay `error`: they
+  are the vehicle's fault, not ours, but CI and the ledger count them as errors; whether a
+  malformed-packet flood should be a warning level is a decision. (2) CCDD errors name the JSON
+  file; once the CSV adapter exists they should name the CSV row (the CSV is the source of truth
+  and the JSON is generated). (3) `ib find zzzz` exits 1 with an uncoded line; whether "no match"
+  is a failure, informational or coded is a decision. (4) Reader-level damage reasons still use
+  record-type names (`FRAME`, `INDEX`, `CRC`) in `ib rec check`; only `BLOB` has a plain name,
+  because the malformed-recording corpus pins the others. (5) TOML and JSON syntax errors repeat
+  the parser's own text; a `file:line:col` form and the "text values need quotes" hint need the
+  parsers' positions. (6) The ad-hoc `info`/`warning` lines in `cli/main.py` and `prunecmd.py` that
+  bypass `Notice` (so skip coalescing) are moved to `_coded_line` only where this pass touched
+  them. (7) Error text says `target mock` (the CCDD's name) where the user typed a node name.

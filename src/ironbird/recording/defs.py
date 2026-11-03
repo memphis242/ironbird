@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from ironbird.ccdd.loader import load_ccdd, load_ccdd_bytes
-from ironbird.codec import Codec
+from ironbird.codec import CAP_ADVICE, Codec
 from ironbird.config import SystemConfig
 from ironbird.errors import Code, IronbirdError
 from ironbird.frame import Stream
@@ -53,6 +53,7 @@ class Head:
     streams: Mapping[int, Stream]
     blobs: Blobs
     problem: str = ""  # why the definitions cannot be trusted as a set (empty: nothing wrong)
+    damaged: bool = False  # damage lies among the head records: some definitions may be lost
 
 
 def label_of(path: Path) -> str:
@@ -60,9 +61,11 @@ def label_of(path: Path) -> str:
     return clean(str(path), 200)
 
 
-def read_head(reader: RecordingReader) -> Head:
+def read_head(reader: RecordingReader, *, skip_damage: bool = False) -> Head:
     """The streams and embedded definitions at the head of the file (the records before the first
-    frame), without moving ``reader``. It does not raise for what the file contains: a repeated
+    frame), without moving ``reader``. With ``skip_damage`` the walk goes on past damage (the
+    caller reads past it too) and :attr:`Head.damaged` says there was some. It does not raise
+    for what the file contains: a repeated
     definition keeps the first and a contradiction, or more nodes than are allowed, is recorded
     in :attr:`Head.problem` for :func:`embedded_codecs` to refuse, so output that needs no
     definitions (hex) still works."""
@@ -72,7 +75,15 @@ def read_head(reader: RecordingReader) -> Head:
     problem = ""
     seen_bytes = 0
     others = sources = 0  # a later part's head repeats every SOURCE, up to fmt.MAX_SOURCES
-    for item in reader.head_records(reader.body_start, reader.size()):
+    damaged = False
+
+    def note_damage() -> None:
+        nonlocal damaged
+        damaged = True
+
+    for item in reader.head_records(
+        reader.body_start, reader.size(), resync=note_damage if skip_damage else None
+    ):
         seen_bytes += item.end - item.offset
         if item.rtype == RecordType.SOURCE:
             sources += 1
@@ -108,7 +119,7 @@ def read_head(reader: RecordingReader) -> Head:
             else:
                 nodes.add(blob.node)
                 blobs[key] = blob
-    return Head(streams, blobs, problem)
+    return Head(streams, blobs, problem, damaged)
 
 
 def _meta_digest(meta: Mapping[str, Any], node: str, kind: BlobKind) -> str | None:
@@ -153,11 +164,13 @@ def embedded_codecs(
         found = {kind: head.blobs.get((node, kind)) for kind in _ALL_KINDS}
         missing = [_KIND_NAMES[kind] for kind, blob in found.items() if blob is None]
         if missing:
+            why = (
+                "(the part of the file that held it is damaged)"
+                if head.damaged
+                else "(recorded with embed_definitions = false, or by a node without them)"
+            )
             raise _unusable(
-                label,
-                f"it embeds no {', '.join(missing)} for node {clean(node, 64)} "
-                "(recorded with embed_definitions = false, or by a node without them)",
-                hint,
+                label, f"it embeds no {', '.join(missing)} for node {clean(node, 64)} {why}", hint
             )
         for kind, blob in found.items():
             assert blob is not None
@@ -229,9 +242,9 @@ def config_codecs(
                 raise
             raise IronbirdError(
                 exc.code,
-                f"{exc.summary}; the {max_packet_bytes}-byte cap is the recording's, not the "
-                f"configuration's; {command} without --defs config to use the recording's own "
-                "definitions",
+                f"{exc.summary.removesuffix(CAP_ADVICE)}; the {max_packet_bytes}-byte cap is the "
+                f"recording's, not the configuration's; {command} without --defs config to use "
+                "the recording's own definitions",
                 details=exc.detail_text(),
                 cause=exc,
             ) from exc

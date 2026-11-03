@@ -48,7 +48,7 @@ from typing import Final
 import serial
 
 from ironbird.config import DATA_BITS, PARITIES, STOP_BITS, FramingSpec, SerialLinkSpec
-from ironbird.errors import Code, IronbirdError
+from ironbird.errors import Code, IronbirdError, counted
 from ironbird.sigmask import start_thread
 from ironbird.transport.base import (
     LinkStateHandler,
@@ -349,7 +349,7 @@ class SerialTransport:
             holder = _OPEN_DEVICES.get(info.st_rdev)
         if holder is not None and holder is not self:
             raise IronbirdError(
-                Code.TX_BUSY,
+                Code.CFG_LINK,
                 f"{self.description} is the same device as {holder.description}, held by "
                 "another link of this process; one device carries one link, so fix the "
                 "device paths in the config",
@@ -422,9 +422,11 @@ class SerialTransport:
             skipped = sum(e.skipped for e in episodes)
             samples = "; ".join(e.sample.hex(" ") for e in episodes[:RESYNC_SAMPLES])
             self._report(
-                IronbirdError(
+                counted(
                     Code.TX_RESYNC,
-                    f"{self.description}: resynchronised, {skipped} byte(s) of the stream skipped",
+                    f"{self.description}: {{n}} byte(s) of noise skipped to find the next frame; "
+                    "check baud, parity and framing.sync if it persists",
+                    skipped,
                     details=(
                         f"{len(episodes)} run(s) skipped, first bytes of up to {RESYNC_SAMPLES} "
                         f"of them: {samples}"
@@ -562,8 +564,7 @@ class SerialTransport:
                     self._report(
                         IronbirdError(
                             Code.TX_DOWN,
-                            f"{self.description}: still down after {attempt} attempt(s): "
-                            f"{err.summary}",
+                            f"{err.summary}; still down after {attempt} attempt(s), retrying",
                             cause=err,
                         )
                     )

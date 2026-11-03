@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import traceback
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -50,7 +51,7 @@ from ironbird.engine import (
     FrameSink,
     MidStatSnapshot,
 )
-from ironbird.errors import Code, DecodeError, IronbirdError
+from ironbird.errors import MAX_SUMMARY_LEN, Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
 from ironbird.filter import Filter, FilterError, Matcher, compile_filter
 from ironbird.frame import SERIAL_TRANSPORT, Decoded, Frame, Stream
@@ -58,7 +59,7 @@ from ironbird.header import HeaderProfile, ProfileKind, parse_profile_file, read
 from ironbird.ledger import Ledger
 from ironbird.ledgertiers import Tier
 from ironbird.notice import Level, Notice, level_of
-from ironbird.sanitize import HEX_PREVIEW_BYTES, hex_preview
+from ironbird.sanitize import HEX_PREVIEW_BYTES, clean, hex_preview
 from ironbird.transport import LinkEnd
 
 TICK_S: Final = 1.0
@@ -332,6 +333,9 @@ class Session:
     ) -> None:
         """Ledger in full, notify the user coalesced (one notice per key per window).
 
+        An error with a :attr:`~ironbird.errors.IronbirdError.tally` makes a coalesced line carry
+        the total of the amounts of the occurrences it stands for.
+
         ``level`` defaults from the code (:func:`ironbird.notice.level_of`): a warning code is
         displayed and ledgered as a warning, any other as an error.
 
@@ -380,6 +384,8 @@ class Session:
             ledger_file=self.ledger.part_file,
             raw=raw[:HEX_PREVIEW_BYTES] if raw is not None else b"",
             raw_len=(len(raw) if wire_len is None else wire_len) if raw is not None else None,
+            amount=err.tally[0] if err.tally is not None else None,
+            template=clean(err.tally[1], MAX_SUMMARY_LEN) if err.tally is not None else None,
         )
 
     # -- loading -------------------------------------------------------------------
@@ -396,11 +402,20 @@ class Session:
                 f"node {node_name!r} has no ccdd/command_header/telemetry_header in "
                 f"{self.config.path}",
             )
-        definitions = DefinitionBytes(
-            read_ccdd(node.ccdd, node.ccdd_adapter),
-            read_profile(node.command_header),
-            read_profile(node.telemetry_header),
-        )
+        where = f"in {self.config.path.name}"
+        try:
+            ccdd_bytes = read_ccdd(node.ccdd, node.ccdd_adapter)
+        except IronbirdError as exc:
+            raise _referred(exc, f"nodes.{node_name}.ccdd {where}") from exc
+        try:
+            command_bytes = read_profile(node.command_header)
+        except IronbirdError as exc:
+            raise _referred(exc, f"nodes.{node_name}.command_header {where}") from exc
+        try:
+            telemetry_bytes = read_profile(node.telemetry_header)
+        except IronbirdError as exc:
+            raise _referred(exc, f"nodes.{node_name}.telemetry_header {where}") from exc
+        definitions = DefinitionBytes(ccdd_bytes, command_bytes, telemetry_bytes)
         model = load_ccdd_bytes(definitions.ccdd, str(node.ccdd), node.ccdd_adapter)
         command_profile = self._profile_of_kind(
             node_name,
@@ -742,12 +757,15 @@ class Session:
         nodes whose frames it will test) and this configuration's link names. Raises
         ``IB-FLT-*`` (exit 2) before anything is opened."""
         codecs = {name: self.codec_for(name) for name in dict.fromkeys(nodes)}
-        return compile_filter(
+        flt = compile_filter(
             text,
             codecs,
             links=[link.name for link in self.config.links],
             aliases={node.alias: node.name for node in self.config.nodes.values()},
         )
+        for warning in flt.warnings:  # a part that matches nothing: the run is not refused
+            self.report(warning, context="filter", level=Level.WARNING)
+        return flt
 
     @staticmethod
     def _require_overlap(flt: Filter, allowed: frozenset[int] | None, what: str) -> None:
@@ -1088,7 +1106,8 @@ class Listener:
                 IronbirdError(
                     Code.ENG_LAG,
                     f"listening ended with {stats.unread} frame(s) received but not shown",
-                )
+                ),
+                level=Level.WARNING,
             )
 
 
@@ -1210,6 +1229,12 @@ def event_record_fields(event: Event, frame: Frame) -> dict[str, Any]:
     }
 
 
+def _referred(exc: IronbirdError, key: str) -> IronbirdError:
+    """``exc`` (a definition file that cannot be read) with the configuration key that named the
+    file, so the line says where to fix it."""
+    return IronbirdError(exc.code, f"{exc.summary} ({key})", details=exc.details, cause=exc)
+
+
 def _validate_rules(node: Node, codec: Codec, config: SystemConfig) -> Mapping[str, ResponseRule]:
     """Check every response rule against the CCDD up front; trial-encode its literals."""
     model = codec.model
@@ -1265,8 +1290,13 @@ def _validate_rules(node: Node, codec: Codec, config: SystemConfig) -> Mapping[s
         try:
             codec.encode_telemetry(rule.reply, rule.fields)  # surfaces bad literal values now
         except IronbirdError as exc:
+            # a value in the configuration, not a command argument: reported against its key
+            named = re.match(rf"{re.escape(reply.name)}: argument (\w+): (.*)$", exc.summary)
+            key, why = (
+                (f"fields.{named.group(1)}", named.group(2)) if named else ("fields", exc.summary)
+            )
             raise IronbirdError(
-                exc.code, f"{where}.fields: {exc.summary}", details=exc.details, cause=exc
+                Code.CFG_SCHEMA, f"{where}.{key}: {why}", details=exc.details, cause=exc
             ) from exc
         rules[rule.on] = rule
     codec.reset_sequences()
@@ -1435,8 +1465,8 @@ class Responder:
                 session.report(
                     IronbirdError(
                         Code.RSP_RULE,
-                        f"rule {rule.on!r}: command {command.message.name} has no argument "
-                        f"{arg!r} to echo into {reply_field}; no reply sent",
+                        f"rule {rule.on!r}: echo.{reply_field} names argument {arg!r}, which "
+                        f"{command.message.name} does not have; no reply sent",
                     )
                 )
                 return None

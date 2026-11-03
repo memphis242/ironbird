@@ -395,7 +395,7 @@ class Replay:
         try:
             self.meta: fmt.Meta = first.meta
             self.max_packet_bytes: int = first.max_packet_bytes
-            self.head: Head = read_head(first)
+            self.head: Head = read_head(first, skip_damage=skip_damage)
             self.label = label_of(first.path)
             self.writer_active = first.writer_active
             self._resolve_parts(list(paths), first)

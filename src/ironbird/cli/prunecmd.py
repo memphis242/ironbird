@@ -238,12 +238,13 @@ def work(
             f"warning {Code.RET_TARGET.value}: {term(unreachable_summary(plan), 1000, err=True)}"
         )
     if scan.unsafe:
+        where = term(str(directory), 400, err=True)
+        # a dry run deletes nothing either way: it only warns that a real prune is refused
+        severity = "warning" if flags.dry_run else "error"
         console.err(
-            f"error {Code.RET_UNSAFE.value}: {term(str(directory), 400, err=True)} is writable by "
-            "others without the sticky bit, so another user could swap names under a prune; "
-            f"run 'chmod +t {term(str(directory), 400, err=True)}' or "
-            f"'chmod go-w {term(str(directory), 400, err=True)}'"
-            + (" (nothing deleted)" if not flags.dry_run else " (a real prune would be refused)")
+            f"{severity} {Code.RET_UNSAFE.value}: prune "
+            f"{'would be refused' if flags.dry_run else 'refused'}: {where} is writable by "
+            "others, so another user could swap names under it; run: chmod go-w <that directory>"
         )
         if not flags.dry_run:
             return 1

@@ -279,10 +279,12 @@ def test_a_group_writable_directory_without_the_sticky_bit_is_refused(state: Pat
     state.chmod(0o770)
     before = digest(state)
     done = run(state, *PRUNE, "--yes")
-    assert done.returncode == 1 and "IB-RET-006" in done.stderr and "chmod +t" in done.stderr
+    assert done.returncode == 1 and "error IB-RET-006" in done.stderr
+    assert "chmod go-w" in done.stderr  # the one-line remedy
     assert {k: v for k, v in digest(state).items() if k in before} == before
     listed = run(state, *PRUNE, "--dry-run")
-    assert listed.returncode == 0 and "IB-RET-006" in listed.stderr
+    # a dry run deletes nothing either way, so it only warns that a real prune is refused
+    assert listed.returncode == 0 and "warning IB-RET-006" in listed.stderr
 
 
 def test_prune_refuses_to_delete_without_a_usable_ledger_but_dry_run_still_lists(
@@ -370,8 +372,9 @@ def test_the_age_warning_text_names_what_prune_would_propose(
     done = run(state, "listen", "fc", "--timeout", "1", config=mock_config_path)
     line = next(x for x in done.stderr.splitlines() if "IB-RET-001" in x)
     # 15 old sessions plus this run's own: the ten most recent are kept, six are proposable
-    assert line.startswith("warning IB-RET-001: 6 ledger sessions older than 7d (")
-    assert "more protected" in line and "review with 'ib ledger prune'" in line
+    assert line.startswith("warning IB-RET-001: 6 ledger sessions")
+    assert "more protected" in line and "retention.max_age" in line and "7d" in line
+    assert "ib ledger prune" in line
 
 
 def test_unlimited_age_and_total_turn_their_warnings_off(
@@ -387,7 +390,7 @@ def test_unlimited_age_and_total_turn_their_warnings_off(
     assert "IB-RET-001" not in done.stderr and "IB-RET-002" not in done.stderr
 
 
-def test_usage_past_the_cap_at_start_is_warned_and_names_the_prune(
+def test_usage_past_the_cap_at_start_is_warned_and_does_not_name_an_impossible_prune(
     state: Path, mock_config_path: Path
 ) -> None:
     for i in range(1, 6):
@@ -397,8 +400,9 @@ def test_usage_past_the_cap_at_start_is_warned_and_names_the_prune(
     )
     done = run(state, "listen", "fc", "--timeout", "1", config=mock_config_path)
     line = next(x for x in done.stderr.splitlines() if "IB-RET-002" in x)
-    assert "past 1.0 MiB" in line or "past 1 MiB" in line
-    assert "ib ledger prune --until-under" in line and "retention.max_total_bytes" in line
+    assert "1 MiB" in line and "retention.max_total_bytes" in line
+    # this run's own session and the most recent ones are protected: a prune would delete nothing
+    assert "protected" in line and "--until-under" not in line
 
 
 def test_three_consecutive_processes_leave_every_file_present_and_identical(

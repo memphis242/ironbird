@@ -307,7 +307,7 @@ def test_a_file_that_is_not_a_recording_is_ib_rec_004(tmp_path: Path, env: dict[
     done = run_ib(tmp_path, ["replay", str(tmp_path / "t.txt")], env)
     assert done.returncode == 1 and "error IB-REC-004" in done.stderr
     missing = run_ib(tmp_path, ["replay", str(tmp_path / "nope.ibrec")], env)
-    assert missing.returncode == 1 and "error IB-REC-004" in missing.stderr
+    assert missing.returncode == 1 and "error IB-REC-014" in missing.stderr
 
 
 # -- ranges --

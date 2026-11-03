@@ -117,17 +117,18 @@ class Damage:
     def to_error(self) -> IronbirdError:
         """The coded error for this damage (not raised; the caller decides how loud to be)."""
         where = f"at offset {self.offset}"
+        reason = self.reason.replace("BLOB record", "embedded-definitions record")
         if self.torn:
             what = "an incomplete record" if self.incomplete else "a damaged record"
             return IronbirdError(
                 Code.REC_TORN,
-                f"the recording ends in {what} {where} ({self.reason}); "
+                f"the recording ends in {what} {where} ({reason}); "
                 "everything before it is readable",
             )
         span = f"{self.span} bytes" if self.resumed_at is not None else "to the end of the file"
         return IronbirdError(
             Code.REC_DAMAGED,
-            f"damaged recording {where}, {span} ({self.reason})"
+            f"damaged recording {where}, {span} ({reason})"
             + (
                 f"; valid records resume at {self.resumed_at}"
                 if self.resumed_at is not None
@@ -198,7 +199,7 @@ class RecordingReader:
             self._fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOCTTY)
         except OSError as exc:
             raise IronbirdError(
-                Code.REC_FORMAT,
+                Code.REC_OPEN,
                 f"cannot open recording {_shown(self.path)}: {exc.strerror or exc}"
                 + self._missing_hint(exc),
                 cause=exc,
@@ -228,10 +229,10 @@ class RecordingReader:
             info = os.fstat(self._fd)
         except OSError as exc:
             raise IronbirdError(
-                Code.REC_FORMAT, f"cannot read {shown}: {exc.strerror or exc}", cause=exc
+                Code.REC_OPEN, f"cannot read {shown}: {exc.strerror or exc}", cause=exc
             ) from exc
         if not stat.S_ISREG(info.st_mode):
-            raise IronbirdError(Code.REC_FORMAT, f"{shown} is not a regular file")
+            raise IronbirdError(Code.REC_OPEN, f"{shown} is not a regular file")
         self.identity = (info.st_dev, info.st_ino)
         # A reader takes a shared lock where it can, so retention sees the session as in use; a
         # writer's exclusive lock refuses it, which says the recording is still being written.
@@ -427,7 +428,7 @@ class RecordingReader:
             data = os.pread(self._fd, max(block, size), offset)
         except OSError as exc:  # the file went away or the disk failed under the reader
             raise IronbirdError(
-                Code.REC_FORMAT,
+                Code.REC_OPEN,
                 f"cannot read {_shown(self.path)}: {exc.strerror or exc}",
                 cause=exc,
             ) from exc
@@ -440,7 +441,7 @@ class RecordingReader:
         if len(head) < fmt.ENVELOPE_SIZE:
             if not head:
                 return _Fail("end of file", eof=True)
-            return _Fail("ends inside a record envelope", incomplete=True)
+            return _Fail("ends inside a record header", incomplete=True)
         body_len, rtype, flags, reserved, crc = fmt.ENVELOPE.unpack_from(head, 0)
         if flags or reserved:
             return _Fail("envelope flags or reserved bytes are not zero")
@@ -673,7 +674,7 @@ class RecordingReader:
                 block = os.pread(self._fd, want + 16, position)
             except OSError as exc:
                 raise IronbirdError(
-                    Code.REC_FORMAT,
+                    Code.REC_OPEN,
                     f"cannot read {_shown(self.path)}: {exc.strerror or exc}",
                     cause=exc,
                 ) from exc
@@ -921,12 +922,25 @@ class RecordingReader:
             and raw.end == self.size()
         )
 
-    def head_records(self, start: int, stop: int) -> Iterator[Item]:
+    def head_records(
+        self, start: int, stop: int, *, resync: Callable[[], None] | None = None
+    ) -> Iterator[Item]:
         """The leading non-frame records of a chunk (``start`` up to its first FRAME or ``stop``),
-        read without the stream state; for tools that summarise a chunk without reading it."""
+        read without the stream state; for tools that summarise a chunk without reading it.
+
+        Damage ends the walk, unless ``resync`` is given: it is called once for each stretch of
+        damage and the walk goes on at the next valid record, so definitions that follow damage
+        are found (a read that skips damage needs them)."""
         offset = start
         while offset < stop:
             raw = self._read_raw(offset, SMALL_BLOCK)
+            if isinstance(raw, _Fail) and not raw.eof and resync is not None:
+                found, _ = self._resync(offset)
+                if found is None:
+                    return
+                resync()
+                offset = found
+                continue
             if isinstance(raw, _Fail) or raw.rtype not in fmt.HEAD_TYPES:
                 return
             try:
@@ -944,7 +958,14 @@ class RecordingReader:
                     case _:
                         value = None
             except fmt.FormatError:
-                return
+                if resync is None:
+                    return
+                found, _ = self._resync(offset)
+                if found is None:
+                    return
+                resync()
+                offset = found
+                continue
             yield Item(raw.offset, raw.end, raw.rtype, value)
             offset = raw.end
 

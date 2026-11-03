@@ -217,8 +217,14 @@ ib rec repair /data/run1.ibrec /data/run1.fixed.ibrec [--force]
   `IB-REC-007`, everything before it is readable. Damage followed by valid records is mid-file
   damage (`IB-REC-006`). `ib rec repair IN OUT` writes the valid prefix plus a fresh index and
   trailer to a new file and never modifies `IN`; it exits 5 if frames after mid-file damage were
-  left out. `ib rec info` reads the trailer, index and chunk summaries, not frames (a missing or
-  bad index falls back to a full read, `IB-REC-008`); `ib rec check` reads everything.
+  left out, and says so (`IB-REC-013`, with the `ib replay --skip-damage` command that reads them; a
+  `repair` that kept none of the frames is reported as a partial repair, not as success). A
+  recording whose closing records were cut short is a torn tail to `check`, `repair` and `replay`
+  alike. `ib rec info` reads the trailer, index and chunk summaries, not frames (a missing or
+  bad index falls back to a full read, `IB-REC-008`), so for a closed file it says the contents
+  are not verified; `ib rec check` reads everything. A recording file that cannot be opened or
+  read at all (missing, no permission, not a regular file) is `IB-REC-014`; one that opens but is
+  not a recording is `IB-REC-004`.
 - **Config.** `[recording]`: `dir`, `fsync = "chunk" | "always" | "never"`,
   `max_buffer_bytes` (default 256 MiB, 1 MiB to 64 GiB), `min_free_bytes` (default 1 GiB, 0 to 1 PiB:
   recording refuses to start below it, `IB-REC-010`), `embed_definitions` (default true). Both sizes take
@@ -282,7 +288,9 @@ ib replay run1.ibrec --follow                                 # a recording stil
   everything before it was replayed (exit 0); a recording a recorder still holds open is not called
   torn. Mid-file damage is `IB-REC-006` with its offset and span: replay stops there (exit 5), or
   with `--skip-damage` goes on at the next valid record (still exit 5; the lost frames show as a
-  sequence gap). The end-of-run summary on stderr counts frames read, in range, shown, malformed,
+  sequence gap). Damage that took the embedded definitions leaves nothing to decode with: replay
+  says so (`IB-REC-009`) and `--defs config` decodes with the configuration's files, with an info
+  line that names the file. The end-of-run summary on stderr counts frames read, in range, shown, malformed,
   unknown and garbage, skipped chunks, GAP records (and the frames they say were lost) and damage.
 - **Following.** `--follow` keeps reading a recording that is being written: at the end of the file
   it polls every 100 ms, treats a partly written last record as pending, and ends at the trailer
@@ -382,7 +390,9 @@ ib export run1.ibrec --format text --from +90s --to +2m -o minute.txt
 - **Exit codes.** As for `replay`: 0 normal (a torn tail or a recording never closed is a warning),
   5 when the recording was damaged mid-file (the export ends there, or with `--skip-damage` goes
   past it) or a part of a split recording is missing; the output exists and holds everything read.
-  1 for `IB-REC-004..009`, `IB-EXP-*`; 2 for usage and `IB-FLT-*`.
+  1 for `IB-REC-004..009`, `IB-REC-014`, `IB-EXP-*`; 2 for usage and `IB-FLT-*`. Frames that have no
+  place in a single-file CSV are left out with a warning (`IB-EXP-004`), which is not a write
+  failure (`IB-EXP-001`).
 - **Cost and workers.** A recording of 8 MiB or more is decoded by a pool of worker processes, one per
   core by default (the cores this process may run on, as its CPU affinity and control-group quota say,
   at most 64; `--jobs N`, or `[export] jobs` in the configuration; `--jobs 1` decodes in the calling
@@ -436,8 +446,9 @@ ends with a `session.end` record holding `exit` (the code) and `outcome` (`ok`, 
 | 128+n | Ended by signal n: 130 (Ctrl-C), 129 (SIGHUP), 143 (SIGTERM). The ledger is flushed first; an interrupted `send` says whether the command went out |
 
 Output never blocks the tool while it runs: a stalled stdout (unread pipe, paused pager) drops
-lines with one coalesced `IB-OUT-001` notice instead of freezing signals and `--timeout`; the
-ledger keeps everything. When the command ends normally it then waits, with no deadline, for a
+lines with one coalesced `IB-OUT-001` warning (the total of the lines dropped in its window) instead
+of freezing signals and `--timeout`; those lines are not saved anywhere, so redirect the output to a
+file when it must be complete. When the command ends normally it then waits, with no deadline, for a
 slow reader to take the lines already queued (one `IB-OUT-003` warning line, also in the ledger, says so
 after 2 s; a signal abandons them), so `--timeout` bounds the run, not the output: lines may keep
 draining after it. `ib listen --count N | slow-consumer` is lossless only while the backlog fits
@@ -453,12 +464,32 @@ warning (once per session; capture continues and exit codes are unchanged): ask 
 raise `net.core.rmem_max` (`sysctl -w net.core.rmem_max=...`).
 
 The ledger directory is an absolute `$IRONBIRD_STATE_DIR` (a relative one is refused), else an absolute `$XDG_STATE_HOME/ironbird`,
-else `~/.local/state/ironbird`. `send` and `respond` refuse to run (`IB-LED-002`, nothing sent)
-when the state directory is unusable: a relative path, no home, no permission, a read-only file
+else `~/.local/state/ironbird`. `send` and `respond` refuse to run (`IB-LED-002`, "nothing sent")
+when the state directory is unusable; a command that only reads goes on and warns that the run is
+not logged (`warning IB-LED-002`, exit 0). Unusable means: a relative path, no home, no permission, a read-only file
 system, a path through a file. When the directory is usable but the disk or the system fails
 (disk or quota full, I/O error, out of descriptors, a hung file server), they send and warn
 (`IB-LED-004`, exit 6 if the record is never written) under the default `on_full = "continue"`,
 or refuse (exit 1) under `on_full = "refuse_commands"`.
+
+### Error lines
+
+Every failure is one line: `error|warning|info IB-XXX-NNN: what failed and what to do`. The label
+follows the outcome: `error` for what stops the work or the command, `warning` for what the run
+survives (a dropped line, a link that is down and retried, a filter part that matches nothing),
+`info` for state (a link back, an index rebuilt). A fatal error that has more to say ends in
+`(more: -v)`; `--verbose` and the ledger hold the full detail. A line that stands for repeats
+carries the total, not the latest figure: `serial /dev/ttyUSB0: 140 byte(s) of noise skipped ...
+(x5 in 4 s)`; distinct occurrences past five per code and window are folded into one line, shown
+when the window closes, and all of them are in the ledger. Configuration errors give the file, the
+key and the value that was written (`ledger.max_file_bytes: '1GB' is not a size; write '1GiB'`) and
+name the nearest known key for an unknown one.
+
+Codes added by the error-message pass: `IB-TX-009` (link restored; `IB-TX-008` is only "lost"),
+`IB-REC-013` (valid frames after damage exist only in the original; warning), `IB-REC-014` (a
+recording file that cannot be opened or read; `IB-REC-004` is only "not a recording"), `IB-EXP-004`
+(frames left out of an export; warning; `IB-EXP-001` is only a write failure). `IB-TX-006` is only
+"locked by another process": two links naming one device is `IB-CFG-005`.
 
 ## Serial links
 
@@ -511,12 +542,13 @@ One process owns the device at a time (`flock`): a second `ib` on it fails with 
 `listen` and a `send` take turns (a `respond` on the flight side answers on the same device).
 Errors a user can act on: a missing device (`IB-TX-001`: check the cable, list
 `/dev/serial/by-id`), no permission (`IB-TX-001`: it names the device's group and says to log in
-again after being added), a device two links of one process both name (`IB-TX-006`),
-a device already in use (`IB-TX-006`). If the device goes away after it was opened (an unplugged
-adapter, `EIO`/`ENXIO`), the link is down, not the command: `IB-TX-008` is shown once, the device is
+again after being added), a device two links of one process both name (`IB-CFG-005`, a configuration error),
+a device already in use by another process (`IB-TX-006`). If the device goes away after it was opened (an unplugged
+adapter, `EIO`/`ENXIO`), the link is down, not the command: `IB-TX-008` is shown once (a warning: the run goes on), the device is
 reopened with a backoff of 0.5 s to 5 s, a recording gets `link_down` and `link_up` marks and one
 `link_down` gap for the outage (its frame count is unknown, so the gap counts the interruption), and
-`IB-TX-008` is shown once more as an info line when the link is back. A `send` while the link is down is
+`IB-TX-009` is shown as an info line when the link is back (and says the gap is marked only when a
+recording takes it). A `send` while the link is down is
 not sent (`IB-TX-008`). Closing the device may drop DTR on real hardware (the Linux default); a
 device that resets on DTR needs that handled on its side.
 
@@ -619,7 +651,10 @@ never equal there), and `x != L` is `not x == L` for every message that has `x`.
 rounded to the field's width (`ratio == 0.1` matches a stored float32 0.1) and a decimal compared
 with an integer is exact. `node ==` accepts a node's alias. `event.type >= error` shows what
 `--min-type error` shows, including events whose type has no severity. A filter that can never
-match (`msg == A and msg == B`, or MIDs outside `--mid`) is refused with `IB-FLT-003`. Limits: 4096
+match (`msg == A and msg == B`, or MIDs outside `--mid`) is refused with `IB-FLT-003`. A part that
+can never be true for one message (`cmd_counter > 300` on a `uint8`, `x == 300` where only some
+messages have a narrow `x`) does not refuse the filter: it is a `warning IB-FLT-003` that names the
+field, the type and the message, since the filter is then still right for the other messages. Limits: 4096
 characters, 1024 tokens outside `in` lists, 32 levels of `not` and parentheses, 1024 `in` items,
 numbers of at most 40 characters. A frame whose MID cannot match is never decoded for the filter,
 and neither is a serial garbage frame (it is malformed whatever its bytes say). Malformed frames

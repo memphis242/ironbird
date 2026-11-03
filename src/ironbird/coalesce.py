@@ -41,8 +41,14 @@ class _Entry:
     raw: bytes = b""  # of the latest occurrence
     raw_len: int | None = None
     shared: str | None = None  # the words every occurrence had in common, once they differed
+    template: str | None = None  # a summary with ``{n}`` where the running total goes
+    amount: int = 0  # the total of every occurrence's amount (with ``template``)
+    folded: bool = False  # the distinct keys past the group's limit: shown once, when it closes
 
 
+FOLD_SUMMARY: Final = (
+    "more distinct problems of this kind, not listed one by one; all are in the ledger"
+)
 VARY: Final = " (details vary)"  # marks a summary that stands for several differing ones
 
 
@@ -90,15 +96,19 @@ class Coalescer:
         self._groups: dict[Code, tuple[float, int]] = {}
 
     def _summary(self, entry: _Entry, now: float) -> None:
-        if entry.suppressed:
+        if entry.suppressed or entry.folded:
+            if entry.template is not None:
+                text = entry.template.replace("{n}", str(entry.amount))
+            else:
+                text = entry.summary if entry.shared is None else entry.shared
             self._emit(
                 Notice(
                     entry.code,
                     entry.level,
                     entry.key,
-                    entry.summary if entry.shared is None else entry.shared,
+                    text,
                     count=entry.suppressed + 1,
-                    window_s=max(0.0, now - entry.started),
+                    window_s=max(0.0, now - entry.started) if entry.suppressed else 0.0,
                     ledger_n=entry.ledger_n,
                     ledger_part=entry.ledger_part,
                     ledger_file=entry.ledger_file,
@@ -121,33 +131,46 @@ class Coalescer:
         ledger_file: str = "",
         raw: bytes = b"",
         raw_len: int | None = None,
+        amount: int | None = None,
+        template: str | None = None,
     ) -> None:
         """Report one occurrence.
 
         ``key`` groups repeats (e.g. code plus MID). ``group`` (e.g. the error code) rate-limits
         distinct keys: after ``MAX_NEW_PER_GROUP`` new keys per window the rest fold into one
-        "more distinct occurrences" notice, so unique-garbage floods cannot spam the user.
+        notice (``FOLD_SUMMARY``, shown when the window closes, with the number of occurrences it
+        stands for), so unique-garbage floods cannot spam the user.
         ``window_s`` overrides the window for this key (the ledger's slow warnings use 10 min).
         ``raw`` is the start of the offending packet and ``raw_len`` its full size; a summary
         carries those of the latest occurrence.
+
+        ``amount`` is how much this occurrence stands for (lines dropped, bytes skipped) and
+        ``template`` the summary with ``{n}`` in the place of that figure: a line that stands for
+        several occurrences then carries the total of their amounts, not the latest one's.
         """
+        assert (amount is None) == (template is None), "an amount comes with its template"
         now = self._clock()
         entry = self._entries.get(key)
+        folding = False
         if entry is None and group is not None:
             started, count = self._groups.get(group, (now, 0))
             if now - started >= self._window:
                 started, count = now, 0
             if count >= MAX_NEW_PER_GROUP:
                 key = f"{group.value}/other"
-                code, summary = group, "more distinct occurrences"
-                raw, raw_len = b"", None
+                code, summary = group, FOLD_SUMMARY
+                raw, raw_len, amount, template = b"", None, None, None
                 entry = self._entries.get(key)
+                folding = True
             else:
                 self._groups[group] = (started, count + 1)
         if entry is not None:
             if now - entry.started < entry.window_s:
                 entry.suppressed += 1
-                if summary != entry.summary:  # a count says "the same again": keep what is true
+                if template is not None and amount is not None:
+                    entry.amount += amount
+                    entry.template = template
+                elif summary != entry.summary:  # a count says "the same again": keep what is true
                     entry.shared = _shared_words(
                         entry.summary if entry.shared is None else entry.shared, summary
                     )
@@ -164,19 +187,20 @@ class Coalescer:
             self._summary(old, now)
             assert old_key not in self._entries
             assert len(self._entries) < self._max_keys, "an eviction makes room for one key"
-        self._emit(
-            Notice(
-                code,
-                level,
-                key,
-                summary,
-                ledger_n=ledger_n,
-                ledger_part=ledger_part,
-                ledger_file=ledger_file,
-                raw=raw,
-                raw_len=raw_len,
+        if not folding:  # a fold is announced once, when its window closes
+            self._emit(
+                Notice(
+                    code,
+                    level,
+                    key,
+                    summary,
+                    ledger_n=ledger_n,
+                    ledger_part=ledger_part,
+                    ledger_file=ledger_file,
+                    raw=raw,
+                    raw_len=raw_len,
+                )
             )
-        )
         self._entries[key] = _Entry(
             code,
             level,
@@ -190,6 +214,10 @@ class Coalescer:
             ledger_file,
             raw,
             raw_len,
+            None,
+            template,
+            amount or 0,
+            folding,
         )
         assert len(self._entries) <= self._max_keys, "the table of open windows is bounded"
 
