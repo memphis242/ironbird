@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "coverage>=7.10",  # patch = ["subprocess"] and the [tool.coverage] section below
     "pytest>=8,<9",  # pytest-benchmark 5.x is not yet compatible with pytest 9
     "pytest-xdist>=3.5,<4",
     "hypothesis>=6.100,<7",
@@ -80,3 +81,27 @@ reportUnknownParameterType = false
 reportUnknownLambdaType = false
 reportPrivateUsage = false
 reportMissingParameterType = false
+
+# Branch coverage of src/ironbird. Run it with tools/coverage.sh: several tests start `ib` as a
+# subprocess with a scrubbed environment, so a plain `coverage run` would miss that code; the
+# script makes every Python process of the test run measure itself.
+[tool.coverage.run]
+branch = true
+source = ["ironbird"]
+parallel = true  # one data file per process (parent, xdist workers, subprocesses), combined after
+patch = ["subprocess"]
+omit = ["*/__pycache__/*"]
+
+[tool.coverage.paths]
+ironbird = ["src/ironbird", "*/site-packages/ironbird"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+precision = 2
+fail_under = 94  # measured 95.2 (branch, with the exclusions below); the margin absorbs timing-skipped paths
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise AssertionError\\(",  # unreachable-by-construction guards
+    "^\\s+\\.\\.\\.$",  # Protocol method bodies
+]
