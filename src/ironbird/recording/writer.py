@@ -1177,7 +1177,8 @@ class Recorder:
         leaves a file without its trailer, readable up to the last record that reached it, and
         the notice says how many frames were not written. A cancellation of the caller (a
         signal) does not cut the wait short, since the writer thread dies with the process: the
-        close ends as it would have, ledgered, and then the cancellation propagates.
+        close ends as it would have, ledgered, and then the cancellation propagates; once
+        cancelled, the wait lasts at most :data:`CLOSE_STALL_S` more, even on a slow disk.
         """
         if self._closed:
             return self.stats()
@@ -1199,13 +1200,18 @@ class Recorder:
             jobs.put(("close", self._held_fd))
         jobs.put(None)
         cancelled: asyncio.CancelledError | None = None
+        cancelled_at = 0.0
         seen, moved_at = self._writer.progress, time.monotonic()
         while self._writer.is_alive():
             try:
                 await asyncio.sleep(0.005)
             except asyncio.CancelledError as exc:
+                if cancelled is None:
+                    cancelled_at = time.monotonic()
                 cancelled = cancelled or exc  # raised once the close is complete
             now = time.monotonic()
+            if cancelled is not None and now - cancelled_at >= CLOSE_STALL_S:
+                break  # a cancelled close waits at most this long, even on a disk still moving
             if self._writer.progress != seen:
                 seen, moved_at = self._writer.progress, now
             elif now - moved_at >= CLOSE_STALL_S:

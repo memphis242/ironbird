@@ -906,11 +906,15 @@ As built (where the build differs from, or settles, the text above)
   daemon threads (`ironbird.offloop`, signals blocked), never on the loop's default executor,
   which Python 3.11's `asyncio.run` joins with no time limit: a lookup that never answers is
   abandoned with its thread, so neither the exit nor a signal waits for it, and at most
-  `RESOLVER_THREADS` (8) such threads are kept (past that an open is refused, `IB-TX-001`). Every
+  `RESOLVER_THREADS` (8) such threads are kept (past that an open of a name is refused,
+  `IB-TX-001`; a numeric host is resolved on the loop with `AI_NUMERICHOST` and never waits). Every
   step of the 1 Hz tick is guarded: one that fails is reported (`IB-INT-001`, coalesced per step)
   and the ticking goes on, and one transport's failed `poll` does not skip the drop accounting of
   the others. `Session.__aexit__` closes the engine even when it is cancelled while it collects
-  its background tasks. `EventStream` ends its iteration when its capture ends, cleanly or not,
+  its background tasks. Deferred (PR #35 review): `/proc` scans start one short daemon thread per
+  tick (about 100 us/s); a long-lived scanner worker is not worth its lifecycle code yet.
+  Declined: clearing `opening_step` at `open()` start, since a transport is opened at most once
+  (asserted). `EventStream` ends its iteration when its capture ends, cleanly or not,
   once the queued events are read; `_attach` re-checks `closed` under the lock, so a
   capture opened across a close raises (`IB-INT-001`, "the session is closed") and its transport
   is closed, never an iteration that does not end. A send made twice on a closed transport says
@@ -2312,7 +2316,8 @@ As built (where the build differs from, or settles, the text above)
   against the monotonic clock is a MARK. `Recorder.rate_bytes_per_s()` (bytes encoded over the last
   minute) is the hook for 2d's `IB-RET-002` projection; nothing consumes it yet. A split keeps part
   1 open and locked, and every part repeats META, BLOBs and definitions. A signal that lands inside
-  the close (a cancellation of its caller) does not cut it short either: the close finishes, is ledgered
+  the close (a cancellation of its caller) does not cut it short either, though it then waits at most
+  `CLOSE_STALL_S` more even on a disk still making progress: the close finishes, is ledgered
   and its summary line is printed, then the cancellation goes on. A second signal does not
   abandon the close (the CLI ignores repeated signals); the close gives up only when the writer makes no
   progress for 5 s, writes the GAP for dropped frames and the trailer first when the disk is

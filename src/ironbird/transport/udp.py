@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import errno
 import functools
+import ipaddress
 import os
 import socket
 import struct
@@ -126,6 +127,15 @@ def read_proc_drops(inodes: Iterable[int]) -> dict[int, int]:
         except OSError:
             continue
     return found
+
+
+def _is_ip_literal(host: str) -> bool:
+    """Whether ``host`` is an IPv4/IPv6 address (an IPv6 one may carry a ``%scope``)."""
+    try:
+        ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    return True
 
 
 async def scan_kernel_drops(transports: Collection[UdpTransport]) -> None:
@@ -431,6 +441,13 @@ class UdpTransport:
     async def _resolve(self, what: str, endpoint: Endpoint) -> list[Any]:
         """``getaddrinfo`` for ``endpoint`` in a daemon thread (see ``RESOLVER_THREADS``). While it
         runs, and after a cancel cut it short, :attr:`opening_step` names it."""
+        if _is_ip_literal(endpoint.host):  # needs no name service, so never waits on a thread
+            return socket.getaddrinfo(
+                endpoint.host,
+                endpoint.port,
+                type=socket.SOCK_DGRAM,
+                flags=socket.AI_NUMERICHOST | socket.AI_NUMERICSERV,
+            )
         lookup = functools.partial(
             socket.getaddrinfo, endpoint.host, endpoint.port, type=socket.SOCK_DGRAM
         )

@@ -467,6 +467,8 @@ def test_a_slow_transport_open_is_bounded_and_close_does_not_wait_for_it(
             return real(*args, **kwargs)
 
         monkeypatch.setattr(socket, "getaddrinfo", slow)
+        # The mock endpoints are IP literals, which skip the resolver; treat them as names.
+        monkeypatch.setattr(udp, "_is_ip_literal", lambda _host: False)
         route = ground.route("fc")
         data = ground.codec_for("fc").encode_command("MOCK_NOOP").data
         sending = asyncio.ensure_future(ground._engine.send(route.link, LinkEnd.SOURCE, data))

@@ -172,6 +172,35 @@ def test_f1_lookups_that_never_answer_are_bounded_then_refused_with_a_coded_erro
     assert udp_module._RESOLVER.running == 0  # released lookups give their slots back
 
 
+def test_s1_an_ip_literal_opens_while_every_resolver_slot_hangs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    real = socket.getaddrinfo
+
+    def hanging(host: Any, *args: Any, **kwargs: Any) -> Any:
+        if host == "hang.invalid":
+            release.wait(30)
+        return real(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", hanging)
+    (port,) = free_udp_ports(1)
+
+    async def main() -> None:
+        for _ in range(udp_module.RESOLVER_THREADS):
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.05):
+                    await UdpTransport(remote=Endpoint("hang.invalid", 9)).open(None)
+        transport = UdpTransport(remote=Endpoint("127.0.0.1", port))
+        await transport.open(None)
+        await transport.close()
+
+    try:
+        asyncio.run(main())
+    finally:
+        release.set()
+
+
 # -- F2: serial sends with part of the packet on the line -----------------------------------------
 
 
@@ -359,6 +388,41 @@ def test_f3_a_cancel_during_the_recorder_close_still_writes_the_backlog_and_trai
     assert not writer_alive
     report = rec_inspect.info(path)
     assert report.status == "closed" and report.frames == count
+
+
+def test_s2_a_cancelled_close_on_a_slow_but_moving_disk_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ironbird.recording import writer as writer_module
+
+    monkeypatch.setattr(writer_module, "CLOSE_STALL_S", 0.3)
+    path = tmp_path / "crawl.ibrec"
+
+    def crawl(fd: int, view: memoryview) -> int:  # always progressing, never finishing soon
+        time.sleep(0.01)
+        return os.write(fd, view[:64])
+
+    async def main() -> float:
+        loop = asyncio.get_running_loop()
+        rec = Recorder.open(
+            path,
+            meta(),
+            streams=(RX, TX),
+            options=RecorderOptions(min_free_bytes=0),
+            loop=loop,
+            write=crawl,
+        )
+        for i in range(1, 2001):
+            rec.append(frame(i, data=bytes([i % 251]) * 1000))
+        me = asyncio.current_task()
+        assert me is not None
+        loop.call_later(0.05, me.cancel)
+        start = time.monotonic()
+        with pytest.raises(asyncio.CancelledError):
+            await rec.close()
+        return time.monotonic() - start
+
+    assert asyncio.run(main()) < 3.0
 
 
 # -- F4: bytes the serial device holds at close --------------------------------------------------

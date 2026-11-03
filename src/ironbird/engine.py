@@ -1207,6 +1207,7 @@ class Engine:
             *(transport.poll() for _, transport in transports), return_exceptions=True
         )
         assert len(outcomes) == len(transports)
+        escaped: BaseException | None = None
         for (io, transport), outcome in zip(transports, outcomes, strict=True):
             if isinstance(outcome, Exception):
                 self._report(
@@ -1220,11 +1221,13 @@ class Engine:
                     context=f"poll {io.description}",
                 )
             elif outcome is not None:  # a poll cancelled on its own, or a BaseException
-                raise outcome
+                escaped = escaped or outcome  # raised once every transport is accounted for
             if io.transport is transport:  # a replaced transport was accounted for as it closed
                 self._poll_kernel(io, transport)
             for sub in io.subs:
                 self._poll_sub(sub)
+        if escaped is not None:
+            raise escaped
 
     def _poll_sub(self, sub: _Subscription) -> None:
         """Report frames this consumer's queue refused since the last poll (coalesced, ledgered)."""
