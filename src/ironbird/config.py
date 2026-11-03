@@ -849,7 +849,7 @@ def _same_host(a: str, b: str) -> bool:
     ``_host_key``, or a wildcard (``0.0.0.0``, ``::``, which binds every local address) against
     loopback. A wildcard against another address is allowed: that address may be a remote peer."""
     keys = {_host_key(a), _host_key(b)}
-    return len(keys) == 1 or keys in ({"loopback", "0.0.0.0"}, {"loopback", "::"})  # noqa: S104 - compared, not bound
+    return len(keys) == 1 or keys in ({"loopback", "0.0.0.0"}, {"loopback", "::"})  # noqa: S104 # nosec B104  # compared, not bound
 
 
 def _framing_for_line(
