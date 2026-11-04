@@ -113,6 +113,10 @@ jobs:
       - name: The coverage hook leaves nothing in the venv
         if: always()
         run: |
+          if [ ! -d "$RUNNER_TEMP/venv" ]; then
+            echo "The venv was never created ($RUNNER_TEMP/venv is missing), so there is no coverage hook to check."
+            exit 0
+          fi
           leftover="$(find "$RUNNER_TEMP/venv" -name '*ironbird_cov*' -o -name 'zz_ironbird_coverage_*')"
           test -z "$leftover" || { echo "::error::coverage hook left behind: $leftover"; exit 1; }
       - name: Coverage report files

@@ -5,15 +5,17 @@
 #
 # Run it from the venv that has `pip install -e '.[dev]'`. The report is printed, and the run
 # fails when total coverage is under [tool.coverage.report] fail_under in pyproject.toml.
-# Data files go to $IRONBIRD_COV_DIR (default: a fresh per-run mktemp directory, never the
-# source tree).
+# Data files go to $IRONBIRD_COV_DIR (default: a fresh per-run mktemp directory, removed on exit;
+# never the source tree).
 #
 # Why this is not just `coverage run -m pytest`: several tests start `ib` as a subprocess with a
 # scrubbed environment (env={"PATH": ...}), which drops COVERAGE_PROCESS_START, so the child never
-# measures itself. This script installs a per-run .pth hook and helper module into the active venv
-# that start coverage only in processes descended from this script (checked through /proc), so
-# other sessions using the same venv are never measured. Both are removed on exit; a hook left by
-# a killed run is inert (its owner PID is gone) and is removed by the next run.
+# measures itself. This script installs a per-run .pth hook into the active venv that starts
+# coverage only in processes descended from this script (checked through /proc), so other
+# sessions using the same venv are never measured. The hook is a single self-contained .pth line
+# (as coverage's own a1_coverage.pth is), so no module is imported and no bytecode is written
+# beside it. It is removed on exit; a hook left by a killed run is inert (its owner PID is gone)
+# and is removed by the next run.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,9 +33,20 @@ for stale in "$purelib"/zz_ironbird_coverage_*.pth; do
     owner="${stale##*_}"; owner="${owner%.pth}"
     if ! kill -0 "$owner" 2>/dev/null; then
         echo "coverage.sh: removing stale hook from a killed run: $stale" >&2
-        rm -f "$stale" "$purelib/_ironbird_cov_$owner.py"
+        rm -f "$stale"
     fi
 done
+
+run_id="$$"
+pth="$purelib/zz_ironbird_coverage_$run_id.pth"
+own_data=""  # set to the data directory when this run created it
+cleanup() {
+    rm -f "$pth"
+    if [[ -n "$own_data" ]]; then
+        rm -rf "$own_data"
+    fi
+}
+trap cleanup EXIT
 
 if [[ -n "${IRONBIRD_COV_DIR:-}" ]]; then
     data="$IRONBIRD_COV_DIR"
@@ -41,49 +54,44 @@ if [[ -n "${IRONBIRD_COV_DIR:-}" ]]; then
     rm -f "$data"/.coverage*
 else
     data="$(mktemp -d "${TMPDIR:-/tmp}/ironbird-coverage.XXXXXX")"
+    own_data="$data"
 fi
 
-run_id="$$"
-mod="_ironbird_cov_$run_id"
-pth="$purelib/zz_ironbird_coverage_$run_id.pth"
-trap 'rm -f "$pth" "$purelib/$mod.py"' EXIT
-
-# Values reach Python through repr(), so any path characters are safe.
-IB_REPO="$repo" IB_DATA="$data" IB_OWNER="$run_id" IB_OUT="$purelib/$mod.py" "$python" - <<'PY'
+# Values reach Python through repr(), so any path characters are safe. site.py runs a .pth line
+# that starts with "import" through exec(), so the whole hook is one line: the body is a string
+# literal (its newlines escaped by repr) run with its own globals.
+IB_REPO="$repo" IB_DATA="$data" IB_OWNER="$run_id" IB_OUT="$pth" "$python" - <<'PY'
 import os
-src = f'''import os
-
-def _descends_from(owner: int) -> bool:
-    pid = os.getpid()
-    for _ in range(256):
-        if pid == owner:
-            return True
-        if pid <= 1:
-            return False
-        try:
-            with open(f"/proc/{{pid}}/stat", "rb") as f:
-                stat = f.read()
-            pid = int(stat[stat.rindex(b")") + 2:].split()[1])
-        except (OSError, ValueError, IndexError):
-            return False
-    return False
-
-if _descends_from({int(os.environ["IB_OWNER"])!r}):
-    os.environ.setdefault("COVERAGE_PROCESS_START", {os.path.join(os.environ["IB_REPO"], "pyproject.toml")!r})
-    os.environ.setdefault("COVERAGE_FILE", {os.path.join(os.environ["IB_DATA"], ".coverage")!r})
-    import coverage
-    coverage.process_startup()
+body = f'''import os
+pid = os.getpid()
+owner = {int(os.environ["IB_OWNER"])!r}
+for _ in range(256):
+    if pid == owner:
+        os.environ.setdefault("COVERAGE_PROCESS_START", {os.path.join(os.environ["IB_REPO"], "pyproject.toml")!r})
+        os.environ.setdefault("COVERAGE_FILE", {os.path.join(os.environ["IB_DATA"], ".coverage")!r})
+        import coverage
+        coverage.process_startup()
+        break
+    if pid <= 1:
+        break
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as f:
+            stat = f.read()
+        pid = int(stat[stat.rindex(b")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        break
 '''
+line = "import sys; exec(" + repr(body) + ", {})\n"
+assert "\n" not in line[:-1]
 with open(os.environ["IB_OUT"], "w") as f:
-    f.write(src)
+    f.write(line)
 PY
-echo "import $mod" > "$pth"
 
 cd "$repo"
 status=0
 "$python" -m pytest -p no:cacheprovider --benchmark-disable "$@" || status=$?
 
-rm -f "$pth" "$purelib/$mod.py"  # stop measuring before the report is built
+rm -f "$pth"  # stop measuring before the report is built
 report=0
 if ! COVERAGE_FILE="$data/.coverage" "$python" -m coverage combine --quiet "$data"; then
     echo "coverage.sh: error COV002: coverage combine failed for $data; no report built" >&2

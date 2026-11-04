@@ -25,14 +25,21 @@ state_dir = r2.state_dir
 
 # -- 1: the direct signal notice never blocks the exit --
 
-# stderr is a pipe nobody reads. As the ledger closes, with everything else already written to
-# stderr (however much the host made the run print, e.g. an IB-TX-005 receive-buffer warning),
-# the pipe is filled to within five bytes of full and SIGTERM lands, so the notice is written
-# with the shutdown signals held.
+# stderr is a pipe nobody reads. As the ledger closes, the pipe is filled until a write would
+# block, whatever the run already wrote to it and whatever the pipe's capacity, and SIGTERM lands,
+# so the notice is written with the shutdown signals held. The script starts from a clean signal
+# state (no blocked mask or SIGTERM disposition inherited from the test runner) and keeps a dup of
+# the real stderr for its own diagnostics, which the test puts in the assertion message.
 FULL_STDERR_SCRIPT = """
-import os, signal, sys, fcntl, termios, struct
+import os, signal, sys, traceback
 import ironbird.cli.main as m
 from ironbird.ledger import Ledger
+signal.pthread_sigmask(signal.SIG_SETMASK, ())
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+diag = os.dup(2)
+def report(kind, value, tb):
+    os.write(diag, "".join(traceback.format_exception(kind, value, tb)).encode())
+sys.excepthook = report
 r, w = os.pipe()
 os.dup2(w, 2)
 original = Ledger.close
@@ -40,14 +47,14 @@ fired = []
 def close(self, end=None):
     if not fired:
         fired.append(1)
-        cap = fcntl.fcntl(w, fcntl.F_GETPIPE_SZ)
-        queued = struct.unpack("i", fcntl.ioctl(r, termios.FIONREAD, bytes(4)))[0]
-        assert 0 < queued < cap - 5, (queued, cap)
-        os.set_blocking(w, False)  # a short write still leaves at most five bytes free
-        try:
-            os.write(w, b"." * (cap - queued - 5))
-        except BlockingIOError:
-            pass
+        # Bulk writes, then single bytes into the room left in the last page, until EAGAIN.
+        os.set_blocking(w, False)
+        for size in (1 << 16, 1):
+            try:
+                while os.write(w, b"." * size):
+                    pass
+            except BlockingIOError:
+                pass
         os.set_blocking(w, True)
         os.kill(os.getpid(), signal.SIGTERM)
     return original(self, end)
@@ -63,11 +70,11 @@ def test_signal_notice_on_a_full_stderr_pipe_does_not_hang_and_the_ledger_has_it
     proc = subprocess.Popen(
         [sys.executable, "-c", FULL_STDERR_SCRIPT, str(mock_config_path)],
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         text=True,
     )
     try:
-        proc.communicate(timeout=20)
+        _, diagnostics = proc.communicate(timeout=20)
     except subprocess.TimeoutExpired:
         kill_quietly(proc)
         raise AssertionError(
@@ -75,7 +82,7 @@ def test_signal_notice_on_a_full_stderr_pipe_does_not_hang_and_the_ledger_has_it
         ) from None
     finally:
         kill_quietly(proc)
-    assert proc.returncode == 143
+    assert proc.returncode == 143, diagnostics
     (event,) = events_named(state_dir, "cli.signal")
     assert event["signum"] == int(signal.SIGTERM)
 

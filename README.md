@@ -750,7 +750,7 @@ Shipped files:
 ```bash
 pytest -n auto
 ruff check . && ruff format --check .
-pyright                                # strict on src/, "standard" on tests/ (config: [tool.pyright])
+pyright                                # strict on src/, strict minus style rules on tests/ ([tool.pyright])
 mypy                                   # strict, src/ only (config: [tool.mypy])
 bandit -c pyproject.toml -r src        # security lint; a skip is `# nosec B301  # reason`
 tools/coverage.sh -n auto              # branch coverage of src/ironbird; fails under fail_under

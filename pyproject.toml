@@ -100,16 +100,16 @@ reportUnknownLambdaType = false
 reportPrivateUsage = false
 reportMissingParameterType = false
 
-# src keeps the strict rule set above. Tests are held to pyright's "standard" rule set (CLAUDE.md
-# Testing Guidelines: test code only needs to work): the rules strict adds on top of standard are
-# turned back off for them. Correctness checks (types, attributes, calls, optionals) still apply.
+# src keeps the strict rule set above. Tests are held to a lower bar (CLAUDE.md Testing Guidelines:
+# test code only needs to work): strict's style and API-hygiene rules are turned off for them.
+# Correctness checks (types, attributes, calls, optionals) still apply, including the ones that
+# expose a vacuous test: reportUnnecessaryComparison and reportUnnecessaryContains (a condition
+# that can never change) and reportUnusedVariable (a computed result never asserted on).
 [[tool.pyright.executionEnvironments]]
 root = "tests"
 extraPaths = ["src"]
 reportMissingTypeArgument = false
 reportUnnecessaryCast = false
-reportUnnecessaryComparison = false
-reportUnnecessaryContains = false
 reportUnnecessaryIsInstance = false
 reportUntypedFunctionDecorator = false
 reportUntypedClassDecorator = false
@@ -117,7 +117,6 @@ reportUntypedBaseClass = false
 reportUntypedNamedTuple = false
 reportUnusedClass = false
 reportUnusedFunction = false
-reportUnusedVariable = false
 reportConstantRedefinition = false
 reportDeprecated = false
 reportTypeCommentUsage = false
@@ -132,7 +131,7 @@ root = "src"
 
 [tool.mypy]
 # src only, by decision (CLAUDE.md Testing Guidelines: strict analyses are not extended to tests;
-# pyright checks them at its "standard" level, see [tool.pyright]).
+# pyright checks them with a relaxed strict rule set, see [tool.pyright]).
 files = ["src"]
 python_version = "3.11"
 strict = true

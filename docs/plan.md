@@ -4572,16 +4572,19 @@ CI gates beyond ruff, pyright and the tests (`.github/workflows/ci.yml`):
 
 - **Test code is held to a lower bar than `src/`** (CLAUDE.md Testing Guidelines). The strict analyses
   apply to `src/` only: mypy strict, pyright strict, bandit and the full ruff rule set. Tests get
-  pyright's "standard" rule set (an `executionEnvironments` entry for `tests` in `[tool.pyright]`
-  turns off the rules strict adds), ruff's correctness rules (F, B, E9, ...) with a few
-  fixture-oriented security/style rules relaxed in `per-file-ignores`, and no mypy.
-- **coverage** (`coverage` job): `tools/coverage.sh -n auto --ignore=tests/cfs` on a fresh venv (the script
-  refuses a non-virtualenv Python and installs its per-run `.pth` hook in the venv's site-packages,
-  removing it on exit; the job checks nothing is left behind), branch coverage of `src/ironbird`,
-  failing under `[tool.coverage.report] fail_under`. A job of its own keeps `checks` fast. The HTML
-  and XML reports are uploaded as the `coverage-report` artifact. `fail_under` sits a small margin
-  under the measured total (95.27% branch on 4 cores, `fail_under = 94`), which absorbs timing-skipped paths; re-measure and move it when the
-  suite changes materially.
+  pyright strict minus its style and API-hygiene rules (an `executionEnvironments` entry for `tests`
+  in `[tool.pyright]` turns those off; `reportUnnecessaryComparison`, `reportUnnecessaryContains`
+  and `reportUnusedVariable` stay on because they expose vacuous tests), ruff's correctness rules
+  (F, B, E9, ...) with a few fixture-oriented security/style rules relaxed in `per-file-ignores`,
+  and no mypy (mypy stays on `src/` only).
+- **coverage** (`coverage` job): `tools/coverage.sh -n auto --ignore=tests/cfs` on a fresh venv (the
+  script refuses a non-virtualenv Python and installs its per-run `.pth` hook, a single self-contained
+  line with no helper module and so no bytecode, in the venv's site-packages, removing it on exit;
+  the job checks nothing is left behind), branch coverage of `src/ironbird`, failing under
+  `[tool.coverage.report] fail_under`. A job of its own keeps `checks` fast. The HTML and XML reports
+  are uploaded as the `coverage-report` artifact. `fail_under` sits a small margin under the measured
+  total (95.28% branch in CI, `fail_under = 94`), which absorbs timing-skipped paths; re-measure and
+  move it when the suite changes materially.
 - **mypy** (strict, `src/` only; `[tool.mypy]`) and **bandit** (`src/`; `[tool.bandit]`) run in the
   `checks` job. Every bandit skip is inline with a reason (`# nosec B301  # reason`; the only global
   skip is B101, because asserts are the assertive-programming tool).
@@ -4600,8 +4603,6 @@ Deferred (decisions open):
 
 - pytest is held below 9 and so carries PYSEC-2026-1845 (fixed in 9.0.3; accepted in
   `tools/ci/audit-ignore.txt`). Verify pytest-benchmark and xdist on pytest 9, bump, drop the entry.
-- Resolved (decision): mypy stays on `src/` only and is not extended to `tests/`; pyright checks tests
-  at its "standard" level, not strict. See "Test code is held to a lower bar" above.
 - `recording/pexport.py` unpickles the export worker's replies in the parent. The pipe is private and
   the worker is the tool's own process, but a worker that a decoder bug compromised could then run
   code in the parent. Replacing pickle with a fixed binary framing removes that class (design change).
