@@ -535,7 +535,12 @@ def test_the_export_table_of_the_configuration(tmp_path: Path) -> None:
         8192,
     )
     assert parse("[export]\npool_min_bytes = 0\n").export.pool_min_bytes == 0
+    assert default.export.worker_stall_s == 300
+    assert parse('[export]\nworker_stall = "90s"\n').export.worker_stall_s == 90
     for bad in (
+        '[export]\nworker_stall = "1s"\n',
+        '[export]\nworker_stall = "2d"\n',
+        "[export]\nworker_stall = 60\n",
         "[export]\njobs = 0\n",
         "[export]\njobs = 1000\n",
         "[export]\njobs = true\n",

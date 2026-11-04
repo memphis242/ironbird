@@ -4062,13 +4062,26 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   worker's end closed after the start so that a worker that dies is an end of file on its pipe; the
   definitions, jobs and results are frames of the pool's wire format over that pipe (see Wire format,
   below), each worker
-  has up to two jobs sent (one running, one ready; a job message over 16 KiB goes only to an idle worker so a
-  send never waits on a busy one), and the parent reads on the calling thread with
-  `multiprocessing.connection.wait` in 50 ms slices, taking from each ready pipe only what it holds
-  (a per-worker assembler of the length-prefixed message; the length is checked against the reply
-  cap before a body byte is held), so a worker that stays alive and stops part way through a reply
-  (stopped, wedged or hostile) costs the parent one slice at a time and cannot keep it from acting
-  on SIGINT or SIGTERM. There is no manager thread and no queue shared
+  has up to two jobs sent (one running, one ready; a job message over 16 KiB goes only to an idle worker, so
+  a large job never waits in an outbox behind another message), and the parent uses the pipes on the
+  calling thread only, never blocking on one: its end of each pipe is non-blocking, with an outbox
+  (the definitions greeting and the jobs, queued by reference and written as far as the pipe takes
+  them) and an inbox (a per-worker assembler of the length-prefixed reply). It waits for readable and
+  writable pipes together (`selectors`) in 50 ms slices, one slice shared by the pipes that are
+  ready (so a poll cannot outlast a signal by the number of workers times the slice), and moves only
+  what a pipe takes or holds. A worker that stays alive and stops reading, or stops part way through a
+  reply (stopped, wedged or hostile), therefore costs the parent nothing beyond a slice and cannot keep
+  it from acting on SIGINT or SIGTERM, in either direction and for the greeting too. The length of a
+  reply is checked before a body byte is held, against the cap of the job it answers (`reply_cap`: the
+  job's `text_cap` at 5 bytes a character plus the row that passes it, one record per 32 bytes of
+  the range for the row kinds, the `event_cap` notes and a fixed allowance for diagnostics; never
+  more than the 128 MiB of any reply), so a stalled reply holds no more than the job could honestly
+  have made. A worker that holds work and moves no byte of its pipe, either way, for `[export]
+  worker_stall` (5 minutes; 10 s to 24 h; a worker decoding a range moves none until it replies, so
+  the default is far above the seconds a 4 MiB range takes) has stalled: the export ends with
+  `IB-EXP-003` ("an export worker made no progress for 300 s (stopped or hung); ..."; the worker, its
+  jobs and the unsent and held bytes are in the details). Until then the export waits, and a
+  signal always ends the wait. There is no manager thread and no queue shared
   between workers. (Found in review: the executor this replaced had a manager thread that read the
   results; after the export terminated its workers part way through sending a result, that thread
   blocked reading a message that was never completed and the interpreter waited for it at exit, forever;
@@ -4165,7 +4178,16 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   definition makes it; (6) a worker that stopped part way through a reply hung the parent in a
   blocking read that no signal ended (also true of the executor this replaced): replies are
   assembled from what the pipe holds; (7) the encoder did not spend the item budget; (8) the
-  tally's `rejected` keys were free text.
+  tally's `rejected` keys were free text. Found in the second review, each a test that fails on the
+  code before: (9) the same hang in the other direction: a job (a seed of 60,000 sources frames to
+  1.3 MB) or the definitions greeting (up to 128 MiB) sent with a blocking write to a worker that
+  does not read, which no signal ended: the pipes are non-blocking with an outbox, and a poll waits
+  for read and write readiness together; (10) one poll could outlast a signal by up to the number of
+  ready workers times the slice: the slice is shared; (11) a stalled reply held up to 128 MiB per
+  worker: the cap is the job's; (12) a stalled worker stalled the export forever, without a word:
+  `[export] worker_stall` ends it with `IB-EXP-003`; (13) `layouts` defaulted to none on `submit` and
+  `Ticket`, which refused every CSV reply of a caller that forgot it, blaming the worker: it is
+  required.
 - **When the pool is used.** `--jobs N` (1..64) beats `[export] jobs`, which beats the default of one
   worker per core the process may run on (its CPU affinity and the `cpu.max` quota of its cgroup v2
   group and the groups above it, rounded up; a group that cannot be examined, such as `EACCES`, is no
@@ -4322,7 +4344,7 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
 | `IB-FLT-004` | `FLT_LIMIT` | filter too long, deep or wide | 2f |
 | `IB-EXP-001` | `EXP_WRITE` | cannot write export output | 2h |
 | `IB-EXP-002` | `EXP_EXISTS` | export output exists (pass `--force`), is the input, or is a file retention manages (`--force` does not apply to these two) | 2h |
-| `IB-EXP-003` | `EXP_WORKER` | an export worker process died (killed, out of memory), failed to return a result, or could not be started; the message says to run again or with `--jobs 1`; the cause or traceback is in the ledger | 2m |
+| `IB-EXP-003` | `EXP_WORKER` | an export worker process died (killed, out of memory), made no progress for `[export] worker_stall` (stopped or hung), failed to return a result, or could not be started; the message says to run again or with `--jobs 1`; the cause or traceback is in the ledger | 2m |
 | `IB-DEC-008` | `DEC_COUNT` | variable-length count above the CCDD maximum | 2j |
 | `IB-DEC-009` | `DEC_OVERRUN` | variable-length data runs past the packet end | 2j |
 

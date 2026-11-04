@@ -2836,6 +2836,7 @@ def export_command(
                     min_bytes=export_config.pool_min_bytes,
                     range_bytes=export_config.range_bytes,
                     codecs=codecs,
+                    stall_s=export_config.worker_stall_s,
                 )
 
             def run_it(dest: Destination) -> ExportResult:

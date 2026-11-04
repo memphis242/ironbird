@@ -64,24 +64,30 @@ coordinates), exit if the parent goes away, and are terminated when the export e
 signal, an error, the output closing). The pool is owned: one process and one pipe per worker, jobs
 and results over that pipe, no helper thread and no queue shared between workers, so a worker that
 is terminated or dies part way through a message is an end of file on its pipe and nothing waits
-for bytes that will not come. A worker that stays alive and stops part way through a message is
-not waited for either: the parent waits in :func:`multiprocessing.connection.wait` in short
-slices and, between them, takes only what a pipe holds (:class:`_Inbox`), so a signal is acted on
-within a slice whatever a worker does. The processes, and the resource tracker the first of them
+for bytes that will not come. A worker that stays alive and stops part way through a message, or
+stops reading one, is not waited for either: the parent's end of each pipe is non-blocking, with a
+queue of what it sends (:class:`_Outbox`) and an assembler of what it receives (:class:`_Inbox`),
+and the parent waits for readable and writable pipes together in short slices (one slice shared
+by the pipes that are ready), moving only what a pipe takes or holds. A signal is therefore acted
+on within a slice whatever a worker does, for both directions, the definitions a worker is given
+first included. A reply is held only up to what its job can honestly have (:func:`reply_cap`). A
+worker that holds work and moves no byte of its pipe for ``stall_s`` (``[export] worker_stall``)
+has stalled: the export ends with ``IB-EXP-003`` instead of waiting for it forever (it can always
+be interrupted meanwhile). The processes, and the resource tracker the first of them
 starts, are created with the shutdown signals blocked, so a hangup sent to the process group
-reaches the parent alone. A worker that dies, or whose result cannot be read, is ``IB-EXP-003``. A
-worker is started with nothing but its pipe and the parent's process id; the definitions it decodes
-with are the first message on the pipe.
+reaches the parent alone. A worker that dies, stalls, or whose result cannot be read, is
+``IB-EXP-003``. A worker is started with nothing but its pipe and the parent's process id; the
+definitions it decodes with are the first message on the pipe.
 
 Untrusted input: everything a worker reads is validated by the reader before it is decoded, and a
 worker that decodes untrusted recordings is not trusted either. Every message on the pipe, both
 ways, is a frame of the fixed binary format of :mod:`~ironbird.recording.poolframe`: no object is
 ever serialized, so no message can run code or name a type to build. The parent reads a reply
-only through :func:`~ironbird.recording.poolframe.decode` (caps on every length, the pipe refusing
-a message longer than any reply before reading it), checks it against the job it answers
-(:func:`~ironbird.recording.poolframe.check_reply`, the tables of a CSV reply among them: only
-those the export's definitions make) and then against the walk; a reply that fails
-any of these is ``IB-EXP-003``, as a worker that died is.
+only through :func:`~ironbird.recording.poolframe.decode` (caps on every length, the parent
+refusing a message longer than its job's reply can be before holding a byte of it), checks it
+against the job it answers (:func:`~ironbird.recording.poolframe.check_reply`, the tables of a
+CSV reply among them: only those the export's definitions make) and then against the walk; a reply
+that fails any of these is ``IB-EXP-003``, as a worker that died is.
 """
 
 from __future__ import annotations
@@ -91,6 +97,7 @@ import contextlib
 import dataclasses
 import multiprocessing
 import os
+import selectors
 import signal
 import struct
 import threading
@@ -107,7 +114,9 @@ from ironbird.codec import Codec
 from ironbird.config import (
     DEFAULT_POOL_MIN_BYTES,
     DEFAULT_RANGE_BYTES,
+    DEFAULT_WORKER_STALL_S,
     MAX_EXPORT_JOBS,
+    MAX_RANGE_BYTES,
     MIN_RANGE_BYTES,
 )
 from ironbird.errors import Code, IronbirdError
@@ -156,9 +165,17 @@ FIRST_RANGE_DIVISOR: Final = 32  # ranges planned before any width is known are 
 MAX_RANGE_EVENTS: Final = 1000  # damage and gap notes one result carries before the range is cut
 PARENT_WATCH_S: Final = 1.0  # how often a worker looks for its parent
 STOP_WAIT_S: Final = 5.0  # how long terminated workers are waited for before they are killed
+STALL_S: Final = float(DEFAULT_WORKER_STALL_S)  # a busy worker silent this long has stalled
 ALIGN: Final = fmt.ALIGN
 assert RANGE_BYTES % ALIGN == 0 and MIN_RANGE_BYTES % ALIGN == 0
 assert RESULT_TEXT_CAP <= poolframe.MAX_TEXT_CAP and MAX_RANGE_EVENTS <= poolframe.MAX_EVENT_CAP
+
+# What a reply to a job can honestly hold, from the job's own caps (see :func:`reply_cap`).
+REPLY_ROW_CHARS: Final = 4 * MIB  # characters of the one row that passes the text cap
+REPLY_NOTE_BYTES: Final = 5 * 1024  # one damage, gap or definition note (a stream is at most 4 KiB)
+REPLY_EXTRA_BYTES: Final = 16 * MIB  # failure and crash texts, the tally, the tables' columns
+REPLY_CHARS_BYTES: Final = 5  # per character of rows: 4 as UTF-8, and the order of a line of one
+assert REPLY_ROW_CHARS <= poolframe.MAX_TEXT_CAP
 
 
 CGROUP_ROOT: Final = Path("/sys/fs/cgroup")
@@ -592,6 +609,7 @@ def make_options(
     text_budget: int = PENDING_TEXT_BUDGET,
     event_cap: int = MAX_RANGE_EVENTS,
     codecs: Mapping[str, Codec] | None = None,
+    stall_s: float = STALL_S,
 ) -> ParallelOptions:
     """The options of an export of ``replay`` with ``jobs`` workers: ``definitions`` says how a
     worker rebuilds the codecs the parent decodes with; the rest repeats what the export was given
@@ -620,7 +638,30 @@ def make_options(
         text_budget=text_budget,
         event_cap=event_cap,
         codecs=codecs,
+        stall_s=stall_s,
     )
+
+
+def reply_cap(job: Job) -> int:
+    """The most bytes an honest worker's reply to ``job`` has, which is what the parent holds of a
+    reply that stalls part way through: the rows (up to the job's text cap, plus the one row that
+    passes it, at most 4 bytes a character, and 4 bytes of order for each line, a line being at
+    least one character), the kind of each row (one record per 32 bytes of the range at most; a
+    range to the end of the file is at most two ranges long), the notes (damage, gaps and
+    definitions stop the range at the job's event cap), and a fixed allowance for the failure and
+    crash texts, the tally and the tables' columns. Never more than the cap of any reply
+    (:data:`~ironbird.recording.poolframe.MAX_REPLY_BYTES`)."""
+    assert 1 <= job.text_cap <= poolframe.MAX_TEXT_CAP
+    assert 1 <= job.event_cap <= poolframe.MAX_EVENT_CAP
+    span = job.stop - job.guess if job.stop is not None else 2 * MAX_RANGE_BYTES
+    records = max(span, 0) // fmt.FRAME_FIXED_SIZE + 2
+    total = (
+        REPLY_CHARS_BYTES * (job.text_cap + REPLY_ROW_CHARS)
+        + records
+        + 2 * (job.event_cap + 1) * REPLY_NOTE_BYTES
+        + REPLY_EXTRA_BYTES
+    )
+    return min(total, poolframe.MAX_REPLY_BYTES)
 
 
 @dataclass(slots=True)
@@ -642,12 +683,13 @@ class Ticket:
     """A submitted job: waiting for a worker, running, or answered (an outcome, or the error that
     ended the pool before it was)."""
 
-    __slots__ = ("cancelled", "data", "error", "job", "layouts", "outcome")
+    __slots__ = ("cancelled", "data", "error", "job", "layouts", "outcome", "reply_cap")
 
-    def __init__(self, job: Job, data: bytes, layouts: Collection[TableKey] = frozenset()) -> None:
+    def __init__(self, job: Job, data: bytes, layouts: Collection[TableKey]) -> None:
         self.job = job
-        self.data: bytes | None = data  # the job as sent; dropped once sent
+        self.data: bytes | None = data  # the job as sent; dropped once handed to the worker's pipe
         self.layouts = layouts  # the tables the answer may hold (see ``poolframe.check_reply``)
+        self.reply_cap = reply_cap(job)  # the longest reply the job can honestly have
         self.outcome: Outcome | None = None
         self.error: IronbirdError | None = None
         self.cancelled = False  # nobody wants the answer any more
@@ -667,7 +709,7 @@ class Ticket:
 
 
 class MessageTooLong(Exception):
-    """A message on the pipe announced a length that no reply has."""
+    """A message on the pipe announced a length that its job's reply cannot have."""
 
 
 class _Inbox:
@@ -676,28 +718,34 @@ class _Inbox:
     A message on the pipe is a 4-byte big-endian length (what :meth:`Connection.send_bytes`
     writes) and that many bytes. A read of the pipe that waits until a whole message has come
     would wait on a worker that sends part of one and stops (stopped, wedged or hostile), and
-    cannot be interrupted by a signal; :meth:`take` makes one read of what is there, so the
-    caller's loop, which waits in slices, always gets back to its checkpoint. The length is
-    checked against ``cap`` before a byte of the body is held, and the body is held only as it
-    arrives, so a lying length costs nothing."""
+    cannot be interrupted by a signal; :meth:`take` makes one read of the non-blocking pipe, so
+    the caller's loop, which waits in slices, always gets back to its checkpoint. The length is
+    checked against the cap of the reply being waited for before a byte of the body is held, and
+    the body is held only as it arrives, so a lying length costs nothing and a stalled reply holds
+    no more than the job could honestly have."""
 
-    __slots__ = ("_body", "_cap", "_fd", "_head", "_size")
+    __slots__ = ("_body", "_fd", "_head", "_size")
 
     LENGTH: Final = struct.Struct("!i")
     CHUNK: Final = 256 * 1024  # the most one read takes (about a socket's buffer)
+    MAX_MESSAGE: Final = 0x7FFFFFFF  # the longest length the 4 bytes carry
 
-    def __init__(self, fd: int, cap: int) -> None:
+    def __init__(self, fd: int) -> None:
         self._fd = fd
-        self._cap = cap
         self._head = bytearray()
         self._body = bytearray()
         self._size: int | None = None  # the announced length, once the 4 bytes of it are in
 
-    def take(self) -> bytearray | None:
-        """Read what the pipe holds, which must be readable now; the message once it is whole,
-        else ``None``. Raises :class:`EOFError` if the worker's end closed (part way through a
+    def held(self) -> int:
+        """Bytes of a message that is not whole yet."""
+        return len(self._head) + len(self._body)
+
+    def take(self, cap: int) -> bytearray | None:
+        """Read what the pipe holds: the message once it is whole, else ``None`` (call again).
+        ``cap`` is the longest message that may start now. Raises :class:`BlockingIOError` when
+        the pipe holds nothing, :class:`EOFError` if the worker's end closed (part way through a
         message or not), :class:`OSError` for a failed read and :class:`MessageTooLong` for a
-        length over the cap or negative (the sentinel of a message past 2 GiB)."""
+        length over ``cap`` or negative (the sentinel of a message past 2 GiB)."""
         size = self._size
         if size is None:
             chunk = os.read(self._fd, self.LENGTH.size - len(self._head))
@@ -707,7 +755,7 @@ class _Inbox:
             if len(self._head) < self.LENGTH.size:
                 return None
             (size,) = self.LENGTH.unpack(self._head)
-            if not 0 <= size <= self._cap:
+            if not 0 <= size <= cap:
                 raise MessageTooLong(size)
             self._head.clear()
             if size == 0:
@@ -724,17 +772,71 @@ class _Inbox:
         return message
 
 
-class _Slot:
-    """A worker process and the pipe to it: the tickets sent to it and not yet answered, oldest
-    first (a worker answers in the order it was asked), and the reply being received."""
+class _Outbox:
+    """The messages for a worker, written as far as its pipe takes them, never waiting for room.
 
-    __slots__ = ("conn", "inbox", "process", "sent")
+    The mirror of :class:`_Inbox`: a blocking write of a message larger than the pipe's buffer
+    waits for a worker that does not read (stopped, wedged or hostile) and a signal cannot end
+    it. :meth:`put` only queues; :meth:`flush` writes what the non-blocking pipe takes now, and
+    the caller's loop, which waits in slices for the pipe to be writable, always gets back to its
+    checkpoint. A message goes out as :meth:`Connection.send_bytes` sends it (a 4-byte big-endian
+    length, then the bytes), so the worker reads it with ``recv_bytes``. Messages are held by
+    reference, not copied."""
+
+    __slots__ = ("_fd", "_offset", "_pieces", "unsent")
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._pieces: deque[bytes] = deque()
+        self._offset = 0  # of the first piece, already written
+        self.unsent = 0  # bytes queued and not yet written
+
+    def put(self, message: bytes) -> None:
+        assert 0 < len(message) <= _Inbox.MAX_MESSAGE
+        head = _Inbox.LENGTH.pack(len(message))
+        self._pieces.append(head)
+        self._pieces.append(message)
+        self.unsent += len(head) + len(message)
+
+    def flush(self, until: float) -> int:
+        """Write what the pipe takes, at least one attempt and then until the clock reaches
+        ``until``; the bytes written. Raises :class:`OSError` if the worker's end is closed."""
+        pieces = self._pieces
+        written = 0
+        while pieces:
+            piece = pieces[0]
+            try:
+                count = os.write(self._fd, memoryview(piece)[self._offset :])
+            except BlockingIOError:
+                break
+            written += count
+            self.unsent -= count
+            self._offset += count
+            if self._offset == len(piece):
+                pieces.popleft()
+                self._offset = 0
+            if time.monotonic() >= until:
+                break
+        return written
+
+
+class _Slot:
+    """A worker process and the non-blocking pipe to it: the tickets sent to it and not yet
+    answered, oldest first (a worker answers in the order it was asked), the reply being received
+    and the messages not yet written. ``progress``: when the pipe last moved a byte either way, or
+    the worker was last given work (:meth:`WorkerPool._check_stall`)."""
+
+    __slots__ = ("conn", "inbox", "outbox", "process", "progress", "sent")
 
     def __init__(self, process: Any, conn: connection.Connection) -> None:
         self.process = process
         self.conn = conn
-        self.inbox = _Inbox(conn.fileno(), poolframe.MAX_REPLY_BYTES)
+        fd = conn.fileno()
+        os.set_blocking(fd, False)  # our end only: the worker's is another file description
+        self.inbox = _Inbox(fd)
+        self.outbox = _Outbox(fd)
         self.sent: deque[Ticket] = deque()
+        self.progress = time.monotonic()
 
 
 class WorkerPool:
@@ -745,21 +847,24 @@ class WorkerPool:
     The pool is owned end to end: one spawned process and one pipe per worker, no helper thread,
     no queue shared between workers. A worker's end of its pipe is the only other copy of it, so
     a worker that dies (killed, out of memory, ended mid-message) is an end of file on its pipe,
-    never a read that waits for bytes that will not come. Only the calling thread reads the pipes:
-    :meth:`poll` waits in short slices, so a shutdown signal is acted on between two."""
+    never a read that waits for bytes that will not come. Only the calling thread uses the pipes,
+    and never blocks on one: they are non-blocking, each with an inbox and an outbox, and
+    :meth:`poll` waits for readable and writable pipes together in short slices, so a shutdown
+    signal is acted on between two whatever a worker does. A worker that holds work and moves no
+    byte either way for ``stall_s`` seconds has stalled, which ends the pool as a death does."""
 
     #: Jobs sent to a worker and not yet answered: the one running and one ready behind it, so a
     #: worker that finishes starts at once instead of after the parent has seen its result.
     DEPTH: Final = 2
-    #: A job message longer than this goes only to a worker with nothing outstanding: two unread
-    #: messages (the one being read and the next) then always fit in a pipe's buffer, and a send
-    #: never waits for a worker that is busy.
+    #: A job message longer than this goes only to a worker with nothing outstanding, so a large
+    #: job never waits in an outbox behind another message to a worker that is busy.
     AHEAD_BYTES: Final = 16 * 1024
 
-    def __init__(self, definitions: Definitions, jobs: int) -> None:
-        assert 1 <= jobs <= MAX_JOBS
+    def __init__(self, definitions: Definitions, jobs: int, *, stall_s: float = STALL_S) -> None:
+        assert 1 <= jobs <= MAX_JOBS and stall_s > 0
         self.definitions = definitions
         self.jobs = jobs
+        self.stall_s = stall_s
         self._slots: list[_Slot] = []
         self._queued: deque[Ticket] = deque()  # submitted, not yet sent to a worker
         self._error: IronbirdError | None = None
@@ -768,10 +873,10 @@ class WorkerPool:
 
     # -- the tickets --
 
-    def submit(self, job: Job, layouts: Collection[TableKey] = frozenset()) -> Ticket:
+    def submit(self, job: Job, layouts: Collection[TableKey]) -> Ticket:
         """Queue ``job`` and hand it to a worker as soon as one can take it (starting a worker
         when all those running are busy and fewer than ``jobs`` exist). ``layouts``: the tables
-        the answer may hold (a CSV export's: :func:`poolframe.layouts_of`)."""
+        the answer may hold (a CSV export's: :func:`poolframe.layouts_of`; empty for none)."""
         if self._error is not None:
             raise self._error
         try:
@@ -788,31 +893,61 @@ class WorkerPool:
         return bool(self._queued) or any(slot.sent for slot in self._slots)
 
     def poll(self, timeout: float = 0.0) -> None:
-        """Receive every result that is ready (waiting up to ``timeout`` seconds for the first)
-        and send the queued jobs to the workers that have room. Raises nothing for a worker that
-        died or an answer that cannot be read: the pool is then broken and the tickets without an
-        answer carry the error."""
+        """Move what the pipes take, waiting up to ``timeout`` seconds for the first pipe to be
+        ready: write the queued messages to the workers that will take them, receive every result
+        that is ready, and send the queued jobs to the workers that have room. Never waits on a
+        worker beyond that: each ready pipe gets a share of one wait slice. Raises nothing for a
+        worker that died, stalled or sent an answer that cannot be read: the pool is then broken
+        and the tickets without an answer carry the error."""
         self._dispatch()
-        busy: dict[Any, _Slot] = {slot.conn: slot for slot in self._slots if slot.sent}
-        if not busy:
+        if self._error is not None:
             return
-        for ready in connection.wait(list(busy), timeout):
-            if self._error is not None:
+        with selectors.DefaultSelector() as selector:
+            for slot in self._slots:
+                wanted = (selectors.EVENT_READ if slot.sent else 0) | (
+                    selectors.EVENT_WRITE if slot.outbox.unsent else 0
+                )
+                if wanted:
+                    selector.register(slot.conn.fileno(), wanted, slot)
+            if not selector.get_map():
+                return
+            ready = selector.select(timeout)
+        share = WAIT_SLICE_S / max(1, len(ready))
+        for key, events in ready:
+            if self.broken:
                 break
-            self._receive(busy[ready])
+            slot = key.data
+            if events & selectors.EVENT_WRITE:
+                self._send(slot, time.monotonic() + share)
+            if events & selectors.EVENT_READ and not self.broken:
+                self._receive(slot, share)
+        self._check_stall()
         self._dispatch()
 
-    def _receive(self, slot: _Slot) -> None:
-        """Take what ``slot``'s worker has sent of its next answer, for up to one wait slice (a
+    def _send(self, slot: _Slot, until: float) -> None:
+        """Write what ``slot``'s pipe takes of the messages for its worker (until ``until`` at
+        the latest); an end that has closed is a worker that died."""
+        try:
+            written = slot.outbox.flush(until)
+        except OSError as exc:  # the worker is gone
+            self._fail(self.died(exc))
+            return
+        if written:
+            slot.progress = time.monotonic()
+
+    def _receive(self, slot: _Slot, budget: float) -> None:
+        """Take what ``slot``'s worker has sent of its next answer, for up to ``budget`` seconds (a
         worker that stops part way through a message is not waited for: the caller's loop goes
-        on, and its checkpoints act on a signal). The answer is untrusted: read only by
-        :func:`poolframe.read_reply`, and anything it refuses ends the pool as a worker that
-        died does."""
-        conn = slot.conn
-        deadline = time.monotonic() + WAIT_SLICE_S
+        on, and its checkpoints act on a signal). The answer is untrusted: its length is checked
+        against what the job can have, then it is read only by :func:`poolframe.read_reply`, and
+        anything it refuses ends the pool as a worker that died does."""
+        ticket = slot.sent[0]  # a worker answers in the order it was asked
+        deadline = time.monotonic() + budget
         while True:
             try:
-                data = slot.inbox.take()
+                data = slot.inbox.take(ticket.reply_cap)
+            except BlockingIOError:
+                return  # nothing more now: the next poll goes on from here
             except MessageTooLong as exc:  # refused from its length, before any of it is held
                 self._fail(
                     self._undeliverable("an export worker sent a result too long to be one", exc)
@@ -821,11 +956,12 @@ class WorkerPool:
             except (EOFError, OSError) as exc:
                 self._fail(self.died(exc))
                 return
+            now = time.monotonic()
+            slot.progress = now
             if data is not None:
                 break
-            if time.monotonic() >= deadline or not connection.wait([conn], 0):
-                return  # the rest has not come: the next poll goes on from here
-        ticket = slot.sent[0]  # a worker answers in the order it was asked
+            if now >= deadline:
+                return
         try:
             reply = poolframe.read_reply(ticket.job, data, ticket.layouts)
         except FrameError as exc:  # the ticket is still sent: the failure answers it
@@ -834,8 +970,22 @@ class WorkerPool:
             )
             return
         slot.sent.popleft()
+        if slot.sent:
+            slot.progress = now  # the next job is waited for from here
         if not ticket.cancelled:
             ticket.outcome = reply
+
+    def _check_stall(self) -> None:
+        """End the pool if a worker that holds work has moved no byte of its pipe, either way,
+        for ``stall_s`` seconds. (A worker that is busy decoding a range moves none until it
+        replies, so the limit is far above the longest a range takes.)"""
+        if self._error is not None:
+            return
+        now = time.monotonic()
+        for slot in self._slots:
+            if slot.sent and now - slot.progress >= self.stall_s:
+                self._fail(self._stalled(slot, now - slot.progress))
+                return
 
     def _fail(self, error: IronbirdError) -> None:
         """The pool is of no more use: every ticket without an answer ends with ``error``."""
@@ -859,6 +1009,20 @@ class WorkerPool:
             cause=exc,
         )
 
+    def _stalled(self, slot: _Slot, idle: float) -> IronbirdError:
+        """The error for a worker that holds work and has moved no byte for ``idle`` seconds."""
+        pid = getattr(slot.process, "pid", None)
+        return IronbirdError(
+            Code.EXP_WORKER,
+            f"an export worker made no progress for {idle:.0f} s (stopped or hung); run the export "
+            "again, or with --jobs 1 to decode in one process",
+            details=(
+                f"worker pid {pid}: {len(slot.sent)} job(s) outstanding, {slot.outbox.unsent} "
+                f"bytes not yet taken by it, {slot.inbox.held()} bytes of a reply held; the "
+                f"limit is {self.stall_s:g} s ([export] worker_stall)"
+            ),
+        )
+
     @staticmethod
     def _undeliverable(summary: str, exc: BaseException) -> IronbirdError:
         return IronbirdError(
@@ -871,7 +1035,8 @@ class WorkerPool:
     # -- the workers --
 
     def _dispatch(self) -> None:
-        """Send queued jobs, in order, to the workers with room."""
+        """Hand queued jobs, in order, to the workers with room. A job is queued in the worker's
+        outbox and written as far as its pipe takes it; the rest follows in :meth:`poll`."""
         queued = self._queued
         while queued and self._error is None:
             ticket = queued[0]
@@ -883,14 +1048,12 @@ class WorkerPool:
             if slot is None:
                 return
             queued.popleft()
-            try:
-                slot.conn.send_bytes(ticket.data)
-            except OSError as exc:  # the worker is gone
-                slot.sent.append(ticket)
-                self._fail(self.died(exc))
-                return
+            if not slot.sent:
+                slot.progress = time.monotonic()  # the worker is waited for from now
+            slot.outbox.put(ticket.data)
             ticket.data = None
             slot.sent.append(ticket)
+            self._send(slot, 0.0)  # one write; :meth:`poll` goes on when the pipe has room
 
     def _slot_for(self, size: int) -> _Slot | None:
         """The worker to send a job of ``size`` bytes to: the least loaded, or a new one when
@@ -942,15 +1105,12 @@ class WorkerPool:
                 theirs.close()  # the worker holds the only other copy: its death is our end of file
         slot = _Slot(process, ours)
         self._slots.append(slot)  # ended by close() whatever happens next
-        try:
-            ours.send_bytes(self._greeting)
-        except OSError as exc:  # the worker is gone already
-            raise self._cannot_start(exc) from exc
+        slot.outbox.put(self._greeting)  # written by the first :meth:`_send`, with the first job
         return slot
 
     def _cannot_start(self, exc: BaseException) -> IronbirdError:
-        """The error that ends the pool when a worker cannot be started or given its
-        definitions."""
+        """The error that ends the pool when a worker cannot be started or its definitions cannot
+        be framed."""
         self.broken = True
         if isinstance(exc, FrameError):
             reason = exc.reason
@@ -1003,7 +1163,9 @@ class ParallelOptions:
     size of the files below which the export stays in this process; ``range_bytes``: the size of
     a range; ``pool``: workers kept by the caller (``None``: the export starts its own);
     ``text_cap``, ``text_budget`` and ``event_cap``: the bounds on what a result carries and on
-    what is waiting at once (see the module); ``codecs``: what the export decodes with."""
+    what is waiting at once (see the module); ``codecs``: what the export decodes with;
+    ``stall_s``: how long a worker that holds work may move no byte before it has stalled (for a
+    pool the export starts; a kept ``pool`` has its own)."""
 
     jobs: int
     definitions: Definitions
@@ -1016,9 +1178,10 @@ class ParallelOptions:
     text_budget: int = PENDING_TEXT_BUDGET
     event_cap: int = MAX_RANGE_EVENTS
     codecs: Mapping[str, Codec] | None = field(default=None, compare=False, repr=False)
+    stall_s: float = STALL_S
 
     def __post_init__(self) -> None:
-        assert 1 <= self.jobs <= MAX_JOBS
+        assert 1 <= self.jobs <= MAX_JOBS and self.stall_s > 0
         assert self.range_bytes >= MIN_RANGE_BYTES and self.range_bytes % ALIGN == 0
         assert self.text_cap >= 1 and self.text_budget >= 1 and self.event_cap >= 1
         assert self.text_cap <= poolframe.MAX_TEXT_CAP and self.event_cap <= poolframe.MAX_EVENT_CAP
@@ -1040,7 +1203,11 @@ class ParallelOptions:
         how the export ended. A part too small to share, one read with skips, and one still
         being written are read in this process, with the same ``pipe``."""
         owned = self.pool is None
-        pool = WorkerPool(self.definitions, self.jobs) if self.pool is None else self.pool
+        pool = (
+            WorkerPool(self.definitions, self.jobs, stall_s=self.stall_s)
+            if self.pool is None
+            else self.pool
+        )
         runner = _Runner(replay, pipe, dest, self, pool)
         try:
             ending = runner.run()

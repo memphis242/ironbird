@@ -588,6 +588,266 @@ def test_a_worker_that_stops_part_way_through_a_reply_does_not_hang_the_parent()
         pool.close(abnormal=True)
 
 
+# -- the parent never waits on a worker that does not read, or stops, either ------------------
+
+
+def _big_job(sources: int = 60000) -> Job:
+    """A job whose frame is far larger than a socket's buffer (a seed that names many sources, as a
+    recording with many UDP peers does)."""
+    seed = Seed(
+        JOB.seed.streams,
+        {
+            i: f"10.{i >> 16 & 255}.{i >> 8 & 255}.{i & 255}:{5000 + i % 1000}"
+            for i in range(sources)
+        },
+        41,
+        512,
+    )
+    job = dataclasses.replace(JOB, seed=seed)
+    assert len(pf.encode(job)) > 1_000_000
+    return job
+
+
+def _runs_within(seconds: float, action: Any) -> bool:
+    """Whether ``action()`` returns within ``seconds``; it runs in a thread, so that a parent that
+    blocks fails the test instead of hanging it."""
+    import threading
+
+    thread = threading.Thread(target=action, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    return not thread.is_alive()
+
+
+def test_a_big_job_sent_to_a_worker_that_does_not_read_never_hangs_the_parent() -> None:
+    """The other direction of the stalled reply: a blocking send of a job over the socket buffer
+    waited for a worker that was stopped or wedged, and no signal ended it."""
+    pool, _, theirs = _pool_with_a_fake_worker()
+    pool._slots[0].sent.clear()  # an idle worker: it is given the big job at once
+    job = _big_job()
+    try:
+
+        def send_and_poll() -> None:
+            pool.submit(job, LAYOUTS)
+            for _ in range(5):
+                pool.poll(pexport.WAIT_SLICE_S)
+
+        assert _runs_within(10.0, send_and_poll), "the parent waits for a worker that does not read"
+        assert pool._slots[0].outbox.unsent > 0 and not pool.broken
+    finally:
+        theirs.close()
+        pool.close(abnormal=True)
+
+
+def test_what_a_worker_does_not_read_at_once_reaches_it_when_it_does_in_order() -> None:
+    """The greeting and the job travel the way ``send_bytes`` sends them: the worker's
+    ``recv_bytes`` reads each whole, in order, however the pipe took them."""
+    import threading
+
+    definitions = SAMPLES["embedded"]
+    pool, _, theirs = _pool_with_a_fake_worker()
+    slot = pool._slots[0]
+    slot.sent.clear()
+    job = _big_job()
+    greeting = pf.encode(definitions)
+    slot.outbox.put(greeting)
+    got: list[bytes] = []
+    reader = threading.Thread(
+        target=lambda: got.extend(theirs.recv_bytes() for _ in range(2)), daemon=True
+    )
+    try:
+        pool.submit(job, LAYOUTS)
+        reader.start()
+        for _ in range(400):
+            pool.poll(pexport.WAIT_SLICE_S)
+            if not reader.is_alive():
+                break
+        reader.join(10.0)
+        assert got == [greeting, pf.encode(job)]
+        assert slot.outbox.unsent == 0 and not pool.broken
+    finally:
+        theirs.close()
+        pool.close(abnormal=True)
+
+
+def test_a_worker_that_does_not_read_is_a_stall_with_a_message_that_names_it() -> None:
+    import time
+
+    pool, _, theirs = _pool_with_a_fake_worker()
+    pool.stall_s = 0.3
+    slot = pool._slots[0]
+    slot.sent.clear()
+    try:
+        ticket = pool.submit(_big_job(), LAYOUTS)
+        started = time.monotonic()
+        while not ticket.done() and time.monotonic() - started < 10.0:
+            pool.poll(pexport.WAIT_SLICE_S)
+        assert ticket.done() and pool.broken
+        with pytest.raises(IronbirdError) as caught:
+            ticket.result()
+        assert caught.value.code is Code.EXP_WORKER
+        assert "no progress" in caught.value.summary and "\n" not in caught.value.summary
+        assert "[export] worker_stall" in (caught.value.details or "")
+    finally:
+        theirs.close()
+        pool.close(abnormal=True)
+
+
+def test_a_worker_that_holds_a_job_and_never_answers_is_a_stall() -> None:
+    import time
+
+    pool, ticket, theirs = _pool_with_a_fake_worker()
+    pool.stall_s = 0.3
+    try:
+        started = time.monotonic()
+        while not ticket.done() and time.monotonic() - started < 10.0:
+            pool.poll(pexport.WAIT_SLICE_S)
+        assert ticket.done() and pool.broken and 0.3 <= time.monotonic() - started < 5.0
+        with pytest.raises(IronbirdError) as caught:
+            ticket.result()
+        assert caught.value.code is Code.EXP_WORKER and "no progress" in caught.value.summary
+    finally:
+        theirs.close()
+        pool.close(abnormal=True)
+
+
+def test_a_worker_that_keeps_moving_bytes_is_not_a_stall() -> None:
+    import time
+
+    pool, ticket, theirs = _pool_with_a_fake_worker()
+    pool.stall_s = 0.5
+    frame = pf.encode(outcome())
+    wire = struct.pack("!i", len(frame)) + frame
+    try:
+        started = time.monotonic()
+        at = 0
+        while time.monotonic() - started < 1.5 and at < 12:  # three times the limit in all
+            os.write(theirs.fileno(), wire[at : at + 1])
+            at += 1
+            pool.poll(0.1)
+        assert not ticket.done() and not pool.broken
+    finally:
+        theirs.close()
+        pool.close(abnormal=True)
+
+
+def test_an_idle_worker_is_never_a_stall() -> None:
+    import time
+
+    pool, _, theirs = _pool_with_a_fake_worker()
+    pool.stall_s = 0.2
+    pool._slots[0].sent.clear()
+    try:
+        time.sleep(0.4)
+        pool.poll(0.05)
+        assert not pool.broken
+    finally:
+        theirs.close()
+        pool.close(abnormal=True)
+
+
+def test_one_wait_slice_is_shared_by_the_pipes_that_are_ready() -> None:
+    """Each ready pipe is served for its share of one slice, so a poll cannot outlast a signal by
+    the number of workers times the slice."""
+    import multiprocessing
+
+    pool, _, first = _pool_with_a_fake_worker()
+    others = []
+    for _ in range(3):
+        ours, theirs = multiprocessing.Pipe()
+        slot = pexport._Slot(None, ours)
+        slot.sent.append(pexport.Ticket(JOB, b"", LAYOUTS))
+        pool._slots.append(slot)
+        others.append(theirs)
+    budgets: list[float] = []
+    pool._receive = lambda slot, budget: budgets.append(budget)  # type: ignore[method-assign]
+    try:
+        for end in (first, *others):
+            end.send_bytes(b"x")
+        pool.poll(5.0)
+        assert len(budgets) == 4
+        assert sum(budgets) <= pexport.WAIT_SLICE_S * 1.0001
+    finally:
+        for end in (first, *others):
+            end.close()
+        pool.close(abnormal=True)
+
+
+def test_a_reply_is_held_only_up_to_what_its_job_can_have() -> None:
+    """The length is checked against the job's own cap, not the cap of any reply: a worker that
+    announces more than the job can honestly make is refused unread, and one that announces what it
+    can make and stops is waited for without holding anything."""
+    small = dataclasses.replace(JOB, text_cap=1000, event_cap=10, stop=JOB.guess + 4096)
+    cap = pexport.reply_cap(small)
+    assert cap < pf.MAX_REPLY_BYTES // 2
+    for length, refused_at_once in ((cap + 1, True), (cap, False)):
+        pool, ticket, theirs = _pool_with_a_fake_worker()
+        pool._slots[0].sent[0] = pexport.Ticket(small, b"", LAYOUTS)
+        ticket = pool._slots[0].sent[0]
+        try:
+            os.write(theirs.fileno(), struct.pack("!i", length))
+            assert _polls_return(pool, 2, 0.05)
+            assert ticket.done() is refused_at_once and pool.broken is refused_at_once
+            assert pool._slots[0].inbox.held() <= 4
+            if refused_at_once:
+                with pytest.raises(IronbirdError) as caught:
+                    ticket.result()
+                assert "too long" in caught.value.summary
+        finally:
+            theirs.close()
+            pool.close(abnormal=True)
+
+
+def test_the_reply_cap_is_a_bound_on_what_an_honest_worker_makes() -> None:
+    big = dataclasses.replace(JOB, text_cap=pf.MAX_TEXT_CAP, event_cap=pf.MAX_EVENT_CAP, stop=None)
+    assert pexport.reply_cap(big) == pf.MAX_REPLY_BYTES
+    sizes = [
+        pexport.reply_cap(dataclasses.replace(JOB, text_cap=cap)) for cap in (1, 1000, 1 << 20)
+    ]
+    assert sizes == sorted(sizes) and sizes[0] > 0 and sizes[-1] < pf.MAX_REPLY_BYTES
+    # rows past the cap of the widest allowed row, every character four bytes: still within it
+    job = dataclasses.replace(JOB, text_cap=1000)
+    wide = "\U0001f600" * (job.text_cap + pexport.REPLY_ROW_CHARS - 1) + "\n"
+    worst = Outcome(job.index, blocks=[Block(None, False, 1, wide, 0)])
+    assert len(pf.encode(worst)) <= pexport.reply_cap(job)
+
+
+def test_a_table_is_a_layout_or_the_reply_is_refused() -> None:
+    """A table name from a worker reaches the file system in a directory export (it was accepted:
+    ``../../escaped`` was opened as a table). Every key that is not exactly a layout's is refused
+    as the reply of a worker, by ``read_reply`` and through the pool."""
+    keys = [
+        ("../../escaped", ("seq", "CmdCounter")),
+        ("HK_TLM", ("seq", "CmdCounter", "x")),
+        ("HK_TLM\x00", ("seq", "CmdCounter")),
+        ("hk_tlm", ("seq", "CmdCounter")),
+    ]
+    for key in keys:
+        evil = dataclasses.replace(
+            outcome(), blocks=[Block(key, False, 2, ROWS, 1), Block(None, True, 1, "5,6\n", 0)]
+        )
+        with pytest.raises(pf.FrameError, match="no definition makes"):
+            pf.read_reply(JOB, pf.encode(evil), LAYOUTS)
+        pool, ticket, theirs = _pool_with_a_fake_worker()
+        try:
+            theirs.send_bytes(pf.encode(evil))
+            pool.poll(5.0)
+            assert ticket.done() and pool.broken
+            with pytest.raises(IronbirdError) as caught:
+                ticket.result()
+            assert caught.value.code is Code.EXP_WORKER
+        finally:
+            pool.close(abnormal=True)
+            theirs.close()
+
+
+def test_the_tables_an_answer_may_hold_are_always_given() -> None:
+    import inspect
+
+    for function in (pexport.WorkerPool.submit, pexport.Ticket.__init__):
+        assert inspect.signature(function).parameters["layouts"].default is inspect.Parameter.empty
+
+
 def test_a_worker_that_dies_part_way_through_a_reply_ends_the_pool() -> None:
     pool, ticket, theirs = _pool_with_a_fake_worker()
     try:

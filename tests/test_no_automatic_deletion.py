@@ -84,8 +84,8 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
     ("recording/pexport.py", "subprocess"): {
         "",
         "serve",
+        "_from_parent",
         "_Slot.__init__",
-        "WorkerPool.poll",
         "WorkerPool._start",
     },
     # attribute lookups by a computed name on the program's own record types
