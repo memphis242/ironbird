@@ -44,18 +44,22 @@ from ironbird.seqstate import (
     LIVE_BYTES,
     LIVE_NAME,
     LOCK_NAME,
+    MAX_BATCH,
     MAX_BYTES,
     MAX_KEY_LEN,
+    MAX_STEP,
     MAX_STREAMS,
     SLOT_BYTES,
     STATE_NAME,
     SequenceStore,
+    batch_for,
     key_of,
     node_stem,
     parse_key,
     parse_state,
     read_boot_id,
     render_state,
+    step_for,
 )
 from ironbird.session import Session
 from ironbird.transport import LinkEnd, TransportClosed
@@ -1705,8 +1709,15 @@ async def _series_counts(counts: Any, wanted: int, wake: asyncio.Event) -> list[
     return got
 
 
-def _series(store: SequenceStore, wake: asyncio.Event, seat: int | None = None) -> Any:
-    return store.for_node("fc").series("command", 0x1890, seat=seat, wake=wake.set)
+def _series(
+    store: SequenceStore,
+    wake: asyncio.Event,
+    seat: int | None = None,
+    per_second: float | None = 10,  # a step of BLOCK, a batch of 1
+) -> Any:
+    return store.for_node("fc").series(
+        "command", 0x1890, seat=seat, wake=wake.set, per_second=per_second
+    )
 
 
 def test_a_series_takes_its_counts_without_waiting_and_continues_the_streams(
@@ -1912,7 +1923,7 @@ def test_packets_built_and_never_sent_have_spent_their_counts(
         target = session.series_target("fc")
         prepared = target.codec.prepare_command("MOCK_NOOP")
         wake = asyncio.Event()
-        counts = session.series_counts(target, prepared, seat=None, wake=wake.set)
+        counts = session.series_counts(target, prepared, seat=None, wake=wake.set, per_second=10)
         assert counts is not None
         built: list[int | None] = []
         while len(built) < 3:
@@ -1927,3 +1938,302 @@ def test_packets_built_and_never_sent_have_spent_their_counts(
         return [*built, *sent]
 
     assert _run(scenario()) == [0, 1, 2, 3]
+
+
+# -- PR 40 round 3: a series sizes its steps and reservations to its rate --------------------
+
+
+def test_the_step_and_the_batch_of_a_series_follow_its_rate() -> None:
+    """S1 (round 3): every series raised its ceiling by 64 whatever its rate, a sync every 32
+    packets of a burst."""
+    assert step_for(None) == MAX_STEP and batch_for(None) == MAX_BATCH
+    assert step_for(1) == BLOCK and batch_for(1) == 1  # a slow series: the least step
+    assert step_for(1000) == 500 and batch_for(1000) == 20  # 1 ms: half a second, 20 ms
+    assert step_for(1e9) == MAX_STEP and batch_for(1e9) == MAX_BATCH  # capped
+    steps = [step_for(rate) for rate in (1, 10, 100, 1000, 5000, 1e4, 1e6)]
+    assert steps == sorted(steps) and all(BLOCK <= step <= MAX_STEP for step in steps)
+
+
+def test_a_burst_syncs_a_few_times_not_every_32_counts_and_gaps_by_one_step_at_most(
+    tmp_path: Path,
+) -> None:
+    """S1 and N1 (round 3): 20000 packets of a burst cost 600 syncs (every 32 counts), each one
+    followed by an empty raise. A raise now covers the takes made while it runs, and the durable
+    ceiling stays within one step of the count in use."""
+    fs = FaultFs()
+    reports = _Reports()
+    ahead_calls: list[int] = []
+    original = seqstate._Files.extend
+
+    def counting(self: Any, keys: Any, **kw: Any) -> Any:
+        if kw.get("ahead"):
+            ahead_calls.append(len(keys))
+            time.sleep(0.03)  # a slow raise: the takes go on while it runs
+        return original(self, keys, **kw)
+
+    async def scenario() -> list[int]:
+        store = _store(tmp_path, reports, fs=fs)
+        wake = asyncio.Event()
+        counts = _series(store, wake, per_second=None)
+        got: list[int] = []
+        while len(got) < 6000:
+            count = counts.next()
+            if count is None:
+                await asyncio.wait_for(wake.wait(), 10)
+                wake.clear()
+                continue
+            got.append(count)
+            if len(got) % 64 == 0:
+                await asyncio.sleep(0)  # the raise in the background
+        assert _marks(tmp_path)[KEY] - (got[-1] + 1) <= MAX_STEP + MAX_BATCH
+        await counts.aclose()
+        await store.aclose()
+        return got
+
+    seqstate._Files.extend = counting  # type: ignore[method-assign]
+    try:
+        got = _run(scenario())
+    finally:
+        seqstate._Files.extend = original  # type: ignore[method-assign]
+    assert got == list(range(6000))
+    assert fs.count("fdatasync") <= 6, fs.count("fdatasync")  # was 190 at a step of 64
+    raised = [e for e in reports.named("sequence.extend") if e["why"] == "ahead"]
+    assert len(ahead_calls) == len(raised), "a raise ran with nothing to raise"
+
+
+def test_the_ceiling_of_a_series_never_exceeds_its_step_so_a_power_loss_gaps_by_one_step(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        wake = asyncio.Event()
+        counts = _series(store, wake, per_second=1000)  # a step of 500
+        got = await _series_counts(counts, 1, wake)
+        assert _marks(tmp_path)[KEY] - got[-1] <= 500 + 1
+        for _ in range(3):
+            await _series_counts(counts, 400, wake)
+            await asyncio.sleep(0.05)
+            last = _stored_next(tmp_path)
+            assert _marks(tmp_path)[KEY] - last <= 500
+        await counts.aclose()
+        await store.aclose()
+
+    _run(scenario())
+
+
+def _stored_next(directory: Path) -> int:
+    """The next count of ``KEY`` as the live table holds it."""
+    raw = (directory / LIVE_NAME).read_bytes()
+    for start in range(seqstate.HEAD_BYTES, len(raw) - SLOT_BYTES + 1, SLOT_BYTES):
+        slot = raw[start : start + SLOT_BYTES]
+        if slot.startswith(KEY.encode()):
+            return int.from_bytes(slot[MAX_KEY_LEN : MAX_KEY_LEN + 8], "little")
+    raise AssertionError("no slot")
+
+
+def test_a_series_reserves_its_counts_a_batch_at_a_time_and_the_rest_is_a_gap(
+    tmp_path: Path,
+) -> None:
+    """S1 (round 3) and N5: a 1 ms series reserves 20 counts in one take; the ones it does not
+    use when it ends are spent, and the next send goes on above them."""
+
+    async def scenario() -> tuple[list[int], list[int]]:
+        store = _store(tmp_path)
+        wake = asyncio.Event()
+        counts = _series(store, wake, per_second=1000)
+        got = await _series_counts(counts, 3, wake)
+        await counts.aclose()
+        after = await _takes(store, 1)
+        await store.aclose()
+        return got, after
+
+    got, after = _run(scenario())
+    assert got == [0, 1, 2] and after == [batch_for(1000)]
+
+
+def test_a_batch_is_never_more_than_the_packets_still_planned(tmp_path: Path) -> None:
+    """A complete series leaves no gap: the last reservation asks for what is left."""
+
+    async def scenario() -> list[int]:
+        store = _store(tmp_path)
+        wake = asyncio.Event()
+        counts = store.for_node("fc").series(
+            "command", 0x1890, seat=None, wake=wake.set, per_second=None, planned=70
+        )
+        got = await _series_counts(counts, 70, wake)
+        await counts.aclose()
+        got += await _takes(store, 1)
+        await store.aclose()
+        return got
+
+    assert _run(scenario()) == list(range(71))
+
+
+def test_prime_takes_the_first_counts_before_the_start_with_no_sync_left_for_the_start(
+    tmp_path: Path,
+) -> None:
+    """S2 (round 3): the store was opened and the seat written 20 ms before the first slot, so a
+    sync of another process at that moment made the packet late. After prime, the first counts
+    come with the durable lock held by someone else."""
+
+    async def scenario() -> list[int | None]:
+        store = _store(tmp_path)
+        wake = asyncio.Event()
+        counts = _series(store, wake, seat=7)
+        await counts.prime(0.5)
+        durable = os.open(tmp_path / LOCK_NAME, os.O_RDWR)
+        fcntl.flock(durable, fcntl.LOCK_EX)  # another process is syncing
+        try:
+            got = [counts.next() for _ in range(5)]
+        finally:
+            os.close(durable)
+        await counts.aclose()
+        await store.aclose()
+        return got
+
+    assert _run(scenario()) == [7, 8, 9, 10, 11]
+
+
+def test_prime_of_a_distant_start_opens_the_store_and_leaves_the_counts_to_the_builds(
+    tmp_path: Path,
+) -> None:
+    """A count taken hours ahead would be passed by every send that came meanwhile, and a seat
+    written now would be undone by them: a start beyond the window only opens the store and
+    raises the ceiling, so the first take at the start needs no sync."""
+
+    async def scenario() -> tuple[list[int | None], int]:
+        store = _store(tmp_path)
+        other = _store(tmp_path)
+        wake = asyncio.Event()
+        counts = _series(store, wake)
+        await counts.prime(3600)
+        meanwhile = await _takes(other, 3)  # sends before the series starts
+        durable = os.open(tmp_path / LOCK_NAME, os.O_RDWR)
+        fcntl.flock(durable, fcntl.LOCK_EX)
+        try:
+            got = [counts.next() for _ in range(2)]
+        finally:
+            os.close(durable)
+        await counts.aclose()
+        await store.aclose()
+        await other.aclose()
+        return got, len(meanwhile)
+
+    got, meanwhile = _run(scenario())
+    assert meanwhile == 3 and got == [3, 4]
+
+
+def test_prime_that_cannot_take_a_count_fails_with_the_takes_coded_error(tmp_path: Path) -> None:
+    async def scenario() -> IronbirdError:
+        store = _store(tmp_path, wait=0.3)
+        await _takes(store, 1)
+        holder = os_open_live(tmp_path)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        counts = _series(store, asyncio.Event())
+        try:
+            with pytest.raises(IronbirdError) as info:
+                await counts.prime(0.0)
+        finally:
+            os.close(holder)
+        await store.aclose()
+        return info.value
+
+    assert _run(scenario()).code is Code.SEQ_TAKE
+
+
+def _stick_a_raise_on_the_live_lock(store: SequenceStore, directory: Path) -> int:
+    """Hold the live lock from a descriptor of the test and queue a raise, which waits for it."""
+    holder = os_open_live(directory)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    store.keep_ahead(KEY, BLOCK)
+    store._queue_ahead(KEY)
+    return holder
+
+
+def test_closing_after_a_signal_does_not_wait_for_a_raise_stuck_on_a_lock(tmp_path: Path) -> None:
+    """S3 (round 3): Ctrl-C waited the 10 s lock bound for a background raise that another
+    process's lock held, with nothing on screen."""
+
+    async def scenario() -> tuple[float, float]:
+        store = _store(tmp_path, wait=10.0)
+        await _takes(store, 1)
+        holder = _stick_a_raise_on_the_live_lock(store, tmp_path)
+        await asyncio.sleep(0.1)  # the worker is waiting for the lock
+        started = time.monotonic()
+        await store.aclose(cancelled=True)
+        fast = time.monotonic() - started
+        os.close(holder)
+        # a close that is not a cancel waits a moment for the raise, not the lock bound
+        again = _store(tmp_path, wait=10.0)
+        await _takes(again, 1)
+        holder_two = _stick_a_raise_on_the_live_lock(again, tmp_path)
+        await asyncio.sleep(0.1)
+        started = time.monotonic()
+        await again.aclose()
+        slow = time.monotonic() - started
+        os.close(holder_two)
+        return fast, slow
+
+    fast, slow = _run(scenario())
+    assert fast < 0.2, fast
+    assert slow < 2.0, slow
+
+
+def test_a_session_cancelled_by_a_signal_closes_without_waiting_for_a_stuck_raise(
+    tmp_path: Path, mock_config_path: Path
+) -> None:
+    """S3 (round 3), through the session: cancelling the task that runs the command (what the
+    CLI's signal handler does) must reach the store as a cancelled close."""
+    config = load_config(mock_config_path)
+    ledger = Ledger(tmp_path / "ledger", session_id="s3-session")
+    session = Session(config, role="ground", ledger=ledger, notify=lambda _n: None)
+    holders: list[int] = []
+
+    async def command() -> None:
+        async with session:
+            store = session.sequences("fc").store
+            key = key_of("fc", "command", 0x1890)
+            await store.take(key)
+            holders.append(_stick_a_raise_on_the_live_lock_at(store, session, key))
+            await asyncio.sleep(60)
+
+    def _stick_a_raise_on_the_live_lock_at(store: SequenceStore, _s: Session, key: str) -> int:
+        directory = store._directory
+        assert directory is not None
+        holder = os_open_live(directory)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        store.keep_ahead(key, BLOCK)
+        store._queue_ahead(key)
+        return holder
+
+    async def scenario() -> float:
+        task = asyncio.create_task(command())
+        for _ in range(300):
+            if holders:
+                break
+            await asyncio.sleep(0.01)
+        assert holders
+        await asyncio.sleep(0.1)
+        started = time.monotonic()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return time.monotonic() - started
+
+    try:
+        elapsed = _run(scenario())
+    finally:
+        for fd in holders:
+            os.close(fd)
+    assert elapsed < 2.0, elapsed
+
+
+def test_a_tamper_the_header_cannot_hold_is_refused_when_the_command_is_prepared() -> None:
+    """S4 (round 3): `prepare_command` promises that everything that depends on the message is
+    refused before a count is spent, and a `--length-delta` out of the field's range was not."""
+    codec = _codec()
+    with pytest.raises(IronbirdError) as info:
+        codec.prepare_command("MOCK_NOOP", tamper={"length": -100})
+    assert info.value.code is Code.HDR_PACK
+    assert codec.encode_command("MOCK_NOOP").sequence == 0  # nothing was counted
+    prepared = codec.prepare_command("MOCK_NOOP", tamper={"length": 3})  # within range
+    assert codec.frame(prepared, 5).sequence == 5

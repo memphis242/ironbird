@@ -161,7 +161,7 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "events.start": Tier.ESSENTIAL,
         "events.stop": Tier.ESSENTIAL,
         "codec.loaded": Tier.ESSENTIAL,
-        # sequence counts: one per raised ceiling (at most one per 32 packets of a stream), per
+        # sequence counts: one per raised ceiling (a few a second at most for a stream), per
         # seat or reset, or per damaged, rebuilt or unusable state file
         "seq.reset": Tier.ESSENTIAL,  # ib seq reset: a user action, what it removed
         "sequence.extend": Tier.ESSENTIAL,

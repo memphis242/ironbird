@@ -1679,7 +1679,9 @@ async def _send_series(
         if pacer is not None:
             pacer.wake()
 
-    counts = session.series_counts(target, req.prepared, seat=req.sequence, wake=wake)
+    counts = session.series_counts(
+        target, req.prepared, seat=req.sequence, wake=wake, per_second=rate, planned=tally.planned
+    )
     faults_recorded = False
 
     def build(number: int, slot: int) -> Built[EncodedPacket] | None:
@@ -1863,6 +1865,11 @@ async def _send_series(
 
     try:
         try:
+            if counts is not None:  # opened, seated and taken before the wait, not at its end
+                started = plan.start_wall_ns
+                await counts.prime(
+                    0.0 if started is None else (started - time.time_ns()) / NS_PER_S
+                )
             grid = await start_grid(plan, SystemClock())
             tally.planned = grid.planned
             tally.first_mono_ns = tally.last_mono_ns = grid.start_mono

@@ -896,6 +896,15 @@ class Codec:
             self._check_header_values(profile, header, "header")
             values.update(header)
         values.update(inputs)
+        if tamper:  # a tamper the field cannot hold is refused now, not once a count is spent
+            hdr.pack(
+                profile,
+                payload,
+                mid=msg.mid,
+                inputs=values,
+                now=self._clock(),
+                tamper=tamper,
+            )
         return PreparedPacket(
             msg,
             payload,
@@ -1001,7 +1010,6 @@ class Codec:
         message, its arguments and the header values is made here, without building a packet
         and without advancing any sequence counter. The values that only ``raw_enum`` lets
         through are listed in the result's ``raw_enums``."""
-        msg = self._lookup(name, MessageKind.COMMAND)
         msg = self._lookup(name, MessageKind.COMMAND)
         raw: list[tuple[str, int]] | None = [] if raw_enum else None
         payload, faults = self._encode_payload(

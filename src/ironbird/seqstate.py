@@ -21,8 +21,10 @@ Two files in the state directory hold the counts.
 - :data:`STATE_NAME`, the *durable ceilings*: per stream, a count above every count ever handed
   out. It is replaced whole (:class:`~ironbird.atomicfile.TempOutput`, file and directory synced)
   under its own lock :data:`LOCK_NAME` *before* a slot's ceiling is raised to the new value, and
-  is at most :data:`BLOCK` above the next count, so a power loss skips at most :data:`BLOCK`
-  counts of a stream and never reuses one.
+  is at most one *step* above the next count, so a power loss skips at most one step of counts of
+  a stream and never reuses one. The step is :data:`BLOCK` for a single send and for a responder;
+  a series sizes it to its own demand (:func:`step_for`: about :data:`STEP_WINDOW_S` of its rate,
+  at most :data:`MAX_STEP`), so that it syncs a few times a second, not every few dozen counts.
 
 Invariant, per stream: ``next <= ceiling <= durable`` (a missing durable entry counts as 0).
 Only a holder of the durable lock changes a slot's ceiling or the table's layout (insert,
@@ -36,19 +38,25 @@ opening the files) runs in a worker thread (:class:`~ironbird.offloop.OffLoop`) 
 are bounded by :data:`LOCK_WAIT_S`, and the loop stops waiting for it at that bound (an abandoned
 worker ends on its own, and its records still reach the ledger). A contended live lock is polled
 every :data:`POLL_FAST_S` by a helper thread (a sleep on the loop is at least a millisecond), so
-the loop is never blocked and the wait ends within a poll of the holder's release. A long-lived
-sender (:meth:`SequenceStore.keep_ahead`, ``ib respond``) raises a ceiling in the background once
-half a step is left, so its takes do not wait for a sync.
+no syscall on the loop waits for a lock or a sync and the wait ends within a poll of the holder's
+release (the worker threads share the interpreter, though: see :meth:`SequenceStore.keep_ahead`).
+A long-lived sender (``ib respond``, a series) raises a ceiling in the background once half a step
+is left, so its takes do not wait for a sync.
 
 A series of sends (``ib send --repeat/--every/--at``) builds its packets ahead of their slots on
 the loop and sends them from the pacer thread, so it cannot hold a lease from take to hand-off.
-It takes each packet's count when the packet is built, without waiting
-(:meth:`SequenceStore.take_now`: the take above, committed and released at once) or, when that
-would wait, in a task the series resumes from (:class:`SeriesCounts`); the pacer thread never
-takes. Counts are unique and persistent across processes, but are handed to the kernel in count
-order only within one process: two processes running series on one stream interleave their
-packets, each in its own count order, as two processes on one serial line do. A packet built and
-never sent (discarded, unsent, or a series that ended) spends its count: a gap.
+It reserves counts for its packets a few at a time (:func:`batch_for`, about 20 ms of its rate),
+without waiting (:meth:`SequenceStore.reserve_now`: the take above, committed and released at
+once) or, when that would wait, in a task the series resumes from (:class:`SeriesCounts`); the
+pacer thread never takes. Counts are unique and persistent across processes, but are handed to
+the kernel in count order only within one process: two processes running series on one stream
+interleave their packets, each in its own count order, as two processes on one serial line do.
+A count reserved or built and never sent (discarded, unsent, or a series that ended) is spent: a
+gap. An interrupted series therefore leaves a gap of up to the counts it reserved and built
+ahead, about 40 ms of its rate (about 40 counts at a 1 ms period, :data:`MAX_BATCH` plus 8 for
+a burst), besides the power-loss bound above. A reset (``ib seq reset``) is seen by a series at
+its next reservation, so up to that many of its packets still go out with the old counts;
+a single send sees it at once.
 
 Failure paths. A lock that cannot be had within the bound, a worker that does not answer within
 it, or a state file that cannot be read or replaced once the store is open, fails the take
@@ -84,6 +92,7 @@ import fcntl
 import functools
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -114,8 +123,14 @@ MAX_KEY_LEN: Final = 64
 MAX_BYTES: Final = 384 * 1024
 MAX_COUNT: Final = 1 << 62  # every stored count and ceiling, read or written, stays below this
 SPAN: Final = 1 << 64  # what one slot field holds
-BLOCK: Final = 64  # the step: a durable ceiling is at most this far above the next count
+BLOCK: Final = 64  # the least step: a durable ceiling is at most one step above the next count
+MAX_STEP: Final = 4096  # the most a series raises a ceiling by in one sync
+STEP_WINDOW_S: Final = 0.5  # a series raises a ceiling by this much of its own rate, in counts
 AHEAD_AT: Final = BLOCK // 2  # a long-lived sender raises a ceiling when this many are left
+BATCH_WINDOW_S: Final = 0.02  # a series reserves this much of its rate in counts at a time
+MAX_BATCH: Final = 32  # ...and at most this many (a burst reserves this many)
+PRIME_TAKE_WITHIN_S: Final = 2.0  # a series that starts this soon takes its first count at once
+CLOSE_WAIT_S: Final = 0.25  # how long closing the store waits for a raise in the background
 LOCK_WAIT_S: Final = 10.0  # the bound on every wait for a lock of the state files
 CALL_GRACE_S: Final = 0.25  # how long past its own bound the loop waits for a worker's answer
 POLL_FAST_S: Final = 50e-6  # the helper thread's poll of a contended live lock, at first
@@ -144,7 +159,7 @@ _PAD: Final = b"\0\0\0\0"
 assert HEAD_BYTES == 128 and SLOT_BYTES == 88, "the live layout is fixed"
 assert MAX_STREAMS * (MAX_KEY_LEN + 24) + 32 <= MAX_BYTES, "a full durable file fits its cap"
 assert LIVE_SLOTS >= 2 * MAX_STREAMS and LIVE_SLOTS & (LIVE_SLOTS - 1) == 0
-assert BLOCK >= 2 and 0 < AHEAD_AT < BLOCK and MAX_COUNT + BLOCK < SPAN
+assert BLOCK >= 2 and 0 < AHEAD_AT < BLOCK <= MAX_STEP and MAX_COUNT + MAX_STEP < SPAN
 
 _OPEN_FLAGS: Final = (
     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
@@ -216,6 +231,28 @@ def stream_text(key: str) -> str:
     """A key as a message names it: ``fc command 0x1890``."""
     parsed = parse_key(key)
     return f"{parsed[0]} {parsed[1]} 0x{parsed[2]:04X}" if parsed else key
+
+
+def step_for(per_second: float | None) -> int:
+    """The step of a stream sent at about ``per_second`` packets a second (``None``: as fast as
+    they go): the counts a ceiling is raised by in one sync. That is :data:`STEP_WINDOW_S` of the
+    rate, at least :data:`BLOCK` and at most :data:`MAX_STEP`, so a series is raised a few times
+    a second at most, and a power loss skips no more than this many counts of its stream."""
+    if per_second is None:
+        return MAX_STEP
+    assert per_second > 0
+    return min(MAX_STEP, max(BLOCK, math.ceil(per_second * STEP_WINDOW_S)))
+
+
+def batch_for(per_second: float | None) -> int:
+    """The counts a series of about ``per_second`` packets a second reserves in one take:
+    :data:`BATCH_WINDOW_S` of its rate, at least one and at most :data:`MAX_BATCH` (``None``: a
+    burst, the most). One take costs a lock, a stat, a read and a write of the live table; a
+    reservation divides that by the batch, and the contention for the lock with it."""
+    if per_second is None:
+        return MAX_BATCH
+    assert per_second > 0
+    return min(MAX_BATCH, max(1, round(per_second * BATCH_WINDOW_S)))
 
 
 def _refuse(token: str) -> object:
@@ -685,7 +722,8 @@ class _Files:
             IronbirdError(
                 Code.SEQ_LIVE,
                 f"{path} {why}; rebuilt, so every stream carries on from its stored ceiling (up "
-                f"to {self._cfg.block} counts skipped per stream)",
+                f"to a step of counts skipped per stream, at most "
+                f"{max(self._cfg.block, MAX_STEP)})",
             )
         )
 
@@ -897,12 +935,15 @@ class _Files:
         need: str | None = None,
         seat: tuple[str, int] | None = None,
         ahead: bool = False,
+        steps: Mapping[str, int] | None = None,
     ) -> dict[str, int]:
         """Raise the ceilings of ``keys``: of ``need`` when it has no count left, of the others
         when ``ahead`` and half a step or less is left; ``seat`` ``(key, n)`` makes the stream
-        hand out ``n + 1`` next. The durable file is replaced (synced) before any slot holds a
-        new ceiling. Returns the slot index of every key."""
+        hand out ``n + 1`` next. A stream's step is its entry in ``steps`` when that is more than
+        the store's own. The durable file is replaced (synced) before any slot holds a new
+        ceiling. Returns the slot index of every key."""
         block = self._cfg.block
+        wide = steps or {}
         top = MAX_COUNT - 1  # the highest ceiling that is stored
         indices: dict[str, int] = {}
         with self._durable_lock() as dir_fd:
@@ -923,15 +964,16 @@ class _Files:
                         _merged(marks, table.ceilings())
                         scanned = True
                     old = marks.get(key, 0)
+                    step = max(block, wide.get(key, 0))
                     if seat is not None and seated:
                         first = seat[1] + 1
-                        plans[key] = _Plan(index, slot, old, min(first + block, top), first)
+                        plans[key] = _Plan(index, slot, old, min(first + step, top), first)
                         continue
                     left = slot.ceiling - slot.next
-                    if (key == need and left > 0) or (ahead and left > AHEAD_AT):
+                    if (key == need and left > 0) or (ahead and left > step // 2):
                         continue  # raised by another process meanwhile
                     start = slot.next if slot.ceiling == old else max(slot.next, old)
-                    new = min(max(old, start + block), top)
+                    new = min(max(old, start + step), top)
                     if new <= start:  # no count left below the bound
                         if key == need:
                             raise _Exhausted(key)
@@ -1053,8 +1095,17 @@ def _unusable(exc: OSError, salvaged: Mapping[str, int]) -> BaseException:
     return exc
 
 
-def _extend_ahead(keys: Sequence[str], files: _Files) -> dict[str, int]:
-    return files.extend(keys, ahead=True)
+def _extend_one(
+    key: str, seat: int | None, steps: Mapping[str, int], files: _Files
+) -> dict[str, int]:
+    """Raise ``key`` because a take found no count left, or seat it at ``seat`` + 1."""
+    if seat is not None:
+        return files.extend([key], seat=(key, seat), steps=steps)
+    return files.extend([key], need=key, steps=steps)
+
+
+def _extend_ahead(keys: Sequence[str], steps: Mapping[str, int], files: _Files) -> dict[str, int]:
+    return files.extend(keys, ahead=True, steps=steps)
 
 
 def _run(
@@ -1173,14 +1224,17 @@ class Lease:
         self._committed = False
         self._released = False
 
-    def commit(self) -> None:
-        """The count is spent from here: the stream's next take gives ``count + 1``. Raises
-        ``IB-SEQ-006`` when the count cannot be recorded; send nothing then."""
-        assert not self._committed and not self._released
+    def commit(self, want: int = 1) -> int:
+        """The count is spent from here: the stream's next take gives ``count + 1``. With
+        ``want`` above 1 the counts after it are spent too, as many as the ceiling leaves (a
+        seat spends the one); returns how many were spent, ``count`` first. Raises
+        ``IB-SEQ-006`` when they cannot be recorded; send nothing then."""
+        assert not self._committed and not self._released and want >= 1
         self._committed = True
-        self._store._commit(self._key, self.count, self._index, self._ceiling)
+        used = self._store._commit(self._key, self.count, self._index, self._ceiling, want)
         if not self._span:
             self._store._unlock_main()
+        return used
 
     @property
     def holds_lock(self) -> bool:
@@ -1237,6 +1291,7 @@ class SequenceStore:
         self._memory_why: Final = unusable
         self._opened = False  # open once: from then on no falling back to memory
         self._ahead = False
+        self._steps: dict[str, int] = {}  # the step of each stream kept ahead (bounded by them)
         self._pending: set[str] = set()  # streams to raise ahead (bounded by the streams used)
         self._raising: frozenset[str] = frozenset()  # what the running raise ahead covers
         self._prefetch: asyncio.Task[None] | None = None
@@ -1249,9 +1304,15 @@ class SequenceStore:
     def for_node(self, node: str) -> NodeSequences:
         return NodeSequences(self, node)
 
-    def keep_ahead(self) -> None:
-        """Raise ceilings in the background before they are reached (a long-lived sender)."""
+    def keep_ahead(self, key: str | None = None, step: int = 0) -> None:
+        """Raise ceilings in the background before they are reached (a long-lived sender). The
+        raise is a worker thread's, so the loop never waits for a sync; the worker does share the
+        interpreter with the loop, which is why a series asks for few, large steps: ``key``, when
+        given, is raised by ``step`` counts (:func:`step_for`) instead of the store's own step."""
         self._ahead = True
+        if key is not None and step > self._steps.get(key, 0):
+            assert step <= MAX_STEP
+            self._steps[key] = step
 
     # -- taking a count ------------------------------------------------------------------
 
@@ -1274,16 +1335,24 @@ class SequenceStore:
             raise
 
     def take_now(self, key: str) -> int | None:
-        """The next count of ``key``, spent, taken without waiting: a non-blocking ``flock``, one
-        ``fstatat`` and a ``pread`` and ``pwrite`` of one slot (or the in-memory count). ``None``
-        when it would have to wait: the files are not open yet, a send of this process holds its
-        turn, another process holds the live lock, the slot has no count left under its ceiling
-        or was not found nearby, or the live file was replaced. Call :meth:`take` then. Raises
-        ``IB-SEQ-006`` when a file operation fails. Only on the event loop."""
+        """The next count of ``key``, spent, taken without waiting (:meth:`reserve_now` for one
+        count). ``None`` when it would have to wait. Only on the event loop."""
+        got = self.reserve_now(key, 1)
+        return None if got is None else got.start
+
+    def reserve_now(self, key: str, want: int) -> range | None:
+        """The next ``want`` counts of ``key`` (fewer when the ceiling leaves fewer), spent,
+        taken without waiting: a non-blocking ``flock``, one ``fstatat`` and a ``pread`` and
+        ``pwrite`` of one slot (or the in-memory count). ``None`` when it would have to wait:
+        the files are not open yet, a send of this process holds its turn, another process holds
+        the live lock, the slot has no count left under its ceiling or was not found nearby, or
+        the live file was replaced. Call :meth:`reserve` then. Raises ``IB-SEQ-006`` when a file
+        operation fails. Only on the event loop."""
+        assert want >= 1
         if self._memory is not None:
             count = self._memory.get(key, 0)
-            self._memory[key] = count + 1
-            return count
+            self._memory[key] = count + want
+            return range(count, count + want)
         main = self._main
         if main is None or self._turn.locked():
             return None
@@ -1300,8 +1369,8 @@ class SequenceStore:
             if isinstance(taken, str):
                 return None
             index, count, ceiling = taken
-            self._commit(key, count, index, ceiling)
-            return count
+            used = self._commit(key, count, index, ceiling, want)
+            return range(count, count + used)
         finally:
             self._unlock_main()
 
@@ -1309,12 +1378,17 @@ class SequenceStore:
         """The next count of ``key`` (``seat`` when given: the stream goes on from ``seat + 1``),
         spent: :meth:`lease` and :meth:`Lease.commit` with nothing held after. Raises what they
         raise."""
+        return (await self.reserve(key, 1, seat=seat)).start
+
+    async def reserve(self, key: str, want: int, *, seat: int | None = None) -> range:
+        """:meth:`take` for ``want`` counts at once (fewer when the ceiling leaves fewer; a seat
+        is the one count): the range spent."""
         lease = await self.lease(key, seat=seat, span_send=False)
         try:
-            lease.commit()
+            used = lease.commit(1 if seat is not None else want)
         finally:
             lease.release()
-        return lease.count
+        return range(lease.count, lease.count + used)
 
     async def _enter(self, key: str) -> None:
         """This process's turn to take (one send at a time holds the lock of the live table)."""
@@ -1339,7 +1413,9 @@ class SequenceStore:
             deadline = time.monotonic() + self._wait
             if await self._ready(ordered[0], deadline):
                 self._remember(
-                    await self._work(ordered[0], deadline, partial(_extend_ahead, ordered))
+                    await self._work(
+                        ordered[0], deadline, partial(_extend_ahead, ordered, dict(self._steps))
+                    )
                 )
         finally:
             self._end_lease()
@@ -1351,7 +1427,9 @@ class SequenceStore:
             self._memory[key] = count  # commit moves it on
             return Lease(self, key, count, index=None, ceiling=0, span_send=span_send)
         if seat is not None:
-            indices = await self._work(key, deadline, lambda f: f.extend([key], seat=(key, seat)))
+            indices = await self._work(
+                key, deadline, partial(_extend_one, key, seat, dict(self._steps))
+            )
             self._remember(indices)
             await self._lock_main(key, deadline)
             return Lease(self, key, seat, index=None, ceiling=0, span_send=span_send)
@@ -1369,7 +1447,9 @@ class SequenceStore:
             if key in self._raising and task is not None and not task.done():
                 await asyncio.wait({task}, timeout=max(0.0, deadline - time.monotonic()))
                 continue  # raised ahead meanwhile: no second worker contending for the lock
-            self._remember(await self._work(key, deadline, lambda f: f.extend([key], need=key)))
+            self._remember(
+                await self._work(key, deadline, partial(_extend_one, key, None, dict(self._steps)))
+            )
 
     def _try_take(self, key: str) -> tuple[int, int, int] | Literal["slow", "reopen"]:
         """Under the live lock: ``(slot, count, ceiling)`` from the stream's slot; ``"slow"``
@@ -1420,21 +1500,32 @@ class SequenceStore:
             self._index.clear()  # bounded; a stale entry only costs a probe
         self._index.update(indices)
 
-    def _commit(self, key: str, count: int, index: int | None, ceiling: int) -> None:
+    def _commit(self, key: str, count: int, index: int | None, ceiling: int, want: int) -> int:
+        """Spend ``count`` and up to ``want - 1`` after it; returns how many were spent."""
         if self._memory is not None:
-            self._memory[key] = count + 1
-            return
+            self._memory[key] = count + want
+            return want
         if index is None:
-            return  # seated: the worker wrote the slot
+            return 1  # seated: the worker wrote the slot
         main = self._main
         assert main is not None and self._main_locked and count < ceiling < MAX_COUNT
+        used = min(want, ceiling - count)
         try:
-            data = _pack_own_slot(_padded(key), count + 1, ceiling)
+            data = _pack_own_slot(_padded(key), count + used, ceiling)
             _pwrite_all(self._fs, main.fd, data, _offset(index))
         except OSError as exc:
             raise self._failed(key, exc) from exc
-        if self._ahead and ceiling - (count + 1) <= AHEAD_AT:
+        left = ceiling - (count + used)
+        # a raise in progress covers the key: its takes need not queue another
+        if self._ahead and key not in self._raising and left <= self._half_step(key):
             self._queue_ahead(key)
+        return used
+
+    def _half_step(self, key: str) -> int:
+        """The counts left under a ceiling at which a sender kept ahead raises it."""
+        cfg = self._cfg
+        assert cfg is not None
+        return max(cfg.block, self._steps.get(key, 0)) // 2
 
     def _unlock_main(self) -> None:
         main = self._main
@@ -1661,7 +1752,9 @@ class SequenceStore:
             self._raising = frozenset(keys)
             deadline = time.monotonic() + self._wait
             try:
-                self._remember(await self._call(deadline, partial(_extend_ahead, keys)))
+                self._remember(
+                    await self._call(deadline, partial(_extend_ahead, keys, dict(self._steps)))
+                )
             except Exception as exc:  # a take that then finds no count left reports it, coded
                 self._record(
                     "sequence.ahead_failed",
@@ -1715,14 +1808,19 @@ class SequenceStore:
                 cause=cause,
             ) from exc
 
-    async def aclose(self) -> None:
-        """Let a background raise finish (bounded), then close the files. Nothing is given back:
-        a stream's next take, in any process, goes on from where this process stopped."""
+    async def aclose(self, *, cancelled: bool = False) -> None:
+        """Let a background raise finish (for :data:`CLOSE_WAIT_S` at most, and not at all when
+        ``cancelled``: a signal ends the command, which does not wait for a lock), then close
+        the files. The raise's worker ends on its own, and at most a step is skipped. Nothing
+        is given back: a stream's next take, in any process, goes on from where this process
+        stopped."""
         task = self._prefetch
         if task is not None and not task.done():
-            await asyncio.wait({task}, timeout=self._wait)
+            if not cancelled:
+                await asyncio.wait({task}, timeout=min(self._wait, CLOSE_WAIT_S))
             if not task.done():
-                task.cancel()  # its worker ends on its own; at most a step is skipped
+                task.cancel()
+                await asyncio.wait({task}, timeout=CLOSE_WAIT_S)  # it ends at the next turn
         self._unlock_main()
         main, self._main = self._main, None
         if main is not None:
@@ -1752,56 +1850,115 @@ class NodeSequences:
         await self._store.preraise([key_of(self._node, kind, mid) for mid in mids])
 
     def series(
-        self, kind: str, mid: int, *, seat: int | None, wake: Callable[[], None]
+        self,
+        kind: str,
+        mid: int,
+        *,
+        seat: int | None,
+        wake: Callable[[], None],
+        per_second: float | None,
+        planned: int | None = None,
     ) -> SeriesCounts:
-        """The counts of one series of ``kind`` packets with ``mid`` (see :class:`SeriesCounts`).
-        A series is long-lived, so ceilings are raised in the background."""
-        self._store.keep_ahead()
-        return SeriesCounts(self._store, key_of(self._node, kind, mid), seat=seat, wake=wake)
+        """The counts of one series of ``kind`` packets with ``mid`` (see :class:`SeriesCounts`),
+        sent at about ``per_second`` packets a second (``None``: back to back), ``planned`` of
+        them when that is known. A series is long-lived, so ceilings are raised in the
+        background, by a step that fits its rate (:func:`step_for`)."""
+        key = key_of(self._node, kind, mid)
+        self._store.keep_ahead(key, step_for(per_second))
+        return SeriesCounts(
+            self._store, key, seat=seat, wake=wake, batch=batch_for(per_second), planned=planned
+        )
 
 
 class SeriesCounts:
     """The counts of the packets of one series, one per :meth:`next`, on the event loop.
 
-    A count is taken without waiting when it can be (:meth:`SequenceStore.take_now`). When it
-    cannot (the first packet of a series, a ceiling to raise, a contended lock, the seat of
-    ``--sequence`` for the first packet), a task takes it and ``wake`` is called when that
-    task ends; :meth:`next` returns ``None`` until then and the caller asks again after the
-    wake. A failed take is raised by the :meth:`next` that collects it, ``IB-SEQ-005`` or
-    ``IB-SEQ-006``, with nothing taken."""
+    Counts are reserved from the stream a few at a time (:func:`batch_for`: about
+    :data:`BATCH_WINDOW_S` of the series' rate), without waiting when they can be
+    (:meth:`SequenceStore.reserve_now`), and handed out in order. When they cannot (the first
+    packet of a series, a ceiling to raise, a contended lock, the seat of ``--sequence`` for
+    the first packet), a task reserves them and ``wake`` is called when that task ends;
+    :meth:`next` returns ``None`` until then and the caller asks again after the wake. A failed
+    take is raised by the :meth:`next` that collects it, ``IB-SEQ-005`` or ``IB-SEQ-006``, with
+    nothing taken. A reserved count the series does not use (it was interrupted, or skipped
+    its slot) is a gap in the stream, as a packet built and not sent is."""
 
     def __init__(
-        self, store: SequenceStore, key: str, *, seat: int | None, wake: Callable[[], None]
+        self,
+        store: SequenceStore,
+        key: str,
+        *,
+        seat: int | None,
+        wake: Callable[[], None],
+        batch: int,
+        planned: int | None,
     ) -> None:
+        assert batch >= 1 and (planned is None or planned >= 1)
         self._store: Final = store
         self._key: Final = key
         self._seat = seat  # for the first packet only
         self._wake: Final = wake
-        self._task: asyncio.Task[int] | None = None
+        self._batch: Final = batch
+        self._planned: Final = planned  # reserve no more than the packets still to build
+        self._task: asyncio.Task[range] | None = None
+        self._at = self._end = 0  # the reserved counts not yet handed out: [_at, _end)
+        self._reserved = 0
+
+    def _want(self) -> int:
+        if self._planned is None:
+            return self._batch
+        return max(1, min(self._batch, self._planned - self._reserved))
+
+    def _hold(self, got: range) -> None:
+        assert self._at == self._end and len(got) >= 1
+        self._at, self._end = got.start, got.stop
+        self._reserved += len(got)
+
+    async def prime(self, start_in_s: float) -> None:
+        """Get ready for the first packet while the series waits for its start, so that no file
+        is opened and no sync waited for at the start itself. A start within
+        :data:`PRIME_TAKE_WITHIN_S` reserves the first counts now (``--sequence`` seated), and
+        :meth:`next` hands them out; a later one opens the store and raises the stream's
+        ceiling, and the counts are taken as the packets are built (a count taken hours ahead
+        would be passed by every send that came meanwhile). Raises ``IB-SEQ-005`` or
+        ``IB-SEQ-006``, with nothing sent."""
+        assert self._reserved == 0 and self._task is None
+        if start_in_s <= PRIME_TAKE_WITHIN_S:
+            seat, self._seat = self._seat, None
+            self._hold(await self._store.reserve(self._key, self._want(), seat=seat))
+        else:
+            await self._store.preraise([self._key])
 
     def next(self) -> int | None:
         """The count for the next packet, spent; ``None`` while it is being taken (``wake``
         follows)."""
-        task = self._task
-        if task is not None:
-            if not task.done():
-                return None
-            self._task = None
-            return task.result()
-        seat, self._seat = self._seat, None
-        if seat is None:
-            count = self._store.take_now(self._key)
-            if count is not None:
-                return count
-        self._task = asyncio.get_running_loop().create_task(
-            self._store.take(self._key, seat=seat), name="sequence-series-take"
-        )
-        self._task.add_done_callback(lambda _: self._wake())
-        return None
+        if self._at == self._end:
+            task = self._task
+            if task is not None:
+                if not task.done():
+                    return None
+                self._task = None
+                self._hold(task.result())
+            else:
+                seat, self._seat = self._seat, None
+                if seat is None:
+                    got = self._store.reserve_now(self._key, self._want())
+                    if got is not None:
+                        self._hold(got)
+                if self._at == self._end:
+                    self._task = asyncio.get_running_loop().create_task(
+                        self._store.reserve(self._key, self._want(), seat=seat),
+                        name="sequence-series-take",
+                    )
+                    self._task.add_done_callback(lambda _: self._wake())
+                    return None
+        count = self._at
+        self._at += 1
+        return count
 
     async def aclose(self) -> None:
-        """End a take still running (its count, if it is taken, is not used: a gap) and collect
-        its outcome, so nothing is left unretrieved."""
+        """End a take still running (its counts, if they are taken, are not used: a gap) and
+        collect its outcome, so nothing is left unretrieved."""
         task, self._task = self._task, None
         if task is None:
             return

@@ -4336,13 +4336,15 @@ listed as deferred.
       any process is seen by every process's next take. A process crash loses nothing (the page cache
       outlives it).
     - *Durable ceiling* (`sequence-state.json`, unchanged v1 format, "next" now meaning the ceiling):
-      every count handed out is below it, and it is at most one step (64) above the stream's next count.
-      Raised under `sequence-state.lock` and replaced through `TempOutput` (synced) *before* a slot holds
-      the new ceiling; the live lock is never held across that sync (lock order: durable, then live). A
-      table from another boot is rebuilt and each stream resumes from its ceiling: a power loss skips at
-      most 64 counts and never reuses one. A seat (`--sequence N`) sets the ceiling to `N + 1 + 64`,
-      lowering it too, so the bound holds after a backward seat. No give-back exists, so there is no
-      reuse window at exit.
+      every count handed out is below it, and it is at most one step above the stream's next count. The
+      step is 64 (`BLOCK`) for a single send and a responder; a series sizes it to its demand
+      (`step_for`): half a second of its rate, at least 64 and at most 4096 (`MAX_STEP`), a burst the
+      most. Raised under `sequence-state.lock` and replaced through `TempOutput` (synced) *before* a slot
+      holds the new ceiling; the live lock is never held across that sync (lock order: durable, then
+      live). A table from another boot is rebuilt and each stream resumes from its ceiling: a power loss
+      skips at most one step (a gap of up to 64 counts, 4096 for a fast series) and never reuses a count.
+      A seat (`--sequence N`) sets the ceiling to `N + 1 + step`, lowering it too, so the bound holds
+      after a backward seat. No give-back exists, so there is no reuse window at exit.
     - *Off the loop and bounded.* The take on the loop never syncs and never blocks it. A free live lock
       is taken there (non-blocking `flock`); a contended one is polled by a helper thread (50 us steps for
       5 ms, 200 us to 100 ms, then 1 ms), because a sleep on the loop lasts a millisecond at least
@@ -4355,8 +4357,10 @@ listed as deferred.
       bound (a sync that never returns fails the take with `IB-SEQ-006`; the abandoned worker ends on its
       own and its ledger records and warnings are delivered when it does, also when the awaiting task was
       cancelled). A lock held by this process's own abandoned worker is reported as that, not as another
-      process. `ib respond` (`keep_ahead`) raises a ceiling in the background with half a step left, so a
-      reply waits for a sync only when replies outrun it (one sync per 32 counts at most), and raises
+      process. `ib respond` and a series (`keep_ahead`) raise a ceiling in the background with half a step
+      left, so a take waits for a sync only when takes outrun it (a reply: one sync per 32 counts at most; a
+      series: per 2048 counts at the most, a few a second), and a raise in progress is not queued again
+      by the takes it covers (no second, empty raise). `ib respond` raises
       every reply message's ceiling in one sync at start (`NodeSequences.preraise`), so the first reply
       of each message waits for none. A count that cannot be taken within the bound, or a state file that
       cannot be written once the store is open, is `IB-SEQ-006`: nothing is sent. Memory counting
@@ -4385,6 +4389,24 @@ listed as deferred.
       under 100 us at the median, and a take paced at 1 kHz beside a process taking in a tight loop
       (50 us held, 30 us between) stays under 4 ms at p99 (measured 1.1 ms; 8-10 ms with the poll on the
       loop).
+    - *Measured, series (round 3 of PR 40; 4 cores, ext4 on virtio, back to back with main in the same
+      minutes, the host shared with other work).* With a ceiling step of 64 and a take per packet a
+      series paid for the store: a UDP burst of 20000 packets ran at 2.5-3.8 k packets a second against
+      8.6 k on main (480-500 raises), a serial 1 ms series skipped 12% of its slots against 2%, and a 1 ms
+      UDP series beside a burst on its stream 7-11% against 1-3%. With a step sized to the rate and
+      counts reserved a batch at a time: the burst 8.8 k a second against main's 8.4 k (10 raises), the
+      serial 1 ms series skips 1.4% of its slots (main 1.7%), the contended UDP one 0.8% (main 1.0%), and alone 0.8% (main 1.0%). The raise itself
+      was examined for a stall of the loop: its worker spends about 0.1 ms in Python and the rest in
+      `fsync`, `fdatasync` and `rename` (3 to 4 ms each when the host is busy), the `pwrite` of the loop
+      is not delayed by a concurrent `fsync` (0.3 ms at most), and a real raise every 20 ms delays a 1 ms
+      timer of the main thread no more as a thread than as a separate process (so no more with the
+      interpreter lock than without it), at the default 5 ms switch interval and at 0.2 ms alike.
+      The loss measured came from the number of raises and of takes, so both are cut: a raise every
+      2048 counts at the most, a take every 20 packets at 1 ms. Gated by `tests/bench/test_send_timing.py`
+      (serial CI step, `needs_a_quiet_host`): a burst of 20000 at 4 k a second or more with at most 12
+      raises, a serial 1 ms series skipping at most 6% of 3000 slots, and a 1 ms series beside a
+      same-stream burst skipping at most 8% of 4000; each fails on a step of 64 and a take per packet
+      (3.6 k a second and 472 raises; 6.8%; 8.2%).
     - *Limits.* 4096 streams in the durable file; another is refused (`IB-SEQ-005`, `sequence.full`),
       never evicted. The live table has twice the slots; reset streams are dropped from it when it fills.
     - *Untrusted state.* `sequence-state.json`: `O_NOFOLLOW|O_NONBLOCK`, `fstat` (regular, ours, one link),
@@ -4428,24 +4450,45 @@ listed as deferred.
       `sequence.exhausted`, `sequence.ahead_failed`, `sequence.memory_only`; all essential.
     - *Respond.* The responder's telemetry replies count the same way, keyed by the node it acts as; the
       trial encodes made while validating the rules count in the codec's memory, so they take no count.
-    - *A series of sends (`--repeat/--every/--at`, merged with PR #41).* Each packet's count is taken from
-      the store when the pacer's `build()` encodes the packet ahead (on the loop, never in the pacer
-      thread): `SequenceStore.take_now` is the existing non-blocking take (a `LOCK_NB` flock, one
-      `fstatat`, one slot `pread`/`pwrite`) committed and released at once, and the packet is framed with
-      that count (`Codec.frame`, the series' arguments encoded and checked once by
-      `Codec.prepare_command`). When the take would wait (files not open yet, a ceiling to raise, a slot
-      to insert, the lock held by another process, a send of this process holding its turn) `build()`
-      returns nothing, a task (`SeriesCounts`) takes the count with the ordinary bounded `lease`, and
-      its completion wakes the pacer (`SeriesPacer.wake`), which builds that slot again; the loop is
-      never blocked and a slot still without a packet at its deadline is skipped as starved. Series
-      ask for background ceiling raises (`keep_ahead`), so a long series rarely waits on a sync.
-      `--sequence N` is the first packet's count (seated by the task); an unusable value is refused
-      before the series starts. Counts are unique and persistent; cross-process wire order is
-      guaranteed only within one process (as for serial): two processes' series interleave, each in its
-      own count order. A built-but-unsent packet (discarded, unsent, unconfirmed, a series that ended)
-      has spent its count (a gap) and is ledgered as such with its sequence. Tests:
-      `tests/test_sequence_state.py` (`SeriesCounts`, spent counts) and `tests/test_send_modes.py`
-      (continuing, `--sequence` with `--every`, two concurrent series, a reset during a series).
+    - *A series of sends (`--repeat/--every/--at`, merged with PR #41).* Each packet's count comes from
+      the store when the pacer's `build()` frames the packet ahead (on the loop, never in the pacer
+      thread; the series' arguments are encoded and checked once by `Codec.prepare_command`, which also
+      refuses a `--length-delta` the header cannot hold, so a refused series takes no count and fails
+      before its `--at` wait). Counts are reserved a few at a time (`SeriesCounts`, `batch_for`: 20 ms of
+      the series' rate, 1 to 32, a burst 32, never more than the packets still planned):
+      `SequenceStore.reserve_now` is the existing non-blocking take (a `LOCK_NB` flock, one `fstatat`, one
+      slot `pread`/`pwrite`) for `n` counts, committed and released at once, so the flock and slot traffic
+      and the contention with a process taking in a tight loop are divided by `n`. When the take would wait
+      (files not open yet, a ceiling to raise, a slot to insert, the lock held by another process, a send
+      of this process holding its turn) `build()` returns nothing, a task takes the counts with the
+      ordinary bounded `lease`, and its completion wakes the pacer (`SeriesPacer.wake`), which builds that
+      slot again; the loop makes no blocking syscall for it and a slot still without a packet at its
+      deadline is skipped as starved. (The worker threads that raise a ceiling do share the interpreter
+      and the CPU with the loop; see "Measured" for what that costs.)
+      A series asks for background ceiling raises (`keep_ahead`) by a step sized to its rate
+      (`step_for`: half a second of it, 64 to 4096, a burst 4096), so a series syncs a few times a second
+      and not every 32 packets, which cost a burst two thirds of its rate. Right after the link opens,
+      before the `--at` wait, `SeriesCounts.prime` opens the store, seats `--sequence` and reserves the
+      first counts when the start is within 2 s (`PRIME_TAKE_WITHIN_S`; a count taken hours ahead would be
+      passed by every send meanwhile), or only opens the store and raises the ceiling when it is later; a
+      failure is the take's coded error, before anything is sent. `--sequence N` is the first packet's
+      count; an unusable value is refused before the series starts. Counts are unique and persistent;
+      cross-process wire order is guaranteed only within one process (as for serial): two processes' series
+      interleave, each in its own count order, and a single send's count can reach the kernel up to 20 ms
+      before a series' lower one. A reserved or built-but-unsent count (discarded, unsent, unconfirmed,
+      left over at the end or at an interrupt) is spent (a gap), and a built packet is ledgered as such
+      with its sequence. An interrupted series leaves about 40 counts of gap at a 1 ms period (reserved
+      plus built ahead; at most `MAX_BATCH` + 8 for a burst), so every Ctrl-C advances the stream by about
+      that, besides the power-loss bound. A reset (`ib seq reset`) is seen at the series' next
+      reservation, not at once: the packets already built and the counts already reserved (about 40 at
+      1 ms, 20 ms to 40 ms of the series) go out with the old counts. Seeing it at once would take a table
+      read per packet on the loop, which the reservation exists to avoid; a single send sees a reset at
+      once. Closing the session cancels a ceiling raise in the background at once on a signal (and waits
+      0.25 s at most otherwise): the worker ends on its own and at most a step is skipped, so Ctrl-C exits
+      in 0.1 s even when a raise is waiting for a lock another process holds (it waited the 10 s bound
+      before). Tests: `tests/test_sequence_state.py` (`SeriesCounts`, batches, steps, prime, close,
+      spent counts) and `tests/test_send_modes.py` (continuing, `--sequence` with `--every`, two
+      concurrent series, a reset during a series).
     - *Known limits (documented, not fixed).*
         - *Network file systems.* `$XDG_STATE_HOME` defaults under `$HOME`, which is often NFS on lab
           servers. Each take's `flock`, `fstatat`, `pread` and `pwrite` are then RPCs on the event loop (a

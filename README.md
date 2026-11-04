@@ -235,26 +235,39 @@ the state directory (`IRONBIRD_STATE_DIR`, else `$XDG_STATE_HOME/ironbird`). Two
 and the counts wrap at the width of the header profile's sequence field.
 
 - How: a small table, `sequence-live`, holds the next count of each stream; every count is taken under a
-  file lock in microseconds, so counts are exact and in take order across processes. Over UDP the lock is
-  held until the packet is handed to the kernel, so packets are handed to the kernel in count order (what a
-  network does to them after that, on a multi-queue NIC for one, is not ours); over serial it is released once
-  the count is taken (a serial device is one process's), so the order is exact per process. `sequence-state.json` holds a synced ceiling up to 64 counts ahead: a crashed process loses
-  nothing, and a power loss skips at most 64 counts of a stream, never repeating one.
+  file lock in microseconds, so counts are exact and in take order across processes. Over UDP a single send
+  (and a responder's reply) holds the lock until the packet is handed to the kernel, so those packets are
+  handed to the kernel in count order (what a network does to them after that, on a multi-queue NIC for one,
+  is not ours); a series reserves its counts ahead of its packets (below), so its packets are in count order
+  only within their own process. Over serial the lock is released once the count is taken (a serial device is
+  one process's), so the order is exact per process. `sequence-state.json` holds a synced ceiling one *step*
+  ahead of the next count: 64 counts for a single send or a responder, and for a series about half a second
+  of its rate (up to 4096, which a burst uses), so that a series syncs a few times a second, not every few
+  dozen packets. A crashed process loses nothing, and a power loss skips at most one step of a stream (a
+  gap of up to 64 counts, or 4096 for a fast series), never repeating a count.
 - `ib send NODE CMD --sequence N` sends that one packet with count `N` (decimal or `0x`; it must fit
   the sequence field, and the profile must have one, else `IB-ENC-002`, exit 2, nothing sent) and
   continues from it: the next send, from any process, is `N+1`. In a series (`--repeat`, `--every`,
   `--at`) it is the first packet's count and the rest go on from it.
-- A series takes each packet's count when it builds the packet (up to 20 ms before its slot), on the event
-  loop and without waiting when it can: the same file lock and slot as a single send, held for microseconds
-  and released at once. When a take would wait (the first of a series, a ceiling to raise, another process
-  holding the lock) a task takes it and the slot is built when it is there; a slot whose packet is still
-  missing at its deadline is skipped like any other. The pacer thread never takes a count. So a series
-  continues the count of the sends before it, the next send continues the series, and a reset during a
-  series restarts it at 0, as for single sends. Two processes sending on one stream, series or not, get
-  unique counts, but only within one process do the packets reach the kernel in count order (as with two
-  processes on one serial line): their packets interleave on the wire, each process's in its own count
-  order. A packet built and not sent (skipped, unsent, unconfirmed, or a timed packet whose slot was
-  skipped) has spent its count, so the stream shows a gap there; its record in the ledger says so.
+- A series reserves the counts of its packets a few at a time (about 20 ms of its rate, 20 at a 1 ms
+  period, at most 32, which a burst uses) when it builds them (up to 20 ms before their slots), on the
+  event loop and without waiting when it can: the same file lock and slot as a single send, held for
+  microseconds and released at once. When a take would wait (a ceiling to raise, another process holding
+  the lock) a task takes it and the slot is built when it is there; a slot whose packet is still missing
+  at its deadline is skipped like any other. The pacer thread never takes a count. A series starting
+  within 2 s opens the state, seats `--sequence` and takes its first counts before it waits for its start,
+  so the first packet is not held up by a sync; a later start opens the state and raises the ceiling
+  then, and takes the counts as it builds the packets. So a series continues the count of the sends
+  before it and the next send continues the series. Two processes sending on one stream, series or not,
+  get unique counts, but only within one process do the packets reach the kernel in count order (as with
+  two processes on one serial line): their packets interleave on the wire, each process's in its own count
+  order, and a single send's count can reach the kernel up to 20 ms before a series' lower one. A count
+  reserved or built and not sent (skipped, unsent, unconfirmed, a timed packet whose slot was skipped, or
+  left over when the series ends or is interrupted) is spent, so the stream shows a gap there; the ledger
+  record of a built packet says so. An interrupted series at 1 ms leaves a gap of up to about 40 counts
+  (what it had reserved and built ahead), on top of the power-loss bound above; each Ctrl-C costs that.
+  `ib seq reset` is seen by a series at its next reservation, so up to those same 40 or so of its packets
+  can still go out with the old counts before it restarts at 0; a single send sees a reset at once.
 - `ib seq show [NODE]` lists the value the next packet of each stream carries (`-v` adds the unreduced count
   and the stored ceiling); it only reads, so an invalid file is left as it is for you to inspect.
   `ib seq reset NODE MID` forgets one stream, `ib seq reset NODE` all streams of a node, `ib seq reset --all`
@@ -265,7 +278,7 @@ and the counts wrap at the width of the header profile's sequence field.
   IB-SEQ-001`: the next send moves it aside to `sequence-state.json.invalid` and rebuilds it from the live
   table. A damaged or foreign `sequence-live`, or one from before a reboot, is `warning IB-SEQ-004` and is
   rebuilt from the stored ceilings. Keep one state directory per host: a table written by another host is
-  rebuilt each time (counts stay unique, with gaps of up to 64). A `sequence-state.json` that is gone, or older
+  rebuilt each time (counts stay unique, with gaps of up to a step: 64, or 4096 for a fast series). A `sequence-state.json` that is gone, or older
   than the table beside it, is brought up to the table; one that is refused only because it is a hard link or
   another user's file still counts as a floor, so a stray copy can make counts skip but never repeat.
 - A state directory that cannot hold the counts at all (read-only, full, no file locks) is one `warning

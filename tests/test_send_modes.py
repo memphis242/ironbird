@@ -22,6 +22,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -1842,6 +1843,69 @@ def test_a_sequence_that_does_not_fit_is_refused_before_a_series_starts(
         assert sink.sequences() == [0]  # the refused series took no count
 
 
+@pytest.mark.parametrize(
+    "mode", [["--every", "10ms", "--repeat", "3"], ["--at", "+30s"], ["--repeat", "3"]]
+)
+def test_a_length_delta_the_header_cannot_hold_is_refused_at_once_and_spends_no_count(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]], mode: list[str]
+) -> None:
+    """S4 (PR 40 round 3): the range of a tampered field was checked while framing, after the
+    `--at` wait and with a count spent, so every refused series left a gap."""
+    config, port, env = setup
+    with sink_for(port) as sink:
+        started = time.monotonic()
+        done = run_ib(
+            tmp_path,
+            ["-c", str(config), "send", "fc", "MOCK_NOOP", "--length-delta", "-100", *mode],
+            env,
+        )
+        assert done.returncode == 2 and "IB-HDR-003" in done.stderr, done.stderr
+        assert time.monotonic() - started < 20  # not after a 30 s wait
+        send_ok(tmp_path, config, env, "MOCK_NOOP")
+        wait_for_packets(sink, 1)
+        assert sink.sequences() == [0]  # the refused request took no count
+
+
+def test_a_series_prepares_its_counts_before_it_waits_for_its_start(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
+) -> None:
+    """S2 (PR 40 round 3): the store was opened, `--sequence` seated and the first count taken
+    20 ms before the first slot, so another process's sync at that moment made the first packet
+    late. The ceiling is raised while the series still waits for its start."""
+    config, port, env = setup
+    with sink_for(port) as sink:
+        start = time.time() + 1.5
+        done = run_ib(
+            tmp_path,
+            [
+                "-c",
+                str(config),
+                "send",
+                "fc",
+                "MOCK_NOOP",
+                "--at",
+                sm.iso_utc(int(start * SEC)),
+                "--every",
+                "5ms",
+                "--repeat",
+                "6",
+                "--sequence",
+                "50",
+            ],
+            env,
+        )
+        assert done.returncode == 0, done.stderr
+        wait_for_packets(sink, 6)
+        assert sink.sequences() == list(range(50, 56))
+    events = ledger_events(tmp_path)
+
+    def at(event: dict[str, Any]) -> float:
+        return datetime.fromisoformat(event["ts"]).timestamp()
+
+    raised = [e for e in events if e["event"] == "sequence.extend"]
+    assert raised and at(raised[0]) < start - 0.5, "the ceiling was raised at the start itself"
+
+
 def test_two_series_at_once_to_one_node_and_mid_take_unique_counts_with_no_restart(
     tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
 ) -> None:
@@ -1919,8 +1983,10 @@ def test_a_reset_during_a_series_restarts_its_counts_at_zero(
     before, after = sequences[: drops[0] + 1], sequences[drops[0] + 1 :]
     assert before == list(range(len(before)))  # from 0 until the reset
     assert after[0] == 0 and consecutive(after)  # then from 0 again
-    # and the series after the reset left the stream where it ended
+    # and the series left the stream where it ended: above its last packet, by the counts it had
+    # reserved and not used (fewer than a batch)
     with sink_for(port) as sink:
         send_ok(tmp_path, config, env, "MOCK_NOOP")
         wait_for_packets(sink, 1)
-        assert sink.sequences() == [(after[-1] + 1) % 16384]
+        (next_count,) = sink.sequences()
+        assert 0 <= (next_count - after[-1] - 1) % 16384 < 32

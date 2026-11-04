@@ -240,6 +240,7 @@ class Session:
 
     async def __aexit__(self, *exc_info: object) -> None:
         self.ledger.record("action", "session.stop", role=self.node.name)
+        cancelled = isinstance(exc_info[1], asyncio.CancelledError)  # a signal ends the command
         try:
             for task in self._tasks:
                 task.cancel()
@@ -252,11 +253,14 @@ class Session:
                 await self._close_engine_cancelled()
                 raise
             await self._engine.close()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
             try:
                 try:
                     if self._sequences is not None:
-                        await self._sequences.aclose()
+                        await self._sequences.aclose(cancelled=cancelled)
                 finally:
                     self.flush_notices()
             finally:
@@ -612,15 +616,20 @@ class Session:
         *,
         seat: int | None,
         wake: Callable[[], None],
+        per_second: float | None,
+        planned: int | None = None,
     ) -> SeriesCounts | None:
         """The sequence counts of a series of ``prepared`` (taken from the state directory, as
         for a single send), or ``None`` when the header has no sequence field. ``seat``
         (``--sequence``) is the first packet's count; ``wake`` is called when a count that had
-        to be waited for is there (see :class:`~ironbird.seqstate.SeriesCounts`)."""
+        to be waited for is there (see :class:`~ironbird.seqstate.SeriesCounts`);
+        ``per_second`` is the series' rate (``None``: a burst) and ``planned`` the packets it
+        plans, which size the steps its ceilings are raised by and the counts it reserves at a
+        time."""
         if not prepared.sequenced:
             return None
         return self.sequences(target.route.server.name).series(
-            "command", prepared.mid, seat=seat, wake=wake
+            "command", prepared.mid, seat=seat, wake=wake, per_second=per_second, planned=planned
         )
 
     def build_command(
