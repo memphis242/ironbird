@@ -845,17 +845,18 @@ class _Outbox:
 
 @dataclass(frozen=True, slots=True)
 class _Probe:
-    """What ``/proc/<pid>/stat`` says of a worker: its state letter (``T``: stopped) and the CPU
-    time it has used, in clock ticks (user and system)."""
+    """What ``/proc/<pid>/task/<pid>/stat`` says of a worker's main thread: its state letter
+    (``T``: stopped) and the CPU time it has used, in clock ticks (user and system)."""
 
     state: str
     ticks: int
 
 
 def parse_stat(text: str) -> _Probe | None:
-    """The state and CPU time (fields 3, 14 and 15) in the text of a ``/proc/<pid>/stat`` line, or
-    ``None`` for a line that does not have them. The command name (field 2) may hold anything,
-    parentheses included, so the fields are counted from the last closing parenthesis."""
+    """The state and CPU time (fields 3, 14 and 15) in the text of a ``/proc/<pid>/stat`` or
+    ``/proc/<pid>/task/<tid>/stat`` line, or ``None`` for a line that does not have them. The
+    command name (field 2) may hold anything, parentheses included, so the fields are counted from
+    the last closing parenthesis."""
     fields = text.rpartition(")")[2].split()
     try:
         return _Probe(fields[0], int(fields[11]) + int(fields[12]))
@@ -864,10 +865,13 @@ def parse_stat(text: str) -> _Probe | None:
 
 
 def probe(pid: int) -> _Probe | None:
-    """The state and CPU time of our own child ``pid``, or ``None`` where they cannot be read (no
-    ``/proc``, or the process is gone). The child is the same user's, so no privilege is needed."""
+    """The state and CPU time of the main thread of our own child ``pid``, or ``None`` where they
+    cannot be read (no ``/proc``, or the process is gone). The main thread's id is the pid, and its
+    own line is read, not the process's, which sums every thread: a worker's decoding runs on its
+    main thread, and a helper thread's few ticks (the parent watch wakes once a second) must not
+    make a hung worker look busy. The child is the same user's, so no privilege is needed."""
     try:
-        with open(f"/proc/{pid}/stat", "rb") as stat:
+        with open(f"/proc/{pid}/task/{pid}/stat", "rb") as stat:
             text = stat.read(4096).decode("ascii", "replace")
     except OSError:
         return None
@@ -904,8 +908,10 @@ class _Slot:
 
     def defer(self, gap: float, now: float) -> None:
         """The parent was not watching for ``gap`` seconds, which the worker's silence does not
-        count."""
-        self.moved(min(now, self.progress + gap))
+        count: the silence and the CPU baseline both move on by it, so the baseline's evidence is
+        kept."""
+        self.progress = min(now, self.progress + gap)
+        self.cpu_at = min(now, self.cpu_at + gap)
 
 
 class WorkerPool:

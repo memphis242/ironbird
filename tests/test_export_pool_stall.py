@@ -145,6 +145,19 @@ def test_a_wait_the_parent_asked_for_is_not_a_gap() -> None:
 
 BURN = "while True: pass"
 SLEEP = "import time; time.sleep(60)"
+# The main thread sleeps (hung) while a side thread uses a tenth of a core, as a worker's
+# parent-watch thread does at a far lower rate.
+SIDE_THREAD = """
+import threading, time
+def side():
+    while True:
+        time.sleep(0.01)
+        began = time.thread_time()
+        while time.thread_time() - began < 0.001:
+            pass
+threading.Thread(target=side, daemon=True).start()
+time.sleep(60)
+"""
 
 
 def test_a_worker_that_uses_cpu_time_but_moves_no_byte_is_not_a_stall(
@@ -181,6 +194,41 @@ def test_a_worker_that_is_asleep_is_a_stall_that_names_the_setting(
     finally:
         theirs.close()
         pool.close(abnormal=True)
+
+
+def test_cpu_time_of_a_helper_thread_does_not_make_a_hung_worker_look_busy(
+    children: list[subprocess.Popen[bytes]],
+) -> None:
+    """The work of a worker runs on its main thread. A helper thread (the worker's parent watch
+    wakes once a second) adds to the process's CPU time, which must not count as progress: at the
+    default limit it would otherwise hide a hung worker for good."""
+    pool = make_pool(1.5)
+    worker = child(children, SIDE_THREAD)
+    ticket, theirs = add_worker(pool, worker)
+    try:
+        began = time.monotonic()
+        poll_for(pool, 15.0)
+        assert pool.broken and 1.5 <= time.monotonic() - began < 10.0
+        assert "no progress" in the_error(ticket).summary
+        with open(f"/proc/{worker.pid}/stat", "rb") as whole_process:
+            whole = pexport.parse_stat(whole_process.read(4096).decode("ascii", "replace"))
+        main_thread = pexport.probe(worker.pid)
+        assert whole is not None and main_thread is not None
+        assert whole.ticks > main_thread.ticks, "the helper thread used no CPU time: no test"
+    finally:
+        theirs.close()
+        pool.close(abnormal=True)
+
+
+def test_a_gap_moves_the_cpu_baseline_on_with_the_silence() -> None:
+    """Time the parent was not watching is no evidence either way: the CPU reading taken earlier
+    stays, and its time moves on by the gap, as the worker's silence does."""
+    slot = pexport._Slot(None, multiprocessing.Pipe()[0], 100.0)
+    slot.cpu, slot.cpu_at = 7, 150.0
+    slot.defer(30.0, 200.0)
+    assert slot.cpu == 7 and slot.cpu_at == 180.0 and slot.progress == 130.0
+    slot.defer(1000.0, 200.0)  # never past now
+    assert slot.cpu == 7 and slot.cpu_at == 200.0 and slot.progress == 200.0
 
 
 def test_a_worker_that_is_stopped_is_a_stall_that_says_so(

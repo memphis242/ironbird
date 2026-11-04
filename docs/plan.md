@@ -4087,7 +4087,7 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   either way, and used no CPU time. A worker decoding a range moves no byte until it replies, and
   a range may take minutes (a 256 MiB range of a filter that decodes every frame and matches almost
   none takes about 73 s on an idle core, four times that on a busy one), so the parent reads the
-  worker's CPU time (`/proc/<pid>/stat`, the parent's own child, no privilege) once when the
+  worker's main-thread CPU time (`/proc/<pid>/task/<pid>/stat`, the parent's own child, no privilege; not the process's `stat`, which sums the watch thread's wakeups too, so a hung worker would look busy) once when the
   silence is half the limit and again after, and CPU time used in between counts as progress and
   starts the clock again; it counts only for a worker with nothing left unsent (one that spins
   instead of reading what it is sent is not working on it), and where `/proc` cannot be read the
@@ -4224,6 +4224,18 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   (16) one write of a large buffer to a worker that drains could copy tens of MiB in one call and
   a pipe ready both ways was served for two shares: writes are capped at 256 KiB and a pipe gets
   one share for both; (17) every poll made an epoll descriptor: `PollSelector`.
+  Found in the fourth review: (18) the probe read the process's `/proc/<pid>/stat`, which sums every
+  thread, so the worker's parent-watch thread (a few tens of microseconds a second) made a hung
+  worker look busy and, at the default 300 s limit, it was often never reported: the leader
+  thread's own `/proc/<pid>/task/<pid>/stat` is read (a real child whose main thread sleeps while a
+  side thread burns CPU must stall; a busy main thread must not); (19) an unwatched gap shifts the
+  CPU baseline's time by the gap instead of discarding the baseline. Noted, not changed: (N1) a
+  probe that fails on a live worker (a transient `EMFILE` at the descriptor margin of a CSV
+  directory export with many workers) leaves the silence alone to decide, which can end an honest
+  range longer than the limit, loudly and naming the setting; keeping the last good probe for one
+  more window would close it. (N2) the layout digest's byte encoding is ambiguous
+  (`("a", ("b",))` and `("a\0b", ())` hash alike); no CCDD or header name can hold a NUL and the
+  digest only detects a divergence, so a length-prefixed encoding is cosmetic.
 - **When the pool is used.** `--jobs N` (1..64) beats `[export] jobs`, which beats the default of one
   worker per core the process may run on (its CPU affinity and the `cpu.max` quota of its cgroup v2
   group and the groups above it, rounded up; a group that cannot be examined, such as `EACCES`, is no
