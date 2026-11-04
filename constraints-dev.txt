@@ -5,9 +5,9 @@
 # release break an unrelated change. Transitive packages are left free.
 typer==0.27.3
 pyserial==3.5
-pytest==8.4.2
+pytest==9.2.0
 pytest-xdist==3.8.0
-pytest-benchmark==5.3.0
+pytest-benchmark==5.3.1
 coverage==7.17.0
 hypothesis==6.170.13
 ruff==0.17.3

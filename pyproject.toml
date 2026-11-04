@@ -18,10 +18,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "coverage>=7.10",  # patch = ["subprocess"] and the [tool.coverage] section below
-    "pytest>=8,<9",  # pytest-benchmark 5.x is not yet compatible with pytest 9
+    "pytest>=9.0.3,<10",  # 9.0.3 hardens PYSEC-2026-1845 (symlinks refused); the dir name stays predictable, use --basetemp on shared hosts
     "pytest-xdist>=3.5,<4",
     "hypothesis>=6.100,<7",
-    "pytest-benchmark>=4.0,<6",
+    "pytest-benchmark>=5.3.1,<6",
     "ruff>=0.5,<0.18",  # lint and format rules change between minor releases
     "pyright[nodejs]>=1.1.370,<1.2",  # nodejs extra: the Node pyright runs on comes from PyPI
     "mypy>=1.11,<3",  # second type checker: catches what pyright's inference lets through
@@ -78,7 +78,14 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["PLC0415", "S104", "S108", "S603", "S607", "PLR0915"]
+# Tests are held to a lower bar (CLAUDE.md Testing Guidelines): the correctness rules (F, B, E9,
+# ...) stay on, while security and style rules about fixture data and test idioms are off.
+# The selected set has no annotation or docstring rules (ANN, D), so none need relaxing.
+"tests/**" = [
+    "PLC0415",  # imports inside tests (monkeypatching, import-time behaviour)
+    "S104", "S105", "S106", "S108", "S603", "S607",  # fixture hosts, tokens, temp paths, subprocesses
+    "PLR0915",
+]
 
 [tool.pyright]
 include = ["src", "tests"]
@@ -93,9 +100,38 @@ reportUnknownLambdaType = false
 reportPrivateUsage = false
 reportMissingParameterType = false
 
+# src keeps the strict rule set above. Tests are held to a lower bar (CLAUDE.md Testing Guidelines:
+# test code only needs to work): strict's style and API-hygiene rules are turned off for them.
+# Correctness checks (types, attributes, calls, optionals) still apply, including the ones that
+# expose a vacuous test: reportUnnecessaryComparison and reportUnnecessaryContains (a condition
+# that can never change) and reportUnusedVariable (a computed result never asserted on).
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+extraPaths = ["src"]
+reportMissingTypeArgument = false
+reportUnnecessaryCast = false
+reportUnnecessaryIsInstance = false
+reportUntypedFunctionDecorator = false
+reportUntypedClassDecorator = false
+reportUntypedBaseClass = false
+reportUntypedNamedTuple = false
+reportUnusedClass = false
+reportUnusedFunction = false
+reportConstantRedefinition = false
+reportDeprecated = false
+reportTypeCommentUsage = false
+reportIncompleteStub = false
+reportInconsistentConstructor = false
+reportInvalidStubStatement = false
+reportMatchNotExhaustive = false
+reportMissingSuperCall = false
+
+[[tool.pyright.executionEnvironments]]
+root = "src"
+
 [tool.mypy]
-# src only: pyright (strict) already checks the tests, and mypy's stricter reading of test
-# idioms (monkeypatching module attributes, re-exported names) is left to a later pass.
+# src only, by decision (CLAUDE.md Testing Guidelines: strict analyses are not extended to tests;
+# pyright checks them with a relaxed strict rule set, see [tool.pyright]).
 files = ["src"]
 python_version = "3.11"
 strict = true
