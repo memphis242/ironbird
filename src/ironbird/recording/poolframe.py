@@ -49,8 +49,9 @@ import json
 import os
 import struct
 import sys
+import zlib
 from collections import Counter
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Final, NoReturn
@@ -106,7 +107,7 @@ MAX_NAME_BYTES: Final = 64 * 1024  # one name, reason, filter, endpoint or summa
 MAX_DIAG_BYTES: Final = 1 * MIB  # error details and tracebacks (the worker keeps the end)
 MAX_META_BYTES: Final = 8 * MIB  # META as ASCII JSON: its 1 MiB, every character escaped
 MAX_CODE_BYTES: Final = 32  # an error code ("IB-EXP-003")
-MAX_NAMES: Final = 1 << 16  # names in one list: links, aliases, messages, nodes, columns
+MAX_NAMES: Final = 1 << 16  # names in one list: links, aliases, messages, nodes
 MAX_BLOBS: Final = 3 * MAX_DEFINED_NODES  # a CCDD and two header profiles per node
 MAX_SEED_STREAMS: Final = MAX_STREAM_ID + 1
 MAX_SEED_SOURCES: Final = 1 << 16
@@ -138,14 +139,15 @@ _TIME_BYTES: Final = 16
 # Every instant ``--from``/``--to`` accept (years 1 to 9999 in nanoseconds, a bound the recording's
 # u64 times never reach) fits a signed time, so a bound is never a reason to refuse a job.
 assert 1 << (8 * _TIME_BYTES - 1) > 253_402_300_800 * 10**9
-# index, start, end, first_seq, last_seq, work, scanned, frames_read, frames_in_range, flags
-_OUTCOME: Final = struct.Struct("<QQQQQqqQQH")
+# index, start, end, first_seq, last_seq, work, scanned, frames_read, frames_in_range, flags,
+# layouts (the digest of the tables the worker numbered its blocks by)
+_OUTCOME: Final = struct.Struct("<QQQQQqqQQHI")
 _DAMAGE: Final = struct.Struct("<QQQQB")  # offset, span, resumed_at, rows before, flags
 _GAP_MARK: Final = struct.Struct("<QQQ")  # rows before, gaps, frames lost
 # rows, decoded, malformed, unknown, garbage, undecoded, skipped_no_definitions, not_written,
 # files, ending
 _COUNTS: Final = struct.Struct("<QQQQQQQQQB")
-_BLOCK: Final = struct.Struct("<BQI")  # flags, rows, handle
+_BLOCK: Final = struct.Struct("<BQI")  # flags, rows, handle; then, with a layout, its u32 index
 _SHA256_BYTES: Final = 32
 
 # Flag bits.
@@ -160,7 +162,7 @@ _OUT_CATEGORIES, _OUT_ORDER = 0x100, 0x200
 _OUT_FLAGS: Final = 0x3FF
 _DAMAGE_TORN, _DAMAGE_RESUMED, _DAMAGE_TRAILING, _DAMAGE_INCOMPLETE = 0x01, 0x02, 0x04, 0x08
 _DAMAGE_FLAGS: Final = 0x0F
-_BLOCK_KEY, _BLOCK_MALFORMED = 0x01, 0x02
+_BLOCK_LAYOUT, _BLOCK_MALFORMED = 0x01, 0x02
 _BLOCK_FLAGS: Final = 0x03
 
 # Code tables: the numbers are the wire's, never reused.
@@ -252,7 +254,7 @@ assert _names(ExportResult) == (
     "rejected",
     "per_table",
 )
-assert _names(Block) == ("key", "malformed", "rows", "text", "handle")
+assert _names(Block) == ("layout", "malformed", "rows", "text", "handle")
 assert _names(Outcome) == (
     "index",
     "start",
@@ -277,6 +279,7 @@ assert _names(Outcome) == (
     "frames_in_range",
     "gap_marks",
     "counts",
+    "layouts",
     "blocks",
     "categories",
     "order",
@@ -564,6 +567,7 @@ def _put_outcome(out: _Out, outcome: Outcome) -> None:
         outcome.frames_read,
         outcome.frames_in_range,
         flags,
+        outcome.layouts,
     )
     out.count(len(outcome.definitions), MAX_NOTES, "definitions")
     for entry in outcome.definitions:
@@ -604,14 +608,12 @@ def _put_outcome(out: _Out, outcome: Outcome) -> None:
     _put_counts(out, outcome.counts)
     out.count(len(outcome.blocks), MAX_BLOCKS, "blocks")
     for block in outcome.blocks:
-        block_flags = _flag(block.key is not None, _BLOCK_KEY) | _flag(
+        block_flags = _flag(block.layout is not None, _BLOCK_LAYOUT) | _flag(
             block.malformed, _BLOCK_MALFORMED
         )
         out.pack(_BLOCK, block_flags, block.rows, block.handle)
-        if block.key is not None:
-            name, columns = block.key
-            out.text(name, MAX_NAME_BYTES, "a table's message")
-            _put_names(out, columns, "a table's columns")
+        if block.layout is not None:
+            out.pack(_U32, block.layout)
         out.text(block.text, MAX_REPLY_BYTES, "rows")
     if outcome.categories is not None:
         out.blob(outcome.categories, MAX_REPLY_BYTES, "the kinds of the rows")
@@ -956,6 +958,7 @@ def _take_outcome(src: _In) -> Outcome:
         frames_read,
         frames_in_range,
         flags,
+        layouts,
     ) = src.unpack(_OUTCOME, "an outcome")
     src.flags(flags, _OUT_FLAGS, "an outcome")
     if not flags & _OUT_START:
@@ -976,6 +979,7 @@ def _take_outcome(src: _In) -> Outcome:
         moved=bool(flags & _OUT_MOVED),
         frames_read=frames_read,
         frames_in_range=frames_in_range,
+        layouts=layouts,
     )
     for _ in range(src.count(MAX_NOTES, "definitions")):
         at = src.pos
@@ -1022,12 +1026,11 @@ def _take_outcome(src: _In) -> Outcome:
     for _ in range(src.count(MAX_BLOCKS, "blocks")):
         block_flags, rows, handle = src.unpack(_BLOCK, "a block")
         src.flags(block_flags, _BLOCK_FLAGS, "a block")
-        key = None
-        if block_flags & _BLOCK_KEY:
-            name = src.text(MAX_NAME_BYTES, "a table's message")
-            key = (name, _take_names(src, "a table's columns"))
+        layout = None
+        if block_flags & _BLOCK_LAYOUT:
+            (layout,) = src.unpack(_U32, "a block's table")
         text = src.text(MAX_REPLY_BYTES, "rows")
-        out.blocks.append(Block(key, bool(block_flags & _BLOCK_MALFORMED), rows, text, handle))
+        out.blocks.append(Block(layout, bool(block_flags & _BLOCK_MALFORMED), rows, text, handle))
     if flags & _OUT_CATEGORIES:
         out.categories = src.blob(MAX_REPLY_BYTES, "the kinds of the rows")
     if flags & _OUT_ORDER:
@@ -1152,20 +1155,50 @@ def diagnostic(text: str) -> str:
 # -- what a reply may claim -------------------------------------------------------------------
 
 
-def layouts_of(codecs: Mapping[str, Codec], *, header_fields: bool) -> frozenset[TableKey]:
-    """Every table a CSV export of ``codecs`` can make: the key (message name, columns) of each
-    message of each codec. The one set a reply's tables are checked against (see
-    :func:`check_reply`), so a name a worker sends is never taken for a table nothing defines."""
-    return frozenset(
+class Layouts:
+    """The tables a CSV export can make, in the one order both sides derive from the same
+    definitions: the distinct keys (message name, columns) of each message of each codec, sorted.
+    A worker names a table of its reply by its index here, so no column name travels and the
+    parent's check is a bounds check; ``digest`` (a CRC-32 of the keys) tells the parent that the
+    worker numbered by the same list. Immutable once made (the index of a key is built when first
+    asked for)."""
+
+    __slots__ = ("_index", "digest", "keys")
+
+    def __init__(self, keys: Iterable[TableKey]) -> None:
+        self.keys: Final[tuple[TableKey, ...]] = tuple(sorted(set(keys)))
+        crc = 0
+        for name, columns in self.keys:
+            crc = zlib.crc32("\0".join((name, *columns)).encode("utf-8", "surrogatepass"), crc)
+            crc = zlib.crc32(b"\1", crc)
+        self.digest: Final[int] = crc
+        self._index: dict[TableKey, int] | None = None
+
+    def __len__(self) -> int:
+        return len(self.keys)
+
+    def index_of(self, key: TableKey) -> int:
+        """The index of ``key``; ``KeyError`` for a table the definitions do not make."""
+        if self._index is None:
+            self._index = {key: i for i, key in enumerate(self.keys)}
+        return self._index[key]
+
+
+NO_LAYOUTS: Final = Layouts(())  # for the formats with one stream of rows
+
+
+def layouts_of(codecs: Mapping[str, Codec], *, header_fields: bool) -> Layouts:
+    """Every table a CSV export of ``codecs`` can make (see :class:`Layouts`), which is all a
+    reply's tables are checked against (see :func:`check_reply`): a worker's table is never
+    taken for one nothing defines."""
+    return Layouts(
         (message.name, table_columns(message, codec, header_fields))
         for codec in codecs.values()
         for message in codec.model.messages
     )
 
 
-def read_reply(
-    job: Job, data: bytes | bytearray | memoryview, layouts: Collection[TableKey]
-) -> Outcome:
+def read_reply(job: Job, data: bytes | bytearray | memoryview, layouts: Layouts) -> Outcome:
     """The outcome a worker's message ``data`` gives for ``job``, whose tables are among
     ``layouts``: the one way the parent reads a reply. Raises :class:`FrameError` for a frame
     :func:`decode` refuses, a worker's :class:`~ironbird.recording.poolmsg.Fault`, any other
@@ -1179,15 +1212,15 @@ def read_reply(
     return reply
 
 
-def check_reply(job: Job, outcome: Outcome, layouts: Collection[TableKey]) -> None:
+def check_reply(job: Job, outcome: Outcome, layouts: Layouts) -> None:
     """Raise :class:`FrameError` unless ``outcome`` answers ``job`` and holds together the way the
     parent applies it: the range asked for; a start where the job says reading starts (an exact
     range always has one, unless it crashed or its file moved) and an end not before it; damage
     and gaps only with the kind of every row; every row kind defined; the tables the format has,
-    each a layout in ``layouts`` (a name from a worker reaches the file system only this way) and
-    at most one block of each; and the lines of the blocks, the rows that made a line and the
-    order of the lines all in agreement. A worker that tells the truth always passes; the rows
-    themselves are the worker's to decode."""
+    each a layout of ``layouts`` by an index in range (a table's name reaches the file system only
+    from the parent's own list), numbered by the same list, and at most one block of each; and the
+    lines of the blocks, the rows that made a line and the order of the lines all in agreement. A
+    worker that tells the truth always passes; the rows themselves are the worker's to decode."""
     if outcome.index != job.index:
         raise FrameError(f"asked for range {job.index}, the answer is for {outcome.index}")
     start = outcome.start
@@ -1210,20 +1243,24 @@ def check_reply(job: Job, outcome: Outcome, layouts: Collection[TableKey]) -> No
     blocks = outcome.blocks
     if shape.fmt is ExportFormat.CSV:
         handles: set[int] = set()
-        keys: set[TableKey] = set()
+        keys: set[int] = set()
         for block in blocks:
-            if block.malformed != (block.key is None) or (block.malformed and not shape.directory):
+            if block.malformed != (block.layout is None) or (
+                block.malformed and not shape.directory
+            ):
                 raise FrameError("a block is not of a table the export has")
-            if block.key is not None:
-                if block.key not in layouts:
+            if block.layout is not None:
+                if block.layout >= len(layouts):
                     raise FrameError("a block is of a table that no definition makes")
-                keys.add(block.key)
+                keys.add(block.layout)
             handles.add(block.handle)
+        if keys and outcome.layouts != layouts.digest:
+            raise FrameError("the worker numbered its tables by other definitions than ours")
         if len(handles) != len(blocks) or len(keys) != len(blocks) - sum(
             b.malformed for b in blocks
         ):
             raise FrameError("two blocks are of one table")
-    elif len(blocks) > 1 or any(b.key is not None or b.malformed or b.handle for b in blocks):
+    elif len(blocks) > 1 or any(b.layout is not None or b.malformed or b.handle for b in blocks):
         raise FrameError(f"a {shape.fmt.value} export has one stream of rows")
     written = [block for block in blocks if block.text]
     if any(block.text[-1] != "\n" for block in written):
@@ -1256,9 +1293,11 @@ __all__ = [
     "MAX_INIT_BYTES",
     "MAX_JOB_BYTES",
     "MAX_REPLY_BYTES",
+    "NO_LAYOUTS",
     "VERSION",
     "FrameError",
     "Kind",
+    "Layouts",
     "Message",
     "check_reply",
     "decode",

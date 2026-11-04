@@ -23,7 +23,7 @@ from ironbird.fsops import read_capped
 from ironbird.header import MAX_PROFILE_FILE_BYTES
 from ironbird.recording import format as fmt
 from ironbird.recording.defs import Blobs, Head, config_codecs, embedded_codecs
-from ironbird.recording.export import ExportFormat, ExportResult, TableKey
+from ironbird.recording.export import ExportFormat, ExportResult
 from ironbird.recording.reader import Damage
 
 if TYPE_CHECKING:
@@ -207,10 +207,11 @@ class Job:
 
 @dataclass(frozen=True, slots=True)
 class Block:
-    """The rows of one table from one range: ``key`` identifies the table (``None``: the malformed
+    """The rows of one table from one range: ``layout`` identifies the table by its index among
+    the export's layouts (:class:`~ironbird.recording.poolframe.Layouts`; ``None``: the malformed
     table, or the only stream of text and JSON Lines), ``text`` has no header row."""
 
-    key: TableKey | None
+    layout: int | None
     malformed: bool
     rows: int
     text: str
@@ -248,6 +249,8 @@ class Outcome:
     """``(rows made before, gaps, frames lost)``: the gap records in range, run together when no
     row came between them."""
     counts: ExportResult = field(default_factory=ExportResult)
+    layouts: int = 0
+    """The digest of the layouts the blocks are numbered by (zero when none is numbered)."""
     blocks: list[Block] = field(default_factory=list)
     categories: bytes | None = None
     """The kind of each row, in the order they were made (``NO_LINE`` set: no line); ``None``

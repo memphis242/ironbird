@@ -104,7 +104,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from multiprocessing import connection, resource_tracker
 from pathlib import Path
@@ -131,7 +131,6 @@ from ironbird.recording.export import (
     Pipeline,
     Selection,
     Table,
-    TableKey,
     make_pipeline,
 )
 from ironbird.recording.format import RecordType
@@ -165,7 +164,9 @@ FIRST_RANGE_DIVISOR: Final = 32  # ranges planned before any width is known are 
 MAX_RANGE_EVENTS: Final = 1000  # damage and gap notes one result carries before the range is cut
 PARENT_WATCH_S: Final = 1.0  # how often a worker looks for its parent
 STOP_WAIT_S: Final = 5.0  # how long terminated workers are waited for before they are killed
-STALL_S: Final = float(DEFAULT_WORKER_STALL_S)  # a busy worker silent this long has stalled
+# A worker that holds work and is silent and idle this long (seconds) has stalled.
+STALL_S: Final = float(DEFAULT_WORKER_STALL_S)
+WATCH_GAP_S: Final = 1.0  # a parent unseen for longer (stopped, or busy elsewhere) is not counted
 ALIGN: Final = fmt.ALIGN
 assert RANGE_BYTES % ALIGN == 0 and MIN_RANGE_BYTES % ALIGN == 0
 assert RESULT_TEXT_CAP <= poolframe.MAX_TEXT_CAP and MAX_RANGE_EVENTS <= poolframe.MAX_EVENT_CAP
@@ -173,7 +174,7 @@ assert RESULT_TEXT_CAP <= poolframe.MAX_TEXT_CAP and MAX_RANGE_EVENTS <= poolfra
 # What a reply to a job can honestly hold, from the job's own caps (see :func:`reply_cap`).
 REPLY_ROW_CHARS: Final = 4 * MIB  # characters of the one row that passes the text cap
 REPLY_NOTE_BYTES: Final = 5 * 1024  # one damage, gap or definition note (a stream is at most 4 KiB)
-REPLY_EXTRA_BYTES: Final = 16 * MIB  # failure and crash texts, the tally, the tables' columns
+REPLY_EXTRA_BYTES: Final = 16 * MIB  # failure and crash texts, the tally
 REPLY_CHARS_BYTES: Final = 5  # per character of rows: 4 as UTF-8, and the order of a line of one
 assert REPLY_ROW_CHARS <= poolframe.MAX_TEXT_CAP
 
@@ -278,6 +279,7 @@ class _Worker:
         process builds its own from ``definitions``."""
         self.codecs = codecs if codecs is not None else definitions.build()
         self._shapes: dict[Shape, tuple[Filter | None, Selection | None]] = {}
+        self._layouts: dict[bool, poolframe.Layouts] = {}  # by ``header_fields``
 
     def _compiled(self, shape: Shape) -> tuple[Filter | None, Selection | None]:
         found = self._shapes.get(shape)
@@ -447,8 +449,16 @@ class _Worker:
             or len(out.definitions) >= job.event_cap
         )
 
-    @staticmethod
-    def _collect(shape: Shape, pipe: Pipeline, dest: _BlockDestination, out: Outcome) -> None:
+    def _layouts_of(self, header_fields: bool) -> poolframe.Layouts:
+        """The tables a CSV export of these codecs makes, as the parent derives them."""
+        found = self._layouts.get(header_fields)
+        if found is None:
+            found = self._layouts[header_fields] = poolframe.layouts_of(
+                self.codecs, header_fields=header_fields
+            )
+        return found
+
+    def _collect(self, shape: Shape, pipe: Pipeline, dest: _BlockDestination, out: Outcome) -> None:
         out.counts = pipe.result
         tables = pipe.tables
         if tables is None:
@@ -461,13 +471,21 @@ class _Worker:
             )
             out.blocks.append(Block(None, False, rows, "".join(dest.parts[0])))
         else:
+            layouts: poolframe.Layouts | None = None
             for table in tables.all:
                 parts = dest.parts[table.handle]
                 text = "".join(parts[1:])  # the first part is the header row
-                if text:
-                    out.blocks.append(
-                        Block(table.key, table is tables.malformed, table.rows, text, table.handle)
-                    )
+                if not text:
+                    continue
+                layout = None
+                if table.key is not None:
+                    if layouts is None:
+                        layouts = self._layouts_of(shape.header_fields)
+                    layout = layouts.index_of(table.key)
+                    out.layouts = layouts.digest
+                out.blocks.append(
+                    Block(layout, table is tables.malformed, table.rows, text, table.handle)
+                )
         if shape.categories or out.damage or out.gap_marks:
             assert pipe.categories is not None
             out.categories = bytes(pipe.categories)
@@ -609,7 +627,7 @@ def make_options(
     text_budget: int = PENDING_TEXT_BUDGET,
     event_cap: int = MAX_RANGE_EVENTS,
     codecs: Mapping[str, Codec] | None = None,
-    stall_s: float = STALL_S,
+    stall_s: float | None = STALL_S,
 ) -> ParallelOptions:
     """The options of an export of ``replay`` with ``jobs`` workers: ``definitions`` says how a
     worker rebuilds the codecs the parent decodes with; the rest repeats what the export was given
@@ -649,7 +667,7 @@ def reply_cap(job: Job) -> int:
     least one character), the kind of each row (one record per 32 bytes of the range at most; a
     range to the end of the file is at most two ranges long), the notes (damage, gaps and
     definitions stop the range at the job's event cap), and a fixed allowance for the failure and
-    crash texts, the tally and the tables' columns. Never more than the cap of any reply
+    crash texts and the tally. Never more than the cap of any reply
     (:data:`~ironbird.recording.poolframe.MAX_REPLY_BYTES`)."""
     assert 1 <= job.text_cap <= poolframe.MAX_TEXT_CAP
     assert 1 <= job.event_cap <= poolframe.MAX_EVENT_CAP
@@ -685,7 +703,7 @@ class Ticket:
 
     __slots__ = ("cancelled", "data", "error", "job", "layouts", "outcome", "reply_cap")
 
-    def __init__(self, job: Job, data: bytes, layouts: Collection[TableKey]) -> None:
+    def __init__(self, job: Job, data: bytes, layouts: poolframe.Layouts) -> None:
         self.job = job
         self.data: bytes | None = data  # the job as sent; dropped once handed to the worker's pipe
         self.layouts = layouts  # the tables the answer may hold (see ``poolframe.check_reply``)
@@ -785,6 +803,8 @@ class _Outbox:
 
     __slots__ = ("_fd", "_offset", "_pieces", "unsent")
 
+    CHUNK: Final = _Inbox.CHUNK  # the most one write takes, so one call is short whatever is queued
+
     def __init__(self, fd: int) -> None:
         self._fd = fd
         self._pieces: deque[bytes] = deque()
@@ -800,13 +820,16 @@ class _Outbox:
 
     def flush(self, until: float) -> int:
         """Write what the pipe takes, at least one attempt and then until the clock reaches
-        ``until``; the bytes written. Raises :class:`OSError` if the worker's end is closed."""
+        ``until`` (each write at most :attr:`CHUNK` bytes); the bytes written. Raises
+        :class:`OSError` if the worker's end is closed."""
         pieces = self._pieces
         written = 0
         while pieces:
             piece = pieces[0]
             try:
-                count = os.write(self._fd, memoryview(piece)[self._offset :])
+                count = os.write(
+                    self._fd, memoryview(piece)[self._offset : self._offset + self.CHUNK]
+                )
             except BlockingIOError:
                 break
             written += count
@@ -820,15 +843,49 @@ class _Outbox:
         return written
 
 
+@dataclass(frozen=True, slots=True)
+class _Probe:
+    """What ``/proc/<pid>/stat`` says of a worker: its state letter (``T``: stopped) and the CPU
+    time it has used, in clock ticks (user and system)."""
+
+    state: str
+    ticks: int
+
+
+def parse_stat(text: str) -> _Probe | None:
+    """The state and CPU time (fields 3, 14 and 15) in the text of a ``/proc/<pid>/stat`` line, or
+    ``None`` for a line that does not have them. The command name (field 2) may hold anything,
+    parentheses included, so the fields are counted from the last closing parenthesis."""
+    fields = text.rpartition(")")[2].split()
+    try:
+        return _Probe(fields[0], int(fields[11]) + int(fields[12]))
+    except (IndexError, ValueError):
+        return None
+
+
+def probe(pid: int) -> _Probe | None:
+    """The state and CPU time of our own child ``pid``, or ``None`` where they cannot be read (no
+    ``/proc``, or the process is gone). The child is the same user's, so no privilege is needed."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat:
+            text = stat.read(4096).decode("ascii", "replace")
+    except OSError:
+        return None
+    return parse_stat(text)
+
+
 class _Slot:
     """A worker process and the non-blocking pipe to it: the tickets sent to it and not yet
     answered, oldest first (a worker answers in the order it was asked), the reply being received
     and the messages not yet written. ``progress``: when the pipe last moved a byte either way, or
-    the worker was last given work (:meth:`WorkerPool._check_stall`)."""
+    the worker was last given work, or the worker was last seen using CPU time (see
+    :meth:`WorkerPool._check_stall`); ``cpu``: the worker's CPU time (clock ticks) when it had been
+    silent for half the limit, to tell later whether it has been working since, and ``cpu_at``
+    when that was."""
 
-    __slots__ = ("conn", "inbox", "outbox", "process", "progress", "sent")
+    __slots__ = ("conn", "cpu", "cpu_at", "inbox", "outbox", "process", "progress", "sent")
 
-    def __init__(self, process: Any, conn: connection.Connection) -> None:
+    def __init__(self, process: Any, conn: connection.Connection, now: float) -> None:
         self.process = process
         self.conn = conn
         fd = conn.fileno()
@@ -836,7 +893,19 @@ class _Slot:
         self.inbox = _Inbox(fd)
         self.outbox = _Outbox(fd)
         self.sent: deque[Ticket] = deque()
-        self.progress = time.monotonic()
+        self.progress = now
+        self.cpu: int | None = None
+        self.cpu_at = now
+
+    def moved(self, now: float) -> None:
+        """The pipe moved a byte, or the worker was given work or seen working, at ``now``."""
+        self.progress = now
+        self.cpu = None
+
+    def defer(self, gap: float, now: float) -> None:
+        """The parent was not watching for ``gap`` seconds, which the worker's silence does not
+        count."""
+        self.moved(min(now, self.progress + gap))
 
 
 class WorkerPool:
@@ -851,7 +920,8 @@ class WorkerPool:
     and never blocks on one: they are non-blocking, each with an inbox and an outbox, and
     :meth:`poll` waits for readable and writable pipes together in short slices, so a shutdown
     signal is acted on between two whatever a worker does. A worker that holds work and moves no
-    byte either way for ``stall_s`` seconds has stalled, which ends the pool as a death does."""
+    byte either way, and uses no CPU time, for ``stall_s`` seconds has stalled, which ends the pool
+    as a death does (``None``: never)."""
 
     #: Jobs sent to a worker and not yet answered: the one running and one ready behind it, so a
     #: worker that finishes starts at once instead of after the parent has seen its result.
@@ -860,11 +930,20 @@ class WorkerPool:
     #: job never waits in an outbox behind another message to a worker that is busy.
     AHEAD_BYTES: Final = 16 * 1024
 
-    def __init__(self, definitions: Definitions, jobs: int, *, stall_s: float = STALL_S) -> None:
-        assert 1 <= jobs <= MAX_JOBS and stall_s > 0
+    def __init__(
+        self,
+        definitions: Definitions,
+        jobs: int,
+        *,
+        stall_s: float | None = STALL_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        assert 1 <= jobs <= MAX_JOBS and (stall_s is None or stall_s > 0)
         self.definitions = definitions
         self.jobs = jobs
         self.stall_s = stall_s
+        self.clock = clock  # monotonic seconds; a test supplies its own
+        self._seen = clock()  # when the parent last looked at the pool (see :meth:`_watch`)
         self._slots: list[_Slot] = []
         self._queued: deque[Ticket] = deque()  # submitted, not yet sent to a worker
         self._error: IronbirdError | None = None
@@ -873,10 +952,11 @@ class WorkerPool:
 
     # -- the tickets --
 
-    def submit(self, job: Job, layouts: Collection[TableKey]) -> Ticket:
+    def submit(self, job: Job, layouts: poolframe.Layouts) -> Ticket:
         """Queue ``job`` and hand it to a worker as soon as one can take it (starting a worker
         when all those running are busy and fewer than ``jobs`` exist). ``layouts``: the tables
-        the answer may hold (a CSV export's: :func:`poolframe.layouts_of`; empty for none)."""
+        the answer may hold (a CSV export's: :func:`poolframe.layouts_of`; ``NO_LAYOUTS`` for
+        none)."""
         if self._error is not None:
             raise self._error
         try:
@@ -902,7 +982,8 @@ class WorkerPool:
         self._dispatch()
         if self._error is not None:
             return
-        with selectors.DefaultSelector() as selector:
+        self._watch(self.clock())
+        with selectors.PollSelector() as selector:  # needs no descriptor of its own
             for slot in self._slots:
                 wanted = (selectors.EVENT_READ if slot.sent else 0) | (
                     selectors.EVENT_WRITE if slot.outbox.unsent else 0
@@ -912,37 +993,53 @@ class WorkerPool:
             if not selector.get_map():
                 return
             ready = selector.select(timeout)
+        self._watch(self.clock(), timeout)
         share = WAIT_SLICE_S / max(1, len(ready))
         for key, events in ready:
             if self.broken:
                 break
             slot = key.data
+            until = time.monotonic() + share  # for both directions of this pipe
             if events & selectors.EVENT_WRITE:
-                self._send(slot, time.monotonic() + share)
-            if events & selectors.EVENT_READ and not self.broken:
-                self._receive(slot, share)
-        self._check_stall()
+                self._send(slot, until)
+            if events & selectors.EVENT_READ and slot.sent and not self.broken:
+                self._receive(slot, until)
+        now = self.clock()
+        self._watch(now)
+        self._check_stall(now)
         self._dispatch()
 
+    def _watch(self, now: float, allowed: float = 0.0) -> None:
+        """Note that the parent looked at the pool at ``now``. The parent may not have, for longer
+        than ``allowed`` (a wait it asked for) and a second or so: it was stopped (Ctrl-Z, a
+        debugger, ``SIGSTOP``, a frozen cgroup, and its workers with it, while the clock went on),
+        or it was busy elsewhere. That time is not the workers' silence: every worker's clock is
+        moved on by it."""
+        gap = now - self._seen - allowed
+        self._seen = now
+        if gap > WATCH_GAP_S:
+            for slot in self._slots:
+                slot.defer(gap, now)
+
     def _send(self, slot: _Slot, until: float) -> None:
-        """Write what ``slot``'s pipe takes of the messages for its worker (until ``until`` at
-        the latest); an end that has closed is a worker that died."""
+        """Write what ``slot``'s pipe takes of the messages for its worker (until ``until`` on the
+        monotonic clock at the latest); an end that has closed is a worker that died."""
         try:
             written = slot.outbox.flush(until)
         except OSError as exc:  # the worker is gone
             self._fail(self.died(exc))
             return
         if written:
-            slot.progress = time.monotonic()
+            slot.moved(self.clock())
 
-    def _receive(self, slot: _Slot, budget: float) -> None:
-        """Take what ``slot``'s worker has sent of its next answer, for up to ``budget`` seconds (a
-        worker that stops part way through a message is not waited for: the caller's loop goes
-        on, and its checkpoints act on a signal). The answer is untrusted: its length is checked
-        against what the job can have, then it is read only by :func:`poolframe.read_reply`, and
-        anything it refuses ends the pool as a worker that died does."""
+    def _receive(self, slot: _Slot, deadline: float) -> None:
+        """Take what ``slot``'s worker has sent of its next answer, until ``deadline`` on the
+        monotonic clock (a worker that stops part way through a message is not waited for: the
+        caller's loop goes on, and its checkpoints act on a signal). The answer is untrusted: its
+        length is checked against what the job can have, then it is read only by
+        :func:`poolframe.read_reply`, and anything it refuses ends the pool as a worker that died
+        does."""
         ticket = slot.sent[0]  # a worker answers in the order it was asked
-        deadline = time.monotonic() + budget
         while True:
             try:
                 data = slot.inbox.take(ticket.reply_cap)
@@ -956,11 +1053,10 @@ class WorkerPool:
             except (EOFError, OSError) as exc:
                 self._fail(self.died(exc))
                 return
-            now = time.monotonic()
-            slot.progress = now
+            slot.moved(self.clock())
             if data is not None:
                 break
-            if now >= deadline:
+            if time.monotonic() >= deadline:
                 return
         try:
             reply = poolframe.read_reply(ticket.job, data, ticket.layouts)
@@ -971,20 +1067,37 @@ class WorkerPool:
             return
         slot.sent.popleft()
         if slot.sent:
-            slot.progress = now  # the next job is waited for from here
+            slot.moved(self.clock())  # the next job is waited for from here
         if not ticket.cancelled:
             ticket.outcome = reply
 
-    def _check_stall(self) -> None:
-        """End the pool if a worker that holds work has moved no byte of its pipe, either way,
-        for ``stall_s`` seconds. (A worker that is busy decoding a range moves none until it
-        replies, so the limit is far above the longest a range takes.)"""
-        if self._error is not None:
+    def _check_stall(self, now: float) -> None:
+        """End the pool if a worker that holds work has been silent and idle for ``stall_s``
+        seconds: it has moved no byte of its pipe, either way, and used no CPU time. A worker
+        decoding a range moves no byte until it replies, however long the range takes, so its CPU
+        time says whether it is working: it is read once when the silence is half the limit, and
+        again at the limit, and a worker that used any in between has not stalled (its clock
+        starts again). Only a worker with nothing left unsent is given that: one that does not
+        read what it is sent is not working on it. Where the CPU time cannot be read the silence
+        alone decides."""
+        limit = self.stall_s
+        if limit is None or self._error is not None:
             return
-        now = time.monotonic()
         for slot in self._slots:
-            if slot.sent and now - slot.progress >= self.stall_s:
-                self._fail(self._stalled(slot, now - slot.progress))
+            idle = now - slot.progress
+            if not slot.sent or idle < limit / 2:
+                continue
+            seen = probe(slot.process.pid) if slot.process is not None else None
+            if seen is not None and not slot.outbox.unsent:
+                if slot.cpu is None:
+                    slot.cpu, slot.cpu_at = seen.ticks, now  # the baseline
+                elif seen.ticks > slot.cpu:
+                    slot.moved(now)
+                    continue
+                if now - slot.cpu_at < limit / 2:
+                    continue  # not watched for long enough to say it does nothing
+            if idle >= limit:
+                self._fail(self._stalled(slot, idle, seen, limit))
                 return
 
     def _fail(self, error: IronbirdError) -> None:
@@ -1009,17 +1122,27 @@ class WorkerPool:
             cause=exc,
         )
 
-    def _stalled(self, slot: _Slot, idle: float) -> IronbirdError:
-        """The error for a worker that holds work and has moved no byte for ``idle`` seconds."""
+    def _stalled(
+        self, slot: _Slot, idle: float, seen: _Probe | None, limit: float
+    ) -> IronbirdError:
+        """The error for a worker that holds work and has been silent and idle for ``idle``
+        seconds: ``seen`` says whether it is stopped (``T``)."""
         pid = getattr(slot.process, "pid", None)
+        setting = f"[export] worker_stall = {limit:g} s"
+        stopped = seen is not None and seen.state in ("T", "t")
+        what = "was stopped and made" if stopped else "made"
+        state = (
+            f"state {seen.state}, {seen.ticks} CPU ticks" if seen is not None else "state unknown"
+        )
         return IronbirdError(
             Code.EXP_WORKER,
-            f"an export worker made no progress for {idle:.0f} s (stopped or hung); run the export "
+            f"an export worker {what} no progress for {idle:.0f} s ({setting}); run the export "
             "again, or with --jobs 1 to decode in one process",
             details=(
-                f"worker pid {pid}: {len(slot.sent)} job(s) outstanding, {slot.outbox.unsent} "
-                f"bytes not yet taken by it, {slot.inbox.held()} bytes of a reply held; the "
-                f"limit is {self.stall_s:g} s ([export] worker_stall)"
+                f"worker pid {pid} ({state}): {len(slot.sent)} job(s) outstanding, "
+                f"{slot.outbox.unsent} bytes not yet taken by it, {slot.inbox.held()} bytes of a "
+                f"reply held; it moved no byte and used no CPU time for the {setting} "
+                '(a longer range needs a larger value, or "unlimited")'
             ),
         )
 
@@ -1049,7 +1172,7 @@ class WorkerPool:
                 return
             queued.popleft()
             if not slot.sent:
-                slot.progress = time.monotonic()  # the worker is waited for from now
+                slot.moved(self.clock())  # the worker is waited for from now
             slot.outbox.put(ticket.data)
             ticket.data = None
             slot.sent.append(ticket)
@@ -1103,7 +1226,7 @@ class WorkerPool:
         finally:
             if theirs is not None:
                 theirs.close()  # the worker holds the only other copy: its death is our end of file
-        slot = _Slot(process, ours)
+        slot = _Slot(process, ours, self.clock())
         self._slots.append(slot)  # ended by close() whatever happens next
         slot.outbox.put(self._greeting)  # written by the first :meth:`_send`, with the first job
         return slot
@@ -1178,10 +1301,10 @@ class ParallelOptions:
     text_budget: int = PENDING_TEXT_BUDGET
     event_cap: int = MAX_RANGE_EVENTS
     codecs: Mapping[str, Codec] | None = field(default=None, compare=False, repr=False)
-    stall_s: float = STALL_S
+    stall_s: float | None = STALL_S
 
     def __post_init__(self) -> None:
-        assert 1 <= self.jobs <= MAX_JOBS and self.stall_s > 0
+        assert 1 <= self.jobs <= MAX_JOBS and (self.stall_s is None or self.stall_s > 0)
         assert self.range_bytes >= MIN_RANGE_BYTES and self.range_bytes % ALIGN == 0
         assert self.text_cap >= 1 and self.text_budget >= 1 and self.event_cap >= 1
         assert self.text_cap <= poolframe.MAX_TEXT_CAP and self.event_cap <= poolframe.MAX_EVENT_CAP
@@ -1303,7 +1426,7 @@ class _Runner:
         self._moved = False  # the file is no longer under its name: this process reads it all
         self._local: _Worker | None = None
         self._codec_map: Mapping[str, Codec] | None = None
-        self._layout_set: frozenset[TableKey] | None = None
+        self._layout_set: poolframe.Layouts | None = None
         self._largest = 0  # an estimate of the most text a running range will return
         self._ratio = 0.0  # an estimate of the characters of text a byte of the file makes
 
@@ -1586,7 +1709,7 @@ class _Runner:
                 ) from exc
         return self._codec_map
 
-    def _layouts(self) -> frozenset[TableKey]:
+    def _layouts(self) -> poolframe.Layouts:
         """The tables a worker's answer may hold (once): every layout the codecs make for a CSV
         export, none for the formats that have one stream of rows."""
         if self._layout_set is None:
@@ -1594,7 +1717,7 @@ class _Runner:
             self._layout_set = (
                 poolframe.layouts_of(self._codecs(), header_fields=shape.header_fields)
                 if shape.fmt is ExportFormat.CSV
-                else frozenset()
+                else poolframe.NO_LAYOUTS
             )
         return self._layout_set
 
@@ -1665,8 +1788,8 @@ class _Runner:
                 handle = table.handle
                 table.rows += block.rows
             else:
-                assert block.key is not None
-                table = tables.table_for(*block.key)
+                assert block.layout is not None
+                table = tables.table_for(*self._layouts().keys[block.layout])
                 handle = table.handle
                 table.rows += block.rows
             self._dest.write(handle, block.text)
@@ -1723,8 +1846,8 @@ class _Runner:
         if block.malformed:
             assert tables.malformed is not None
             return tables.malformed.handle, tables.malformed
-        assert block.key is not None
-        table = tables.table_for(*block.key)
+        assert block.layout is not None
+        table = tables.table_for(*self._layouts().keys[block.layout])
         return table.handle, table
 
 

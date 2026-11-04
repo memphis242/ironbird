@@ -547,7 +547,7 @@ def test_the_pool_and_the_helpers_it_starts_are_made_with_the_shutdown_signals_b
     pool = pexport.WorkerPool(definitions, 2)
     try:
         # a job that no worker will accept is enough to start one
-        ticket = pool.submit(job_of(), frozenset())
+        ticket = pool.submit(job_of(), pexport.poolframe.NO_LAYOUTS)
         assert ticket is not None
     finally:
         pool.close(abnormal=True)
@@ -574,8 +574,8 @@ job = pexport.Job(0, Path("x"), 0, None, True, pexport.Seed({}, {}, 0, 0), None,
     pexport.Shape(pexport.ExportFormat.TEXT, None, frozenset(), None, (), False, False, False,
                   False), (0, 0), 1, 1)
 try:
-    pool.submit(job, frozenset())
-    pool.submit(job, frozenset())
+    pool.submit(job, pexport.poolframe.NO_LAYOUTS)
+    pool.submit(job, pexport.poolframe.NO_LAYOUTS)
 finally:
     pool.close(abnormal=True)
 json.dump(seen, sys.stdout)

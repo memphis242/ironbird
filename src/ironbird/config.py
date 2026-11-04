@@ -267,9 +267,10 @@ DEFAULT_POOL_MIN_BYTES: Final = 8 * MIB
 DEFAULT_RANGE_BYTES: Final = 4 * MIB
 MIN_RANGE_BYTES: Final = 4096
 MAX_RANGE_BYTES: Final = 256 * MIB
-#: How long an export worker that holds work may move no byte of its pipe before it has stalled
-#: (the export then ends with IB-EXP-003). A worker decoding a range moves none until it replies,
-#: so this is far above the longest a range takes (a 4 MiB range takes seconds).
+#: How long an export worker that holds work may move no byte of its pipe and use no CPU time
+#: before it has stalled (the export then ends with IB-EXP-003). A worker decoding a range moves
+#: no byte until it replies but uses CPU time, which counts as progress; ``"unlimited"`` never
+#: ends the export for a silent worker.
 DEFAULT_WORKER_STALL_S: Final = 300
 MIN_WORKER_STALL_S: Final = 10
 MAX_WORKER_STALL_S: Final = 86400
@@ -282,12 +283,13 @@ class ExportConfig:
     size of the recording (all its parts) from which workers are used; ``range_bytes``, how much
     of the file a worker takes at a time (smaller ranges balance better and use less memory,
     larger ones hand off less often); ``worker_stall_s``, how long a worker that holds work may
-    move no byte of its pipe before the export ends instead of waiting for it."""
+    move no byte of its pipe and use no CPU time before the export ends instead of waiting for it
+    (``None``: never)."""
 
     jobs: int | None = None
     pool_min_bytes: int = DEFAULT_POOL_MIN_BYTES
     range_bytes: int = DEFAULT_RANGE_BYTES
-    worker_stall_s: int = DEFAULT_WORKER_STALL_S
+    worker_stall_s: int | None = DEFAULT_WORKER_STALL_S
 
 
 @dataclass(frozen=True, slots=True)
@@ -760,8 +762,9 @@ def _parse_export(ctx: _Ctx, raw: object) -> ExportConfig:
         MIN_WORKER_STALL_S,
         MAX_WORKER_STALL_S,
         defaults.worker_stall_s,
+        unlimited=True,
     )
-    assert pool_min is not None and span is not None and stall is not None
+    assert pool_min is not None and span is not None
     if span % 8:
         raise ctx.fail("export.range_bytes", "must be a multiple of 8 bytes")
     return ExportConfig(

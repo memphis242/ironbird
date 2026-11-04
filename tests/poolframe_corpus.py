@@ -69,7 +69,7 @@ JOB = Job(
     10,
 )
 #: The tables the definitions of :data:`JOB` make: what a reply's tables are checked against.
-LAYOUTS = frozenset({("HK_TLM", ("seq", "CmdCounter"))})
+LAYOUTS = pf.Layouts([("HK_TLM", ("seq", "CmdCounter"))])
 REASON = "FRAME record fails its CRC"
 ROWS = "1,2\n3,4\n"
 
@@ -104,9 +104,10 @@ def outcome() -> Outcome:
             per_table={"HK_TLM": 2},
         ),
         blocks=[
-            Block(("HK_TLM", ("seq", "CmdCounter")), False, 2, ROWS, 1),
+            Block(0, False, 2, ROWS, 1),
             Block(None, True, 1, "5,6\n", 0),
         ],
+        layouts=LAYOUTS.digest,
         categories=bytes([0, 1, 0x80 | 2, 0]),
         order=array.array("I", [1, 0, 1]),
     )
@@ -195,7 +196,7 @@ def cases() -> dict[str, bytes]:
     case("rows-length-huge", _replace_once(good, _length_prefixed(ROWS), huge))
     lying = struct.pack("<I", len(ROWS) + 400) + ROWS.encode()
     case("rows-length-past-end", _replace_once(good, _length_prefixed(ROWS), lying))
-    zeros = pf._OUTCOME.pack(7, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    zeros = pf._OUTCOME.pack(7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     case(
         "definitions-over-cap",
         _frame(pf.Kind.OUTCOME, zeros + struct.pack("<I", pf.MAX_NOTES + 1)),
@@ -212,7 +213,7 @@ def cases() -> dict[str, bytes]:
     case("reason-overlong", _replace_once(good, REASON.encode(), b"\xc0\xaf" + b"x" * 24))
     case("reason-cut-sequence", _replace_once(good, REASON.encode(), b"x" * 24 + b"\xe2\x82"))
     # fixed fields, flags and code tables
-    flags_at = pf.HEADER.size + pf._OUTCOME.size - 2
+    flags_at = pf.HEADER.size + pf._OUTCOME.size - 6  # the flags, then the layouts digest
     (flags,) = struct.unpack_from("<H", good, flags_at)
     case(
         "undefined-flags",
@@ -261,20 +262,14 @@ def cases() -> dict[str, bytes]:
         "two-blocks-one-key",
         blocks=[bad.blocks[0], bad.blocks[1], dataclasses.replace(bad.blocks[0], handle=7)],
     )
+    semantic("block-of-undefined-table", blocks=[Block(1, False, 2, ROWS, 1), bad.blocks[1]])
     semantic(
-        "block-of-undefined-table",
-        blocks=[
-            Block(("../../escaped", ("seq", "CmdCounter")), False, 2, ROWS, 1),
-            bad.blocks[1],
-        ],
+        "block-of-table-index-huge", blocks=[Block(0xFFFFFFFF, False, 2, ROWS, 1), bad.blocks[1]]
     )
-    semantic(
-        "block-of-undefined-layout",
-        blocks=[Block(("HK_TLM", ("seq", "Other")), False, 2, ROWS, 1), bad.blocks[1]],
-    )
+    semantic("blocks-numbered-by-other-definitions", layouts=LAYOUTS.digest ^ 1)
     semantic(
         "malformed-block-with-key",
-        blocks=[bad.blocks[0], dataclasses.replace(bad.blocks[1], key=("x", ()))],
+        blocks=[bad.blocks[0], dataclasses.replace(bad.blocks[1], layout=0)],
     )
     return out
 

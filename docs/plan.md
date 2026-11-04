@@ -4067,20 +4067,43 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   calling thread only, never blocking on one: its end of each pipe is non-blocking, with an outbox
   (the definitions greeting and the jobs, queued by reference and written as far as the pipe takes
   them) and an inbox (a per-worker assembler of the length-prefixed reply). It waits for readable and
-  writable pipes together (`selectors`) in 50 ms slices, one slice shared by the pipes that are
-  ready (so a poll cannot outlast a signal by the number of workers times the slice), and moves only
-  what a pipe takes or holds. A worker that stays alive and stops reading, or stops part way through a
-  reply (stopped, wedged or hostile), therefore costs the parent nothing beyond a slice and cannot keep
-  it from acting on SIGINT or SIGTERM, in either direction and for the greeting too. The length of a
+  writable pipes together (`selectors.PollSelector`, which makes no descriptor of its own, so a
+  directory export that has used up the descriptor limit cannot fail in a poll) in 50 ms slices, one
+  slice shared by the pipes that are ready, one share for both directions of a pipe, and moves only
+  what a pipe takes or holds: each write is at most 256 KiB and each read at most 256 KiB, with the
+  share's deadline looked at between two. A worker that stays alive and stops reading, or stops part
+  way through a reply (stopped, wedged or hostile), therefore costs the parent nothing beyond a
+  slice and cannot keep it from acting on SIGINT or SIGTERM, in either direction and for the
+  greeting too. The bound is a slice plus, for each ready worker, the time of one capped write and
+  one capped read (a fraction of a millisecond each) and, when a reply becomes whole in that poll,
+  of decoding and checking it; it is not exactly the slice. (Measured, 8 workers that drain
+  everything and flood a reply, 3 s of polls: the longest poll was 23-54 ms (174-518 ms before writes were capped and a pipe got one share), and 27-55 ms in honest runs of 1, 4 and 8 workers with greetings of 1 to 32 MiB; a host load of about 10 on 4 cores.) The length of a
   reply is checked before a body byte is held, against the cap of the job it answers (`reply_cap`: the
   job's `text_cap` at 5 bytes a character plus the row that passes it, one record per 32 bytes of
   the range for the row kinds, the `event_cap` notes and a fixed allowance for diagnostics; never
   more than the 128 MiB of any reply), so a stalled reply holds no more than the job could honestly
-  have made. A worker that holds work and moves no byte of its pipe, either way, for `[export]
-  worker_stall` (5 minutes; 10 s to 24 h; a worker decoding a range moves none until it replies, so
-  the default is far above the seconds a 4 MiB range takes) has stalled: the export ends with
-  `IB-EXP-003` ("an export worker made no progress for 300 s (stopped or hung); ..."; the worker, its
-  jobs and the unsent and held bytes are in the details). Until then the export waits, and a
+  have made. A worker that holds work and has been silent and idle for `[export] worker_stall`
+  (5 minutes; 10 s to 24 h, or `"unlimited"`) has stalled: it has moved no byte of its pipe,
+  either way, and used no CPU time. A worker decoding a range moves no byte until it replies, and
+  a range may take minutes (a 256 MiB range of a filter that decodes every frame and matches almost
+  none takes about 73 s on an idle core, four times that on a busy one), so the parent reads the
+  worker's CPU time (`/proc/<pid>/stat`, the parent's own child, no privilege) once when the
+  silence is half the limit and again after, and CPU time used in between counts as progress and
+  starts the clock again; it counts only for a worker with nothing left unsent (one that spins
+  instead of reading what it is sent is not working on it), and where `/proc` cannot be read the
+  silence alone decides. The limit is on silence, not on progress toward a reply: a worker that
+  trickles one byte inside every window is never stalled, nor is one that spins forever (the
+  export stays interruptible, and `"unlimited"` removes the limit for a user who wants that
+  everywhere). Time the parent was not watching is not silence: Ctrl-Z, `SIGSTOP`, a debugger or a
+  frozen cgroup stop the parent and its workers together while the monotonic clock goes on, and the
+  first poll after `fg` would find every busy worker "silent" for the whole stop. The pool notes
+  when it last looked (before a wait, after it, and at the end of each poll); a gap of more than
+  a second beyond the wait the caller asked for moves every worker's clock forward by it (a parent
+  busy elsewhere for that long also gets the grace, which can only delay noticing a hung
+  worker). The export ends with `IB-EXP-003` ("an export worker made no progress for 300 s
+  ([export] worker_stall = 300 s); run the export again, or with --jobs 1 ...", or "was stopped
+  and made no progress" for a worker in state `T`; the worker, its state and CPU ticks, its jobs and
+  the unsent and held bytes are in the details). Until then the export waits, and a
   signal always ends the wait. There is no manager thread and no queue shared
   between workers. (Found in review: the executor this replaced had a manager thread that read the
   results; after the export terminated its workers part way through sending a result, that thread
@@ -4129,19 +4152,21 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   `--from`/`--to` bounds travel as signed 16-byte integers (every instant of years 1 to 9999 and
   more), not 64-bit ones. The tally's `rejected` keys are error codes (the same table as a
   failure's code, at most one entry per code), so a worker cannot grow the parent's counter.
-  4 Mi items is enough for any honest range (a table costs two items per column, a range holds
-  at most one table per message of the definitions): a range of a definition set so large that
-  its tables pass it ends the export with `IB-EXP-003` and that reason, as a limit of the format
-  and not a malformed reply. A
+  4 Mi items is more than any frame can reach (every list is capped far below it, and a table
+  costs one item, its text), so the budget is a backstop; the tests lower it. A
   worker is spawned with only its pipe and the parent's pid; the definitions are the pipe's first
   frame (encoded once per pool). The parent reads a reply only through `read_reply`, which decodes
   it, refuses a fault or any other type, and checks it against the job (`check_reply`): the range
   asked for, a start where the job reads from and an end not before it, a cut that moves on,
   damage and gaps only with the kinds of the rows, every row kind defined, the tables the format
   has (one stream for text and JSON Lines, a malformed table only in a directory export, one block
-  per table by handle and by key, and each table's key (message name, columns) a layout the
-  export's codecs make, `poolframe.layouts_of`, so a name from a worker never reaches the file
-  system), and the lines of the blocks, the rows that made a line and the order of the lines in
+  per table by handle and by layout, and each table named by a u32 index into the export's
+  layouts (`poolframe.Layouts`: the distinct (message name, columns) keys the export's codecs
+  make, sorted; the parent and every worker derive the same list from the same definitions, so no
+  column name travels, the check is a bounds check, and a name from a worker never reaches the
+  file system; the outcome also carries a CRC-32 of the worker's list, which must equal the
+  parent's, so a worker that numbered its tables by other definitions is `IB-EXP-003`, not other
+  files), and the lines of the blocks, the rows that made a line and the order of the lines in
   agreement; then the walk checks it as before. A worker answers a message it cannot read with a
   fault and ends; a result it cannot frame becomes a crash outcome. Error text sent back is made
   sendable (`diagnostic`: lone surrogates as their `\udcXX` escape, what the display shows anyway;
@@ -4157,7 +4182,7 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   replies; the parent's pool on a fake worker: garbage, a fault, a job, the wrong range and a
   length over the cap are `IB-EXP-003` and a truthful reply reaches its ticket; a worker answers an
   unreadable message with a fault; a worker that sends part of a reply and stops, or dies, or
-  sends it in pieces, is never waited for), the corpus `tests/corpus/malformed/poolframe-*.bin` (45 replies,
+  sends it in pieces, is never waited for; `tests/test_export_pool_stall.py`: the stall limit), the corpus `tests/corpus/malformed/poolframe-*.bin` (46 replies,
   built by `tests/poolframe_corpus.py`, each refused), and the nightly atheris harness
   `tools/fuzz/fuzz_poolframe.py`. Found while replacing it, each a test that fails on the code
   before: (1) a worker's crash outcome (a job that raised, or definitions a worker cannot build,
@@ -4187,7 +4212,18 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   worker: the cap is the job's; (12) a stalled worker stalled the export forever, without a word:
   `[export] worker_stall` ends it with `IB-EXP-003`; (13) `layouts` defaulted to none on `submit` and
   `Ticket`, which refused every CSV reply of a caller that forgot it, blaming the worker: it is
-  required.
+  required. Found in the third review, each a test that fails on the code before (except (15), a throughput finding measured instead): (14) the stall
+  limit ended honest exports: after Ctrl-Z (the monotonic clock ran while the parent and its
+  workers were stopped; `fg` found every worker "silent" for the whole stop) and when a range took
+  longer than the limit to decode (no byte moves until a range is done); the pool does not count
+  time it was not watching, and a worker using CPU time is working (see above; the message names
+  `[export] worker_stall`, and `"unlimited"` is accepted); (15) a CSV export of thousands of wide
+  tables was about 50% slower than main (`--jobs 4`: 93-104 s against 65 s),
+  99 of the parent's 182 profiled seconds in decoding each reply's table keys one column name at a
+  time (26M names): a block now names its table by an index into the layouts both sides derive (the same export: the parent's own CPU 7.1-7.7 s against main's 11.1-13.0 s, wall 76-85 s against 72-97 s on a host loaded to 10-16 on 4 cores, identical output trees);
+  (16) one write of a large buffer to a worker that drains could copy tens of MiB in one call and
+  a pipe ready both ways was served for two shares: writes are capped at 256 KiB and a pipe gets
+  one share for both; (17) every poll made an epoll descriptor: `PollSelector`.
 - **When the pool is used.** `--jobs N` (1..64) beats `[export] jobs`, which beats the default of one
   worker per core the process may run on (its CPU affinity and the `cpu.max` quota of its cgroup v2
   group and the groups above it, rounded up; a group that cannot be examined, such as `EACCES`, is no
@@ -4344,7 +4380,7 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
 | `IB-FLT-004` | `FLT_LIMIT` | filter too long, deep or wide | 2f |
 | `IB-EXP-001` | `EXP_WRITE` | cannot write export output | 2h |
 | `IB-EXP-002` | `EXP_EXISTS` | export output exists (pass `--force`), is the input, or is a file retention manages (`--force` does not apply to these two) | 2h |
-| `IB-EXP-003` | `EXP_WORKER` | an export worker process died (killed, out of memory), made no progress for `[export] worker_stall` (stopped or hung), failed to return a result, or could not be started; the message says to run again or with `--jobs 1`; the cause or traceback is in the ledger | 2m |
+| `IB-EXP-003` | `EXP_WORKER` | an export worker process died (killed, out of memory), made no progress for `[export] worker_stall` (no byte moved and no CPU time used: stopped or hung), failed to return a result, or could not be started; the message says to run again or with `--jobs 1`; the cause or traceback is in the ledger | 2m |
 | `IB-DEC-008` | `DEC_COUNT` | variable-length count above the CCDD maximum | 2j |
 | `IB-DEC-009` | `DEC_OVERRUN` | variable-length data runs past the packet end | 2j |
 

@@ -143,24 +143,29 @@ def test_a_message_longer_than_its_type_may_be_is_refused_unread() -> None:
 
 
 def test_counts_over_their_caps_are_refused_before_anything_is_made() -> None:
-    zeros = pf._OUTCOME.pack(7, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    zeros = pf._OUTCOME.pack(7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     for count in (pf.MAX_NOTES + 1, 0xFFFFFFFF):
         body = zeros + struct.pack("<I", count)
         frame = pf.HEADER.pack(pf.MAGIC, pf.VERSION, pf.Kind.OUTCOME, 0, len(body)) + body
         assert "more than" in refused(frame).reason
 
 
-def _many_small_items() -> Outcome:
-    """An outcome of tables with so many columns that its items pass the budget (their bytes
-    are far under the cap of a reply)."""
-    columns = pf.MAX_ITEMS // pf.MAX_BLOCKS + 2
-    block = Block(("m", ("",) * columns), False, 0, "", 0)
-    return Outcome(7, blocks=[dataclasses.replace(block, handle=h) for h in range(pf.MAX_BLOCKS)])
+SMALL_BUDGET = 1000  # the item budget the tests below run with (the real one is 2**22)
 
 
-def test_a_message_of_many_small_items_is_refused_at_the_item_budget() -> None:
+def _many_small_items(notes: int = SMALL_BUDGET) -> Outcome:
+    """An outcome of so many small notes (a definition of a source each, two items) that it passes
+    the budget of :data:`SMALL_BUDGET` (its bytes are far under the cap of a reply). No outcome
+    reaches the real budget: every list is capped far under it."""
+    return Outcome(7, definitions=[("source", i, "") for i in range(notes)])
+
+
+def test_a_message_of_many_small_items_is_refused_at_the_item_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Small strings cost far more memory than their bytes: one message makes at most
     ``MAX_ITEMS`` of them, whatever each list's own cap allows."""
+    monkeypatch.setattr(pf, "MAX_ITEMS", SMALL_BUDGET)
     many = _many_small_items()
     out = pf._Out(pf.MAX_REPLY_BYTES)
     out.items = 1 << 62  # a sender that has no budget, to make the frame a receiver must refuse
@@ -168,27 +173,27 @@ def test_a_message_of_many_small_items_is_refused_at_the_item_budget() -> None:
     assert "items" in refused(out.finish(pf.Kind.OUTCOME)).reason
 
 
-def test_the_encoder_spends_the_item_budget_as_the_decoder_does() -> None:
+def test_the_encoder_spends_the_item_budget_as_the_decoder_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A frame the encoder writes is never one the decoder refuses for its items (an honest
     worker with a very large definition set found its reply refused by the parent, not named
     at the sender)."""
+    monkeypatch.setattr(pf, "MAX_ITEMS", SMALL_BUDGET)
     many = _many_small_items()
     with pytest.raises(pf.FrameError) as caught:
         pf.encode(many)
     assert "items" in caught.value.reason and "cannot be sent" in caught.value.summary
     assert "malformed" not in caught.value.summary
     # the largest outcome the budget allows is written, and read back
-    columns = (pf.MAX_ITEMS // pf.MAX_BLOCKS - 3) // 2  # a block spends 2 a column, 2 more
-    fits = Outcome(
-        7,
-        blocks=[
-            Block(("m", ("",) * columns), False, 0, "", handle) for handle in range(pf.MAX_BLOCKS)
-        ],
-    )
+    fits = _many_small_items(SMALL_BUDGET // 2 - 1)
     assert pf.decode(pf.encode(fits)) == fits
 
 
-def test_a_result_over_the_item_budget_is_a_crash_outcome_that_says_why() -> None:
+def test_a_result_over_the_item_budget_is_a_crash_outcome_that_says_why(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pf, "MAX_ITEMS", SMALL_BUDGET)
     reply = pf.decode(pexport._reply(_many_small_items()))
     assert isinstance(reply, Outcome) and reply.crash
     lines = reply.crash.strip().splitlines()
@@ -328,7 +333,7 @@ _COUNTS = st.builds(
 )
 _BLOCK = st.builds(
     Block,
-    st.none() | st.tuples(_NAME, st.lists(_NAME, max_size=4).map(tuple)),
+    st.none() | _U32,
     st.booleans(),
     _U64,
     st.text(st.characters(codec="utf-8"), max_size=40),
@@ -368,6 +373,7 @@ def _outcomes(draw: st.DrawFn) -> Outcome:
         frames_in_range=draw(_U64),
         gap_marks=draw(st.lists(st.tuples(_U64, _U64, _U64), max_size=3)),
         counts=draw(_COUNTS),
+        layouts=draw(_U32),
         blocks=draw(st.lists(_BLOCK, max_size=3)),
         categories=draw(st.none() | st.binary(max_size=16)),
         order=draw(st.none() | st.lists(_U32, max_size=6).map(lambda xs: array.array("I", xs))),
@@ -449,7 +455,7 @@ def _pool_with_a_fake_worker() -> tuple[pexport.WorkerPool, pexport.Ticket, Any]
     assert isinstance(definitions, EmbeddedDefinitions)
     pool = pexport.WorkerPool(definitions, 1)
     ours, theirs = multiprocessing.Pipe()
-    slot = pexport._Slot(None, ours)
+    slot = pexport._Slot(None, ours, pool.clock())
     ticket = pexport.Ticket(JOB, b"", LAYOUTS)
     ticket.data = None
     slot.sent.append(ticket)
@@ -497,16 +503,12 @@ def test_a_reply_longer_than_any_reply_is_refused_before_it_is_read() -> None:
 
 
 def test_a_reply_of_a_table_no_definition_makes_ends_the_pool() -> None:
-    """A table name from a worker reaches the file system in a directory export: a name that is
-    not the key of a layout the codecs make is refused like any reply the parent cannot apply
-    (it was accepted, and ``../../escaped`` was opened as a table: an ``AssertionError``, or with
-    ``-O`` a file outside the export)."""
+    """A table of a reply is an index into the export's own layouts, so a name from a worker never
+    reaches the file system (it was a name, and ``../../escaped`` was opened as a table: an
+    ``AssertionError``, or with ``-O`` a file outside the export): an index past the list is
+    refused like any reply the parent cannot apply."""
     evil = dataclasses.replace(
-        outcome(),
-        blocks=[
-            Block(("../../escaped", ("seq", "CmdCounter")), False, 2, ROWS, 1),
-            Block(None, True, 1, "5,6\n", 0),
-        ],
+        outcome(), blocks=[Block(1, False, 2, ROWS, 1), Block(None, True, 1, "5,6\n", 0)]
     )
     pool, ticket, theirs = _pool_with_a_fake_worker()
     try:
@@ -522,13 +524,26 @@ def test_a_reply_of_a_table_no_definition_makes_ends_the_pool() -> None:
 
 
 def test_a_table_is_accepted_only_if_a_codec_makes_it() -> None:
-    assert LAYOUTS and pf.read_reply(JOB, pf.encode(outcome()), LAYOUTS)
+    assert len(LAYOUTS) and pf.read_reply(JOB, pf.encode(outcome()), LAYOUTS)
     with pytest.raises(pf.FrameError):
-        pf.read_reply(JOB, pf.encode(outcome()), frozenset())
+        pf.read_reply(JOB, pf.encode(outcome()), pf.NO_LAYOUTS)
     csv_only = dataclasses.replace(JOB, shape=dataclasses.replace(SHAPE, fmt=ExportFormat.TEXT))
-    keyed = Outcome(7, blocks=[Block(("HK_TLM", ("seq", "CmdCounter")), False, 1, "1,2\n", 0)])
-    with pytest.raises(pf.FrameError):  # text and JSON Lines have one stream, with no key
+    keyed = Outcome(7, blocks=[Block(0, False, 1, "1,2\n", 0)], layouts=LAYOUTS.digest)
+    with pytest.raises(pf.FrameError):  # text and JSON Lines have one stream, with no table
         pf.check_reply(csv_only, keyed, LAYOUTS)
+
+
+def test_the_layouts_are_one_sorted_list_both_sides_derive() -> None:
+    keys = [("B", ("x", "y")), ("A", ("x",)), ("B", ("x",)), ("A", ("x",))]
+    layouts = pf.Layouts(keys)
+    assert layouts.keys == (("A", ("x",)), ("B", ("x",)), ("B", ("x", "y")))  # sorted, distinct
+    assert [layouts.index_of(key) for key in layouts.keys] == [0, 1, 2]
+    assert pf.Layouts(reversed(keys)).digest == layouts.digest  # however they are listed
+    assert pf.Layouts([("A", ("x",))]).digest != pf.Layouts([("A", ("x", ""))]).digest
+    assert pf.Layouts([("A", ("x", "y"))]).digest != pf.Layouts([("A", ("xy",))]).digest
+    assert pf.Layouts([("A", ("x",)), ("B", ())]).digest != pf.Layouts([("AB", ("x",))]).digest
+    with pytest.raises(KeyError):
+        layouts.index_of(("C", ()))
 
 
 def test_the_layouts_of_the_codecs_are_the_tables_an_export_makes(tmp_path: Path) -> None:
@@ -549,8 +564,9 @@ def test_the_layouts_of_the_codecs_are_the_tables_an_export_makes(tmp_path: Path
         replaying.close()
     plain = pf.layouts_of(codecs, header_fields=False)
     wide = pf.layouts_of(codecs, header_fields=True)
-    assert plain and wide and not plain & wide  # header columns change every table's key
-    assert all(name and "/" not in name and columns for name, columns in plain | wide)
+    assert len(plain) and len(wide) and not set(plain.keys) & set(wide.keys)  # header columns
+    assert all(name and "/" not in name and columns for name, columns in plain.keys + wide.keys)
+    assert plain.digest != wide.digest
 
 
 # -- a worker that stops part way through a reply is not waited for ---------------------------
@@ -747,26 +763,38 @@ def test_an_idle_worker_is_never_a_stall() -> None:
 
 
 def test_one_wait_slice_is_shared_by_the_pipes_that_are_ready() -> None:
-    """Each ready pipe is served for its share of one slice, so a poll cannot outlast a signal by
-    the number of workers times the slice."""
+    """Each ready pipe is served for its share of one slice, both directions together, so a poll
+    cannot outlast a signal by the number of workers times the slice."""
     import multiprocessing
+    import time
 
     pool, _, first = _pool_with_a_fake_worker()
     others = []
     for _ in range(3):
         ours, theirs = multiprocessing.Pipe()
-        slot = pexport._Slot(None, ours)
+        slot = pexport._Slot(None, ours, pool.clock())
         slot.sent.append(pexport.Ticket(JOB, b"", LAYOUTS))
         pool._slots.append(slot)
         others.append(theirs)
-    budgets: list[float] = []
-    pool._receive = lambda slot, budget: budgets.append(budget)  # type: ignore[method-assign]
+    for slot in pool._slots:
+        slot.outbox.put(b"x")  # ready both ways
+    shares: list[tuple[str, float]] = []
+    pool._receive = lambda slot, deadline: shares.append(("r", deadline))  # type: ignore[method-assign]
+    pool._send = lambda slot, until: shares.append(("w", until))  # type: ignore[method-assign]
     try:
         for end in (first, *others):
             end.send_bytes(b"x")
+        began = time.monotonic()
         pool.poll(5.0)
-        assert len(budgets) == 4
-        assert sum(budgets) <= pexport.WAIT_SLICE_S * 1.0001
+        assert len(shares) == 8  # a write and a read for each of four pipes
+        for number in range(4):  # the two directions of a pipe have the one deadline
+            assert shares[2 * number][0] == "w" and shares[2 * number + 1][0] == "r"
+            assert shares[2 * number][1] == shares[2 * number + 1][1]
+        deadlines = [until for _, until in shares[::2]]
+        share = pexport.WAIT_SLICE_S / 4
+        assert all(
+            b - a < share + 0.5 for a, b in zip([began, *deadlines], deadlines, strict=False)
+        )
     finally:
         for end in (first, *others):
             end.close()
@@ -813,20 +841,18 @@ def test_the_reply_cap_is_a_bound_on_what_an_honest_worker_makes() -> None:
 
 
 def test_a_table_is_a_layout_or_the_reply_is_refused() -> None:
-    """A table name from a worker reaches the file system in a directory export (it was accepted:
-    ``../../escaped`` was opened as a table). Every key that is not exactly a layout's is refused
-    as the reply of a worker, by ``read_reply`` and through the pool."""
-    keys = [
-        ("../../escaped", ("seq", "CmdCounter")),
-        ("HK_TLM", ("seq", "CmdCounter", "x")),
-        ("HK_TLM\x00", ("seq", "CmdCounter")),
-        ("hk_tlm", ("seq", "CmdCounter")),
+    """A table of a reply is refused unless it is an index into the export's own layouts, numbered
+    by the same definitions, by ``read_reply`` and through the pool."""
+    tail = Block(None, True, 1, "5,6\n", 0)
+    cases: list[dict[str, Any]] = [
+        {"blocks": [Block(1, False, 2, ROWS, 1), tail]},  # past the list
+        {"blocks": [Block(2**32 - 1, False, 2, ROWS, 1), tail]},
+        {"layouts": LAYOUTS.digest ^ 1},  # numbered by other definitions
+        {"layouts": 0},
     ]
-    for key in keys:
-        evil = dataclasses.replace(
-            outcome(), blocks=[Block(key, False, 2, ROWS, 1), Block(None, True, 1, "5,6\n", 0)]
-        )
-        with pytest.raises(pf.FrameError, match="no definition makes"):
+    for changes in cases:
+        evil = dataclasses.replace(outcome(), **changes)
+        with pytest.raises(pf.FrameError, match=r"no definition makes|other definitions"):
             pf.read_reply(JOB, pf.encode(evil), LAYOUTS)
         pool, ticket, theirs = _pool_with_a_fake_worker()
         try:
@@ -839,6 +865,33 @@ def test_a_table_is_a_layout_or_the_reply_is_refused() -> None:
         finally:
             pool.close(abnormal=True)
             theirs.close()
+
+
+def test_a_worker_numbers_its_tables_by_the_layouts_the_parent_derives(tmp_path: Path) -> None:
+    """The two sides never exchange a column name: a worker's block names its table by its index,
+    and the index leads to the same key in the parent's list (the worker's list is built from the
+    definitions it was sent, the parent's from the codecs it decodes with)."""
+    from ironbird.recording.defs import embedded_codecs
+    from ironbird.recording.replay import Replay
+    from poolutil import clean_recording
+
+    replaying = Replay([clean_recording(tmp_path / "run.ibrec")])
+    try:
+        definitions = EmbeddedDefinitions.of(replaying, "")
+        codecs = embedded_codecs(
+            replaying.parts[0],
+            replaying.head,
+            replaying.nodes,
+            replaying.meta.data,
+            replaying.max_packet_bytes,
+        )
+    finally:
+        replaying.close()
+    worker = pexport._Worker(definitions)
+    for header_fields in (False, True):
+        theirs = worker._layouts_of(header_fields)
+        mine = pf.layouts_of(codecs, header_fields=header_fields)
+        assert theirs.keys == mine.keys and theirs.digest == mine.digest and len(mine) > 0
 
 
 def test_the_tables_an_answer_may_hold_are_always_given() -> None:
