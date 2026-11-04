@@ -1,8 +1,10 @@
 name: ci
 
 # Two families of jobs, on purpose:
-#   checks / cfs          Ubuntu runner, setup-python: fast feedback (cached, ~minutes) on the
+#   checks / coverage / cfs
+#                         Ubuntu runner, setup-python: fast feedback (cached, ~minutes) on the
 #                         newest toolchain, and the home of the coverage that needs a real VM.
+#                         `coverage` is the fail_under gate on branch coverage of src/ironbird.
 #   el8-checks / el8-cfs  the same lint/types/tests and real-cFS acceptance inside Oracle Linux 8
 #                         (and, best effort, UBI 8) containers, as an unprivileged user: the
 #                         user's target servers are RHEL 8 / Oracle Linux 8 (glibc 2.28, gcc 8,
@@ -77,6 +79,61 @@ jobs:
       # The 10k packets/s target (60 s) is the development host's: IRONBIRD_BENCH_10K=1.
       - name: Throughput gate (serial, 1k packets/s floor)
         run: pytest tests/bench -n0 -s
+
+  # Branch coverage of src/ironbird with the fail_under gate in pyproject.toml. A job of its own so
+  # `checks` keeps its speed (coverage slows the suite). tools/coverage.sh installs a per-run .pth
+  # hook into the venv so the `ib` subprocesses the tests start measure themselves, and removes it
+  # on exit; the runner is discarded anyway. Real-cFS tests are opt-in and skipped (tests/cfs
+  # needs a cFS build; the `cfs` job runs them), and benchmarks are disabled by the script.
+  coverage:
+    name: coverage (branch, fail_under)
+    if: github.event.schedule != '43 5 * * 1'  # not the weekly audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            constraints-dev.txt
+      # tools/coverage.sh refuses a non-virtualenv Python (it writes its .pth hook into the venv's
+      # site-packages), and setup-python's interpreter is not one.
+      - name: Create venv and install
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install -c constraints-dev.txt -e '.[dev]'
+      - name: Tests under coverage (fails below fail_under)
+        env:
+          IRONBIRD_COV_DIR: ${{ runner.temp }}/coverage
+        run: tools/coverage.sh -n auto --ignore=tests/cfs -q
+      - name: The coverage hook leaves nothing in the venv
+        if: always()
+        run: |
+          leftover="$(find "$RUNNER_TEMP/venv" -name '*ironbird_cov*' -o -name 'zz_ironbird_coverage_*')"
+          test -z "$leftover" || { echo "::error::coverage hook left behind: $leftover"; exit 1; }
+      - name: Coverage report files
+        if: always()
+        env:
+          IRONBIRD_COV_DIR: ${{ runner.temp }}/coverage
+        run: |
+          # The script already combined the data; render HTML and XML for the artifact.
+          if [ -f "$IRONBIRD_COV_DIR/.coverage" ]; then
+            COVERAGE_FILE="$IRONBIRD_COV_DIR/.coverage" python -m coverage html -d "$IRONBIRD_COV_DIR/html" --fail-under=0
+            COVERAGE_FILE="$IRONBIRD_COV_DIR/.coverage" python -m coverage xml -o "$IRONBIRD_COV_DIR/coverage.xml" --fail-under=0
+          fi
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            ${{ runner.temp }}/coverage/html
+            ${{ runner.temp }}/coverage/coverage.xml
+          if-no-files-found: ignore
 
   package:
     name: packaging (sdist, wheel, clean install)

@@ -750,10 +750,17 @@ Shipped files:
 ```bash
 pytest -n auto
 ruff check . && ruff format --check .
-pyright
+pyright                                # strict on src/, "standard" on tests/ (config: [tool.pyright])
 mypy                                   # strict, src/ only (config: [tool.mypy])
 bandit -c pyproject.toml -r src        # security lint; a skip is `# nosec B301  # reason`
+tools/coverage.sh -n auto              # branch coverage of src/ironbird; fails under fail_under
 ```
+
+The strict analyses (mypy, pyright strict, bandit) cover `src/` only; test code is held to a lower
+bar and needs only to be correct, deterministic and readable. CI enforces coverage in the `coverage`
+job (the same `tools/coverage.sh`, run from a venv; it writes a per-run `.pth` hook into the venv's
+site-packages and removes it on exit) and uploads the HTML/XML report as the `coverage-report`
+artifact. Add `--ignore=tests/cfs` to skip the real-cFS tests, as CI does.
 
 Packaging and dependency checks (the CI `package` job and the weekly `audit` / `el8-audit` jobs):
 

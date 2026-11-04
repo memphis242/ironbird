@@ -78,7 +78,14 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["PLC0415", "S104", "S108", "S603", "S607", "PLR0915"]
+# Tests are held to a lower bar (CLAUDE.md Testing Guidelines): the correctness rules (F, B, E9,
+# ...) stay on, while security and style rules about fixture data and test idioms are off.
+# The selected set has no annotation or docstring rules (ANN, D), so none need relaxing.
+"tests/**" = [
+    "PLC0415",  # imports inside tests (monkeypatching, import-time behaviour)
+    "S104", "S105", "S106", "S108", "S603", "S607",  # fixture hosts, tokens, temp paths, subprocesses
+    "PLR0915",
+]
 
 [tool.pyright]
 include = ["src", "tests"]
@@ -93,9 +100,39 @@ reportUnknownLambdaType = false
 reportPrivateUsage = false
 reportMissingParameterType = false
 
+# src keeps the strict rule set above. Tests are held to pyright's "standard" rule set (CLAUDE.md
+# Testing Guidelines: test code only needs to work): the rules strict adds on top of standard are
+# turned back off for them. Correctness checks (types, attributes, calls, optionals) still apply.
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+extraPaths = ["src"]
+reportMissingTypeArgument = false
+reportUnnecessaryCast = false
+reportUnnecessaryComparison = false
+reportUnnecessaryContains = false
+reportUnnecessaryIsInstance = false
+reportUntypedFunctionDecorator = false
+reportUntypedClassDecorator = false
+reportUntypedBaseClass = false
+reportUntypedNamedTuple = false
+reportUnusedClass = false
+reportUnusedFunction = false
+reportUnusedVariable = false
+reportConstantRedefinition = false
+reportDeprecated = false
+reportTypeCommentUsage = false
+reportIncompleteStub = false
+reportInconsistentConstructor = false
+reportInvalidStubStatement = false
+reportMatchNotExhaustive = false
+reportMissingSuperCall = false
+
+[[tool.pyright.executionEnvironments]]
+root = "src"
+
 [tool.mypy]
-# src only: pyright (strict) already checks the tests, and mypy's stricter reading of test
-# idioms (monkeypatching module attributes, re-exported names) is left to a later pass.
+# src only, by decision (CLAUDE.md Testing Guidelines: strict analyses are not extended to tests;
+# pyright checks them at its "standard" level, see [tool.pyright]).
 files = ["src"]
 python_version = "3.11"
 strict = true
