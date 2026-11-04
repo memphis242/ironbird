@@ -305,6 +305,9 @@ Tests:
   - Deferred: a `keep_recent` survival invariant in `fuzz_retention.py`'s recovering scan - which parts
     recovery may legitimately remove (reserves, damaged parts) needs a retention-owner decision first.
 - Branch coverage of `src/ironbird` gates CI: the `coverage` job runs `tools/coverage.sh -n auto` (real-cFS tests skipped) and fails under `fail_under` in `pyproject.toml`.
+  - Deferred: pytest keeps a predictable `/tmp/pytest-of-USER` base dir even after 9.0.3 (symlinks are
+    refused, but another user can pre-create it and make `tmp_path` tests fail). On shared SSH hosts run
+    tests with `--basetemp` or a private `TMPDIR`.
 - E2E: the mock flight node is sent malformed commands, and the ground side is sent
   malformed telemetry, at rate, asserting the engine keeps capturing and the errors
   coalesce.
@@ -4601,8 +4604,6 @@ CI gates beyond ruff, pyright and the tests (`.github/workflows/ci.yml`):
 
 Deferred (decisions open):
 
-- pytest is held below 9 and so carries PYSEC-2026-1845 (fixed in 9.0.3; accepted in
-  `tools/ci/audit-ignore.txt`). Verify pytest-benchmark and xdist on pytest 9, bump, drop the entry.
 - `recording/pexport.py` unpickles the export worker's replies in the parent. The pipe is private and
   the worker is the tool's own process, but a worker that a decoder bug compromised could then run
   code in the parent. Replacing pickle with a fixed binary framing removes that class (design change).
