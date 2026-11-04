@@ -304,6 +304,9 @@ Tests:
     keeps each key small and GitHub evicts least-recently-used keys; revisit if pip caches get evicted.
   - Deferred: a `keep_recent` survival invariant in `fuzz_retention.py`'s recovering scan - which parts
     recovery may legitimately remove (reserves, damaged parts) needs a retention-owner decision first.
+  - Deferred: pytest keeps a predictable `/tmp/pytest-of-USER` base dir even after 9.0.3 (symlinks are
+    refused, but another user can pre-create it and make `tmp_path` tests fail). On shared SSH hosts run
+    tests with `--basetemp` or a private `TMPDIR`.
 - tools/coverage.sh is not run in CI yet, so `fail_under` is advisory: deferred because a measured full-suite run in CI needs its own job budget and a user decision on gating merges on it.
 - E2E: the mock flight node is sent malformed commands, and the ground side is sent
   malformed telemetry, at rate, asserting the engine keeps capturing and the errors
@@ -4586,8 +4589,6 @@ CI gates beyond ruff, pyright and the tests (`.github/workflows/ci.yml`):
 
 Deferred (decisions open):
 
-- pytest is held below 9 and so carries PYSEC-2026-1845 (fixed in 9.0.3; accepted in
-  `tools/ci/audit-ignore.txt`). Verify pytest-benchmark and xdist on pytest 9, bump, drop the entry.
 - mypy does not yet cover `tests/` (pyright strict does): about 85 findings, mostly monkeypatching of
   module attributes and re-exported names, to be cleaned up in a dedicated pass.
 - `recording/pexport.py` unpickles the export worker's replies in the parent. The pipe is private and
