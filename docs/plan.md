@@ -4586,8 +4586,6 @@ CI gates beyond ruff, pyright and the tests (`.github/workflows/ci.yml`):
 
 Deferred (decisions open):
 
-- pytest is held below 9 and so carries PYSEC-2026-1845 (fixed in 9.0.3; accepted in
-  `tools/ci/audit-ignore.txt`). Verify pytest-benchmark and xdist on pytest 9, bump, drop the entry.
 - mypy does not yet cover `tests/` (pyright strict does): about 85 findings, mostly monkeypatching of
   module attributes and re-exported names, to be cleaned up in a dedicated pass.
 - `recording/pexport.py` unpickles the export worker's replies in the parent. The pipe is private and

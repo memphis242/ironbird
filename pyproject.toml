@@ -18,7 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "coverage>=7.10",  # patch = ["subprocess"] and the [tool.coverage] section below
-    "pytest>=8,<9",  # pytest-benchmark 5.x is not yet compatible with pytest 9
+    "pytest>=9.0.3,<10",  # 9.0.3 fixes PYSEC-2026-1845 (predictable /tmp/pytest-of-USER directory)
     "pytest-xdist>=3.5,<4",
     "hypothesis>=6.100,<7",
     "pytest-benchmark>=4.0,<6",
