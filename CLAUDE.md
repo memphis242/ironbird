@@ -156,6 +156,13 @@ replays telemetry across multiple aliased hardware targets.
 
 # Testing Guidelines
 
+- Test code is held to a much lower standard than application code. Application
+  code (`src/`) gets every strict analysis (mypy strict, pyright strict, bandit,
+  ruff) and the full quality bar above. Test code only needs to work: be correct,
+  deterministic, and readable enough to debug. Do not spend effort on type
+  strictness, const-correctness, or polish in tests, and do not extend the strict
+  analyses (e.g. mypy) to `tests/`.
+
 - When working a bug, first reproduce it in an E2E regression test; where that
   is not feasible, say so and why. The test captures the bug's context and
   gives before/after confirmation of the fix.
@@ -245,9 +252,10 @@ replays telemetry across multiple aliased hardware targets.
 - Use git worktrees for parallel work (see the next section for the full
   rules, which apply to concurrent sessions as well as to subagents).
 
-- Subagents working in a worktree edit files only; the session that owns that
-  worktree owns all git writes in it (branching, committing, merging) unless a
-  project says otherwise.
+- A subagent given its own worktree runs git freely in it: it commits, pushes
+  its branch, and opens that branch's pull request. It never touches another
+  worktree's branch, the primary checkout, or `main`, and never force-pushes.
+  Only the root agent merges into `main`, after the antagonistic review.
 
 # Concurrent Sessions on One Codebase: Always Work in a Worktree
 
