@@ -166,6 +166,7 @@ class _TxWait:
     future: asyncio.Future[None]
     written: bool = False  # every byte reached the device
     failure: IronbirdError | None = None  # how it failed (``TransportClosed``: none went out)
+    label: str = ""  # names the packet in an error reported after its sender stopped waiting
 
 
 _OPEN_DEVICES: Final[dict[int, SerialTransport]] = {}  # device number -> its transport
@@ -591,9 +592,10 @@ class SerialTransport:
         """The error of a packet whose head went out and whose tail is being discarded."""
         size = wait.end - wait.start
         sent = min(size - 1, max(1, self._tx_written - wait.start))
+        packet = f"packet {wait.label}" if wait.label else "a packet"
         return IronbirdError(
             Code.TX_SEND,
-            f"{self.description}: {sent} of {size} bytes of a packet went out and the rest was "
+            f"{self.description}: {sent} of {size} bytes of {packet} went out and the rest was "
             f"discarded ({why}); the peer received a torn packet",
         )
 
@@ -701,6 +703,7 @@ class SerialTransport:
         *,
         confirm: bool = False,
         handed_off: Callable[[], None] | None = None,
+        label: str = "",
     ) -> None:
         """Send one packet: the bytes are written to the device (``handed_off`` runs when they
         all are, or when the send is cancelled after some of them were: the rest follows from
@@ -708,7 +711,8 @@ class SerialTransport:
 
         Raises :class:`TransportClosed` only when none of the packet went out. A packet whose
         head went out and whose tail cannot follow (a stall, a lost device, a close that could
-        not wait for it) fails with a coded error that says how much of it was sent."""
+        not wait for it) fails with a coded error that says how much of it was sent and, when it
+        is reported after its sender stopped waiting, names it by ``label``."""
         if self._closed:
             raise TransportClosed
         if self._down or self._fd < 0:
@@ -744,7 +748,7 @@ class SerialTransport:
         self._tx_bytes += written
         if written < size:
             self._txbuf += data[written:]
-            wait = _TxWait(start, start + size, loop.create_future())
+            wait = _TxWait(start, start + size, loop.create_future(), label=label)
             self._tx_waiters.append(wait)
             self._check_buffer()
             if not self._writer_on:

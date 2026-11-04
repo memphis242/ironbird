@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -32,7 +33,7 @@ from ironbird import sendmodes as sm
 from ironbird.config import Endpoint
 from ironbird.errors import Code, IronbirdError
 from ironbird.ledger import TxSeries
-from ironbird.transport.udp import UdpThreadSender, UdpTransport
+from ironbird.transport.udp import SEND_WAIT_S, UdpThreadSender, UdpTransport
 from recutil import CLI_MAIN, EXAMPLES, Proc, run_ib
 from replayutil import child_env, write_config_58k
 
@@ -377,6 +378,68 @@ def test_the_slot_the_thread_takes_is_published_before_the_loop_can_look() -> No
     assert count(reports, pm.Kind.SENT) == 3
 
 
+class _StepsAtTheSecondLengthRead(deque[pm.Built[int]]):
+    """A packet queue that lets the pacer thread's step (publish the next slot, then pop) land
+    at the second ``len`` of the loop's pass - the one that reads the queue's depth for a slot -
+    just before it returns (``before``) or just after (``after``)."""
+
+    def __init__(self, *, before: bool) -> None:
+        super().__init__()
+        self.before = before
+        self.calls = 0
+        self.step: Callable[[], None] = lambda: None
+
+    def __len__(self) -> int:
+        self.calls += 1
+        fire = self.calls == 2
+        if fire and self.before:
+            self.step()
+        size = super().__len__()
+        if fire and not self.before:
+            self.step()
+        return size
+
+
+@pytest.mark.parametrize("before", [True, False])
+def test_a_thread_step_between_the_loops_reads_of_queue_and_slot_never_builds_one_too_many(
+    before: bool,
+) -> None:
+    """Steady state at the end of a window: the thread waits for slot 8 and the packets for slots
+    8 and 9 are queued, so nothing is left to build. The loop reads the queue's depth and the
+    slot the thread publishes without a lock; the thread publishes slot 9 and pops the packet of
+    slot 8 at the worst point between those two reads, whichever one the loop makes first
+    (``before``: the step lands before the depth is read; else right after). The loop may build
+    late, never a packet no slot is left for."""
+    clock = FakeClock()
+    grid = grid_for(clock, every="5ms", for_="50ms")
+    assert grid.planned == 10
+    built: list[int] = []
+
+    def build(number: int, slot: int) -> pm.Built[int]:
+        built.append(slot)
+        return pm.Built(number, slot, b"", number)
+
+    pacer: pm.SeriesPacer[int] = pm.SeriesPacer(
+        grid, lambda d, s: True, FakeWaiter(clock), timed=False
+    )
+    queue = _StepsAtTheSecondLengthRead(before=before)
+    pacer._queue = queue
+    pacer._slot = 8
+    clock.mono = grid.deadline(8)
+    for slot in (8, 9):
+        queue.append(pm.Built(slot, slot, b"", slot))
+    pacer._built, pacer._next_slot = 2, 10
+
+    def step() -> None:
+        pacer._slot += 1
+        queue.popleft()
+
+    queue.step = step
+    pacer._fill(build)
+    assert queue.calls >= 2 and pacer._slot == 9  # the step did land inside the pass
+    assert built == [] and [b.slot for b in queue] == [9]
+
+
 def test_a_timed_series_whose_start_was_missed_builds_nothing_for_slots_already_past() -> None:
     clock = FakeClock()
     clock.mono += 3 * SEC
@@ -549,10 +612,11 @@ def run_series(
     handle: Callable[[Report], BaseException | None] | None = None,
     cancel_after_s: float | None = None,
     until: Callable[[], bool] | None = None,
+    late: Callable[[Report], None] | None = None,
 ) -> tuple[list[Report], list[int], BaseException | None]:
     """Run a real pacer over ``grid`` with ``send``; the series is cancelled after
-    ``cancel_after_s``, or once ``until()`` holds. Returns the reports, the slots built for, and
-    what the run raised."""
+    ``cancel_after_s``, or once ``until()`` holds. ``late`` takes a failure of the pacer thread
+    after it was abandoned. Returns the reports, the slots built for, and what the run raised."""
     reports: list[Report] = []
     built: list[int] = []
 
@@ -565,7 +629,9 @@ def run_series(
         return handle(report) if handle is not None else report.error
 
     async def main() -> BaseException | None:
-        pacer: pm.SeriesPacer[int] = pm.SeriesPacer(grid, send, pm.ThreadWaiter(0), timed=False)
+        pacer: pm.SeriesPacer[int] = pm.SeriesPacer(
+            grid, send, pm.ThreadWaiter(0), timed=False, late=late
+        )
         task = asyncio.ensure_future(pacer.run(build, handled))
         if cancel_after_s is not None:
             asyncio.get_running_loop().call_later(cancel_after_s, task.cancel)
@@ -616,6 +682,59 @@ def test_a_series_lowers_the_switch_interval_and_restores_it() -> None:
 
     _, _, raised = run_series(burst_grid(5), failing)
     assert raised is boom and sys.getswitchinterval() == before  # also when the series fails
+
+
+def test_overlapping_series_share_one_lowering_and_the_last_one_restores_the_interval() -> None:
+    """The switch interval is process-wide: a series that ends while another runs must leave it
+    lowered for the other, and the last must restore what it was before the first."""
+    before = sys.getswitchinterval()
+    first_done = threading.Event()
+    seen: list[float] = []
+
+    def second_send(data: bytes, stop: threading.Event) -> bool:
+        first_done.wait(10)  # the first series has ended by the time this packet is sent
+        seen.append(sys.getswitchinterval())
+        return True
+
+    def build(number: int, slot: int) -> pm.Built[int]:
+        return pm.Built(number, slot, b"x", number)
+
+    async def main() -> None:
+        first: pm.SeriesPacer[int] = pm.SeriesPacer(
+            burst_grid(3), lambda d, s: True, pm.ThreadWaiter(0), timed=False
+        )
+        second: pm.SeriesPacer[int] = pm.SeriesPacer(
+            burst_grid(1), second_send, pm.ThreadWaiter(0), timed=False
+        )
+        later = asyncio.ensure_future(second.run(build, lambda r: r.error))
+        while pm._SWITCH.users == 0:
+            await asyncio.sleep(0.001)
+        await first.run(build, lambda r: r.error)
+        assert pm._SWITCH.users == 1 and sys.getswitchinterval() <= pm.SWITCH_INTERVAL_S * 1.01
+        first_done.set()
+        await later
+
+    asyncio.run(main())
+    assert seen and max(seen) <= pm.SWITCH_INTERVAL_S * 1.01
+    assert pm._SWITCH.users == 0 and sys.getswitchinterval() == before
+
+
+def test_a_series_never_raises_an_interval_that_is_already_lower() -> None:
+    before = sys.getswitchinterval()
+    sys.setswitchinterval(pm.SWITCH_INTERVAL_S / 2)
+    lowered = sys.getswitchinterval()  # the interpreter rounds to whole microseconds
+    try:
+        seen: list[float] = []
+
+        def send(data: bytes, stop: threading.Event) -> bool:
+            seen.append(sys.getswitchinterval())
+            return True
+
+        run_series(burst_grid(2), send)
+        assert max(seen) == pytest.approx(lowered, rel=0.02)  # not raised to the series' own
+        assert sys.getswitchinterval() == pytest.approx(lowered, rel=0.02)
+    finally:
+        sys.setswitchinterval(before)
 
 
 def test_a_pacer_thread_that_cannot_start_is_a_coded_resource_error(
@@ -690,6 +809,47 @@ def test_an_abandoned_pacer_reports_the_packet_it_was_sending(
     assert len(wire) - sent == unconfirmed  # and the one more on the wire is the one reported
 
 
+def test_an_abandoned_pacer_is_a_coded_error_and_its_late_failure_is_not_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pm, "DONE_TIMEOUT_S", 0.2)
+    wire: list[int] = []
+    release, blocked = threading.Event(), threading.Event()
+    lateness: list[Report] = []
+    late_seen = threading.Event()
+    refusal = OSError(5, "late refusal")
+
+    def send(data: bytes, stop: threading.Event) -> bool:
+        if len(wire) == 3:
+            blocked.set()
+            release.wait(5)  # a send that does not look at ``stop``
+            raise refusal
+        wire.append(len(wire))
+        return True
+
+    def late(report: Report) -> None:
+        lateness.append(report)
+        late_seen.set()
+
+    reports, _, raised = run_series(burst_grid(1000), send, until=blocked.is_set, late=late)
+    assert isinstance(raised, asyncio.CancelledError)
+    kinds = [r.kind for r in reports]
+    assert kinds.count(pm.Kind.ABANDONED) == 1 and not lateness  # nothing late has come yet
+    abandoned = next(r for r in reports if r.kind is pm.Kind.ABANDONED)
+    assert isinstance(abandoned.error, IronbirdError) and abandoned.error.code is Code.TX_SEND
+    assert abandoned.built is not None and abandoned.built.number == 3  # the packet in flight
+    assert kinds.index(pm.Kind.ABANDONED) < kinds.index(pm.Kind.UNCONFIRMED)
+    release.set()
+    assert late_seen.wait(5)
+    for thread in pacer_threads():
+        thread.join(5)
+    assert not pacer_threads()
+    (failure,) = lateness  # the thread's own failure reached the callback, once
+    assert failure.kind is pm.Kind.FAILED and failure.error is refusal
+    assert failure.built is not None and failure.built.number == 3
+    assert not any(r.kind is pm.Kind.FAILED for r in reports)  # and not the series' account
+
+
 class _Io:
     link = object()
     end = object()
@@ -706,7 +866,13 @@ class _HopEngine:
         self.blocked = threading.Event()
 
     async def send(
-        self, link: object, end: object, data: bytes, *, handed_off: Callable[[], None]
+        self,
+        link: object,
+        end: object,
+        data: bytes,
+        *,
+        handed_off: Callable[[], None],
+        label: str = "",
     ) -> None:
         if self.blocked.is_set() or len(self.wire) != self.stalls:
             self.wire.append(data)
@@ -738,9 +904,12 @@ def test_a_send_through_the_loop_ends_with_the_series_and_nothing_is_lost(head_o
         reports.append(report)
         return report.error
 
+    links: list[eng.SeriesLink] = []
+
     async def main() -> float:
         loop = asyncio.get_running_loop()
         link = eng.SeriesLink(cast(Any, engine), cast(Any, _Io()), cast(Any, object()), None, loop)
+        links.append(link)
         pacer: pm.SeriesPacer[int] = pm.SeriesPacer(
             burst_grid(1000), link.send, pm.ThreadWaiter(0), timed=False
         )
@@ -757,6 +926,8 @@ def test_a_send_through_the_loop_ends_with_the_series_and_nothing_is_lost(head_o
     sent, unsent = count(reports, pm.Kind.SENT), count(reports, pm.Kind.UNSENT)
     assert elapsed < pm.DONE_TIMEOUT_S / 2 and not pacer_threads()
     assert sent == len(engine.wire) == 3 + head_out  # what is on the line is what is sent
+    cut = links[0].cut  # a packet the stop cut short with its head on the line is marked
+    assert (cut == engine.wire[-1]) if head_out else cut is None
     assert sent + unsent == len(built)
     assert not count(reports, pm.Kind.UNCONFIRMED) and not count(reports, pm.Kind.FAILED)
 
@@ -814,6 +985,15 @@ def test_a_thread_send_waiting_for_room_gives_up_at_stop_and_at_the_limit(
         UdpThreadSender(cast(Any, full), Endpoint("127.0.0.1", 9)).send(b"abc", threading.Event())
     fake.close()
     full.close()
+
+
+def test_a_full_send_buffer_after_the_wait_is_a_coded_error_that_says_what_to_do() -> None:
+    transport = UdpTransport(remote=Endpoint("127.0.0.1", 9))
+    error = transport.thread_send_error(BlockingIOError(11, "Resource temporarily unavailable"))
+    assert error.code is Code.TX_SEND
+    assert "\n" not in error.summary
+    assert f"{SEND_WAIT_S:g} s" in error.summary  # it waited, and says for how long
+    assert error.summary.count(";") == 1  # and what failed is followed by what to do
 
 
 # -- the ledger records of a series -----------------------------------------------------------
@@ -1306,9 +1486,9 @@ FAIL_AFTER_LEFT = (
     "async def _no_thread_sender(self):\n    return None\n"
     "udp.UdpTransport.thread_sender = _no_thread_sender\n"
     "_send = udp.UdpTransport.send\n_n = [0]\n"
-    "async def _failing(self, data, *, confirm=False, handed_off=None):\n"
+    "async def _failing(self, data, *, confirm=False, handed_off=None, label=''):\n"
     "    _n[0] += 1\n"
-    "    await _send(self, data, confirm=confirm, handed_off=handed_off)\n"
+    "    await _send(self, data, confirm=confirm, handed_off=handed_off, label=label)\n"
     "    if _n[0] == 3:\n        raise OSError(5, 'fault injected after the packet left')\n"
     "udp.UdpTransport.send = _failing\n"
 )
@@ -1364,6 +1544,12 @@ def test_a_signal_notice_names_the_series_whatever_state_it_is_in() -> None:
         run.series, run.series_command = tally, "MOCK_NOOP"
         notice = cli._interrupt_notice("send", int(signal.SIGINT), run)
         assert f"{sent} of 5" in notice  # the count of the series, not "nothing was built"
+    for outcome in ("", "interrupted"):  # the series' end is the signal: it is said once
+        run.series = sm.Tally(planned=5, sent=2, outcome=outcome)
+        assert "series" not in cli._interrupt_notice("send", int(signal.SIGINT), run)
+    for outcome in ("complete", "failed"):  # any other end is news
+        run.series = sm.Tally(planned=5, sent=5, outcome=outcome)
+        assert f"series {outcome}" in cli._interrupt_notice("send", int(signal.SIGINT), run)
 
 
 def test_a_packet_that_left_and_then_failed_is_counted_as_sent(

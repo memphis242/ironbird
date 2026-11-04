@@ -18,6 +18,7 @@ import resource
 import shlex
 import signal
 import sys
+import threading
 import time
 import traceback
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
@@ -528,6 +529,11 @@ async def _main_body(glob: Globals, ledger: Ledger, body: Body, run: _Run) -> in
         return exc.exit_code
 
 
+def _packet_label(command: str, sequence: int | None) -> str:
+    """How an error names a packet of a series: its command and sequence count."""
+    return command if sequence is None else f"{command} sequence count {sequence}"
+
+
 def _interrupt_notice(name: str, signum: int, run: _Run) -> str:
     sig = signal.Signals(signum).name
     tx = run.session.last_tx if run.session is not None else None
@@ -537,7 +543,8 @@ def _interrupt_notice(name: str, signum: int, run: _Run) -> str:
         return f"interrupted ({sig})"
     if run.series is not None:
         done = run.series
-        ended = f" (series {done.outcome})" if done.outcome else ""
+        # An interrupted series says so in "interrupted (SIGINT)"; any other end is added.
+        ended = f" (series {done.outcome})" if done.outcome not in ("", "interrupted") else ""
         return (
             f"interrupted ({sig}) after {done.sent} of {done.planned} "
             f"{term(run.series_command)} sends{ended}"
@@ -1669,8 +1676,18 @@ async def _send_series(
         encoded = report.built.item
         sent_wall = time.time_ns() - (time.monotonic_ns() - report.mono_ns)
         link.sent(encoded.data, sent_wall)
+        # A send the stop cut short with the head of the packet on the line: the rest follows
+        # from the transport's buffer, and is reported torn (naming the packet) if the line does
+        # not take it.
+        cut = link.cut is encoded.data
         session.record_series_packet(
-            series, target, encoded, result="sent", sent=True, at_ns=sent_wall
+            series,
+            target,
+            encoded,
+            result="sent",
+            sent=True,
+            at_ns=sent_wall,
+            **({"cut": True} if cut else {}),
         )
         sent = note_sent(encoded, report.mono_ns)
         tally.send_max_ns = max(tally.send_max_ns, report.took_ns)
@@ -1712,6 +1729,9 @@ async def _send_series(
                 tally.unsent += report.kind is Kind.UNSENT
                 tally.unconfirmed += report.kind is Kind.UNCONFIRMED
                 session.record_series_packet(series, target, built.item, result=result, sent=False)
+            case Kind.ABANDONED:
+                assert isinstance(report.error, IronbirdError)
+                session.report(report.error, context="pacer")
             case Kind.FAILED:
                 assert report.error is not None
                 error = link.error(report.error)
@@ -1730,6 +1750,34 @@ async def _send_series(
             case Kind.DONE:
                 pass
         return None
+
+    def late_failure(report: Report[EncodedPacket]) -> None:
+        """In the abandoned pacer thread: a failure that came too late for the series."""
+        assert report.error is not None
+        error = link.error(report.error)
+        coded = (
+            error
+            if isinstance(error, IronbirdError)
+            else IronbirdError(Code.INTERNAL, f"send failed: {error!r}", cause=error)
+        )
+        packet = ""
+        if report.built is not None:
+            packet = f" ({_packet_label(command, report.built.item.sequence)})"
+        session.ledger.post(
+            "error",
+            coded.code.value,
+            summary=f"late failure of the abandoned pacer thread{packet}: {coded.summary}",
+            details=coded.detail_text(),
+            late=True,
+        )
+
+    def label() -> str:
+        """What the transport names a packet by in its errors (the packet being sent)."""
+        flight = pacer.in_flight if pacer is not None else None
+        return "" if flight is None else _packet_label(command, flight.item.sequence)
+
+    def send(data: bytes, stop: threading.Event) -> bool:
+        return link.send(data, stop, label=label())
 
     def summary(outcome: str) -> str:
         where = ""
@@ -1767,7 +1815,7 @@ async def _send_series(
             tally.planned = grid.planned
             tally.first_mono_ns = tally.last_mono_ns = grid.start_mono
             waiter = ThreadWaiter(SPIN_NS if spins else 0)
-            pacer = SeriesPacer(grid, link.send, waiter, timed=timed)
+            pacer = SeriesPacer(grid, send, waiter, timed=timed, late=late_failure)
             await pacer.run(build, handle)
             if check is not None:
                 check.cancel()

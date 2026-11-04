@@ -26,7 +26,8 @@ interpreter lock with the loop and the other helper threads, though: coming out 
 waits for the lock for as long as another thread runs Python code, up to the interpreter's
 switch interval (5 ms by default, which at a 10 ms period is half a slot). For the life of a
 series the switch interval is therefore lowered to :data:`SWITCH_INTERVAL_S` and restored after
-(``sys.setswitchinterval``; it is process-wide). That bounds the wait, it does not remove it: a
+(``sys.setswitchinterval``; it is process-wide, so series that overlap share one lowering: the
+first saves the original and the last restores it). That bounds the wait, it does not remove it: a
 thread that holds the lock through a long C call still delays the pacer, and the lateness the
 series reports includes any such wait.
 
@@ -41,14 +42,18 @@ unused, and its ledger record says so). Any other packet is sent in the next slo
 
 The loop builds only packets that can be sent: never for a slot the thread has passed or is
 passing (the thread publishes the next slot it will serve the moment it takes a packet), and,
-for a packet that is not tied to a slot, never more than the slots left in the window. A packet
-is left unsent only by a skip near the end or by a stop.
+for a packet that is not tied to a slot, never more than the slots left in the window (the loop
+reads the queue before the slot the thread publishes, so a thread running between the two reads
+can only make it build late, never too many). A packet is left unsent only by a skip near the end
+or by a stop.
 
 Every packet is accounted for. The thread publishes the packet it is sending; a send is asked
 to return when ``stop`` is set (the loop's own stops it through the loop), and the loop joins
 the thread before :meth:`SeriesPacer.run` returns. A send that ignores ``stop`` for
 :data:`DONE_TIMEOUT_S` is abandoned (the one way the thread outlives ``run``): the packet it is
-sending is reported as UNCONFIRMED, since whether it left is not known.
+sending is reported as UNCONFIRMED, since whether it left is not known, after an ABANDONED report
+that carries a coded error. What the abandoned thread reports from then on is not queued for the
+loop (it has finished): a failure goes to the ``late`` callback, which ledgers it.
 """
 
 from __future__ import annotations
@@ -85,6 +90,39 @@ SWITCH_INTERVAL_S: Final = 0.0002  # the GIL switch interval for the life of a s
 T = TypeVar("T")
 
 
+class _SwitchInterval:
+    """The interpreter's GIL switch interval, lowered while any series runs (the setting is
+    process-wide, so series that overlap share it): the first to start saves and lowers it, the
+    last to end restores what it was."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._users = 0
+        self._saved = 0.0
+
+    def acquire(self) -> None:
+        with self._lock:
+            if self._users == 0:
+                self._saved = sys.getswitchinterval()
+                sys.setswitchinterval(min(self._saved, SWITCH_INTERVAL_S))
+            self._users += 1
+
+    def release(self) -> None:
+        with self._lock:
+            assert self._users > 0, "released more often than acquired"
+            self._users -= 1
+            if self._users == 0:
+                sys.setswitchinterval(self._saved)
+
+    @property
+    def users(self) -> int:
+        with self._lock:
+            return self._users
+
+
+_SWITCH: Final = _SwitchInterval()
+
+
 @dataclass(frozen=True, slots=True)
 class Built(Generic[T]):
     """A packet ready for the pacer. ``item`` is the caller's, handed back in its report."""
@@ -101,6 +139,9 @@ class Kind(Enum):
     DISCARDED = "discarded"  # a timed packet whose slot was skipped
     UNSENT = "unsent"  # built, still queued when the series ended
     UNCONFIRMED = "unconfirmed"  # in flight when the pacer was abandoned: left or not, unknown
+    ABANDONED = (
+        "abandoned"  # the loop gave up on the thread (``error``: coded; ``built``: in flight)
+    )
     FAILED = "failed"  # the send raised (``error``); the pacer stops
     DONE = "done"  # the pacer thread is finished
 
@@ -133,6 +174,9 @@ ThreadSend = Callable[[bytes, threading.Event], bool]
 Build = Callable[[int, int], Built[T]]
 #: Handles a report on the loop; for a FAILED one returns the error the series ends with.
 Handle = Callable[[Report[T]], BaseException | None]
+#: Called in the abandoned pacer thread with the FAILED report it can no longer deliver. It must
+#: be thread-safe and must not raise.
+Late = Callable[[Report[T]], None]
 
 
 class Waiter(Protocol):
@@ -202,9 +246,19 @@ class SeriesPacer(Generic[T]):
     under the GIL); the thread's reports come back through a second queue and one
     ``call_soon_threadsafe`` per batch."""
 
-    def __init__(self, grid: Grid, send: ThreadSend, waiter: Waiter, *, timed: bool) -> None:
-        """``timed``: each packet carries its slot's time, so it is valid for that slot only."""
+    def __init__(
+        self,
+        grid: Grid,
+        send: ThreadSend,
+        waiter: Waiter,
+        *,
+        timed: bool,
+        late: Late[T] | None = None,
+    ) -> None:
+        """``timed``: each packet carries its slot's time, so it is valid for that slot only.
+        ``late``: where a failure of the thread goes once the loop has abandoned it."""
         self._grid = grid
+        self._late = late
         self._timed = timed
         self._send = send
         self._waiter = waiter
@@ -228,6 +282,12 @@ class SeriesPacer(Generic[T]):
         self._failure: BaseException | None = None  # found on the loop (see :meth:`abort`)
         self.facts: dict[str, Any] = {}  # how the thread ran (its waiter's setup)
 
+    @property
+    def in_flight(self) -> Built[T] | None:
+        """The packet the thread is sending, if any (read in the thread that sends it, this is
+        the packet of the send that is running)."""
+        return self._inflight
+
     def abort(self, error: BaseException) -> None:
         """On the loop: end the series with ``error`` (a refusal the link reported for one of
         its packets); :meth:`run` raises it."""
@@ -244,13 +304,13 @@ class SeriesPacer(Generic[T]):
         before it returns, even if ``handle`` raised on one of them (the first such error is
         raised when nothing else is, else it is attached to the error that is). ``IB-SYS-001``
         if the thread cannot be started. The interpreter's switch interval is lowered for the
-        life of the series (see the module)."""
-        previous = sys.getswitchinterval()
-        sys.setswitchinterval(min(previous, SWITCH_INTERVAL_S))
+        life of the series, and restored when the last series running in the process ends (see the
+        module)."""
+        _SWITCH.acquire()
         try:
             await self._run(build, handle)
         finally:
-            sys.setswitchinterval(previous)
+            _SWITCH.release()
 
     async def _run(self, build: Build[T], handle: Handle[T]) -> None:
         loop = asyncio.get_running_loop()
@@ -298,8 +358,8 @@ class SeriesPacer(Generic[T]):
     async def _wind_down(self, thread: threading.Thread, handle: Handle[T]) -> list[Exception]:
         """Stop the thread and join it, then account for everything it did not: every report
         and every packet still queued (UNSENT) or in flight if the thread had to be abandoned
-        (UNCONFIRMED). One report that ``handle`` raises on does not stop the rest being
-        handled; the errors are returned."""
+        (UNCONFIRMED, after one ABANDONED report). One report that ``handle`` raises on does not
+        stop the rest being handled; the errors are returned."""
         errors: list[Exception] = []
         self._stop.set()
         self._ready.set()
@@ -311,13 +371,18 @@ class SeriesPacer(Generic[T]):
                         await self._wake.wait()
                         self._wake.clear()
         flight: Built[T] | None = None
-        if self._done:
+        abandoned = not self._done
+        if not abandoned:
             thread.join()
         else:
-            with self._flight_lock:  # what the thread reports from here on is dropped
+            with self._flight_lock:  # what the thread reports from here on goes to ``late``
                 self._abandoned = True
                 flight = self._inflight
         self._drain(handle, errors)
+        if abandoned:
+            self._handle_guarded(
+                handle, Report(Kind.ABANDONED, flight, error=self._abandon_error(flight)), errors
+            )
         if flight is not None:
             self._handle_guarded(handle, Report(Kind.UNCONFIRMED, flight), errors)
         while self._queue:
@@ -325,6 +390,20 @@ class SeriesPacer(Generic[T]):
             if queued is not flight:
                 self._handle_guarded(handle, Report(Kind.UNSENT, queued), errors)
         return errors
+
+    @staticmethod
+    def _abandon_error(flight: Built[T] | None) -> IronbirdError:
+        """The coded error for a pacer thread that did not stop within :data:`DONE_TIMEOUT_S`."""
+        sending = (
+            "its send ignored the stop, so whether the packet in flight left is not known"
+            if flight is not None
+            else "it did not stop"
+        )
+        return IronbirdError(
+            Code.TX_SEND,
+            f"pacer thread abandoned after {DONE_TIMEOUT_S:g} s: {sending}; check the link "
+            "(a device or socket that stopped answering)",
+        )
 
     @staticmethod
     def _handle_guarded(handle: Handle[T], report: Report[T], errors: list[Exception]) -> None:
@@ -378,8 +457,11 @@ class SeriesPacer(Generic[T]):
                 return None
             now = self._waiter.mono_ns()
             if grid.every is not None:
+                # The thread publishes ``_slot`` and then pops, so reading the queue first can
+                # only see a slot too early (a deferred build), never a packet too many.
+                queued = len(self._queue)
                 floor = max(self._slot, grid.nearest(now))
-                slot = max(self._next_slot, floor) if self._timed else floor + len(self._queue)
+                slot = max(self._next_slot, floor) if self._timed else floor + queued
                 if not grid.in_window(slot):
                     return None
                 due = grid.deadline(slot) - AHEAD_NS
@@ -425,17 +507,37 @@ class SeriesPacer(Generic[T]):
     def _land(self, built: Built[T], report: Report[T] | None) -> None:
         """The packet in flight is resolved: report it, or (``None``: the send stopped before
         it left) put it back at the head of the queue. Once the loop has abandoned the thread
-        the packet is the loop's to report, and nothing is."""
+        the packet is the loop's to report, and a failure goes to ``late``."""
         self._flush_starved()
-        with self._flight_lock:
+        with self._flight_lock:  # clearing the flight and queueing the report are one step
             self._inflight = None
-            if self._abandoned:
-                return
-            if report is None:
-                self._queue.appendleft(built)
-                return
-            self._reports.append(report)
-        self._wake_loop()
+            abandoned = self._abandoned
+            if not abandoned:
+                if report is None:
+                    self._queue.appendleft(built)
+                    return
+                self._reports.append(report)
+        if abandoned:
+            self._to_late(report)
+        else:
+            self._wake_loop()
+
+    def _deliver(self, report: Report[T]) -> None:
+        """Hand a report that is not about a packet in flight to the loop (or to ``late``)."""
+        with self._flight_lock:
+            abandoned = self._abandoned
+            if not abandoned:
+                self._reports.append(report)
+        if abandoned:
+            self._to_late(report)
+        else:
+            self._wake_loop()
+
+    def _to_late(self, report: Report[T] | None) -> None:
+        """The loop has abandoned the thread and reported everything else it knew: a failure
+        the thread reports now goes to ``late``."""
+        if report is not None and report.kind is Kind.FAILED and self._late is not None:
+            self._late(report)
 
     def _pace(self) -> None:
         try:
@@ -444,7 +546,8 @@ class SeriesPacer(Generic[T]):
         except BaseException as exc:  # a fault of the pacer itself: it ends the series, coded
             flight = self._inflight
             if flight is None:
-                self._post(Report(Kind.FAILED, error=exc))
+                self._flush_starved()
+                self._deliver(Report(Kind.FAILED, error=exc))
             else:
                 self._land(flight, Report(Kind.FAILED, flight, error=exc))
         finally:

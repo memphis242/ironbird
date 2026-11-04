@@ -158,7 +158,7 @@ ib send fc MOCK_NOOP --at +30s --every 1ms --for 10s  # a timed burst
   the send. (The thread still shares the interpreter lock with the loop and the other helper threads:
   coming out of its sleep it waits for the lock while another thread runs Python code, by default up to
   5 ms, half a slot at 10 ms. For the life of a series the switch interval is lowered to 0.2 ms and then
-  restored; with a helper thread running 8 ms Python bursts against a 10 ms period, that took skipped
+  restored (series that overlap in one process share the lowering: the last one restores it); with a helper thread running 8 ms Python bursts against a 10 ms period, that took skipped
   slots from 61-68 of 300 to 1-5, and from 808 of 2000 to about 100 for a 1 ms period against 3 ms
   bursts. It bounds the wait, it does not remove it, and the lateness the series reports includes any
   that is left.) The loop builds the packets ahead (no earlier than 20 ms before their slots, each fully
@@ -194,7 +194,7 @@ ib send fc MOCK_NOOP --at +30s --every 1ms --for 10s  # a timed burst
   exits 0 however many slots it skipped; a script that needs the cadence reads `skipped` in
   `send.outcome`.
 - **A full send buffer** (a burst on a slow or shaped link) is waited out, up to 2 s, before the send
-  counts as failed.
+  counts as failed (`IB-TX-002`, which says it waited and to slow the series or check the link).
 - **Errors.** A send that fails (`IB-TX-002`, a closed port, a ledger that refuses commands) **stops the
   series** with its coded error, exit 1, after the summary: a link that failed once will fail again, and a
   series with holes in it is harder to read than one that stopped. A UDP refusal (nothing listening) is
@@ -207,8 +207,12 @@ ib send fc MOCK_NOOP --at +30s --every 1ms --for 10s  # a timed burst
   interrupted at once, with nothing sent. A signal that arrives after the series ended (while the
   session closes) still reports how many were sent: the notice and the `cli.signal` record carry the
   series' count (`series_sent`, `series_planned`, `series_outcome`). A send through the event loop
-  (serial) is cancelled by the stop; if it cannot be (the thread does not finish within 5 s), the packet
-  in flight is ledgered as `unconfirmed` and counted so in `send.outcome`: whether it left is unknown.
+  (serial) is cancelled by the stop; a packet with only its head on the line then counts as sent, its
+  `tx.command` carries `cut: true`, and if the line does not take the rest, the `IB-TX-002` torn-packet
+  error names it by command and sequence count. If a send cannot be stopped (the thread does not finish
+  within 5 s), the pacer thread is abandoned with a coded `IB-TX-002` to the ledger and the
+  console, the packet in flight is ledgered as `unconfirmed` and counted so in `send.outcome` (whether it
+  left is unknown), and a failure the abandoned thread reports later is ledgered when it comes.
   A thread that cannot be started is `IB-SYS-001`.
 - **Ledger.** `send.plan` (mode, start and end in UTC, period, count, the arguments, whether a zone was
   assumed, how long the link took to open), `send.fault` once for the faults the packets inject (raw enum

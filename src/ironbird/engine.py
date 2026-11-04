@@ -598,25 +598,32 @@ class SeriesLink:
         self._transport = transport
         self._sender = sender
         self._loop = loop
+        #: The packet whose send the stop cut short with only its head on the line (the rest
+        #: follows from the transport's buffer, and is reported torn if the line does not take it).
+        self.cut: bytes | None = None
 
     @property
     def direct(self) -> bool:
         """Whether the pacer thread sends itself (else through the loop)."""
         return self._sender is not None
 
-    def send(self, data: bytes, stop: threading.Event) -> bool:
-        """In the pacer thread: hand ``data`` to the link (:data:`ironbird.pacer.ThreadSend`).
+    def send(self, data: bytes, stop: threading.Event, label: str = "") -> bool:
+        """In the pacer thread: hand ``data`` to the link (:data:`ironbird.pacer.ThreadSend`);
+        ``label`` names the packet in what the transport reports about it later.
 
         Through the loop, ``stop`` cancels the send there; the transport then reports whether
         any of the packet went out (serial: the head of it on the line is sent), and the answer
-        is that. The send task ends before this returns, so nothing is left in flight."""
+        is that; a packet cancelled with only its head out is :attr:`cut`. The send task ends
+        before this returns, so nothing is left in flight."""
         sender = self._sender
         if sender is not None:
             return sender.send(data, stop)
         loop, hop = self._loop, _Hop()
 
         async def send() -> None:
-            await self._engine.send(self._io.link, self._io.end, data, handed_off=hop.left.set)
+            await self._engine.send(
+                self._io.link, self._io.end, data, handed_off=hop.left.set, label=label
+            )
 
         def start() -> None:
             hop.task = loop.create_task(send())
@@ -638,7 +645,10 @@ class SeriesLink:
             if hop.left.is_set():
                 raise LeftThenFailed(hop.error) from hop.error
             raise hop.error
-        return not hop.cancelled or hop.left.is_set()
+        went = not hop.cancelled or hop.left.is_set()
+        if hop.cancelled and went:
+            self.cut = data
+        return went
 
     def sent(self, data: bytes, time_ns: int) -> None:
         """On the loop, for a packet the pacer thread sent directly at wall time ``time_ns``:
@@ -1181,9 +1191,11 @@ class Engine:
         *,
         confirm: bool = False,
         handed_off: Callable[[], None] | None = None,
+        label: str = "",
     ) -> None:
         """Send ``data`` out of ``end`` of ``link``. The TX frame enters ingest the moment the
         bytes leave the process (``handed_off`` runs right after), so sinks see what was sent.
+        ``label`` names the packet in an error reported about it after its send ended.
 
         The transport is shared with the end's captures, so closing the last one can close it
         under a send that has not yet left the process. That send is made again on the transport
@@ -1204,7 +1216,7 @@ class Engine:
             async with io.lock:
                 transport = await self._ensure_transport(io)
             try:
-                await transport.send(data, confirm=confirm, handed_off=out)
+                await transport.send(data, confirm=confirm, handed_off=out, label=label)
             except TransportClosed as exc:
                 if went_out:
                     raise

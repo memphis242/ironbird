@@ -621,9 +621,11 @@ class Session:
         result: str,
         sent: bool,
         at_ns: int | None = None,
+        **fields: Any,
     ) -> None:
         """The ledger record of one packet of a series (see :class:`~ironbird.ledger.TxSeries`);
-        ``at_ns``: the wall-clock time it was sent, for the series' windows."""
+        ``at_ns``: the wall-clock time it was sent, for the series' windows; ``fields`` are
+        added to the record."""
         node = target.route.server.name
         series.record(
             encoded.message.name,
@@ -639,6 +641,7 @@ class Session:
             function_code=encoded.function_code,
             endpoint=target.endpoint,
             raw=encoded.data,
+            **fields,
         )
 
     @staticmethod

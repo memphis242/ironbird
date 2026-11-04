@@ -183,6 +183,50 @@ def test_a_buffered_send_fails_with_the_cause_when_the_writer_hits_an_error(
     run(body())
 
 
+def test_a_torn_packet_names_the_packet_whose_sender_was_cancelled(
+    device: PtyDevice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop of a series cancels the send that has the head of its packet on the line; the
+    error that reports the discarded tail afterwards has nobody waiting, so it names the packet."""
+
+    async def body() -> None:
+        line = Line(device)
+        await line.open(receiving=False)
+        try:
+            real_write = os.write
+            calls: list[int] = []
+
+            def write(fd: int, data: Any) -> int:
+                if fd != line.transport._fd:
+                    return real_write(fd, data)
+                calls.append(fd)
+                if len(calls) == 1:
+                    return real_write(fd, bytes(data)[:5])  # the head goes out
+                raise BlockingIOError(errno.EAGAIN, "x")  # and the line takes no more
+
+            monkeypatch.setattr(os, "write", write)
+            handed = []
+            task = asyncio.ensure_future(
+                line.transport.send(
+                    hk(1), handed_off=lambda: handed.append(1), label="MOCK_NOOP sequence count 42"
+                )
+            )
+            await wait_for(lambda: len(calls) >= 1, "the head on the line")
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert handed  # the head is on the line: the packet counts as sent
+            monkeypatch.setattr(serial_module, "DRAIN_FLOOR_S", 0.05)
+        finally:
+            await line.transport.close()
+        torn = [error for error in line.reports if "torn" in error.summary]
+        assert len(torn) == 1 and torn[0].code is Code.TX_SEND
+        assert "MOCK_NOOP sequence count 42" in torn[0].summary
+
+    run(body())
+
+
 def test_a_writer_that_would_block_again_keeps_the_send_waiting_until_the_device_drains(
     device: PtyDevice, monkeypatch: pytest.MonkeyPatch
 ) -> None:

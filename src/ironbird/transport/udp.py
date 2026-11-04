@@ -737,7 +737,11 @@ class UdpTransport:
         assert target is not None
         if isinstance(exc, BlockingIOError):
             return IronbirdError(
-                Code.TX_SEND, f"send to udp {target} failed: kernel send buffer full", cause=exc
+                Code.TX_SEND,
+                f"send to udp {target} failed: kernel send buffer still full after waiting "
+                f"{SEND_WAIT_S:g} s; slow the series (a longer --every, or fewer packets in a "
+                "burst) or check that the link and any traffic shaper on it can carry the rate",
+                cause=exc,
             )
         return self._send_error(target, exc, earlier=isinstance(exc, ConnectionRefusedError))
 
@@ -747,8 +751,10 @@ class UdpTransport:
         *,
         confirm: bool = False,
         handed_off: Callable[[], None] | None = None,
+        label: str = "",
     ) -> None:
-        """Send one datagram; with ``confirm`` also wait for a refusal. Fire-and-forget else."""
+        """Send one datagram; with ``confirm`` also wait for a refusal. Fire-and-forget else.
+        (``label`` is for transports that report on a packet after its send: UDP does not.)"""
         if self._tx is None and self._remote is not None and not self._closed:
             async with self._tx_lock:
                 if self._tx is None:

@@ -4569,14 +4569,23 @@ its options:
      ledger's transmit gate and a header time field are current, and only for slots the thread can still
      serve: it publishes the slot it takes before the packet leaves the queue, a timed series starts from
      the slot nearest now, and a packet not tied to a slot is built only while slots remain in the window,
-     so a complete series leaves no count built and unsent) and handles the thread's reports. The loop's
+     so a complete series leaves no count built and unsent, except through a skip in the last 20 ms of
+     the window, which can leave up to a build-ahead's worth of packets built and unsent, each ledgered
+     `unsent`; the loop reads the queue depth before the slot the thread publishes, so an interleaving
+     can only defer a build, never add one) and handles the thread's reports. The loop's
      work never delays a wait or a send, but the thread shares the GIL: the switch interval is lowered
-     (0.2 ms) for the life of a series and restored (measured: 61-68 of 300 slots skipped at 10 ms under 8
+     (0.2 ms) for the life of a series and restored by the last series running in the process (a
+     refcount under a lock; the interval is process-wide) (measured: 61-68 of 300 slots skipped at 10 ms under 8
      ms Python bursts, 1-5 after; 808 of 2000 at 1 ms under 3 ms bursts, about 100 after). The thread is
      started with `sigmask.start_thread`; a start that fails is `IB-SYS-001`.
    - Accounting: the thread publishes the packet in flight; a send through the loop (serial) is cancelled
      by the stop and answers whether the head of the packet is on the line; a send that ignores the stop
-     for 5 s is abandoned and its packet is ledgered `unconfirmed`. Consecutive starved slots are one
+     for 5 s is abandoned: a coded `IB-TX-002` is ledgered and shown, its packet is ledgered `unconfirmed`,
+     and a failure the abandoned thread reports later is ledgered (`late: true`), not dropped. A send
+     the stop cut with only the head of its packet on the line is sent, marked `cut: true` in its
+     `tx.command`, and the torn-packet error (`IB-TX-002`) names it by command and sequence count; the
+     signal notice shows the series' end only when it was not the interruption itself; a UDP send buffer
+     still full after the 2 s wait says so and what to do. Consecutive starved slots are one
      report; a handler error during the wind-down does not skip the rest of it. A burst on a full UDP send
      buffer waits up to 2 s for room. `send.fault` is ledgered once per series; `-v` samples a fast
      series' packets (2 a second) instead of printing each; a signal after the series ended still names
@@ -4606,7 +4615,10 @@ its options:
    `send.outcome` says how many slots were skipped; the threshold wants a user decision on its form),
    and an up-front check that a serial link's baud rate carries one packet per period (framing and
    escaping make the wire size data-dependent; the lateness and skips report it today). The persistent
-   sequence counter is a separate piece of work (`send/sequence`).
+   sequence counter is a separate piece of work (`send/sequence`). **Deferred (PR #41 round 3, outside
+   this PR, both predate it):** a SIGINT that arrives before the interpreter installs its signal
+   handlers ends the process with the default action (exit -2, nothing sent); and a stdout whose read end is closed gives no `IB-OUT` output-lost notice for a single
+   send or a series, which exit 0.
 6. xlsx export, optional semantic search (local sentence-transformer as an extra),
    1553 transport when hardware is available.
 
