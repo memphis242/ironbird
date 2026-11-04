@@ -50,17 +50,24 @@ import os
 import struct
 import sys
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, NoReturn
 
 from ironbird.ccdd.model import MessageKind
+from ironbird.codec import Codec
 from ironbird.errors import Code, IronbirdError
 from ironbird.frame import MAX_STREAM_ID, Direction, Stream
 from ironbird.recording import format as fmt
 from ironbird.recording.defs import MAX_DEFINED_NODES, MAX_HEAD_BYTES
-from ironbird.recording.export import NO_LINE, ExportFormat, ExportResult
+from ironbird.recording.export import (
+    NO_LINE,
+    ExportFormat,
+    ExportResult,
+    TableKey,
+    table_columns,
+)
 from ironbird.recording.player import Ending
 from ironbird.recording.poolmsg import (
     Block,
@@ -124,8 +131,13 @@ _STREAM: Final = struct.Struct("<HBB")  # id, kind, direction
 _SOURCE: Final = struct.Struct("<H")
 _SEED: Final = struct.Struct("<Qq")  # last_seq, work
 _SHAPE: Final = struct.Struct("<BB")  # format, flags
-# index, guess, stop, flags, start_ns, end_ns, device, inode, text_cap, event_cap
-_JOB: Final = struct.Struct("<QQQBqqQQQI")
+# index, guess, stop, flags, start_ns, end_ns, device, inode, text_cap, event_cap; the two times
+# are signed 16-byte integers (see ``_TIME_BYTES``)
+_JOB: Final = struct.Struct("<QQQB16s16sQQQI")
+_TIME_BYTES: Final = 16
+# Every instant ``--from``/``--to`` accept (years 1 to 9999 in nanoseconds, a bound the recording's
+# u64 times never reach) fits a signed time, so a bound is never a reason to refuse a job.
+assert 1 << (8 * _TIME_BYTES - 1) > 253_402_300_800 * 10**9
 # index, start, end, first_seq, last_seq, work, scanned, frames_read, frames_in_range, flags
 _OUTCOME: Final = struct.Struct("<QQQQQqqQQH")
 _DAMAGE: Final = struct.Struct("<QQQQB")  # offset, span, resumed_at, rows before, flags
@@ -301,11 +313,15 @@ Message = EmbeddedDefinitions | ConfigDefinitions | Job | Outcome | Fault
 
 class FrameError(IronbirdError):
     """A pool message that is not one this version writes, or a value that cannot be written:
-    why, and the byte of the message where it was found."""
+    why, and the byte of the message where it was found. ``sending``: the value is one the
+    sender cannot write (``offset`` is the length written so far), not a message that was read."""
 
-    def __init__(self, reason: str, offset: int = 0) -> None:
+    def __init__(self, reason: str, offset: int = 0, *, sending: bool = False) -> None:
         super().__init__(
-            Code.EXP_WORKER, f"a message of the export pool is malformed at byte {offset}: {reason}"
+            Code.EXP_WORKER,
+            f"a message for the export pool cannot be sent: {reason}"
+            if sending
+            else f"a message of the export pool is malformed at byte {offset}: {reason}",
         )
         self.reason = reason
         self.offset = offset
@@ -317,30 +333,40 @@ class FrameError(IronbirdError):
 class _Out:
     """The parts of a frame being written, and their length so far against the cap."""
 
-    __slots__ = ("cap", "parts", "size")
+    __slots__ = ("cap", "items", "parts", "size")
 
     def __init__(self, cap: int) -> None:
         self.parts: list[bytes] = [b""]  # the header goes first, when the length is known
         self.size = 0
         self.cap = cap
+        self.items = MAX_ITEMS  # spent exactly as the reader spends it (see ``_In``)
 
     def put(self, data: bytes) -> None:
         self.parts.append(data)
         self.size += len(data)
         if self.size > self.cap:
-            raise FrameError(f"the message is longer than {self.cap} bytes", self.size)
+            self.fail(f"the message is longer than {self.cap} bytes")
 
     def pack(self, layout: struct.Struct, *values: Any) -> None:
         self.put(layout.pack(*values))
 
+    def fail(self, reason: str) -> NoReturn:
+        raise FrameError(reason, self.size, sending=True)
+
+    def spend(self, n: int, what: str) -> None:
+        self.items -= n
+        if self.items < 0:
+            self.fail(f"{what}: the message holds more than {MAX_ITEMS} items")
+
     def count(self, n: int, cap: int, what: str) -> None:
         if n > cap:
-            raise FrameError(f"{what}: {n} is more than {cap}", self.size)
+            self.fail(f"{what}: {n} is more than {cap}")
+        self.spend(n, what)
         self.put(_U32.pack(n))
 
     def blob(self, data: bytes, cap: int, what: str) -> None:
         if len(data) > cap:
-            raise FrameError(f"{what} is longer than {cap} bytes", self.size)
+            self.fail(f"{what} is longer than {cap} bytes")
         self.put(_U32.pack(len(data)))
         if data:
             self.put(data)
@@ -348,15 +374,17 @@ class _Out:
     def text(self, value: str, cap: int, what: str) -> None:
         try:
             data = value.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise FrameError(f"{what} is not valid Unicode", self.size) from exc
+        except UnicodeEncodeError:
+            self.fail(f"{what} is not valid Unicode")
+        self.spend(1, what)
         self.blob(data, cap, what)
 
     def os_text(self, value: str, cap: int, what: str) -> None:
         try:
             data = os.fsencode(value)
-        except UnicodeEncodeError as exc:
-            raise FrameError(f"{what} cannot be given to the operating system", self.size) from exc
+        except UnicodeEncodeError:
+            self.fail(f"{what} cannot be given to the operating system")
+        self.spend(1, what)
         self.blob(data, cap, what)
 
     def path(self, value: Path, what: str) -> None:
@@ -401,9 +429,7 @@ def _put_definitions(out: _Out, definitions: Definitions) -> None:
             out.count(len(definitions.blobs), MAX_BLOBS, "embedded definitions")
             for key, blob in definitions.blobs.items():
                 if key != (blob.node, blob.kind) or len(blob.sha256) != _SHA256_BYTES:
-                    raise FrameError(
-                        "an embedded definition is not filed under its own node and kind"
-                    )
+                    out.fail("an embedded definition is not filed under its own node and kind")
                 out.pack(_U8, _BLOB_KINDS[blob.kind])
                 out.text(blob.node, MAX_NAME_BYTES, "an embedded definition's node")
                 out.text(blob.adapter, MAX_NAME_BYTES, "an embedded definition's adapter")
@@ -414,7 +440,7 @@ def _put_definitions(out: _Out, definitions: Definitions) -> None:
             try:
                 meta = _meta_text(definitions.meta)
             except (TypeError, ValueError, RecursionError) as exc:
-                raise FrameError(f"META is not JSON data ({type(exc).__name__})") from exc
+                out.fail(f"META is not JSON data ({type(exc).__name__})")
             out.text(meta, MAX_META_BYTES, "META")
             out.pack(_U32, definitions.max_packet_bytes)
             out.text(definitions.hint, MAX_NAME_BYTES, "the definitions' hint")
@@ -437,7 +463,8 @@ def _meta_text(meta: dict[str, Any]) -> str:
 
 
 def _put_job(out: _Out, job: Job) -> None:
-    _check_caps(job.text_cap, job.event_cap, out.size)
+    if not 1 <= job.text_cap <= MAX_TEXT_CAP or not 1 <= job.event_cap <= MAX_EVENT_CAP:
+        out.fail(_cap_reason(job.text_cap, job.event_cap))
     flags = (
         _flag(job.stop is not None, _JOB_STOP)
         | _flag(job.exact, _JOB_EXACT)
@@ -451,8 +478,8 @@ def _put_job(out: _Out, job: Job) -> None:
         job.guess,
         job.stop or 0,
         flags,
-        job.start_ns or 0,
-        job.end_ns or 0,
+        _time_field(job.start_ns),
+        _time_field(job.end_ns),
         device,
         inode,
         job.text_cap,
@@ -464,13 +491,18 @@ def _put_job(out: _Out, job: Job) -> None:
     out.count(len(seed.streams), MAX_SEED_STREAMS, "the seed's streams")
     for stream_id, stream in seed.streams.items():
         if stream_id != stream.id:
-            raise FrameError(f"the seed files stream {stream.id} under {stream_id}", out.size)
+            out.fail(f"the seed files stream {stream.id} under {stream_id}")
         _put_stream(out, stream)
     out.count(len(seed.sources), MAX_SEED_SOURCES, "the seed's sources")
     for source_id, text in seed.sources.items():
         out.pack(_SOURCE, source_id)
         out.text(text, MAX_NAME_BYTES, "a source")
     _put_shape(out, job.shape)
+
+
+def _time_field(value: int | None) -> bytes:
+    """A time bound as the wire carries it: signed, little endian (``OverflowError`` beyond it)."""
+    return (value or 0).to_bytes(_TIME_BYTES, "little", signed=True)
 
 
 def _put_shape(out: _Out, shape: Shape) -> None:
@@ -497,16 +529,17 @@ def _put_shape(out: _Out, shape: Shape) -> None:
         out.os_text(message, MAX_NAME_BYTES, "a message name")
 
 
-def _check_caps(text_cap: int, event_cap: int, offset: int) -> None:
+def _cap_reason(text_cap: int, event_cap: int) -> str:
+    """Why the caps of a job are not ones the format carries (they must not both be fine)."""
     if not 1 <= text_cap <= MAX_TEXT_CAP:
-        raise FrameError(f"a text cap of {text_cap} is outside 1..{MAX_TEXT_CAP}", offset)
-    if not 1 <= event_cap <= MAX_EVENT_CAP:
-        raise FrameError(f"an event cap of {event_cap} is outside 1..{MAX_EVENT_CAP}", offset)
+        return f"a text cap of {text_cap} is outside 1..{MAX_TEXT_CAP}"
+    assert not 1 <= event_cap <= MAX_EVENT_CAP
+    return f"an event cap of {event_cap} is outside 1..{MAX_EVENT_CAP}"
 
 
 def _put_outcome(out: _Out, outcome: Outcome) -> None:
     if len(outcome.damage) != len(outcome.damage_rows):
-        raise FrameError("the damage and the rows before each disagree in number", out.size)
+        out.fail("the damage and the rows before each disagree in number")
     flags = (
         _flag(outcome.start is not None, _OUT_START)
         | _flag(outcome.reached_stop, _OUT_REACHED_STOP)
@@ -543,7 +576,7 @@ def _put_outcome(out: _Out, outcome: Outcome) -> None:
                 out.pack(_SOURCE, source_id)
                 out.text(text, MAX_NAME_BYTES, "a source")
             case _:
-                raise FrameError("a definition is neither a stream nor a source", out.size)
+                out.fail("a definition is neither a stream nor a source")
     _put_ids(out, outcome.used_streams, "stream ids used")
     _put_ids(out, outcome.used_sources, "source ids used")
     out.count(len(outcome.damage), MAX_NOTES, "damage")
@@ -559,7 +592,7 @@ def _put_outcome(out: _Out, outcome: Outcome) -> None:
     if outcome.failure is not None:
         code, summary, details = outcome.failure
         if code not in _CODES:
-            raise FrameError("a failure's code is not an error code", out.size)
+            out.fail("a failure's code is not an error code")
         out.text(code, MAX_CODE_BYTES, "a failure's code")
         out.text(summary, MAX_DIAG_BYTES, "a failure's summary")
         out.text(details, MAX_DIAG_BYTES, "a failure's details")
@@ -585,7 +618,7 @@ def _put_outcome(out: _Out, outcome: Outcome) -> None:
     if outcome.order is not None:
         order = outcome.order
         if order.typecode != "I":
-            raise FrameError("the order of the lines is not of unsigned ints", out.size)
+            out.fail("the order of the lines is not of unsigned ints")
         if _SWAP:  # pragma: no cover - a big-endian host
             order = array.array("I", order)
             order.byteswap()
@@ -606,9 +639,14 @@ def _put_counts(out: _Out, counts: ExportResult) -> None:
         counts.files,
         _ENDINGS[counts.ending],
     )
-    for table, what in ((counts.rejected, "rejections"), (counts.per_table, "tables")):
-        out.count(len(table), MAX_NAMES, what)
+    for table, what, cap in (
+        (counts.rejected, "rejections", len(_CODES)),
+        (counts.per_table, "tables", MAX_NAMES),
+    ):
+        out.count(len(table), cap, what)
         for name, number in table.items():
+            if what == "rejections" and name not in _CODES:
+                out.fail("a rejection's code is not an error code")
             out.text(name, MAX_NAME_BYTES, what)
             out.pack(_U64, number)
 
@@ -634,7 +672,9 @@ def encode(message: Message) -> bytes:
     try:
         put(out, message)
     except (struct.error, OverflowError) as exc:
-        raise FrameError(f"a number is out of the range of its field ({exc})", out.size) from exc
+        raise FrameError(
+            f"a number is out of the range of its field ({exc})", out.size, sending=True
+        ) from exc
     return out.finish(kind)
 
 
@@ -802,32 +842,13 @@ def _take_embedded(src: _In) -> EmbeddedDefinitions:
         meta = json.loads(meta_text)
     except (ValueError, RecursionError) as exc:
         raise FrameError(f"META is not JSON ({type(exc).__name__})", at) from exc
-    if not isinstance(meta, dict) or _depth(meta) > fmt.MAX_META_DEPTH:
+    if not isinstance(meta, dict) or fmt.json_depth(meta) > fmt.MAX_META_DEPTH:
         raise FrameError(f"META is not an object nested at most {fmt.MAX_META_DEPTH} deep", at)
     if _meta_text(meta) != meta_text:
         raise FrameError("META is not in the form the pool writes it", at)
     (max_packet_bytes,) = src.unpack(_U32, "the packet cap")
     hint = src.text(MAX_NAME_BYTES, "the definitions' hint")
     return EmbeddedDefinitions(path, blobs, problem, nodes, meta, max_packet_bytes, hint)
-
-
-def _depth(root: Any) -> int:
-    """How deeply decoded JSON nests, measured without recursion."""
-    deepest = 0
-    pending: list[tuple[Any, int]] = [(root, 1)]
-    while pending:
-        value, level = pending.pop()
-        if isinstance(value, dict):
-            children: Any = value.values()
-        elif isinstance(value, list):
-            children = value
-        else:
-            continue
-        deepest = max(deepest, level)
-        if deepest > fmt.MAX_META_DEPTH:
-            break
-        pending.extend((child, level + 1) for child in children)
-    return deepest
 
 
 _DEFINITION_READERS: Final[dict[int, Callable[[_In], Definitions]]] = {
@@ -838,11 +859,14 @@ _DEFINITION_READERS: Final[dict[int, Callable[[_In], Definitions]]] = {
 
 def _take_job(src: _In) -> Job:
     at = src.pos
-    (index, guess, stop, flags, start_ns, end_ns, device, inode, text_cap, event_cap) = src.unpack(
-        _JOB, "a job"
+    (index, guess, stop, flags, start_raw, end_raw, device, inode, text_cap, event_cap) = (
+        src.unpack(_JOB, "a job")
     )
+    start_ns = int.from_bytes(start_raw, "little", signed=True)
+    end_ns = int.from_bytes(end_raw, "little", signed=True)
     src.flags(flags, _JOB_FLAGS, "a job")
-    _check_caps(text_cap, event_cap, at)
+    if not 1 <= text_cap <= MAX_TEXT_CAP or not 1 <= event_cap <= MAX_EVENT_CAP:
+        raise FrameError(_cap_reason(text_cap, event_cap), at)
     for present, value, what in (
         (flags & _JOB_STOP, stop, "the stop"),
         (flags & _JOB_START_NS, start_ns, "the start time"),
@@ -1037,11 +1061,13 @@ def _take_counts(src: _In) -> ExportResult:
     if ending is None:
         raise FrameError(f"ending {ending_code} is not defined", at)
     tables: list[dict[str, int]] = []
-    for what in ("rejections", "tables"):
+    for what, cap in (("rejections", len(_CODES)), ("tables", MAX_NAMES)):
         table: dict[str, int] = {}
-        for _ in range(src.count(MAX_NAMES, what)):
+        for _ in range(src.count(cap, what)):
             entry_at = src.pos
             name = src.text(MAX_NAME_BYTES, what)
+            if what == "rejections" and name not in _CODES:
+                raise FrameError("a rejection's code is not an error code", entry_at)
             (number,) = src.unpack(_U64, what)
             if name in table:
                 raise FrameError(f"{what} name one entry twice", entry_at)
@@ -1126,28 +1152,42 @@ def diagnostic(text: str) -> str:
 # -- what a reply may claim -------------------------------------------------------------------
 
 
-def read_reply(job: Job, data: bytes | bytearray | memoryview) -> Outcome:
-    """The outcome a worker's message ``data`` gives for ``job``: the one way the parent reads a
-    reply. Raises :class:`FrameError` for a frame :func:`decode` refuses, a worker's
-    :class:`~ironbird.recording.poolmsg.Fault`, any other message, and an outcome
-    :func:`check_reply` refuses."""
+def layouts_of(codecs: Mapping[str, Codec], *, header_fields: bool) -> frozenset[TableKey]:
+    """Every table a CSV export of ``codecs`` can make: the key (message name, columns) of each
+    message of each codec. The one set a reply's tables are checked against (see
+    :func:`check_reply`), so a name a worker sends is never taken for a table nothing defines."""
+    return frozenset(
+        (message.name, table_columns(message, codec, header_fields))
+        for codec in codecs.values()
+        for message in codec.model.messages
+    )
+
+
+def read_reply(
+    job: Job, data: bytes | bytearray | memoryview, layouts: Collection[TableKey]
+) -> Outcome:
+    """The outcome a worker's message ``data`` gives for ``job``, whose tables are among
+    ``layouts``: the one way the parent reads a reply. Raises :class:`FrameError` for a frame
+    :func:`decode` refuses, a worker's :class:`~ironbird.recording.poolmsg.Fault`, any other
+    message, and an outcome :func:`check_reply` refuses."""
     reply = decode(data)
     if isinstance(reply, Fault):
         raise FrameError(f"the worker could not read what it was sent: {reply.reason}")
     if not isinstance(reply, Outcome):
         raise FrameError(f"the worker answered with a message of type {type(reply).__name__}")
-    check_reply(job, reply)
+    check_reply(job, reply, layouts)
     return reply
 
 
-def check_reply(job: Job, outcome: Outcome) -> None:
+def check_reply(job: Job, outcome: Outcome, layouts: Collection[TableKey]) -> None:
     """Raise :class:`FrameError` unless ``outcome`` answers ``job`` and holds together the way the
     parent applies it: the range asked for; a start where the job says reading starts (an exact
     range always has one, unless it crashed or its file moved) and an end not before it; damage
-    and gaps only with the kind of every row; every row kind defined; the tables the format has;
-    and the lines of the blocks, the rows that made a line and the order of the lines all in
-    agreement. A worker that tells the truth always passes; the rows themselves are the worker's
-    to decode."""
+    and gaps only with the kind of every row; every row kind defined; the tables the format has,
+    each a layout in ``layouts`` (a name from a worker reaches the file system only this way) and
+    at most one block of each; and the lines of the blocks, the rows that made a line and the
+    order of the lines all in agreement. A worker that tells the truth always passes; the rows
+    themselves are the worker's to decode."""
     if outcome.index != job.index:
         raise FrameError(f"asked for range {job.index}, the answer is for {outcome.index}")
     start = outcome.start
@@ -1169,12 +1209,19 @@ def check_reply(job: Job, outcome: Outcome) -> None:
     shape = job.shape
     blocks = outcome.blocks
     if shape.fmt is ExportFormat.CSV:
-        handles = set()
+        handles: set[int] = set()
+        keys: set[TableKey] = set()
         for block in blocks:
             if block.malformed != (block.key is None) or (block.malformed and not shape.directory):
                 raise FrameError("a block is not of a table the export has")
+            if block.key is not None:
+                if block.key not in layouts:
+                    raise FrameError("a block is of a table that no definition makes")
+                keys.add(block.key)
             handles.add(block.handle)
-        if len(handles) != len(blocks):
+        if len(handles) != len(blocks) or len(keys) != len(blocks) - sum(
+            b.malformed for b in blocks
+        ):
             raise FrameError("two blocks are of one table")
     elif len(blocks) > 1 or any(b.key is not None or b.malformed or b.handle for b in blocks):
         raise FrameError(f"a {shape.fmt.value} export has one stream of rows")
@@ -1217,6 +1264,7 @@ __all__ = [
     "decode",
     "diagnostic",
     "encode",
+    "layouts_of",
     "read_reply",
     "receive_cap",
 ]

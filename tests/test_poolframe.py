@@ -29,7 +29,7 @@ from ironbird.recording.export import ExportFormat, ExportResult
 from ironbird.recording.player import Ending
 from ironbird.recording.poolmsg import Block, EmbeddedDefinitions, Fault, Job, Outcome, Seed, Shape
 from ironbird.recording.reader import Damage
-from poolframe_corpus import CORPUS, JOB, PREFIX, SHAPE, cases, outcome, samples
+from poolframe_corpus import CORPUS, JOB, LAYOUTS, PREFIX, ROWS, SHAPE, cases, outcome, samples
 
 SAMPLES = samples()
 
@@ -65,12 +65,12 @@ def test_every_message_reads_back_as_written(name: str) -> None:
 
 
 def test_a_reply_that_tells_the_truth_is_read() -> None:
-    reply = pf.read_reply(JOB, pf.encode(outcome()))
+    reply = pf.read_reply(JOB, pf.encode(outcome()), LAYOUTS)
     assert reply == outcome() and reply.order is not None and list(reply.order) == [1, 0, 1]
     for name in ("outcome-crash", "outcome-moved", "outcome-failure"):
         message = SAMPLES[name]
         assert isinstance(message, Outcome)
-        assert pf.read_reply(JOB, pf.encode(message)) == message
+        assert pf.read_reply(JOB, pf.encode(message), LAYOUTS) == message
 
 
 def test_the_operating_systems_bytes_travel_as_they_are() -> None:
@@ -150,13 +150,98 @@ def test_counts_over_their_caps_are_refused_before_anything_is_made() -> None:
         assert "more than" in refused(frame).reason
 
 
+def _many_small_items() -> Outcome:
+    """An outcome of tables with so many columns that its items pass the budget (their bytes
+    are far under the cap of a reply)."""
+    columns = pf.MAX_ITEMS // pf.MAX_BLOCKS + 2
+    block = Block(("m", ("",) * columns), False, 0, "", 0)
+    return Outcome(7, blocks=[dataclasses.replace(block, handle=h) for h in range(pf.MAX_BLOCKS)])
+
+
 def test_a_message_of_many_small_items_is_refused_at_the_item_budget() -> None:
     """Small strings cost far more memory than their bytes: one message makes at most
     ``MAX_ITEMS`` of them, whatever each list's own cap allows."""
-    columns = pf.MAX_ITEMS // pf.MAX_BLOCKS + 2
-    block = Block(("m", ("",) * columns), False, 0, "", 0)
-    many = Outcome(7, blocks=[dataclasses.replace(block, handle=h) for h in range(pf.MAX_BLOCKS)])
-    assert "items" in refused(pf.encode(many)).reason
+    many = _many_small_items()
+    out = pf._Out(pf.MAX_REPLY_BYTES)
+    out.items = 1 << 62  # a sender that has no budget, to make the frame a receiver must refuse
+    pf._put_outcome(out, many)
+    assert "items" in refused(out.finish(pf.Kind.OUTCOME)).reason
+
+
+def test_the_encoder_spends_the_item_budget_as_the_decoder_does() -> None:
+    """A frame the encoder writes is never one the decoder refuses for its items (an honest
+    worker with a very large definition set found its reply refused by the parent, not named
+    at the sender)."""
+    many = _many_small_items()
+    with pytest.raises(pf.FrameError) as caught:
+        pf.encode(many)
+    assert "items" in caught.value.reason and "cannot be sent" in caught.value.summary
+    assert "malformed" not in caught.value.summary
+    # the largest outcome the budget allows is written, and read back
+    columns = (pf.MAX_ITEMS // pf.MAX_BLOCKS - 3) // 2  # a block spends 2 a column, 2 more
+    fits = Outcome(
+        7,
+        blocks=[
+            Block(("m", ("",) * columns), False, 0, "", handle) for handle in range(pf.MAX_BLOCKS)
+        ],
+    )
+    assert pf.decode(pf.encode(fits)) == fits
+
+
+def test_a_result_over_the_item_budget_is_a_crash_outcome_that_says_why() -> None:
+    reply = pf.decode(pexport._reply(_many_small_items()))
+    assert isinstance(reply, Outcome) and reply.crash
+    lines = reply.crash.strip().splitlines()
+    assert "items" in lines[-1] and "IB-EXP-003" not in lines[-1] and "malformed" not in lines[-1]
+    error = pexport._Runner._crashed(object(), reply.crash)  # type: ignore[arg-type]
+    assert error.summary.count("IB-EXP-003") == 0 and "items" in error.summary
+
+
+def test_a_worker_that_cannot_read_what_it_was_sent_says_so_once() -> None:
+    import multiprocessing
+
+    parent, worker = multiprocessing.Pipe()
+    try:
+        parent.send_bytes(b"garbage")
+        assert pexport._from_parent(worker, pf.Kind.JOB) is None
+        answer = pf.decode(parent.recv_bytes())
+        assert isinstance(answer, Fault)
+        with pytest.raises(pf.FrameError) as caught:
+            pf.read_reply(JOB, pf.encode(answer), LAYOUTS)
+        assert caught.value.summary.count("IB-EXP-003") == 0
+        assert caught.value.summary.count("malformed") == 1
+    finally:
+        parent.close()
+        worker.close()
+
+
+# -- times ------------------------------------------------------------------------------------
+
+_YEAR_1_NS = -62_135_596_800 * 10**9
+_YEAR_9999_NS = 253_402_300_799 * 10**9
+
+
+@pytest.mark.parametrize(
+    ("start_ns", "end_ns"),
+    [
+        (_YEAR_1_NS, _YEAR_9999_NS),  # every instant --from/--to accept
+        (None, 9223372036854775808),  # one past a signed 64-bit time (the year 2262)
+        (-9223372036854775809, None),  # one before it (the year 1677)
+        (0, 0),
+        (-(1 << 127), (1 << 127) - 1),
+    ],
+)
+def test_a_time_bound_of_any_year_travels(start_ns: int | None, end_ns: int | None) -> None:
+    """A bound outside the range of a 64-bit nanosecond count is a valid ``--from``/``--to``
+    (``--to 9999-12-31T23:59:59Z``), and a pooled export must take it as one process does."""
+    job = dataclasses.replace(JOB, start_ns=start_ns, end_ns=end_ns)
+    assert pf.decode(pf.encode(job)) == job
+
+
+def test_a_time_bound_the_wire_cannot_hold_is_refused_at_the_sender() -> None:
+    for bound in (1 << 127, -(1 << 127) - 1):
+        with pytest.raises(pf.FrameError):
+            pf.encode(dataclasses.replace(JOB, end_ns=bound))
 
 
 # -- what cannot be written is an error at the sender --------------------------------------------
@@ -208,7 +293,7 @@ def test_the_checked_in_corpus_is_what_is_built_here() -> None:
 def test_every_corpus_reply_is_refused(name: str) -> None:
     data = (CORPUS / name).read_bytes()
     with pytest.raises(pf.FrameError) as caught:
-        pf.read_reply(JOB, data)
+        pf.read_reply(JOB, data, LAYOUTS)
     assert caught.value.code is Code.EXP_WORKER
 
 
@@ -216,6 +301,8 @@ def test_every_corpus_reply_is_refused(name: str) -> None:
 
 _U64 = st.integers(0, (1 << 64) - 1)
 _I64 = st.integers(-(1 << 63), (1 << 63) - 1)
+_I128 = st.integers(-(1 << 127), (1 << 127) - 1)
+_CODE = st.sampled_from([c.value for c in Code])
 _U32 = st.integers(0, (1 << 32) - 1)
 _U16 = st.integers(0, 0xFFFF)
 _NAME = st.text(st.characters(codec="utf-8"), max_size=12)
@@ -236,7 +323,7 @@ _COUNTS = st.builds(
     ExportResult,
     *([_U64] * 9),
     st.sampled_from(Ending),
-    st.dictionaries(_NAME, _U64, max_size=3).map(Counter),
+    st.dictionaries(_CODE, _U64, max_size=3).map(Counter),
     st.dictionaries(_NAME, _U64, max_size=3),
 )
 _BLOCK = st.builds(
@@ -318,8 +405,8 @@ def _jobs(draw: st.DrawFn) -> Job:
             draw(_U64),
             draw(_I64),
         ),
-        draw(st.none() | _I64),
-        draw(st.none() | _I64),
+        draw(st.none() | _I128),
+        draw(st.none() | _I128),
         shape,
         (draw(_U64), draw(_U64)),
         draw(st.integers(1, pf.MAX_TEXT_CAP)),
@@ -345,10 +432,10 @@ def test_any_reply_is_applied_or_refused_never_crashes(reply: Outcome, data: st.
         at = data.draw(st.integers(0, len(frame) - 1))
         frame[at] = data.draw(st.integers(0, 255))
     try:
-        got = pf.read_reply(JOB, bytes(frame))
+        got = pf.read_reply(JOB, bytes(frame), LAYOUTS)
     except pf.FrameError:
         return
-    pf.check_reply(JOB, got)
+    pf.check_reply(JOB, got, LAYOUTS)
 
 
 # -- the pool's two ends ---------------------------------------------------------------------
@@ -363,7 +450,7 @@ def _pool_with_a_fake_worker() -> tuple[pexport.WorkerPool, pexport.Ticket, Any]
     pool = pexport.WorkerPool(definitions, 1)
     ours, theirs = multiprocessing.Pipe()
     slot = pexport._Slot(None, ours)
-    ticket = pexport.Ticket(JOB, b"")
+    ticket = pexport.Ticket(JOB, b"", LAYOUTS)
     ticket.data = None
     slot.sent.append(ticket)
     pool._slots.append(slot)
@@ -407,6 +494,156 @@ def test_a_reply_longer_than_any_reply_is_refused_before_it_is_read() -> None:
     finally:
         pool.close(abnormal=True)
         theirs.close()
+
+
+def test_a_reply_of_a_table_no_definition_makes_ends_the_pool() -> None:
+    """A table name from a worker reaches the file system in a directory export: a name that is
+    not the key of a layout the codecs make is refused like any reply the parent cannot apply
+    (it was accepted, and ``../../escaped`` was opened as a table: an ``AssertionError``, or with
+    ``-O`` a file outside the export)."""
+    evil = dataclasses.replace(
+        outcome(),
+        blocks=[
+            Block(("../../escaped", ("seq", "CmdCounter")), False, 2, ROWS, 1),
+            Block(None, True, 1, "5,6\n", 0),
+        ],
+    )
+    pool, ticket, theirs = _pool_with_a_fake_worker()
+    try:
+        theirs.send_bytes(pf.encode(evil))
+        pool.poll(5.0)
+        assert ticket.done() and pool.broken
+        with pytest.raises(IronbirdError) as caught:
+            ticket.result()
+        assert caught.value.code is Code.EXP_WORKER
+    finally:
+        pool.close(abnormal=True)
+        theirs.close()
+
+
+def test_a_table_is_accepted_only_if_a_codec_makes_it() -> None:
+    assert LAYOUTS and pf.read_reply(JOB, pf.encode(outcome()), LAYOUTS)
+    with pytest.raises(pf.FrameError):
+        pf.read_reply(JOB, pf.encode(outcome()), frozenset())
+    csv_only = dataclasses.replace(JOB, shape=dataclasses.replace(SHAPE, fmt=ExportFormat.TEXT))
+    keyed = Outcome(7, blocks=[Block(("HK_TLM", ("seq", "CmdCounter")), False, 1, "1,2\n", 0)])
+    with pytest.raises(pf.FrameError):  # text and JSON Lines have one stream, with no key
+        pf.check_reply(csv_only, keyed, LAYOUTS)
+
+
+def test_the_layouts_of_the_codecs_are_the_tables_an_export_makes(tmp_path: Path) -> None:
+    from ironbird.recording.defs import embedded_codecs
+    from ironbird.recording.replay import Replay
+    from poolutil import clean_recording
+
+    replaying = Replay([clean_recording(tmp_path / "run.ibrec")])
+    try:
+        codecs = embedded_codecs(
+            replaying.parts[0],
+            replaying.head,
+            replaying.nodes,
+            replaying.meta.data,
+            replaying.max_packet_bytes,
+        )
+    finally:
+        replaying.close()
+    plain = pf.layouts_of(codecs, header_fields=False)
+    wide = pf.layouts_of(codecs, header_fields=True)
+    assert plain and wide and not plain & wide  # header columns change every table's key
+    assert all(name and "/" not in name and columns for name, columns in plain | wide)
+
+
+# -- a worker that stops part way through a reply is not waited for ---------------------------
+
+
+def _polls_return(pool: pexport.WorkerPool, rounds: int, timeout: float) -> bool:
+    """Whether ``rounds`` calls of ``pool.poll(timeout)`` all return within a few seconds (they
+    ran in a thread so that a parent that blocks fails the test instead of hanging it)."""
+    import threading
+
+    def poll() -> None:
+        for _ in range(rounds):
+            pool.poll(timeout)
+
+    thread = threading.Thread(target=poll, daemon=True)
+    thread.start()
+    thread.join(10.0)
+    return not thread.is_alive()
+
+
+def test_a_worker_that_stops_part_way_through_a_reply_does_not_hang_the_parent() -> None:
+    """A worker that is alive and has sent the start of a reply (stopped, wedged or hostile) must
+    cost the parent no more than the slice it waits in, so a signal is acted on between slices
+    (``recv_bytes`` waited for the rest of the message, signals could not end it)."""
+    pool, ticket, theirs = _pool_with_a_fake_worker()
+    try:
+        os.write(theirs.fileno(), struct.pack("!i", 100) + b"IBPF\x01\x03\x00\x00")
+        assert _polls_return(pool, 3, 0.05), "poll waits for a reply that has not come"
+        assert not ticket.done() and not pool.broken
+        os.write(theirs.fileno(), bytes(92))  # the rest, which is not a frame
+        pool.poll(5.0)
+        assert ticket.done() and pool.broken
+    finally:
+        theirs.close()  # frees a parent that is stuck in the read, if the test failed
+        pool.close(abnormal=True)
+
+
+def test_a_worker_that_dies_part_way_through_a_reply_ends_the_pool() -> None:
+    pool, ticket, theirs = _pool_with_a_fake_worker()
+    try:
+        os.write(theirs.fileno(), struct.pack("!i", 100) + b"IBPF")
+        assert _polls_return(pool, 1, 0.05)
+        assert not ticket.done()
+        theirs.close()
+        pool.poll(5.0)
+        assert ticket.done() and pool.broken
+        with pytest.raises(IronbirdError) as caught:
+            ticket.result()
+        assert caught.value.code is Code.EXP_WORKER and "died" in caught.value.summary
+    finally:
+        pool.close(abnormal=True)
+
+
+def test_a_reply_that_arrives_in_small_pieces_is_put_together() -> None:
+    pool, ticket, theirs = _pool_with_a_fake_worker()
+    try:
+        frame = pf.encode(outcome())
+        wire = struct.pack("!i", len(frame)) + frame
+        for at in range(0, len(wire), 7):
+            os.write(theirs.fileno(), wire[at : at + 7])
+            pool.poll(1.0)
+        pool.poll(1.0)
+        assert ticket.result() == outcome() and not pool.broken
+    finally:
+        pool.close(abnormal=True)
+        theirs.close()
+
+
+def test_a_reply_after_a_reply_is_read_in_its_turn() -> None:
+    pool, first, theirs = _pool_with_a_fake_worker()
+    second = pexport.Ticket(JOB, b"", LAYOUTS)
+    pool._slots[0].sent.append(second)
+    try:
+        theirs.send_bytes(pf.encode(outcome()))
+        theirs.send_bytes(pf.encode(outcome()))
+        for _ in range(4):
+            pool.poll(1.0)
+        assert first.result() == outcome() and second.result() == outcome()
+    finally:
+        pool.close(abnormal=True)
+        theirs.close()
+
+
+def test_a_reply_that_is_empty_or_announces_a_negative_length_is_refused() -> None:
+    for length, tail in ((0, b""), (-1, b"\0" * 8)):
+        pool, ticket, theirs = _pool_with_a_fake_worker()
+        try:
+            os.write(theirs.fileno(), struct.pack("!i", length) + tail)
+            pool.poll(5.0)
+            assert ticket.done() and pool.broken
+        finally:
+            pool.close(abnormal=True)
+            theirs.close()
 
 
 def test_a_reply_that_tells_the_truth_reaches_its_ticket() -> None:
@@ -482,7 +719,7 @@ def test_an_exact_range_answered_as_holding_no_record_is_refused() -> None:
     asked to, so a reply without a start (and without a crash or a move) would skip it."""
     exact = dataclasses.replace(JOB, exact=True)
     with pytest.raises(pf.FrameError):
-        pf.check_reply(exact, Outcome(7))
-    pf.check_reply(exact, Outcome(7, crash="x"))
-    pf.check_reply(exact, Outcome(7, moved=True))
-    pf.check_reply(JOB, Outcome(7))  # a guess: the walk decides
+        pf.check_reply(exact, Outcome(7), LAYOUTS)
+    pf.check_reply(exact, Outcome(7, crash="x"), LAYOUTS)
+    pf.check_reply(exact, Outcome(7, moved=True), LAYOUTS)
+    pf.check_reply(JOB, Outcome(7), LAYOUTS)  # a guess: the walk decides

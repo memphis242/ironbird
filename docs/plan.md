@@ -4064,7 +4064,11 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   below), each worker
   has up to two jobs sent (one running, one ready; a job message over 16 KiB goes only to an idle worker so a
   send never waits on a busy one), and the parent reads on the calling thread with
-  `multiprocessing.connection.wait` in 50 ms slices. There is no manager thread and no queue shared
+  `multiprocessing.connection.wait` in 50 ms slices, taking from each ready pipe only what it holds
+  (a per-worker assembler of the length-prefixed message; the length is checked against the reply
+  cap before a body byte is held), so a worker that stays alive and stops part way through a reply
+  (stopped, wedged or hostile) costs the parent one slice at a time and cannot keep it from acting
+  on SIGINT or SIGTERM. There is no manager thread and no queue shared
   between workers. (Found in review: the executor this replaced had a manager thread that read the
   results; after the export terminated its workers part way through sending a result, that thread
   blocked reading a message that was never completed and the interpreter waited for it at exit, forever;
@@ -4106,14 +4110,25 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   Bounds: a frame of each type has a cap (definitions 128 MiB, a job 64 MiB, a reply 128 MiB),
   which the receiver also passes to the pipe so a longer message is refused from its length,
   before it is read; every list has a cap; one frame makes at most 2^22 strings and list elements.
-  The encoder applies the same caps, so a value that cannot be sent is an error at the sender. A
+  The encoder applies the same caps, the item budget included (spent exactly as the reader
+  spends it), so a value that cannot be sent is an error at the sender ("a message for the export
+  pool cannot be sent: ..."), which a worker reports as a crash outcome naming the reason. A job's
+  `--from`/`--to` bounds travel as signed 16-byte integers (every instant of years 1 to 9999 and
+  more), not 64-bit ones. The tally's `rejected` keys are error codes (the same table as a
+  failure's code, at most one entry per code), so a worker cannot grow the parent's counter.
+  4 Mi items is enough for any honest range (a table costs two items per column, a range holds
+  at most one table per message of the definitions): a range of a definition set so large that
+  its tables pass it ends the export with `IB-EXP-003` and that reason, as a limit of the format
+  and not a malformed reply. A
   worker is spawned with only its pipe and the parent's pid; the definitions are the pipe's first
   frame (encoded once per pool). The parent reads a reply only through `read_reply`, which decodes
   it, refuses a fault or any other type, and checks it against the job (`check_reply`): the range
   asked for, a start where the job reads from and an end not before it, a cut that moves on,
   damage and gaps only with the kinds of the rows, every row kind defined, the tables the format
   has (one stream for text and JSON Lines, a malformed table only in a directory export, one block
-  per table), and the lines of the blocks, the rows that made a line and the order of the lines in
+  per table by handle and by key, and each table's key (message name, columns) a layout the
+  export's codecs make, `poolframe.layouts_of`, so a name from a worker never reaches the file
+  system), and the lines of the blocks, the rows that made a line and the order of the lines in
   agreement; then the walk checks it as before. A worker answers a message it cannot read with a
   fault and ends; a result it cannot frame becomes a crash outcome. Error text sent back is made
   sendable (`diagnostic`: lone surrogates as their `\udcXX` escape, what the display shows anyway;
@@ -4128,7 +4143,8 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   encoder must refuse; Hypothesis properties of the round trip and of `read_reply` on mutated
   replies; the parent's pool on a fake worker: garbage, a fault, a job, the wrong range and a
   length over the cap are `IB-EXP-003` and a truthful reply reaches its ticket; a worker answers an
-  unreadable message with a fault), the corpus `tests/corpus/malformed/poolframe-*.bin` (40 replies,
+  unreadable message with a fault; a worker that sends part of a reply and stops, or dies, or
+  sends it in pieces, is never waited for), the corpus `tests/corpus/malformed/poolframe-*.bin` (45 replies,
   built by `tests/poolframe_corpus.py`, each refused), and the nightly atheris harness
   `tools/fuzz/fuzz_poolframe.py`. Found while replacing it, each a test that fails on the code
   before: (1) a worker's crash outcome (a job that raised, or definitions a worker cannot build,
@@ -4139,7 +4155,17 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   (`test_a_worker_that_crashes_ends_the_export_instead_of_skipping_its_range`, real workers).
   (2) A reply refused after its ticket was taken off the worker's queue left that ticket without
   an answer (the parent asserted, or under `-O` polled forever); the ticket now stays queued until
-  the reply is accepted.
+  the reply is accepted. Found in the review of the replacement, each a test that fails on the
+  code before: (3) a `--from`/`--to` bound past the signed 64-bit nanosecond range (`--to
+  9999-12-31T23:59:59Z`) failed every pooled export with `IB-EXP-003` while one process exported
+  it; (4) two GAP records in a row whose lost counts sum past 2^64 - 1 made a gap note the wire
+  could not carry (a worker starts a new note instead of merging when the sum would not fit; the
+  tally is the sum either way); (5) a table name in a reply reached the file system (an
+  `AssertionError`, and a file outside the export under `-O`): a table is accepted only if a
+  definition makes it; (6) a worker that stopped part way through a reply hung the parent in a
+  blocking read that no signal ended (also true of the executor this replaced): replies are
+  assembled from what the pipe holds; (7) the encoder did not spend the item budget; (8) the
+  tally's `rejected` keys were free text.
 - **When the pool is used.** `--jobs N` (1..64) beats `[export] jobs`, which beats the default of one
   worker per core the process may run on (its CPU affinity and the `cpu.max` quota of its cgroup v2
   group and the groups above it, rounded up; a group that cannot be examined, such as `EACCES`, is no

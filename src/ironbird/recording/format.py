@@ -222,8 +222,9 @@ def _int_field(data: Mapping[str, Any], key: str, low: int, high: int, default: 
     return value
 
 
-def _depth(root: Any) -> int:
-    """Nesting depth of decoded JSON, measured without recursion (the data is untrusted)."""
+def json_depth(root: Any) -> int:
+    """Nesting depth of decoded JSON, measured without recursion (the data is untrusted), up to
+    one past :data:`MAX_META_DEPTH`."""
     deepest = 0
     pending: list[tuple[Any, int]] = [(root, 1)]
     while pending:
@@ -248,7 +249,7 @@ def decode_meta(body: bytes | memoryview) -> Meta:
         raise FormatError(f"META is not valid JSON ({type(exc).__name__})") from exc
     if not isinstance(data, dict):
         raise FormatError("META is not a JSON object")
-    if _depth(data) > MAX_META_DEPTH:
+    if json_depth(data) > MAX_META_DEPTH:
         raise FormatError(f"META is nested deeper than {MAX_META_DEPTH} levels")
     if data.get("schema") != META_SCHEMA:
         raise FormatError("META schema is not " + META_SCHEMA)

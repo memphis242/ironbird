@@ -2,11 +2,12 @@
 every type, and the checked-in corpus of malformed replies (``tests/corpus/malformed/poolframe-*``).
 
 Every corpus case is a message a worker could send the parent in answer to :data:`JOB`, and the
-parent must refuse it: :func:`~ironbird.recording.poolframe.read_reply` raises ``FrameError``
-(``IB-EXP-003``), whether the frame is broken (truncated, a lying length, bad UTF-8, an unknown
-type or version) or well formed and not an answer the parent can apply (the wrong range, rows
-that disagree with their kinds). Every case is built here, so a test proves the checked-in files
-are exactly these; a new bug adds a case and regenerates: ``python tests/poolframe_corpus.py``.
+parent must refuse it: :func:`~ironbird.recording.poolframe.read_reply` (given :data:`LAYOUTS`)
+raises ``FrameError`` (``IB-EXP-003``), whether the frame is broken (truncated, a lying length,
+bad UTF-8, an unknown type or version) or well formed and not an answer the parent can apply (the
+wrong range, rows that disagree with their kinds, a table no definition makes). Every case is
+built here, so a test proves the checked-in files are exactly these; a new bug adds a case and
+regenerates: ``python tests/poolframe_corpus.py``.
 """
 
 from __future__ import annotations
@@ -67,6 +68,8 @@ JOB = Job(
     1000,
     10,
 )
+#: The tables the definitions of :data:`JOB` make: what a reply's tables are checked against.
+LAYOUTS = frozenset({("HK_TLM", ("seq", "CmdCounter"))})
 REASON = "FRAME record fails its CRC"
 ROWS = "1,2\n3,4\n"
 
@@ -135,6 +138,9 @@ def samples() -> dict[str, pf.Message]:
             end_ns=-5,
             shape=dataclasses.replace(SHAPE, where=None, aliases=None, fmt=ExportFormat.JSONL),
         ),
+        "job-wide-times": dataclasses.replace(
+            JOB, start_ns=-62_135_596_800 * 10**9, end_ns=253_402_300_799 * 10**9
+        ),
         "outcome": outcome(),
         "outcome-crash": Outcome(7, crash="Traceback (most recent call last):\nValueError: x"),
         "outcome-moved": Outcome(7, moved=True),
@@ -194,6 +200,11 @@ def cases() -> dict[str, bytes]:
         "definitions-over-cap",
         _frame(pf.Kind.OUTCOME, zeros + struct.pack("<I", pf.MAX_NOTES + 1)),
     )
+    rejections = struct.pack("<I", 1) + _length_prefixed("IB-DEC-001")
+    case(
+        "rejections-over-cap",
+        _replace_once(good, rejections, struct.pack("<I", len(pf._CODES) + 1) + rejections[4:]),
+    )
     case("fault-length-over-cap", _frame(pf.Kind.FAULT, struct.pack("<I", pf.MAX_DIAG_BYTES + 1)))
     # text
     case("rows-bad-utf8", _replace_once(good, ROWS.encode(), b"1,2\n3\xff4\n"))
@@ -221,6 +232,7 @@ def cases() -> dict[str, bytes]:
     bad_ending = endings[:-1] + b"\x09"
     case("unknown-ending", _replace_once(good, endings, bad_ending))
     # messages that are not an answer
+    case("rejection-code-unknown", _replace_once(good, b"IB-DEC-001", b"IB-XYZ-999"))
     case("job-as-reply", pf.encode(JOB))
     case("definitions-as-reply", pf.encode(embedded()))
     case("fault", pf.encode(Fault("the job could not be read")))
@@ -244,6 +256,21 @@ def cases() -> dict[str, bytes]:
     semantic("block-not-whole-line", blocks=[bad.blocks[0], Block(None, True, 1, "5,6", 0)])
     semantic(
         "two-blocks-one-table", blocks=[bad.blocks[0], dataclasses.replace(bad.blocks[1], handle=1)]
+    )
+    semantic(
+        "two-blocks-one-key",
+        blocks=[bad.blocks[0], bad.blocks[1], dataclasses.replace(bad.blocks[0], handle=7)],
+    )
+    semantic(
+        "block-of-undefined-table",
+        blocks=[
+            Block(("../../escaped", ("seq", "CmdCounter")), False, 2, ROWS, 1),
+            bad.blocks[1],
+        ],
+    )
+    semantic(
+        "block-of-undefined-layout",
+        blocks=[Block(("HK_TLM", ("seq", "Other")), False, 2, ROWS, 1), bad.blocks[1]],
     )
     semantic(
         "malformed-block-with-key",

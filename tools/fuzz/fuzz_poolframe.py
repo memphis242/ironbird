@@ -9,10 +9,15 @@ raises ``FrameError``. No other exception escapes, and nothing allocates more th
 (the harness's RSS limit is the check).
 
 The first input byte picks how the rest is used: raw (bit 7 clear), or as ``(offset, value)``
-byte pairs written over a valid message (bit 7 set; bits 0-6 pick the sample), with the header's
-body length fixed up when bit 6 is set, so the mutations land in the fields rather than in a
-length the header check refuses at once. Seeds are the checked-in ``poolframe-*`` replies and
-every valid sample of ``tests/poolframe_corpus.py``.
+triples (a 2-byte little-endian offset, taken modulo the length, and a byte) written over a valid
+message (bit 7 set; bits 0-5 pick the sample), with the header's body length fixed up when bit 6
+is set, so the mutations land in the fields rather than in a length the header check refuses at
+once. Seeds are the checked-in ``poolframe-*`` replies and every valid sample of
+``tests/poolframe_corpus.py``.
+
+Replies are checked against the one ``JOB`` (a CSV directory export) and its ``LAYOUTS``; the
+other branches of ``check_reply`` (an exact range, text, JSON Lines) are covered by the unit and
+property tests of ``tests/test_poolframe.py``.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ sys.path.insert(0, str(REPO / "tests"))
 import poolframe_corpus  # noqa: E402
 
 JOB = poolframe_corpus.JOB
+LAYOUTS = poolframe_corpus.LAYOUTS
 SAMPLES = [pf.encode(m) for _, m in sorted(poolframe_corpus.samples().items())]
 
 
@@ -42,10 +48,10 @@ def check(data: bytes) -> None:
     else:
         assert pf.encode(message) == data, "a frame read back is not what was read"
     try:
-        reply = pf.read_reply(JOB, data)
+        reply = pf.read_reply(JOB, data, LAYOUTS)
     except pf.FrameError:
         return
-    pf.check_reply(JOB, reply)
+    pf.check_reply(JOB, reply, LAYOUTS)
 
 
 def one_input(data: bytes) -> None:

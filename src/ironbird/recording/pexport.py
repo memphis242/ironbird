@@ -64,12 +64,14 @@ coordinates), exit if the parent goes away, and are terminated when the export e
 signal, an error, the output closing). The pool is owned: one process and one pipe per worker, jobs
 and results over that pipe, no helper thread and no queue shared between workers, so a worker that
 is terminated or dies part way through a message is an end of file on its pipe and nothing waits
-for bytes that will not come. The parent waits in :func:`multiprocessing.connection.wait` in short
-slices. The processes, and the resource tracker the first of them starts, are created with the
-shutdown signals blocked, so a hangup sent to the process group reaches the parent alone. A worker
-that dies, or whose result cannot be read, is ``IB-EXP-003``. A worker is started with nothing but
-its pipe and the parent's process id; the definitions it decodes with are the first message on the
-pipe.
+for bytes that will not come. A worker that stays alive and stops part way through a message is
+not waited for either: the parent waits in :func:`multiprocessing.connection.wait` in short
+slices and, between them, takes only what a pipe holds (:class:`_Inbox`), so a signal is acted on
+within a slice whatever a worker does. The processes, and the resource tracker the first of them
+starts, are created with the shutdown signals blocked, so a hangup sent to the process group
+reaches the parent alone. A worker that dies, or whose result cannot be read, is ``IB-EXP-003``. A
+worker is started with nothing but its pipe and the parent's process id; the definitions it decodes
+with are the first message on the pipe.
 
 Untrusted input: everything a worker reads is validated by the reader before it is decoded, and a
 worker that decodes untrusted recordings is not trusted either. Every message on the pipe, both
@@ -77,7 +79,8 @@ ways, is a frame of the fixed binary format of :mod:`~ironbird.recording.poolfra
 ever serialized, so no message can run code or name a type to build. The parent reads a reply
 only through :func:`~ironbird.recording.poolframe.decode` (caps on every length, the pipe refusing
 a message longer than any reply before reading it), checks it against the job it answers
-(:func:`~ironbird.recording.poolframe.check_reply`) and then against the walk; a reply that fails
+(:func:`~ironbird.recording.poolframe.check_reply`, the tables of a CSV reply among them: only
+those the export's definitions make) and then against the walk; a reply that fails
 any of these is ``IB-EXP-003``, as a worker that died is.
 """
 
@@ -89,11 +92,12 @@ import dataclasses
 import multiprocessing
 import os
 import signal
+import struct
 import threading
 import time
 import traceback
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from multiprocessing import connection, resource_tracker
 from pathlib import Path
@@ -118,6 +122,7 @@ from ironbird.recording.export import (
     Pipeline,
     Selection,
     Table,
+    TableKey,
     make_pipeline,
 )
 from ironbird.recording.format import RecordType
@@ -403,9 +408,9 @@ class _Worker:
                     if gap_in_range(gap, start, end):
                         lost = gap.lost if gap.reason is not GapReason.LINK_DOWN else 0
                         marks = out.gap_marks
-                        if marks and marks[-1][0] == rows:
+                        if marks and marks[-1][0] == rows and marks[-1][2] + lost <= fmt.MAX_U64:
                             marks[-1] = (rows, marks[-1][1] + 1, marks[-1][2] + lost)
-                        else:
+                        else:  # a run whose sum would not fit the wire's u64 starts a new mark
                             marks.append((rows, 1, lost))
                         if self._full(job, out, dest):
                             return item.end
@@ -515,8 +520,10 @@ def _reply(outcome: Outcome) -> bytes:
         outcome.crash = poolframe.diagnostic(outcome.crash)
     try:
         return poolframe.encode(outcome)
-    except FrameError:
-        crash = poolframe.diagnostic(traceback.format_exc())
+    except FrameError as exc:  # the last line is what the user is shown; the rest is the detail
+        crash = poolframe.diagnostic(
+            f"{traceback.format_exc()}\nthe worker's result cannot be sent: {exc.reason}"
+        )
         return poolframe.encode(Outcome(outcome.index, crash=crash))
 
 
@@ -539,7 +546,8 @@ def _from_parent(conn: connection.Connection, kind: Kind) -> poolframe.Message |
             raise FrameError(f"a {type(message).__name__} came where a {kind.name} must")
     except FrameError as exc:
         with contextlib.suppress(OSError):
-            conn.send_bytes(poolframe.encode(Fault(poolframe.diagnostic(str(exc)))))
+            reason = f"{exc.reason} (at byte {exc.offset})"
+            conn.send_bytes(poolframe.encode(Fault(poolframe.diagnostic(reason))))
         return None
     return message
 
@@ -634,11 +642,12 @@ class Ticket:
     """A submitted job: waiting for a worker, running, or answered (an outcome, or the error that
     ended the pool before it was)."""
 
-    __slots__ = ("cancelled", "data", "error", "job", "outcome")
+    __slots__ = ("cancelled", "data", "error", "job", "layouts", "outcome")
 
-    def __init__(self, job: Job, data: bytes) -> None:
+    def __init__(self, job: Job, data: bytes, layouts: Collection[TableKey] = frozenset()) -> None:
         self.job = job
         self.data: bytes | None = data  # the job as sent; dropped once sent
+        self.layouts = layouts  # the tables the answer may hold (see ``poolframe.check_reply``)
         self.outcome: Outcome | None = None
         self.error: IronbirdError | None = None
         self.cancelled = False  # nobody wants the answer any more
@@ -657,15 +666,74 @@ class Ticket:
         self.cancelled = True
 
 
+class MessageTooLong(Exception):
+    """A message on the pipe announced a length that no reply has."""
+
+
+class _Inbox:
+    """The messages a worker sends, put together from what its pipe holds, never waiting for more.
+
+    A message on the pipe is a 4-byte big-endian length (what :meth:`Connection.send_bytes`
+    writes) and that many bytes. A read of the pipe that waits until a whole message has come
+    would wait on a worker that sends part of one and stops (stopped, wedged or hostile), and
+    cannot be interrupted by a signal; :meth:`take` makes one read of what is there, so the
+    caller's loop, which waits in slices, always gets back to its checkpoint. The length is
+    checked against ``cap`` before a byte of the body is held, and the body is held only as it
+    arrives, so a lying length costs nothing."""
+
+    __slots__ = ("_body", "_cap", "_fd", "_head", "_size")
+
+    LENGTH: Final = struct.Struct("!i")
+    CHUNK: Final = 256 * 1024  # the most one read takes (about a socket's buffer)
+
+    def __init__(self, fd: int, cap: int) -> None:
+        self._fd = fd
+        self._cap = cap
+        self._head = bytearray()
+        self._body = bytearray()
+        self._size: int | None = None  # the announced length, once the 4 bytes of it are in
+
+    def take(self) -> bytearray | None:
+        """Read what the pipe holds, which must be readable now; the message once it is whole,
+        else ``None``. Raises :class:`EOFError` if the worker's end closed (part way through a
+        message or not), :class:`OSError` for a failed read and :class:`MessageTooLong` for a
+        length over the cap or negative (the sentinel of a message past 2 GiB)."""
+        size = self._size
+        if size is None:
+            chunk = os.read(self._fd, self.LENGTH.size - len(self._head))
+            if not chunk:
+                raise EOFError
+            self._head += chunk
+            if len(self._head) < self.LENGTH.size:
+                return None
+            (size,) = self.LENGTH.unpack(self._head)
+            if not 0 <= size <= self._cap:
+                raise MessageTooLong(size)
+            self._head.clear()
+            if size == 0:
+                return bytearray()
+            self._size = size
+            return None
+        chunk = os.read(self._fd, min(size - len(self._body), self.CHUNK))
+        if not chunk:
+            raise EOFError
+        self._body += chunk
+        if len(self._body) < size:
+            return None
+        message, self._body, self._size = self._body, bytearray(), None
+        return message
+
+
 class _Slot:
     """A worker process and the pipe to it: the tickets sent to it and not yet answered, oldest
-    first (a worker answers in the order it was asked)."""
+    first (a worker answers in the order it was asked), and the reply being received."""
 
-    __slots__ = ("conn", "process", "sent")
+    __slots__ = ("conn", "inbox", "process", "sent")
 
     def __init__(self, process: Any, conn: connection.Connection) -> None:
         self.process = process
         self.conn = conn
+        self.inbox = _Inbox(conn.fileno(), poolframe.MAX_REPLY_BYTES)
         self.sent: deque[Ticket] = deque()
 
 
@@ -700,16 +768,17 @@ class WorkerPool:
 
     # -- the tickets --
 
-    def submit(self, job: Job) -> Ticket:
+    def submit(self, job: Job, layouts: Collection[TableKey] = frozenset()) -> Ticket:
         """Queue ``job`` and hand it to a worker as soon as one can take it (starting a worker
-        when all those running are busy and fewer than ``jobs`` exist)."""
+        when all those running are busy and fewer than ``jobs`` exist). ``layouts``: the tables
+        the answer may hold (a CSV export's: :func:`poolframe.layouts_of`)."""
         if self._error is not None:
             raise self._error
         try:
             data = poolframe.encode(job)
         except FrameError as exc:
             raise self._undeliverable("a job could not be sent to a worker", exc) from exc
-        ticket = Ticket(job, data)
+        ticket = Ticket(job, data, layouts)
         self._queued.append(ticket)
         self._dispatch()
         return ticket
@@ -734,23 +803,31 @@ class WorkerPool:
         self._dispatch()
 
     def _receive(self, slot: _Slot) -> None:
-        """Take the next answer of ``slot``'s worker. It is untrusted: read only by
+        """Take what ``slot``'s worker has sent of its next answer, for up to one wait slice (a
+        worker that stops part way through a message is not waited for: the caller's loop goes
+        on, and its checkpoints act on a signal). The answer is untrusted: read only by
         :func:`poolframe.read_reply`, and anything it refuses ends the pool as a worker that
         died does."""
         conn = slot.conn
-        try:
-            data = conn.recv_bytes(poolframe.MAX_REPLY_BYTES)
-        except (EOFError, OSError) as exc:
-            if conn.readable:
-                self._fail(self.died(exc))
-            else:  # the pipe refused a message longer than any reply, before reading it
+        deadline = time.monotonic() + WAIT_SLICE_S
+        while True:
+            try:
+                data = slot.inbox.take()
+            except MessageTooLong as exc:  # refused from its length, before any of it is held
                 self._fail(
                     self._undeliverable("an export worker sent a result too long to be one", exc)
                 )
-            return
+                return
+            except (EOFError, OSError) as exc:
+                self._fail(self.died(exc))
+                return
+            if data is not None:
+                break
+            if time.monotonic() >= deadline or not connection.wait([conn], 0):
+                return  # the rest has not come: the next poll goes on from here
         ticket = slot.sent[0]  # a worker answers in the order it was asked
         try:
-            reply = poolframe.read_reply(ticket.job, data)
+            reply = poolframe.read_reply(ticket.job, data, ticket.layouts)
         except FrameError as exc:  # the ticket is still sent: the failure answers it
             self._fail(
                 self._undeliverable("an export worker returned a result that cannot be read", exc)
@@ -1058,6 +1135,8 @@ class _Runner:
         self._live: dict[int, Ticket] = {}
         self._moved = False  # the file is no longer under its name: this process reads it all
         self._local: _Worker | None = None
+        self._codec_map: Mapping[str, Codec] | None = None
+        self._layout_set: frozenset[TableKey] | None = None
         self._largest = 0  # an estimate of the most text a running range will return
         self._ratio = 0.0  # an estimate of the characters of text a byte of the file makes
 
@@ -1230,7 +1309,7 @@ class _Runner:
 
         def submit(job: Job) -> None:
             jobs[job.index] = job
-            tickets[job.index] = self._pool.submit(job)
+            tickets[job.index] = self._pool.submit(job, self._layouts())
             report.workers = self._pool.jobs
 
         def exactly(index: int) -> Outcome:
@@ -1324,17 +1403,38 @@ class _Runner:
         self.cancel()
         jobs.clear()
 
-    def _here(self, job: Job, reader: RecordingReader) -> Outcome:
-        """``job`` run in this process, on the file this process has open."""
-        if self._local is None:
+    def _codecs(self) -> Mapping[str, Codec]:
+        """The codecs the export decodes with: the ones it was given, else built from the
+        definitions the workers build from (once)."""
+        if self._codec_map is None:
             options = self._options
             try:
-                self._local = _Worker(options.definitions, options.codecs)
+                self._codec_map = (
+                    options.codecs if options.codecs is not None else options.definitions.build()
+                )
             except _Changed as exc:
                 raise IronbirdError(
                     Code.EXP_WORKER,
                     f"{exc}; run the export again, or with --jobs 1 to decode in one process",
                 ) from exc
+        return self._codec_map
+
+    def _layouts(self) -> frozenset[TableKey]:
+        """The tables a worker's answer may hold (once): every layout the codecs make for a CSV
+        export, none for the formats that have one stream of rows."""
+        if self._layout_set is None:
+            shape = self._shape
+            self._layout_set = (
+                poolframe.layouts_of(self._codecs(), header_fields=shape.header_fields)
+                if shape.fmt is ExportFormat.CSV
+                else frozenset()
+            )
+        return self._layout_set
+
+    def _here(self, job: Job, reader: RecordingReader) -> Outcome:
+        """``job`` run in this process, on the file this process has open."""
+        if self._local is None:
+            self._local = _Worker(self._options.definitions, self._codecs())
         outcome = self._local.run(job, reader)
         self._report.scanned += outcome.scanned
         return outcome

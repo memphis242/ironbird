@@ -76,7 +76,7 @@ def build(path: Path, rng: random.Random, steps: int = 400) -> Path:
             gap = fmt.Gap(
                 rng.choice((0, 2, 0xFFFF)),
                 rng.choice(tuple(GapReason)),
-                rng.randrange(0, 9),
+                rng.choice((*range(9), 2**63, 2**64 - 1)),  # a count is a u64
                 t - STEP_NS,
                 t,
                 seq,

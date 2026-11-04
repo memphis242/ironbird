@@ -22,7 +22,10 @@ import export_corpus
 from conftest import CORPUS
 from ironbird.config import parse_config
 from ironbird.errors import Code
+from ironbird.frame import GapReason
+from ironbird.recording import format as recfmt
 from ironbird.recording.export import ExportFormat
+from ironbird.recording.format import RecordType
 from ironbird.recording.pexport import (
     ALIGN,
     WINDOW_PER_WORKER,
@@ -35,7 +38,7 @@ from ironbird.recording.pexport import (
     head_seed,
 )
 from ironbird.recording.reader import Damage, Item, RecordingReader
-from ironbird.recording.replay import Replay, TimeSpec
+from ironbird.recording.replay import Replay, TimeSpec, parse_time_spec
 from ironbird.recording.writer import RecorderOptions
 from poolutil import (
     RANGE,
@@ -51,7 +54,7 @@ from poolutil import (
 )
 from rec_corpus import cases as rec_cases
 from recutil import RX, SERIAL, TX
-from replayutil import write_recording
+from replayutil import STEP_NS, T0, crafted, good_blobs, hk, write_recording
 
 JOBS = 3
 FORMATS = list(ExportFormat)
@@ -128,6 +131,27 @@ def test_a_time_range_exports_the_same(clean: Path) -> None:
     both(clean, pooled_part=False, end=TimeSpec(offset_ns=1))
     # a range that takes in every chunk skips none, and shares
     both(clean, end=TimeSpec(offset_ns=10**15))
+
+
+@pytest.mark.parametrize(
+    ("option", "text"),
+    [
+        ("end", "2262-04-12T00:00:00Z"),  # the first instant past a signed 64-bit nanosecond count
+        ("end", "9999-12-31T23:59:59Z"),  # "until the end of time"
+        ("start", "1677-09-21T00:00:00Z"),  # the last before it
+        ("start", "0001-01-01T00:00:00Z"),
+        ("end", "1000-01-01T00:00:00Z"),
+        ("start", "9999-12-31T23:59:59Z"),
+    ],
+)
+def test_a_time_bound_of_any_year_exports_the_same(clean: Path, option: str, text: str) -> None:
+    """``--from``/``--to`` accept any year from 1 to 9999; a bound the signed 64-bit nanosecond
+    count cannot hold failed every pooled export (``IB-EXP-003``) while one process exported."""
+    bound = parse_time_spec(text, f"--{option}")
+    selects_nothing = (option, text[:4]) in {("end", "1000"), ("start", "9999")}
+    bounds: dict[str, Any] = {option: bound}
+    both(clean, pooled_part=not selects_nothing, **bounds)
+    assert run_export(clean, jobs=JOBS, **bounds).error is None
 
 
 def test_a_range_that_selects_nothing_exports_the_same(clean: Path) -> None:
@@ -222,6 +246,31 @@ def test_gaps_marks_and_time_ranges_count_the_same(tmp_path: Path) -> None:
             pooled = run_export(path, fmt, jobs=JOBS, **kwargs)
             assert_same(single, pooled, label=str(kwargs))
             assert pooled.report.parts_pooled == 1
+
+
+def test_gap_records_whose_counts_overflow_a_u64_together_export_the_same(tmp_path: Path) -> None:
+    """Each GAP record is valid (a count is a u64), and the pool merges the gaps that no row
+    separates into one note: two of them past 2**64 - 1 together made a note the wire cannot
+    carry, and the export ended ``IB-EXP-003`` while one process finished it."""
+    builder = crafted(good_blobs(), frames=0)
+    for seq in range(1, 1201):
+        if seq in (300, 600):
+            time_ns = T0 + seq * STEP_NS
+            for lost in (2**63, 2**63, 2**64 - 1):
+                gap = recfmt.Gap(
+                    0, GapReason.KERNEL_DROP, lost, time_ns - STEP_NS, time_ns, seq, seq
+                )
+                builder.add(RecordType.GAP, recfmt.encode_gap(gap))
+        builder.frame(seq, data=hk(seq), stream=0, source=0, mid=0x890, time_ns=T0 + seq * STEP_NS)
+    path = write_builder(builder, tmp_path / "gaps.ibrec")
+    whole = run_export(path, jobs=1)
+    assert whole.error is None and whole.stats["gap_frames"] == 2 * (2**65 - 1)
+    for fmt_ in FORMATS:
+        single = run_export(path, fmt_, jobs=1)
+        pooled = run_export(path, fmt_, jobs=JOBS)
+        assert pooled.error is None, pooled.error
+        assert_same(single, pooled, label=str(fmt_))
+        assert pooled.report.parts_pooled == 1
 
 
 @pytest.mark.parametrize("every", [3, 40, 400])
