@@ -4548,6 +4548,17 @@ its options:
    mockups are the reference until the TUI exists.
 4. TUI command composer with tiered search and argument entry.
 5. Send modes: scheduled at T, repeat N, every M ms/s until T or for duration.
+   **Done for `ib send` (`send/modes`)**: `--at`, `--repeat`, `--every` with `--for`/`--until`, and
+   `--raw-enum`; the flags, timing model and decisions are in the README's "Send modes" section and in
+   `src/ironbird/sendmodes.py`. Decisions: absolute monotonic deadlines (no drift), a wall-clock `--at`
+   re-read until the last second; zone-less times are UTC; an overrunning slot is skipped (not caught up)
+   when more than half a period late and counted; a failed send stops the series (exit 1); the first
+   packet's UDP refusal check runs beside the series so it does not make the first slots late; a series
+   ledgers its arguments once in `send.plan` and one `tx.command` per packet. Remaining in Stage 5: replay
+   to the wire (`ib replay --send`, D5), the TUI commanding page and its scheduling UI, send modes for
+   `ib respond`, and a spin-free timer if the 1 ms target must be held on a loaded host (a dedicated thread
+   or `timerfd`; today a period under a few ms keeps one core busy and a preempted host skips slots).
+   The persistent sequence counter is a separate piece of work (`send/sequence`).
 6. xlsx export, optional semantic search (local sentence-transformer as an extra),
    1553 transport when hardware is available.
 

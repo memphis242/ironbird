@@ -91,7 +91,7 @@ pointer names the part too: `[ledger n=1234 file=<stamp>-<session>.p0003]`.
 |---------|--------------|---------|
 | `ib nodes` | List nodes, aliases and links, and check every definition file | below |
 | `ib find TEXT` | Search commands and telemetry by name, MID or description | below |
-| `ib send NODE CMD [name=value ...]` | Encode and send one command | below |
+| `ib send NODE CMD [name=value ...] [--at T] [--repeat N] [--every D (--for D\|--until T)]` | Encode and send a command: once, at a time, N times or periodically | below |
 | `ib listen NODE [--where EXPR] [--record PATH]` | Decode and print incoming packets | Filtering |
 | `ib events [--min-type T] [--where EXPR]` | Print only cFS events from every telemetry link | below |
 | `ib respond --as NODE` | Act as a flight node: answer commands with configured telemetry | below |
@@ -101,11 +101,75 @@ pointer names the part too: `[ledger n=1234 file=<stamp>-<session>.p0003]`.
 | `ib replay FILE... [--where EXPR] [--from T] [--to T] [--follow]` | Play a recording back as `listen` shows it | Replay |
 | `ib export FILE... [-o OUT] [--format csv\|text\|jsonl] [--jobs N]` | Export a recording to tables, text or JSON Lines | Export |
 
-**Fault injection** (`ib send`): `--bad-checksum`, `--length-delta N` and `--allow-count-mismatch` send
-a deliberately broken packet. The confirmation line ends with `[fault injected: ...]` naming what was
+**Fault injection** (`ib send`): `--bad-checksum`, `--length-delta N`, `--allow-count-mismatch` and
+`--raw-enum` send a deliberately broken packet. The confirmation line ends with `[fault injected: ...]` naming what was
 done, so a "sent" line is never mistaken for a clean send; the packet's ledger record says the same.
 `--length-delta` is refused (`IB-HDR-003`, exit 2, nothing sent) when the changed value would leave
-the length field's range, since it would wrap to an unrelated size.
+the length field's range, since it would wrap to an unrelated size. `--raw-enum` lets an integer outside
+a field's CCDD `enum` through for this invocation (without it the value is refused with `IB-ENC-002`,
+whose message names the flag; a CCDD field with `"allow_raw": true` accepts any value, always). The
+line says `[fault injected: raw enum value mode=9]`, the ledger gets a `send.fault` record with
+`fault = "raw_enum"` and the field and value, and in a repeat/every run it applies to every packet
+(the values are in the series' `send.plan`). The flag is a usage error (`IB-CLI-001`) when no argument
+is outside its enum, so it cannot be left on by habit.
+
+### Send modes
+
+```bash
+ib send fc MOCK_NOOP --repeat 5                       # five packets back to back
+ib send fc MOCK_NOOP --at +10s                        # once, ten seconds from now
+ib send fc MOCK_NOOP --at 2026-11-04T12:00:00Z        # once, at a UTC time
+ib send fc MOCK_NOOP --every 250ms --for 1m           # four a second for a minute
+ib send fc MOCK_NOOP --every 1s --until 2026-11-04T12:05:00Z --repeat 100   # whichever ends first
+ib send fc MOCK_NOOP --at +30s --every 1ms --for 10s  # a timed burst
+```
+
+- **Times** (`--at`, `--until`) are ISO 8601 with seconds, or an offset such as `+10s`, `+1m30s`,
+  `+250ms` counted from the moment the command was typed. **A time with no zone is UTC**, never
+  local time (`2026-11-04T12:00:00` is `...Z`); write `+02:00` for another zone. The plan line and the
+  ledger show the start in UTC and say when a zone was assumed. A start in the past (or `+0s`) is refused,
+  as is one more than a year ahead. **Durations** (`--every`, `--for`) are `250ms`, `1.5s`, `2m`,
+  `1m30s` (units `ms s m h`; a bare `5` is refused, its unit could be anything).
+- **Combining.** `--repeat N` alone sends N packets back to back, each as soon as the previous send
+  returned. `--every P` sends one per period (at least 1 ms) and needs an end: `--repeat N` (a cap),
+  `--for D` (counted from the first packet) or `--until T`; with several, the first reached ends the
+  series. The window is half open: `--every 1s --for 3s` sends at 0, 1 and 2 s. `--at` delays the
+  start of any of these. Refused with `IB-CLI-001` (exit 2), before anything is opened or sent:
+  `--every` with no end, `--for`/`--until` without `--every`, `--for` with `--until`, `--repeat 1` with
+  `--every`, a window not longer than the period (one packet at most), an end not after the start, more
+  than 100,000,000 packets. A bad argument is refused up front too, not when a scheduled start arrives.
+- **Timing.** One process, one open link and one codec serve the whole series, and every packet is
+  encoded fresh (its sequence advances). Deadlines are absolute points on the monotonic clock
+  (`start + k * period`), so nothing drifts; a wall-clock `--at` is followed through clock steps until the
+  last second before it. The wait for each deadline sleeps and then yields in a tight loop for the last
+  1.5 ms (the event loop's timers round up to a millisecond), so a period under a few milliseconds keeps one
+  core busy. On loopback `--every 1ms` holds the period with a mean lateness of a few microseconds; a loaded
+  host loses slots, which is reported, never hidden.
+- **Overruns skip, they do not catch up.** A slot that cannot be started within half a period of its
+  deadline (a slow link, a stalled host) is skipped and counted, and the series carries on at the slot
+  nearest to now. Catching up would send the missed packets back to back, loading a slow link or vehicle
+  further and putting packets at times nobody asked for. Consecutive packets are therefore never closer than
+  half a period. A skipped slot does not count toward `--repeat` (N packets are sent) but is lost from a
+  `--for`/`--until` window. The summary says how many were skipped.
+- **Lateness** is the time between a slot's deadline and the start of its send; the summary gives the
+  maximum and mean, the ledger the same.
+- **Output.** One line announces the plan (stderr). A series of at most 2 packets per second (or at most
+  10 back to back), or any series under `-v`, prints a line per packet (with `-v`, the hex); a faster one
+  prints a `progress:` line on stderr every 5 s, so a 1 kHz series does not flood the terminal. The run
+  ends with `complete: sent N of M ..., skipped S, lateness max ... mean ...` on stdout.
+- **Errors.** A send that fails (`IB-TX-002`, a closed port, a ledger that refuses commands) **stops the
+  series** with its coded error, exit 1, after the summary: a link that failed once will fail again, and a
+  series with holes in it is harder to read than one that stopped. A UDP refusal is only reported by
+  the OS after the fact, so it is looked for on the first packet (beside the series, so it does not delay
+  the first slots), on the last, and on every packet of a series slower than 200 ms; one that arrives
+  in between is found when the OS reports it in time.
+- **Signals.** Ctrl-C, SIGTERM and SIGHUP stop the series between sends (a signal during a send ends
+  it as for a single `send`: the notice says whether the packet went out), print the summary and exit
+  128+n. Waiting for `--at` is interrupted at once, with nothing sent.
+- **Ledger.** `send.plan` (mode, start and end in UTC, period, count, the arguments, whether a zone was
+  assumed), one `tx.command` per packet (the arguments are not repeated), and `send.outcome` last
+  (`complete`, `interrupted` or `failed`, with sent, planned, skipped, overruns, maximum and mean lateness,
+  the longest send, elapsed time), however the series ends.
 
 ## The ledger under load, a full disk, and retention
 
@@ -611,8 +675,9 @@ Argument text is checked, never repaired, and every refusal is `IB-ENC-002` nami
 - A list is `1,2,3`, `[1, 2, 3]` or `1 2 3`. With commas every element must be present
   (`1,,2` is refused as `Entries[1]`; one trailing comma is allowed).
 - `char[N]` and `char[]` text is ASCII and carries no NUL, because decode ends text at a NUL.
-- An integer that no name of a command field's `enum` gives is refused (telemetry from `ib respond` is not restricted). A CCDD field that is meant to carry
-  other values in its type's range says so with `"allow_raw": true` next to its `enum`.
+- An integer that no name of a command field's `enum` gives is refused (telemetry from `ib respond` is not
+  restricted). A CCDD field that is meant to carry other values in its type's range says so with
+  `"allow_raw": true` next to its `enum`; `ib send --raw-enum` sends one deliberately, once (fault injection).
 - `seq N` in the `send` line, the ledger's `sequence` and `SentCommand.sequence` are the value in the
   packet's sequence field (wrapped at the field width); a profile with no sequence field reports none.
   The sequence count starts at 0 in every process (see the plan's deferral on a persistent count).

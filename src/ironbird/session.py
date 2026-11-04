@@ -562,6 +562,18 @@ class Session:
 
     # -- commander: send -----------------------------------------------------------
 
+    async def prepare_send(self, peer: str, *, link: str | None = None) -> None:
+        """Open the link a :meth:`send_command` to ``peer`` goes out on now, so the first send of
+        a timed series does not include the open. Errors are those of the send."""
+        route = self.route(peer, require=Side.COMMANDER, link_name=link)
+        await self._engine.open_for_send(route.link, link_end(route.side))
+
+    async def settle_sends(self, peer: str, *, link: str | None = None) -> None:
+        """Wait out the link's grace period for a refusal of the packets just sent to ``peer``
+        and raise it as the send would have; for a series that cannot wait inside a send."""
+        route = self.route(peer, require=Side.COMMANDER, link_name=link)
+        await self._engine.settle(route.link, link_end(route.side))
+
     async def send_command(
         self,
         peer: str,
@@ -572,26 +584,52 @@ class Session:
         link: str | None = None,
         header: Mapping[str, int] | None = None,
         allow_count_mismatch: bool = False,
+        confirm: bool = True,
+        record_request: bool = True,
+        raw_enum: bool = False,
     ) -> SentCommand:
+        """Encode and send one command. ``confirm`` waits briefly after the hand-off for the
+        link to refuse it (a UDP port nobody listens on); a timed series leaves it off for the
+        packets whose period is shorter than that wait. ``record_request`` writes the
+        ``send.request`` record; a series writes the arguments once, in its ``send.plan``, and
+        leaves the per-packet ``tx.command`` record to say what went out. ``raw_enum`` (fault
+        injection) lets a value outside its field's enum through; ``send.fault`` records which."""
         route = self.route(peer, require=Side.COMMANDER, link_name=link)
         codec = self.codec_for(route.server.name)
         endpoint = route.link.command_target
         extra: dict[str, Any] = {"header": dict(header)} if header else {}
         if allow_count_mismatch:
             extra["allow_count_mismatch"] = True  # asked for; ``send.fault`` records what it did
-        self.ledger.record(
-            "action",
-            "send.request",
-            node=route.server.name,
-            command=command,
-            args=dict(args or {}),
-            tamper=dict(tamper or {}),
-            link=route.link.name,
-            **extra,
-        )
+        if raw_enum:
+            extra["raw_enum"] = True  # asked for; ``send.fault`` records the values
+        if record_request:
+            self.ledger.record(
+                "action",
+                "send.request",
+                node=route.server.name,
+                command=command,
+                args=dict(args or {}),
+                tamper=dict(tamper or {}),
+                link=route.link.name,
+                **extra,
+            )
         encoded = codec.encode_command(
-            command, args, tamper=tamper, header=header, allow_count_mismatch=allow_count_mismatch
+            command,
+            args,
+            tamper=tamper,
+            header=header,
+            allow_count_mismatch=allow_count_mismatch,
+            raw_enum=raw_enum,
         )
+        if encoded.raw_enums and record_request:  # a series ledgers them once, in its plan
+            self.ledger.record(
+                "action",
+                "send.fault",
+                node=route.server.name,
+                command=encoded.message.name,
+                fault="raw_enum",
+                fields=[{"field": name, "value": value} for name, value in encoded.raw_enums],
+            )
         if encoded.count_faults:  # the values that went out and the ones the data implied
             self.ledger.record(
                 "action",
@@ -622,7 +660,11 @@ class Session:
 
         try:
             await self._engine.send(
-                route.link, link_end(route.side), encoded.data, confirm=True, handed_off=handed_off
+                route.link,
+                link_end(route.side),
+                encoded.data,
+                confirm=confirm,
+                handed_off=handed_off,
             )
         except IronbirdError as exc:
             result = exc.code.value

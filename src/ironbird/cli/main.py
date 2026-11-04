@@ -112,7 +112,20 @@ from ironbird.retention import LONG_COMMANDS
 from ironbird.retnotices import Notices
 from ironbird.retservice import Retention
 from ironbird.sanitize import hex_preview
-from ironbird.session import Route, Session, Side
+from ironbird.sendmodes import (
+    SendPlan,
+    SystemClock,
+    Tally,
+    execute,
+    fmt_ns,
+    iso_utc,
+    outcome_fields,
+    parse_spec,
+    plan_fields,
+    resolve,
+    timing_text,
+)
+from ironbird.session import Route, SentCommand, Session, Side
 from ironbird.sigmask import (
     HANDLED_SIGNALS,
     Hold,
@@ -128,6 +141,10 @@ EXIT_OUTPUT_LOST: Final = 4  # the command completed but stdout lines were lost
 EXIT_DAMAGED_INPUT: Final = 5  # output produced, but the input recording was damaged mid-file
 EXIT_UNLOGGED: Final = 6  # a command or reply went out but its ledger record was never written
 STATUS_INTERVAL_S: Final = 5.0  # ``ib record`` status line on stderr
+NS_PER_S: Final = 1_000_000_000
+CONFIRM_MIN_PERIOD_NS: Final = 200_000_000  # at this period a send can afford to await a refusal
+SEND_LINE_MAX_RATE: Final = 2.0  # a series up to this many packets/s prints a line for each
+SEND_LINE_MAX_BURST: Final = 10  # a back-to-back series of at most this many does too
 MAX_TIMEOUT_S: Final = 365 * 24 * 3600.0
 OUTPUT_POLL_S: Final = 0.5
 DRAIN_NOTICE_S: Final = 2.0  # waiting this long for the reader of stdout earns one notice
@@ -373,6 +390,8 @@ class _Run:
     retention: Retention | None = None
     # an output complete under its final name, as "the export was written to X" (for a signal)
     wrote: str | None = None
+    # how far a series of sends (``ib send --repeat/--every``) got, for a signal's notice
+    batch: str | None = None
 
 
 Body = Callable[[Session, SystemConfig, "_Run"], Awaitable[int]]
@@ -511,6 +530,8 @@ def _interrupt_notice(name: str, signum: int, run: _Run) -> str:
         if run.wrote is not None:
             return f"interrupted ({sig}) after {run.wrote}"
         return f"interrupted ({sig})"
+    if run.batch is not None:
+        return f"interrupted ({sig}) after {run.batch}"
     if tx is None:
         return f"interrupted ({sig}): no command was built, so nothing was sent"
     if tx.went_out:
@@ -1288,15 +1309,75 @@ def send(
             "data of the variable-length field it sizes.",
         ),
     ] = False,
+    raw_enum: Annotated[
+        bool,
+        typer.Option(
+            "--raw-enum",
+            help="Fault injection: accept an integer outside the field's CCDD enum list for "
+            "this invocation (the CCDD key allow_raw does it for every send).",
+        ),
+    ] = False,
+    at: Annotated[
+        str | None,
+        typer.Option(
+            "--at",
+            metavar="TIME",
+            help="Start at this time: UTC such as 2026-11-04T12:00:00Z (a time with no zone is "
+            "UTC, never local) or an offset from now such as +10s. Must be in the future.",
+        ),
+    ] = None,
+    repeat: Annotated[
+        int | None,
+        typer.Option(
+            "--repeat",
+            metavar="N",
+            help="Send N packets. With --every, a cap on the packets; alone, back to back.",
+        ),
+    ] = None,
+    every: Annotated[
+        str | None,
+        typer.Option(
+            "--every",
+            metavar="DURATION",
+            help="Send one packet per period (1ms, 250ms, 1.5s, 2m; at least 1ms). Needs "
+            "--repeat, --for or --until to end it; the first one reached does.",
+        ),
+    ] = None,
+    until: Annotated[
+        str | None,
+        typer.Option(
+            "--until",
+            metavar="TIME",
+            help="With --every: stop sending at this time (as --at; a packet is sent only "
+            "before it).",
+        ),
+    ] = None,
+    for_: Annotated[
+        str | None,
+        typer.Option(
+            "--for",
+            metavar="DURATION",
+            help="With --every: stop sending this long after the first packet.",
+        ),
+    ] = None,
     as_node: AsOption = None,
     verbose: VerboseOption = False,
 ) -> None:
     """Encode and send one command; print a one-line confirmation.
 
     A variable-length argument is a list (Entries=1,2,3 or Entries=[1,2,3]), text, or hex for
-    bytes; its count or length argument is filled in when left out."""
+    bytes; its count or length argument is filled in when left out.
+
+    Send modes: --at starts later, --repeat N sends N packets, --every P with --repeat,
+    --for or --until sends periodically (see README, "Send modes"). A series ends with a
+    summary of what was sent and skipped and how late the packets were."""
+    invoked_wall_ns = time.time_ns()  # what an offset such as +10s counts from
+
+    def check_modes(_: Session) -> None:
+        resolve(parse_spec(at, repeat, every, until, for_), invoked_wall_ns, time.time_ns())
 
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
+        spec = parse_spec(at, repeat, every, until, for_)
         parsed = _parse_args(args)
         header_values = _parse_header_values(header)
         tamper: dict[str, int] = {}
@@ -1317,36 +1398,219 @@ def send(
                 f"--allow-count-mismatch needs a command with a count or length field; "
                 f"{term(command[:64])} has none",
             )
-        sent = await session.send_command(
-            node,
-            command,
-            parsed,
-            tamper=tamper,
-            link=link,
-            header=header_values,
-            allow_count_mismatch=allow_count_mismatch,
-        )
+        raw_values: tuple[tuple[str, int], ...] = ()
+        if raw_enum or spec.is_series:  # refused now, not at the start time of a series
+            raw_values = codec.check_command(
+                command,
+                parsed,
+                header=header_values,
+                allow_count_mismatch=allow_count_mismatch,
+                raw_enum=raw_enum,
+            )
+        if raw_enum and not raw_values:
+            raise IronbirdError(
+                Code.CLI_USAGE,
+                f"--raw-enum needs an argument outside its field's enum list; every argument "
+                f"of {term(command[:64])} is a named value or not an enum field",
+            )
         faults = [
             text
             for text in (
                 "bad checksum" if bad_checksum else "",
                 f"length {length_delta:+d}" if length_delta is not None else "",
                 "count/length mismatch allowed" if allow_count_mismatch else "",
+                "raw enum value " + ", ".join(f"{term(n, 40)}={v}" for n, v in raw_values)
+                if raw_values
+                else "",
             )
             if text
         ]
-        seq_text = "" if sent.sequence is None else f" seq {sent.sequence}"
-        run.console.out(
-            f"sent {term(sent.command)} to {term(sent.node)} via "
-            f"{term(sent.transport)} {term(sent.endpoint)} "
-            f"(mid 0x{sent.mid:04X} fc {sent.function_code}{seq_text}, "
-            f"{sent.size} bytes)" + (f" [fault injected: {', '.join(faults)}]" if faults else "")
-        )
+
+        async def send_one(confirm: bool = True, record_request: bool = True) -> SentCommand:
+            return await session.send_command(
+                node,
+                command,
+                parsed,
+                tamper=tamper,
+                link=link,
+                header=header_values,
+                allow_count_mismatch=allow_count_mismatch,
+                confirm=confirm,
+                record_request=record_request,
+                raw_enum=raw_enum,
+            )
+
+        if spec.is_series:
+            plan = resolve(spec, invoked_wall_ns, time.time_ns())
+            # The arguments were checked above; the link is opened here so that the first
+            # packet does not pay for it.
+            await session.prepare_send(node, link=link)
+            return await _send_series(
+                session,
+                run,
+                plan,
+                send_one,
+                lambda: session.settle_sends(node, link=link),
+                command=command,
+                node=node,
+                request={
+                    "args": parsed,
+                    "tamper": tamper,
+                    "header": header_values,
+                    "link": link,
+                    "allow_count_mismatch": allow_count_mismatch,
+                    "raw_enums": [{"field": n, "value": v} for n, v in raw_values],
+                },
+                faults=faults,
+                show_hex=session_verbose(ctx, verbose),
+            )
+        sent = await send_one()
+        run.console.out(_sent_line(sent, faults))
         if session_verbose(ctx, verbose):
             run.console.out(f"  hex: {sent.data.hex(' ')}")
         return 0
 
-    _run(ctx, as_node, verbose, body, "send", transmits=True)
+    _run(ctx, as_node, verbose, body, "send", transmits=True, precheck=check_modes)
+
+
+def _sent_line(sent: SentCommand, faults: Sequence[str], number: int | None = None) -> str:
+    seq_text = "" if sent.sequence is None else f" seq {sent.sequence}"
+    nth = "" if number is None else f" #{number}"
+    return (
+        f"sent{nth} {term(sent.command)} to {term(sent.node)} via "
+        f"{term(sent.transport)} {term(sent.endpoint)} "
+        f"(mid 0x{sent.mid:04X} fc {sent.function_code}{seq_text}, "
+        f"{sent.size} bytes)" + (f" [fault injected: {', '.join(faults)}]" if faults else "")
+    )
+
+
+def _series_plan_text(plan: SendPlan, planned: int, command: str, node: str) -> str:
+    """The one line announcing a series, with the times in UTC."""
+    what = f"{planned} x {term(command)} to {term(node)}"
+    if plan.every_ns is not None:
+        what += f", one every {fmt_ns(plan.every_ns)}"
+    elif planned > 1:
+        what += ", back to back"
+    if plan.start_wall_ns is not None:
+        wait = max(plan.start_wall_ns - time.time_ns(), 0)
+        when = f" starting at {iso_utc(plan.start_wall_ns)} UTC (in {fmt_ns(wait)})"
+        if plan.assumed_utc:
+            when += "; a time with no zone is read as UTC"
+    else:
+        when = " starting now"
+    return f"sending {what}{when}"
+
+
+async def _send_series(
+    session: Session,
+    run: _Run,
+    plan: SendPlan,
+    send_one: Callable[[bool, bool], Awaitable[SentCommand]],
+    settle: Callable[[], Awaitable[None]],
+    *,
+    command: str,
+    node: str,
+    request: Mapping[str, object],
+    faults: Sequence[str],
+    show_hex: bool,
+) -> int:
+    """Run a series of sends (see :mod:`ironbird.sendmodes`) and report how it went.
+
+    The ledger gets ``send.plan`` first, every packet's own records, and ``send.outcome`` last,
+    however the series ends. A send that fails ends the series with its coded error (exit 1,
+    after the summary); a signal ends it between sends, or during one (then the packet either
+    went out or not, as for a single ``send``), with the summary and exit 128+n.
+    """
+    now_wall = time.time_ns()
+    start_estimate = plan.start_wall_ns if plan.start_wall_ns is not None else now_wall
+    tally = Tally(planned=plan.planned(start_estimate))
+    rate = None if plan.every_ns is None else NS_PER_S / plan.every_ns
+    show_each = (
+        show_hex
+        or (rate is not None and rate <= SEND_LINE_MAX_RATE)
+        or (rate is None and tally.planned <= SEND_LINE_MAX_BURST)
+    )
+    # The arguments are ledgered once, here; each packet then has its own ``tx.command`` record.
+    session.ledger.record(
+        "action",
+        "send.plan",
+        node=node,
+        command=command,
+        request=dict(request),
+        **plan_fields(plan, tally.planned),
+    )
+    run.console.err(_series_plan_text(plan, tally.planned, command, node))
+    last: list[SentCommand] = []
+    next_status = time.monotonic() + STATUS_INTERVAL_S
+    fast = plan.every_ns is None or plan.every_ns < CONFIRM_MIN_PERIOD_NS
+    probe: asyncio.Future[None] | None = None  # the first packet's wait for a refusal
+
+    async def send_counted() -> SentCommand:
+        nonlocal probe
+        if probe is not None and probe.done():
+            done, probe = probe, None
+            done.result()  # a refusal found since the last packet ends the series
+        # Waiting for a refusal (50 ms) inside a send is only affordable when the period is
+        # long, and for the last packet; in a fast series the first packet's wait runs beside
+        # the series (``probe``) so that it does not make the first slots late.
+        confirm = not fast or tally.sent + 1 >= tally.planned
+        sent = await send_one(confirm, False)
+        if tally.sent == 0 and not confirm:
+            probe = asyncio.ensure_future(settle())
+        last[:] = [sent]
+        if show_each:
+            run.console.out(_sent_line(sent, faults, tally.sent + 1))
+            if show_hex:
+                run.console.out(f"  hex: {sent.data.hex(' ')}")
+        return sent
+
+    def progress(done: Tally) -> None:
+        nonlocal next_status
+        if show_each or time.monotonic() < next_status:
+            return
+        next_status = time.monotonic() + STATUS_INTERVAL_S
+        extra = timing_text(done, plan.every_ns)
+        run.console.err(
+            f"progress: sent {done.sent} of {done.planned}" + (f", {extra}" if extra else "")
+        )
+
+    def summary(outcome: str) -> str:
+        target = ""
+        if last:
+            target = (
+                f" to {term(last[0].node)} via {term(last[0].transport)} {term(last[0].endpoint)}"
+            )
+        elapsed = f" in {fmt_ns(tally.elapsed_ns)}" if tally.sent else ""
+        extra = timing_text(tally, plan.every_ns)
+        return (
+            f"{outcome}: sent {tally.sent} of {tally.planned} {term(command)}{target}{elapsed}"
+            + (f"; {extra}" if extra else "")
+            + (f" [fault injected: {', '.join(faults)}]" if faults else "")
+        )
+
+    def finish(outcome: str, **more: Any) -> None:
+        session.ledger.record("state", "send.outcome", **outcome_fields(tally, outcome), **more)
+        run.console.out(summary(outcome))
+
+    try:
+        await execute(plan, SystemClock(), send_counted, tally, progress)
+        if probe is not None:
+            await probe
+    except asyncio.CancelledError:
+        if probe is not None:
+            probe.cancel()
+        unconfirmed = tally.inflight and session.last_tx is not None and session.last_tx.went_out
+        if unconfirmed:  # it left the process; the confirmation never came back
+            tally.sent += 1
+        tail = " (the last went out; delivery not confirmed)" if unconfirmed else ""
+        run.batch = f"{tally.sent} of {tally.planned} {term(command)} sends{tail}"
+        finish("interrupted", unconfirmed=unconfirmed)
+        raise
+    except IronbirdError as exc:
+        finish("failed", error=exc.code.value)
+        raise
+    finish("complete")
+    return 0
 
 
 def session_verbose(ctx: typer.Context, local: bool) -> bool:

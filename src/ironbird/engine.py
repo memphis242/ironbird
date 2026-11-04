@@ -1000,6 +1000,41 @@ class Engine:
         if failure is not None:
             raise failure
 
+    async def _ensure_transport(self, io: _LinkIO) -> Transport:
+        """The open transport of ``io``, opening one when there is none. Called with
+        ``io.lock`` held. A session that is closing refuses with ``IB-TX-002``."""
+        if self._closed:
+            raise IronbirdError(
+                Code.TX_SEND, "not sent: the session is closing (not a link failure)"
+            )
+        if io.transport is None:
+            transport = self._new_transport(io)
+            try:
+                await self._open_transport(io, transport, None)
+            except _Closing:
+                raise IronbirdError(
+                    Code.TX_SEND, "not sent: the session is closing (not a link failure)"
+                ) from None
+            io.transport = transport
+        assert io.transport is not None
+        return io.transport
+
+    async def open_for_send(self, link: Link, end: LinkEnd) -> None:
+        """Open the transport a later :meth:`send` out of ``end`` of ``link`` uses, so that the
+        first send of a timed series does not pay for the open (a serial port, a resolver)."""
+        io = self._io(link, end)
+        async with io.lock:
+            await self._ensure_transport(io)
+
+    async def settle(self, link: Link, end: LinkEnd) -> None:
+        """Wait out the transport's short grace period for a refusal of what was just sent out
+        of ``end`` of ``link`` (a UDP port nobody listens on) and raise it, coded. A no-op for a
+        transport with no such notion, or none open."""
+        transport = self._io(link, end).transport
+        confirm = getattr(transport, "confirm", None)
+        if confirm is not None:
+            await confirm()
+
     async def send(
         self,
         link: Link,
@@ -1029,20 +1064,7 @@ class Engine:
         closed: TransportClosed | None = None
         for _ in range(2):
             async with io.lock:
-                if self._closed:
-                    raise IronbirdError(
-                        Code.TX_SEND, "not sent: the session is closing (not a link failure)"
-                    )
-                if io.transport is None:
-                    transport = self._new_transport(io)
-                    try:
-                        await self._open_transport(io, transport, None)
-                    except _Closing:
-                        raise IronbirdError(
-                            Code.TX_SEND, "not sent: the session is closing (not a link failure)"
-                        ) from None
-                    io.transport = transport
-                transport = io.transport
+                transport = await self._ensure_transport(io)
             try:
                 await transport.send(data, confirm=confirm, handed_off=out)
             except TransportClosed as exc:
