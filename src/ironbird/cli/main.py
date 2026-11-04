@@ -42,7 +42,7 @@ from ironbird.cli.output import (
     line_codec,
     write_within,
 )
-from ironbird.codec import Codec, parse_ascii_int
+from ironbird.codec import Codec, EncodedPacket, parse_ascii_int
 from ironbird.config import (
     MAX_EXPORT_JOBS,
     ExportConfig,
@@ -52,12 +52,13 @@ from ironbird.config import (
     find_config,
     load_config,
 )
-from ironbird.engine import RECORDER
+from ironbird.engine import RECORDER, SETTLE_S
 from ironbird.errors import Code, IronbirdError, counted
 from ironbird.filter import Filter
 from ironbird.fsops import REAL_FS
-from ironbird.ledger import ExitReport, Ledger, default_state_dir
+from ironbird.ledger import ExitReport, Ledger, TxSeries, default_state_dir
 from ironbird.notice import Level, Notice
+from ironbird.pacer import SPIN_NS, Built, Kind, Report, SeriesPacer, ThreadWaiter
 from ironbird.recording import inspect as rec_inspect
 from ironbird.recording.defs import (
     EXPORT_HINT,
@@ -113,16 +114,17 @@ from ironbird.retnotices import Notices
 from ironbird.retservice import Retention
 from ironbird.sanitize import hex_preview
 from ironbird.sendmodes import (
+    Grid,
     SendPlan,
     SystemClock,
     Tally,
-    execute,
     fmt_ns,
     iso_utc,
     outcome_fields,
     parse_spec,
     plan_fields,
     resolve,
+    start_grid,
     timing_text,
 )
 from ironbird.session import Route, SentCommand, Session, Side
@@ -142,7 +144,8 @@ EXIT_DAMAGED_INPUT: Final = 5  # output produced, but the input recording was da
 EXIT_UNLOGGED: Final = 6  # a command or reply went out but its ledger record was never written
 STATUS_INTERVAL_S: Final = 5.0  # ``ib record`` status line on stderr
 NS_PER_S: Final = 1_000_000_000
-CONFIRM_MIN_PERIOD_NS: Final = 200_000_000  # at this period a send can afford to await a refusal
+RAW_ENUM_HINT: Final = "use --raw-enum"
+RAW_ENUM_SHOWN: Final = 3  # raw enum values named in a confirmation line
 SEND_LINE_MAX_RATE: Final = 2.0  # a series up to this many packets/s prints a line for each
 SEND_LINE_MAX_BURST: Final = 10  # a back-to-back series of at most this many does too
 MAX_TIMEOUT_S: Final = 365 * 24 * 3600.0
@@ -1406,6 +1409,7 @@ def send(
                 header=header_values,
                 allow_count_mismatch=allow_count_mismatch,
                 raw_enum=raw_enum,
+                enum_hint=RAW_ENUM_HINT,
             )
         if raw_enum and not raw_values:
             raise IronbirdError(
@@ -1419,58 +1423,55 @@ def send(
                 "bad checksum" if bad_checksum else "",
                 f"length {length_delta:+d}" if length_delta is not None else "",
                 "count/length mismatch allowed" if allow_count_mismatch else "",
-                "raw enum value " + ", ".join(f"{term(n, 40)}={v}" for n, v in raw_values)
-                if raw_values
-                else "",
+                "raw enum value " + _raw_enum_text(raw_values) if raw_values else "",
             )
             if text
         ]
-
-        async def send_one(confirm: bool = True, record_request: bool = True) -> SentCommand:
-            return await session.send_command(
-                node,
-                command,
-                parsed,
-                tamper=tamper,
-                link=link,
-                header=header_values,
-                allow_count_mismatch=allow_count_mismatch,
-                confirm=confirm,
-                record_request=record_request,
-                raw_enum=raw_enum,
-            )
-
         if spec.is_series:
             plan = resolve(spec, invoked_wall_ns, time.time_ns())
-            # The arguments were checked above; the link is opened here so that the first
-            # packet does not pay for it.
-            await session.prepare_send(node, link=link)
             return await _send_series(
                 session,
+                config,
                 run,
                 plan,
-                send_one,
-                lambda: session.settle_sends(node, link=link),
-                command=command,
-                node=node,
-                request={
-                    "args": parsed,
-                    "tamper": tamper,
-                    "header": header_values,
-                    "link": link,
-                    "allow_count_mismatch": allow_count_mismatch,
-                    "raw_enums": [{"field": n, "value": v} for n, v in raw_values],
-                },
+                _SeriesRequest(
+                    node=node,
+                    command=command,
+                    args=parsed,
+                    tamper=tamper,
+                    header=header_values,
+                    link=link,
+                    allow_count_mismatch=allow_count_mismatch,
+                    raw_enum=raw_enum,
+                    raw_values=raw_values,
+                ),
                 faults=faults,
                 show_hex=session_verbose(ctx, verbose),
             )
-        sent = await send_one()
+        sent = await session.send_command(
+            node,
+            command,
+            parsed,
+            tamper=tamper,
+            link=link,
+            header=header_values,
+            allow_count_mismatch=allow_count_mismatch,
+            raw_enum=raw_enum,
+            enum_hint=RAW_ENUM_HINT,
+        )
         run.console.out(_sent_line(sent, faults))
         if session_verbose(ctx, verbose):
             run.console.out(f"  hex: {sent.data.hex(' ')}")
         return 0
 
     _run(ctx, as_node, verbose, body, "send", transmits=True, precheck=check_modes)
+
+
+def _raw_enum_text(values: Sequence[tuple[str, int]]) -> str:
+    """``mode=9, Entries[2]=10 +3 more``: the first few raw enum values of a command."""
+    shown = ", ".join(f"{term(n, 40)}={v}" for n, v in values[:RAW_ENUM_SHOWN])
+    rest = len(values) - RAW_ENUM_SHOWN
+    return shown + (f" +{rest} more" if rest > 0 else "")
 
 
 def _sent_line(sent: SentCommand, faults: Sequence[str], number: int | None = None) -> str:
@@ -1484,16 +1485,25 @@ def _sent_line(sent: SentCommand, faults: Sequence[str], number: int | None = No
     )
 
 
-def _series_plan_text(plan: SendPlan, planned: int, command: str, node: str) -> str:
-    """The one line announcing a series, with the times in UTC."""
+def _series_plan_text(
+    plan: SendPlan, planned: int, command: str, node: str, *, now_wall_ns: int, open_ns: int
+) -> str:
+    """The one line announcing a series, with the times in UTC, and an ``--at`` the open of
+    the link made late."""
     what = f"{planned} x {term(command)} to {term(node)}"
     if plan.every_ns is not None:
         what += f", one every {fmt_ns(plan.every_ns)}"
     elif planned > 1:
         what += ", back to back"
     if plan.start_wall_ns is not None:
-        wait = max(plan.start_wall_ns - time.time_ns(), 0)
-        when = f" starting at {iso_utc(plan.start_wall_ns)} UTC (in {fmt_ns(wait)})"
+        wait = plan.start_wall_ns - now_wall_ns
+        if wait >= 0:
+            when = f" starting at {iso_utc(plan.start_wall_ns)} UTC (in {fmt_ns(wait)})"
+        else:
+            when = (
+                f" from {iso_utc(plan.start_wall_ns)} UTC, missed by {fmt_ns(-wait)}: the link "
+                f"took {fmt_ns(open_ns)} to open"
+            )
         if plan.assumed_utc:
             when += "; a time with no zone is read as UTC"
     else:
@@ -1501,113 +1511,250 @@ def _series_plan_text(plan: SendPlan, planned: int, command: str, node: str) -> 
     return f"sending {what}{when}"
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _SeriesRequest:
+    """The command of a series, as typed and checked."""
+
+    node: str
+    command: str
+    args: Mapping[str, object]
+    tamper: Mapping[str, int]
+    header: Mapping[str, int]
+    link: str | None
+    allow_count_mismatch: bool
+    raw_enum: bool
+    raw_values: tuple[tuple[str, int], ...]
+
+    def ledger_fields(self) -> dict[str, object]:
+        return {
+            "args": dict(self.args),
+            "tamper": dict(self.tamper),
+            "header": dict(self.header),
+            "link": self.link,
+            "allow_count_mismatch": self.allow_count_mismatch,
+            "raw_enums": [{"field": n, "value": v} for n, v in self.raw_values],
+        }
+
+
 async def _send_series(
     session: Session,
+    config: SystemConfig,
     run: _Run,
     plan: SendPlan,
-    send_one: Callable[[bool, bool], Awaitable[SentCommand]],
-    settle: Callable[[], Awaitable[None]],
+    req: _SeriesRequest,
     *,
-    command: str,
-    node: str,
-    request: Mapping[str, object],
     faults: Sequence[str],
     show_hex: bool,
 ) -> int:
-    """Run a series of sends (see :mod:`ironbird.sendmodes`) and report how it went.
+    """Run a series of sends (see :mod:`ironbird.sendmodes` and :mod:`ironbird.pacer`) and
+    report how it went.
 
-    The ledger gets ``send.plan`` first, every packet's own records, and ``send.outcome`` last,
-    however the series ends. A send that fails ends the series with its coded error (exit 1,
-    after the summary); a signal ends it between sends, or during one (then the packet either
-    went out or not, as for a single ``send``), with the summary and exit 128+n.
+    The ledger gets ``send.plan`` first (the arguments, once), each packet's records (see
+    :class:`~ironbird.ledger.TxSeries`), and ``send.outcome`` last, however the series ends. A
+    send that fails, or a refusal the link reports for any packet of the series (checked within
+    :data:`~ironbird.engine.SETTLE_S` of every send, and once after the last), ends the series
+    with its coded error (exit 1, after the summary); a signal ends it with the summary and exit
+    128+n. The pacer thread is stopped before either is reported, so the count sent is exact.
+
+    The count of each packet is its own: every packet is encoded with the next count of its
+    codec. (A seated first count, ``--sequence`` of the persistent counter, applies to packet 0
+    only; the counts used are in each packet's record and in ``send.outcome``.)
     """
+    command, node = req.command, req.node
+    target = session.series_target(node, link=req.link)
+    opening = time.monotonic_ns()
+    link = await session.series_link(target)  # the link opens here, before any packet is built
+    open_ns = time.monotonic_ns() - opening
     now_wall = time.time_ns()
-    start_estimate = plan.start_wall_ns if plan.start_wall_ns is not None else now_wall
-    tally = Tally(planned=plan.planned(start_estimate))
+    tally = Tally(planned=plan.planned(plan.start_wall_ns or now_wall))
     rate = None if plan.every_ns is None else NS_PER_S / plan.every_ns
     show_each = (
         show_hex
         or (rate is not None and rate <= SEND_LINE_MAX_RATE)
         or (rate is None and tally.planned <= SEND_LINE_MAX_BURST)
     )
-    # The arguments are ledgered once, here; each packet then has its own ``tx.command`` record.
     session.ledger.record(
         "action",
         "send.plan",
         node=node,
         command=command,
-        request=dict(request),
+        request=req.ledger_fields(),
+        open_ns=open_ns,
         **plan_fields(plan, tally.planned),
     )
-    run.console.err(_series_plan_text(plan, tally.planned, command, node))
+    run.console.err(
+        _series_plan_text(plan, tally.planned, command, node, now_wall_ns=now_wall, open_ns=open_ns)
+    )
+    spin_below_ns = config.send.spin_below_us * 1000
+    spins = plan.every_ns is None or plan.every_ns < spin_below_ns
+    tally.pacer = {
+        "direct": link.direct,
+        "spin_below_us": config.send.spin_below_us,
+        "spin_ns": SPIN_NS if spins else 0,
+    }
+    series = TxSeries(session.ledger)
+    timed = target.codec.command_carries_time
+    loop = asyncio.get_running_loop()
     last: list[SentCommand] = []
     next_status = time.monotonic() + STATUS_INTERVAL_S
-    fast = plan.every_ns is None or plan.every_ns < CONFIRM_MIN_PERIOD_NS
-    probe: asyncio.Future[None] | None = None  # the first packet's wait for a refusal
+    grid: Grid | None = None
+    pacer: SeriesPacer[EncodedPacket] | None = None
+    check: asyncio.TimerHandle | None = None
+    refused: list[IronbirdError] = []  # a refusal found on the loop, the first only
 
-    async def send_counted() -> SentCommand:
-        nonlocal probe
-        if probe is not None and probe.done():
-            done, probe = probe, None
-            done.result()  # a refusal found since the last packet ends the series
-        # Waiting for a refusal (50 ms) inside a send is only affordable when the period is
-        # long, and for the last packet; in a fast series the first packet's wait runs beside
-        # the series (``probe``) so that it does not make the first slots late.
-        confirm = not fast or tally.sent + 1 >= tally.planned
-        sent = await send_one(confirm, False)
-        if tally.sent == 0 and not confirm:
-            probe = asyncio.ensure_future(settle())
-        last[:] = [sent]
-        if show_each:
-            run.console.out(_sent_line(sent, faults, tally.sent + 1))
-            if show_hex:
-                run.console.out(f"  hex: {sent.data.hex(' ')}")
-        return sent
+    def build(number: int, slot: int) -> Built[EncodedPacket]:
+        assert grid is not None
+        # A packet carries its slot's time (or, built late, the time it was built).
+        stamp_ns = max(grid.slot_wall_ns(slot), time.time_ns())
+        encoded = session.build_command(
+            target,
+            command,
+            req.args,
+            tamper=req.tamper,
+            header=req.header,
+            allow_count_mismatch=req.allow_count_mismatch,
+            raw_enum=req.raw_enum,
+            enum_hint=RAW_ENUM_HINT,
+            at_time=stamp_ns / NS_PER_S,
+        )
+        return Built(number, slot, encoded.data, encoded)
 
-    def progress(done: Tally) -> None:
+    def check_refusal() -> None:
+        nonlocal check
+        check = None
+        try:
+            link.check()
+        except IronbirdError as exc:
+            refused[:] = refused or [exc]
+            if pacer is not None:
+                pacer.abort(exc)
+
+    def progress() -> None:
         nonlocal next_status
         if show_each or time.monotonic() < next_status:
             return
         next_status = time.monotonic() + STATUS_INTERVAL_S
-        extra = timing_text(done, plan.every_ns)
+        extra = timing_text(tally, plan.every_ns)
         run.console.err(
-            f"progress: sent {done.sent} of {done.planned}" + (f", {extra}" if extra else "")
+            f"progress: sent {tally.sent} of {tally.planned}" + (f", {extra}" if extra else "")
         )
 
+    def on_sent(report: Report[EncodedPacket]) -> None:
+        nonlocal check
+        assert report.built is not None and grid is not None
+        encoded = report.built.item
+        link.sent(encoded.data, time.time_ns() - (time.monotonic_ns() - report.mono_ns))
+        session.record_series_packet(series, target, encoded, result="sent", sent=True)
+        tally.sent += 1
+        tally.last_mono_ns = report.mono_ns
+        tally.send_max_ns = max(tally.send_max_ns, report.took_ns)
+        if plan.every_ns is not None and report.took_ns > plan.every_ns:
+            tally.overruns += 1
+        if tally.sent == 1 and grid.at:
+            tally.start_late_ns = report.mono_ns - grid.start_mono
+        if report.late_ns is not None and plan.every_ns is not None:
+            tally.note_late(report.late_ns)
+        if tally.first_sequence is None:
+            tally.first_sequence = encoded.sequence
+        tally.last_sequence = encoded.sequence
+        sent = session.sent_command(target, encoded)
+        last[:] = [sent]
+        if show_each:
+            run.console.out(_sent_line(sent, faults, tally.sent))
+            if show_hex:
+                run.console.out(f"  hex: {sent.data.hex(' ')}")
+        if check is None:
+            check = loop.call_later(SETTLE_S, check_refusal)
+        progress()
+
+    def handle(report: Report[EncodedPacket]) -> BaseException | None:
+        built = report.built
+        match report.kind:
+            case Kind.SENT:
+                on_sent(report)
+            case Kind.SKIPPED:
+                tally.skipped += report.slots
+                if report.starved:
+                    tally.starved += report.slots
+            case Kind.DISCARDED | Kind.UNSENT:
+                assert built is not None
+                skipped = report.kind is Kind.DISCARDED
+                tally.discarded += skipped
+                tally.unsent += not skipped
+                result = "skipped" if skipped else "unsent"
+                session.record_series_packet(series, target, built.item, result=result, sent=False)
+            case Kind.FAILED:
+                assert report.error is not None
+                error = link.error(report.error)
+                if built is not None:
+                    if isinstance(error, IronbirdError):
+                        error.details += ("\n" if error.details else "") + (
+                            f"packet ({len(built.data)} bytes) hex: {hex_preview(built.data)}"
+                        )
+                    result = error.code.value if isinstance(error, IronbirdError) else "error"
+                    session.record_series_packet(
+                        series, target, built.item, result=result, sent=report.went_out
+                    )
+                    tally.sent += report.went_out
+                return error
+            case Kind.DONE:
+                pass
+        return None
+
     def summary(outcome: str) -> str:
-        target = ""
+        where = ""
         if last:
-            target = (
+            where = (
                 f" to {term(last[0].node)} via {term(last[0].transport)} {term(last[0].endpoint)}"
             )
         elapsed = f" in {fmt_ns(tally.elapsed_ns)}" if tally.sent else ""
         extra = timing_text(tally, plan.every_ns)
         return (
-            f"{outcome}: sent {tally.sent} of {tally.planned} {term(command)}{target}{elapsed}"
+            f"{outcome}: sent {tally.sent} of {tally.planned} {term(command)}{where}{elapsed}"
             + (f"; {extra}" if extra else "")
             + (f" [fault injected: {', '.join(faults)}]" if faults else "")
         )
 
     def finish(outcome: str, **more: Any) -> None:
-        session.ledger.record("state", "send.outcome", **outcome_fields(tally, outcome), **more)
+        if check is not None:
+            check.cancel()
+        if pacer is not None:
+            tally.pacer.update(pacer.facts)
+        series.close()
+        session.ledger.record(
+            "state",
+            "send.outcome",
+            **outcome_fields(tally, outcome),
+            totals=dict(series.totals),
+            **more,
+        )
         run.console.out(summary(outcome))
 
     try:
-        await execute(plan, SystemClock(), send_counted, tally, progress)
-        if probe is not None:
-            await probe
+        try:
+            grid = await start_grid(plan, SystemClock())
+            tally.planned = grid.planned
+            tally.first_mono_ns = tally.last_mono_ns = grid.start_mono
+            waiter = ThreadWaiter(SPIN_NS if spins else 0)
+            pacer = SeriesPacer(grid, link.send, waiter, timed=timed)
+            await pacer.run(build, handle)
+            if check is not None:
+                check.cancel()
+                check = None
+            if refused:
+                raise refused[0]
+            await link.settle()
+        finally:
+            link.close()
     except asyncio.CancelledError:
-        if probe is not None:
-            probe.cancel()
-        unconfirmed = tally.inflight and session.last_tx is not None and session.last_tx.went_out
-        if unconfirmed:  # it left the process; the confirmation never came back
-            tally.sent += 1
-        tail = " (the last went out; delivery not confirmed)" if unconfirmed else ""
-        run.batch = f"{tally.sent} of {tally.planned} {term(command)} sends{tail}"
-        finish("interrupted", unconfirmed=unconfirmed)
+        run.batch = f"{tally.sent} of {tally.planned} {term(command)} sends"
+        finish("interrupted")
         raise
     except IronbirdError as exc:
         finish("failed", error=exc.code.value)
+        raise
+    except Exception:
+        finish("failed", error=Code.INTERNAL.value)
         raise
     finish("complete")
     return 0

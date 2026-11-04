@@ -128,6 +128,24 @@ def test_ib_send_goes_out_over_the_line_and_the_responder_decodes_it(
     assert not isinstance(decoded, DecodeError) and decoded.message.name == "MOCK_NOOP"
 
 
+def test_a_periodic_series_goes_out_over_the_line_through_the_loop(
+    tmp_path: Path, bridge: PtyBridge, configs: dict[str, Path], env: dict[str, str]
+) -> None:
+    """A serial link has no thread-safe send: the pacer hands each packet through the loop."""
+    env = {**env, "IRONBIRD_STATE_DIR": str(tmp_path / "state")}
+    argv = ["-c", str(configs["ground"]), "send", "fc", "MOCK_NOOP", "--every", "20ms"]
+    sent = run_ib(tmp_path, [*argv, "--repeat", "5"], env)
+    assert sent.returncode == 0, sent.stderr
+    wait_until(lambda: len(bridge.log("b")) >= 5 * len(noop()), "five packets on the line")
+    outcome = next(
+        json.loads(line)
+        for path in (tmp_path / "state").glob("*.jsonl")
+        for line in path.read_text().splitlines()
+        if '"send.outcome"' in line
+    )
+    assert outcome["sent"] == 5 and outcome["pacer"]["direct"] is False
+
+
 def test_a_second_process_on_a_device_in_use_is_told_it_is_locked(
     tmp_path: Path, bridge: PtyBridge, configs: dict[str, Path], env: dict[str, str]
 ) -> None:

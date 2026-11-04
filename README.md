@@ -108,7 +108,8 @@ done, so a "sent" line is never mistaken for a clean send; the packet's ledger r
 the length field's range, since it would wrap to an unrelated size. `--raw-enum` lets an integer outside
 a field's CCDD `enum` through for this invocation (without it the value is refused with `IB-ENC-002`,
 whose message names the flag; a CCDD field with `"allow_raw": true` accepts any value, always). The
-line says `[fault injected: raw enum value mode=9]`, the ledger gets a `send.fault` record with
+line says `[fault injected: raw enum value mode=9]` (an array element by its index, `Entries[2]=10`;
+the first three values, then `+N more`), the ledger gets a `send.fault` record with
 `fault = "raw_enum"` and the field and value, and in a repeat/every run it applies to every packet
 (the values are in the series' `send.plan`). The flag is a usage error (`IB-CLI-001`) when no argument
 is outside its enum, so it cannot be left on by habit.
@@ -125,51 +126,85 @@ ib send fc MOCK_NOOP --at +30s --every 1ms --for 10s  # a timed burst
 ```
 
 - **Times** (`--at`, `--until`) are ISO 8601 with seconds, or an offset such as `+10s`, `+1m30s`,
-  `+250ms` counted from the moment the command was typed. **A time with no zone is UTC**, never
-  local time (`2026-11-04T12:00:00` is `...Z`); write `+02:00` for another zone. The plan line and the
-  ledger show the start in UTC and say when a zone was assumed. A start in the past (or `+0s`) is refused,
-  as is one more than a year ahead. **Durations** (`--every`, `--for`) are `250ms`, `1.5s`, `2m`,
-  `1m30s` (units `ms s m h`; a bare `5` is refused, its unit could be anything).
-- **Combining.** `--repeat N` alone sends N packets back to back, each as soon as the previous send
-  returned. `--every P` sends one per period (at least 1 ms) and needs an end: `--repeat N` (a cap),
-  `--for D` (counted from the first packet) or `--until T`; with several, the first reached ends the
+  `+250ms` counted from the moment `ib` started (it reads the clock once its command line is parsed,
+  after interpreter start-up, typically 0.3 s after Enter). **A time with no zone is UTC**, never local
+  time (`2026-11-04T12:00:00` is `...Z`); write `+02:00` for another zone. The plan line and the ledger
+  show the start in UTC and say when a zone was assumed. A start in the past (or `+0s`) is refused, as
+  is a start, an end or an offset more than a year ahead. **Durations** (`--every`, `--for`) are `250ms`,
+  `1.5s`, `2m`, `1m30s` (units `h m s ms`, largest first, each at most once: `30s1m` and `1s1s` are
+  refused, as is a bare `5`, whose unit could be anything); `--for` is at most a year.
+- **Combining.** `--repeat N` alone sends N packets back to back, each as soon as the previous one
+  left. `--every P` sends one per period (at least 1 ms) and needs an end: `--repeat N` (a cap),
+  `--for D` (counted from the first slot) or `--until T`; with several, the first reached ends the
   series. The window is half open: `--every 1s --for 3s` sends at 0, 1 and 2 s. `--at` delays the
   start of any of these. Refused with `IB-CLI-001` (exit 2), before anything is opened or sent:
   `--every` with no end, `--for`/`--until` without `--every`, `--for` with `--until`, `--repeat 1` with
   `--every`, a window not longer than the period (one packet at most), an end not after the start, more
   than 100,000,000 packets. A bad argument is refused up front too, not when a scheduled start arrives.
-- **Timing.** One process, one open link and one codec serve the whole series, and every packet is
-  encoded fresh (its sequence advances). Deadlines are absolute points on the monotonic clock
-  (`start + k * period`), so nothing drifts; a wall-clock `--at` is followed through clock steps until the
-  last second before it. The wait for each deadline sleeps and then yields in a tight loop for the last
-  1.5 ms (the event loop's timers round up to a millisecond), so a period under a few milliseconds keeps one
-  core busy. On loopback `--every 1ms` holds the period with a mean lateness of a few microseconds; a loaded
-  host loses slots, which is reported, never hidden.
-- **Overruns skip, they do not catch up.** A slot that cannot be started within half a period of its
+- **The start.** The link is opened first, then the series starts. With `--at`, the start and the window
+  are fixed by the clock before the open: a link that takes longer to open than the time left makes the
+  first slots late, and they are skipped and counted on T's grid (with no `--every`, the packet goes late
+  and the summary says by how much); the plan line names the miss and the open time, and a window that
+  passed entirely during the open is refused (`IB-CLI-001`, nothing sent). With no `--at` the series
+  starts 20 ms after the link is open, so the first packet is built ahead of its slot; a `--until` window
+  shrinks by the open time, and one left no longer than the period is refused the same way.
+- **Timing.** One process, one open link and one codec serve the whole series. Deadlines are absolute
+  points on the monotonic clock (`start + k * period`), so nothing drifts; a wall-clock `--at` is
+  followed through clock steps until the last second before it, and a `--until` end is fixed on the
+  monotonic clock when the series starts (a clock step during the series is not followed). The packets
+  are sent by a dedicated **pacer thread**: it sleeps to each deadline (`clock_nanosleep` on the
+  monotonic clock, with its timer slack lowered to 1 us by `prctl(PR_SET_TIMERSLACK)`, which needs no
+  privilege) and hands the packet to the socket itself, so the event loop's latency is never added to a
+  packet. The loop builds the packets ahead (no earlier than 20 ms before their slots, each fully encoded
+  with its own count) and handles what the thread reports. Nothing spins by default. Measured on a busy
+  4-core host (load about 4.5), by the receiver's kernel timestamps: `--every 1ms` puts packets on the
+  wire with a median jitter of 23 us (99th percentile 170 us) at 26% of a core, where the spinning
+  pacer this replaced showed 185 us (360 us) at 100%; at 10 ms the series costs 6% of a core (12%
+  before), at 100 ms 3% (3%). A period under `[send] spin_below_us` (0, off, by default) ends each
+  wait with a 75 us spin, which absorbs the thread's wake-up latency (at 1 ms: median 7 us, 99th
+  percentile 110 us, 30% of a core); the wait for an `--at` start always ends that way. A UDP link is sent
+  on from the thread
+  (its own duplicate of the socket); a serial link is handed each packet through the event loop, which
+  adds that loop's latency to it. A slot whose packet is not built in time (a loop stalled for 20 ms)
+  is skipped and counted as `starved`. A header time field (`time_seconds`, `time_subseconds`)
+  carries the packet's slot time (in a burst, the time it was built, at most a few packets ahead).
+- **Overruns skip, they do not catch up.** A slot whose send cannot start within half a period of its
   deadline (a slow link, a stalled host) is skipped and counted, and the series carries on at the slot
-  nearest to now. Catching up would send the missed packets back to back, loading a slow link or vehicle
-  further and putting packets at times nobody asked for. Consecutive packets are therefore never closer than
-  half a period. A skipped slot does not count toward `--repeat` (N packets are sent) but is lost from a
-  `--for`/`--until` window. The summary says how many were skipped.
-- **Lateness** is the time between a slot's deadline and the start of its send; the summary gives the
-  maximum and mean, the ledger the same.
+  nearest to now. Catching up would send the missed packets back to back, loading a slow link or
+  vehicle further and putting packets at times nobody asked for. Consecutive sends therefore start at
+  least half a period apart. A skipped slot does not count toward `--repeat` (N packets are sent) but is
+  lost from a `--for`/`--until` window. A packet whose header carries its slot's time is discarded with
+  its slot (its count goes unused, which its ledger record says); any other is sent in the next slot,
+  so the counts on the wire stay consecutive. The summary says how many slots were skipped.
+- **Lateness** is the time from a slot's deadline to the return of the send call that handed its
+  packet to the kernel, measured in the pacer thread; the summary gives the maximum and mean (and, for
+  `--at`, how late the first packet left), the ledger the same.
 - **Output.** One line announces the plan (stderr). A series of at most 2 packets per second (or at most
   10 back to back), or any series under `-v`, prints a line per packet (with `-v`, the hex); a faster one
   prints a `progress:` line on stderr every 5 s, so a 1 kHz series does not flood the terminal. The run
-  ends with `complete: sent N of M ..., skipped S, lateness max ... mean ...` on stdout.
+  ends with `complete: sent N of M ..., skipped S, lateness max ... mean ...` on stdout. The series
+  exits 0 however many slots it skipped; a script that needs the cadence reads `skipped` in
+  `send.outcome`.
 - **Errors.** A send that fails (`IB-TX-002`, a closed port, a ledger that refuses commands) **stops the
   series** with its coded error, exit 1, after the summary: a link that failed once will fail again, and a
-  series with holes in it is harder to read than one that stopped. A UDP refusal is only reported by
-  the OS after the fact, so it is looked for on the first packet (beside the series, so it does not delay
-  the first slots), on the last, and on every packet of a series slower than 200 ms; one that arrives
-  in between is found when the OS reports it in time.
-- **Signals.** Ctrl-C, SIGTERM and SIGHUP stop the series between sends (a signal during a send ends
-  it as for a single `send`: the notice says whether the packet went out), print the summary and exit
-  128+n. Waiting for `--at` is interrupted at once, with nothing sent.
+  series with holes in it is harder to read than one that stopped. A UDP refusal (nothing listening) is
+  reported by the OS after the send returned, one round trip later; in a series it is never cleared by
+  the next send: the next send fails with it, the loop checks for one within 50 ms of every send, and
+  once more 50 ms after the last, and any of these stops the series with `IB-TX-002` ("an earlier packet
+  of the series was refused").
+- **Signals.** Ctrl-C, SIGTERM and SIGHUP stop the series (the pacer thread is stopped and joined
+  first, so the count sent is exact), print the summary and exit 128+n. Waiting for `--at` is
+  interrupted at once, with nothing sent.
 - **Ledger.** `send.plan` (mode, start and end in UTC, period, count, the arguments, whether a zone was
-  assumed), one `tx.command` per packet (the arguments are not repeated), and `send.outcome` last
-  (`complete`, `interrupted` or `failed`, with sent, planned, skipped, overruns, maximum and mean lateness,
-  the longest send, elapsed time), however the series ends.
+  assumed, how long the link took to open), then the packets: the first 600 each get their own
+  `tx.command` (as a single `send`'s, the arguments not repeated); after them, packets are counted into
+  one `tx.command.window` record per 10 s (packets, bytes, results, first and last time and sequence),
+  so a 1 kHz series for a day does not fill the ledger's disk; a packet whose send failed always gets its
+  own record. `send.outcome` comes last (`complete`, `interrupted` or `failed`, with sent, planned,
+  skipped, starved, discarded, unsent, overruns, maximum and mean lateness, the `--at` start lateness,
+  the longest send, elapsed time, the first and last sequence count sent, exact totals by result, and
+  how the pacer ran: `timer_slack_ns`, or `timer_slack_error` when the slack could not be lowered),
+  however the series ends.
 
 ## The ledger under load, a full disk, and retention
 
@@ -798,6 +833,7 @@ Sizes are bytes or `"64MiB"`, durations `"10min"`. Defaults are in the second co
 | | `keep_recent`, `warn_interval`, `scan_interval` | 10, 24h, 10min |
 | `[export]` | `jobs` | one per core, 1 to 64 (1: never use workers) |
 | | `pool_min_bytes`, `range_bytes` | 8MiB (0: always use workers), 4MiB (a multiple of 8, 4KiB to 256MiB) |
+| `[send]` | `spin_below_us` | 0, off (0 to 1000000): a `--every` period below this (microseconds) ends each wait with a 75 us spin |
 
 Environment: `IRONBIRD_CONFIG`, `IRONBIRD_STATE_DIR` (ledger; absolute), `IRONBIRD_RECORD_DIR`
 (recordings), `XDG_STATE_HOME`, `XDG_DATA_HOME`.

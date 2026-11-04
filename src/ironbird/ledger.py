@@ -109,6 +109,8 @@ JOIN_TIMEOUT_S: Final = 5.0
 GATE_WAIT_S: Final = 0.5  # the most the exit waits for a rate limit that has not answered
 GATE_SHARE: Final = 0.1  # ... and never more than this share of the exit budget
 MAX_REPLY_MESSAGES: Final = 64
+SERIES_FULL_RECORDS: Final = 600  # the first packets of a series each get a ``tx.command``
+SERIES_WINDOW_S: Final = 10.0  # the rest are counted into one record per window
 
 _RESERVED: Final = frozenset({"ts", "session", "n", "kind", "event"})
 _KINDS: Final = frozenset({"action", "command", "state", "packet", "event", "warning", "error"})
@@ -146,7 +148,10 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "find": Tier.ESSENTIAL,
         "send.request": Tier.ESSENTIAL,
         "send.fault": Tier.ESSENTIAL,
+        "send.plan": Tier.ESSENTIAL,
+        "send.outcome": Tier.ESSENTIAL,
         "tx.command": Tier.ESSENTIAL,
+        "tx.command.window": Tier.ESSENTIAL,
         "tx.telemetry": Tier.ESSENTIAL,
         "respond.replies": Tier.ESSENTIAL,
         "respond.start": Tier.ESSENTIAL,
@@ -398,6 +403,115 @@ class _ReplyWindow:
     first_seq: int | None = None
     last_seq: int | None = None
     started: float = 0.0
+
+
+@dataclass(slots=True)
+class _SeriesWindow:
+    count: int = 0
+    bytes: int = 0
+    by_result: dict[str, int] = field(default_factory=dict)
+    first_ns: int = 0
+    last_ns: int = 0
+    first_seq: int | None = None
+    last_seq: int | None = None
+    started: float = 0.0
+
+
+class TxSeries:
+    """The ``tx.command`` records of one series of sends (``ib send --repeat/--every``).
+
+    A series' rate is the user's choice, but one command line can ask for a thousand packets a
+    second for days, which as one essential record each would fill the ledger's disk. So, as for
+    a responder's replies: the first :data:`SERIES_FULL_RECORDS` packets sent each get their
+    full ``tx.command`` record (a packet built and never sent says so: ``result`` "skipped" or
+    "unsent", with the count it took); after them, packets are counted into one
+    ``tx.command.window`` record per :data:`SERIES_WINDOW_S` (packets, bytes, results, first and
+    last time and sequence). A packet whose send failed always gets its own record.
+    :attr:`totals` is exact however the records were written; :meth:`close` writes the open
+    window and must be called when the series ends."""
+
+    def __init__(
+        self,
+        ledger: Ledger,
+        *,
+        full: int = SERIES_FULL_RECORDS,
+        window_s: float = SERIES_WINDOW_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        assert full >= 0 and window_s > 0
+        self._ledger = ledger
+        self._full_left = full
+        self._window_s = window_s
+        self._clock = clock
+        self._window = _SeriesWindow()
+        self._subject = ""
+        self._target = ""
+        self.totals: dict[str, int] = {}  # packets by result, exact
+
+    def record(
+        self,
+        subject: str,
+        target: str,
+        *,
+        result: str,
+        sent: bool,
+        size: int,
+        sequence: int | None,
+        **fields: Any,
+    ) -> None:
+        """One packet of the series (``result`` "sent", "skipped", "unsent" or an error code)."""
+        self.totals[result] = self.totals.get(result, 0) + 1
+        self._subject, self._target = subject, target
+        failed = result not in {"sent", "skipped", "unsent"}
+        if failed or self._full_left > 0:
+            self._full_left = max(self._full_left - 1, 0)
+            self._ledger.record_tx(
+                "tx.command",
+                subject,
+                target,
+                count=1 if sent else 0,
+                result=result,
+                sent=sent,
+                size=size,
+                sequence=sequence,
+                **fields,
+            )
+            return
+        now = self._clock()
+        window = self._window
+        if window.count and now - window.started >= self._window_s:
+            self.close()
+            window = self._window
+        if not window.count:
+            window.started = now
+            window.first_ns = time.time_ns()
+            window.first_seq = sequence
+        window.count += 1
+        window.bytes += size if sent else 0
+        window.by_result[result] = window.by_result.get(result, 0) + 1
+        window.last_ns = time.time_ns()
+        window.last_seq = sequence
+
+    def close(self) -> None:
+        """Write the open window, if it holds anything."""
+        window, self._window = self._window, _SeriesWindow()
+        if not window.count:
+            return
+        sent = window.by_result.get("sent", 0)
+        self._ledger.record_tx(
+            "tx.command.window",
+            self._subject,
+            self._target,
+            count=sent,
+            packets=window.count,
+            sent=sent,
+            bytes=window.bytes,
+            by_result=window.by_result,
+            first_ns=window.first_ns,
+            last_ns=window.last_ns,
+            first_seq=window.first_seq,
+            last_seq=window.last_seq,
+        )
 
 
 class Ledger:

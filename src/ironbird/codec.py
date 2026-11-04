@@ -35,6 +35,7 @@ from ironbird.errors import Code, DecodeError, IronbirdError
 from ironbird.header import Header, HeaderProfile, ProfileKind
 
 MAX_MID_BITS: Final = 32  # a frame carries the MID as a u32
+_TIME_KINDS: Final = frozenset({"time_seconds", "time_subseconds"})  # filled from the send time
 
 _KIND_TO_PROFILE: Final[Mapping[MessageKind, ProfileKind]] = MappingProxyType(
     {
@@ -308,12 +309,14 @@ def coerce_value(
     value: object,
     *,
     raw_enum: list[tuple[str, int]] | None = None,
+    enum_hint: str = "",
 ) -> object:
     """Convert a CLI string (or a typed Python value) into the field's wire value.
 
     A command value outside its field's enum is refused unless the CCDD field says
     ``allow_raw``. ``raw_enum`` (fault injection) is a list that lets it through and receives a
-    ``(field, value)`` entry for each such value."""
+    ``(field, value)`` entry for each such value. ``enum_hint`` names the caller's way to send
+    such a value deliberately, for the refusal (``"use --raw-enum"``)."""
     ftype = field.type
     match ftype.type_class:
         case TypeClass.INT:
@@ -343,11 +346,12 @@ def coerce_value(
                 and number not in field.enum_by_value
             ):
                 if raw_enum is None:
+                    how = f"{enum_hint}, or set" if enum_hint else "set"
                     raise _arg_error(
                         message,
                         field,
                         f"{number} is not a named value{_enum_hint(field)}; to send it "
-                        'deliberately use --raw-enum (or set "allow_raw": true on the CCDD field)',
+                        f'deliberately {how} "allow_raw": true on the CCDD field',
                     )
                 raw_enum.append((field.name, number))
             return number
@@ -428,6 +432,7 @@ def coerce_variable(
     value: object,
     *,
     raw_enum: list[tuple[str, int]] | None = None,
+    enum_hint: str = "",
 ) -> tuple[int, bytes]:
     """The element count and the wire bytes of a variable-length field's value: text for
     ``char[]``, bytes or hex for ``bytes[]``, a list, tuple or ``1,2,3`` text for a scalar array.
@@ -455,13 +460,18 @@ def coerce_variable(
             packer = _element_packer(field)
             pieces: list[bytes] = []
             for i, item in enumerate(items):
+                found = 0 if raw_enum is None else len(raw_enum)
                 try:
-                    number = coerce_value(message, plain, item, raw_enum=raw_enum)
+                    number = coerce_value(
+                        message, plain, item, raw_enum=raw_enum, enum_hint=enum_hint
+                    )
                 except IronbirdError:
                     # Name the element: the same coercion with the element's position in the name.
                     indexed = replace(plain, name=f"{field.name}[{i}]")
-                    coerce_value(message, indexed, item, raw_enum=raw_enum)
+                    coerce_value(message, indexed, item, raw_enum=raw_enum, enum_hint=enum_hint)
                     raise
+                if raw_enum is not None and len(raw_enum) > found:
+                    raw_enum[-1] = (f"{field.name}[{i}]", raw_enum[-1][1])
                 pieces.append(packer.pack(number))
             count, blob = len(items), b"".join(pieces)
     if not spec.min <= count <= spec.max:
@@ -764,6 +774,7 @@ class Codec:
         allow_count_mismatch: bool = False,
         flag_hint: str = "",
         raw_enum: list[tuple[str, int]] | None = None,
+        enum_hint: str = "",
     ) -> tuple[bytes, tuple[CountFault, ...]]:
         names = {f.name for f in msg.fields}
         unexpected = sorted(set(args) - names)
@@ -787,7 +798,9 @@ class Codec:
             if f.var is not None:
                 values.append(None)  # set below, once the data is known
             elif f.name in args:
-                values.append(coerce_value(msg, f, args[f.name], raw_enum=raw_enum))
+                values.append(
+                    coerce_value(msg, f, args[f.name], raw_enum=raw_enum, enum_hint=enum_hint)
+                )
             else:
                 values.append(_zero(f))
         blobs: list[bytes] = []
@@ -795,7 +808,9 @@ class Codec:
         for slot in layout.variables:
             f, spec = slot.field, slot.spec
             if f.name in args:
-                count, blob = coerce_variable(msg, f, args[f.name], raw_enum=raw_enum)
+                count, blob = coerce_variable(
+                    msg, f, args[f.name], raw_enum=raw_enum, enum_hint=enum_hint
+                )
             else:  # not given: the smallest array the CCDD allows, zero-filled
                 count = spec.min
                 blob = bytes(spec.min_bytes)
@@ -837,6 +852,7 @@ class Codec:
         header: Mapping[str, int] | None,
         faults: tuple[CountFault, ...] = (),
         raw_enums: tuple[tuple[str, int], ...] = (),
+        at_time: float | None = None,
     ) -> EncodedPacket:
         profile = self._profiles[msg.kind]
         values: dict[str, int] = {**msg.header}
@@ -851,7 +867,7 @@ class Codec:
             mid=msg.mid,
             inputs=values,
             sequence=counter,
-            now=self._clock(),
+            now=self._clock() if at_time is None else at_time,
             tamper=tamper,
         )
         assert (
@@ -870,13 +886,16 @@ class Codec:
         header: Mapping[str, int] | None = None,
         allow_count_mismatch: bool = False,
         raw_enum: bool = False,
+        enum_hint: str = "",
+        at_time: float | None = None,
     ) -> EncodedPacket:
         """Encode a command. ``header`` sets input fields of the command header profile for this
         packet; it wins over the message's own ``header`` values, which win over the profile's
         defaults. A count or length field is filled from the data it sizes; a value given for it
         that disagrees is refused unless ``allow_count_mismatch`` (fault injection). A value outside
         a field's enum is refused unless ``raw_enum`` (fault injection; the packet's
-        ``raw_enums`` lists them)."""
+        ``raw_enums`` lists them); ``enum_hint`` names the caller's way to send one. The header's
+        time fields carry ``at_time`` (Unix seconds), by default the time of the encode."""
         msg = self._lookup(name, MessageKind.COMMAND)
         raw: list[tuple[str, int]] | None = [] if raw_enum else None
         payload, faults = self._encode_payload(
@@ -886,6 +905,7 @@ class Codec:
             allow_count_mismatch=allow_count_mismatch,
             flag_hint=" (--allow-count-mismatch injects a fault)",
             raw_enum=raw,
+            enum_hint=enum_hint,
         )
         profile = self._profiles[MessageKind.COMMAND]
         assert profile.function_code_field is not None and msg.function_code is not None
@@ -897,7 +917,14 @@ class Codec:
             header,
             faults,
             tuple(raw or ()),
+            at_time,
         )
+
+    @property
+    def command_carries_time(self) -> bool:
+        """Whether the command header has a field filled from the send time."""
+        profile = self._profiles[MessageKind.COMMAND]
+        return any(f.computed in _TIME_KINDS for f in profile.fields)
 
     def check_command(
         self,
@@ -907,6 +934,7 @@ class Codec:
         header: Mapping[str, int] | None = None,
         allow_count_mismatch: bool = False,
         raw_enum: bool = False,
+        enum_hint: str = "",
     ) -> tuple[tuple[str, int], ...]:
         """Refuse with the error :meth:`encode_command` would raise for these arguments and
         header values, without building a packet and without advancing any sequence counter.
@@ -920,6 +948,7 @@ class Codec:
             allow_count_mismatch=allow_count_mismatch,
             flag_hint=" (--allow-count-mismatch injects a fault)",
             raw_enum=raw,
+            enum_hint=enum_hint,
         )
         if header:
             self._check_header_values(self._profiles[MessageKind.COMMAND], header, "header")

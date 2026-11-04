@@ -37,6 +37,8 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
         "FileSystem.renameat2_noreplace",
         "_libc",
     },
+    # the pacer thread's timer slack: one prctl(PR_SET/GET_TIMERSLACK) call, nothing else
+    ("pacer.py", "ctypes"): {"", "lower_timer_slack"},
     # the confirmed prune
     ("prune.py", "removal"): {"_delete_session"},
     # a process's own temporary file on its failure path; the second step of rename_noreplace
@@ -132,12 +134,13 @@ def test_nothing_in_src_uses_tempfile_deleting_helpers_or_o_trunc_or_write_text(
 
 
 def test_ctypes_is_used_only_by_the_file_system_seam() -> None:
+    """And by the pacer's one ``prctl`` (its timer slack), which touches no file."""
     users = {
         path
         for path, findings in findings_by_file().items()
         if any(f.category == "ctypes" for f in findings)
     }
-    assert users == {"fsops.py"}
+    assert users == {"fsops.py", "pacer.py"}
 
 
 def test_every_allowlist_entry_is_still_used() -> None:

@@ -1,15 +1,18 @@
 """``ib send`` modes (--at, --repeat, --every with --until/--for) and --raw-enum.
 
-The schedule is tested on a simulated clock (exact, no sleeping); the command is tested end to
-end against a UDP sink on loopback (counts and timing with tolerances meant for a loaded CI
-host). Nothing here asserts on wording: codes, exit statuses, counts and ledger fields only.
-Ports are in 58000-58999.
+The schedule is tested on simulated time (exact, no sleeping): the pacer thread's slot logic run
+synchronously over packets built ahead. The pacer is tested with its real thread on short
+periods, and the command end to end against a UDP sink on loopback (counts and timing with
+tolerances meant for a loaded CI host; the timing targets are in tests/bench/test_send_timing.py).
+Nothing here asserts on wording: codes, exit statuses, counts and ledger fields only.
 """
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
+import math
 import signal
 import socket
 import threading
@@ -21,20 +24,24 @@ from typing import Any
 
 import pytest
 
+from ironbird import pacer as pm
 from ironbird import sendmodes as sm
+from ironbird.config import Endpoint
 from ironbird.errors import Code, IronbirdError
-from recutil import Proc, run_ib
+from ironbird.ledger import TxSeries
+from ironbird.transport.udp import UdpTransport
+from recutil import EXAMPLES, Proc, run_ib
 from replayutil import child_env, write_config_58k
 
 MS = 1_000_000
 SEC = 1_000_000_000
 
 
-# -- the schedule on a simulated clock --------------------------------------------------------
+# -- the schedule on simulated time -----------------------------------------------------------
 
 
 class FakeClock:
-    """Time that moves only when something sleeps or a send takes time."""
+    """Wall and monotonic time that move only when something sleeps (the wait for a start)."""
 
     def __init__(self, wall_ns: int = 1_800_000_000 * SEC) -> None:
         self.mono = 5 * SEC
@@ -49,29 +56,60 @@ class FakeClock:
 
     async def sleep(self, seconds: float) -> None:
         self.sleeps += seconds > 0.01
-        self.mono += max(round(seconds * SEC), 1_000)  # a yield still takes a moment
+        self.mono += max(round(seconds * SEC), 1_000)
 
 
-def run_plan(
-    plan: sm.SendPlan,
+class FakeWaiter:
+    """The pacer thread's time on the same simulated clock: a wait reaches its deadline."""
+
+    def __init__(self, clock: FakeClock) -> None:
+        self.clock = clock
+
+    def setup(self) -> dict[str, Any]:
+        return {}
+
+    def mono_ns(self) -> int:
+        return self.clock.mono
+
+    def wait_until(self, deadline_ns: int, stop: threading.Event) -> bool:
+        self.clock.mono = max(self.clock.mono, deadline_ns)
+        return True
+
+
+class _NoLoop:
+    def call_soon_threadsafe(self, *_: object) -> None:
+        pass
+
+
+Report = pm.Report[int]
+
+
+def pace(
+    grid: sm.Grid,
     clock: FakeClock,
     cost: int | Callable[[int], int] = 0,
-    progress: sm.Progress | None = None,
-) -> tuple[sm.Tally, list[int]]:
-    """Run ``plan``; ``cost(n)`` is the nanoseconds the n-th send takes. Returns the tally and
-    the monotonic instant each send began."""
-    import asyncio
-
-    tally = sm.Tally(planned=0)
+    *,
+    timed: bool = False,
+    slots: list[int] | None = None,
+) -> tuple[list[Report], list[int]]:
+    """Run the pacer thread's slot logic synchronously over packets built ahead (one per slot,
+    or for ``slots``); ``cost(n)`` is the nanoseconds the n-th send takes. Returns the reports
+    and the monotonic instant each send began."""
     began: list[int] = []
 
-    async def send() -> None:
+    def send(data: bytes, stop: threading.Event) -> bool:
         n = len(began)
         began.append(clock.mono)
         clock.mono += cost(n) if callable(cost) else cost
+        return True
 
-    asyncio.run(sm.execute(plan, clock, send, tally, progress))
-    return tally, began
+    pacer: pm.SeriesPacer[int] = pm.SeriesPacer(grid, send, FakeWaiter(clock), timed=timed)
+    pacer._loop = _NoLoop()  # type: ignore[assignment]
+    wanted = slots if slots is not None else list(range(grid.planned + 64))
+    for number, slot in enumerate(wanted):
+        pacer._queue.append(pm.Built(number, slot, b"", number))
+    pacer._pace_slots()
+    return list(pacer._reports), began
 
 
 def plan_for(clock: FakeClock, **flags: Any) -> sm.SendPlan:
@@ -85,88 +123,306 @@ def plan_for(clock: FakeClock, **flags: Any) -> sm.SendPlan:
     return sm.resolve(spec, clock.wall_ns(), clock.wall_ns())
 
 
+def grid_for(clock: FakeClock, opening_ns: int = 0, **flags: Any) -> sm.Grid:
+    """The grid of the flags, after a link open of ``opening_ns``."""
+    plan = plan_for(clock, **flags)
+    clock.mono += opening_ns
+    return asyncio.run(sm.start_grid(plan, clock))
+
+
+def count(reports: list[Report], kind: pm.Kind) -> int:
+    return sum(r.slots if kind is pm.Kind.SKIPPED else 1 for r in reports if r.kind is kind)
+
+
+def lateness(reports: list[Report]) -> list[int]:
+    return [r.late_ns for r in reports if r.kind is pm.Kind.SENT and r.late_ns is not None]
+
+
 def test_periodic_sends_sit_on_an_absolute_grid_without_drift() -> None:
     clock = FakeClock()
-    tally, began = run_plan(plan_for(clock, every="10ms", for_="1s"), clock, cost=100_000)
-    assert tally.sent == 100 and tally.skipped == 0 and tally.planned == 100
-    gaps = {b - a for a, b in itertools.pairwise(began)}
-    assert gaps == {10 * MS}  # exactly the period, however long a send took
-    assert tally.late_max_ns == 0
+    grid = grid_for(clock, every="10ms", for_="1s")
+    reports, began = pace(grid, clock, cost=100_000)
+    assert count(reports, pm.Kind.SENT) == 100 == grid.planned
+    assert count(reports, pm.Kind.SKIPPED) == 0
+    assert {b - a for a, b in itertools.pairwise(began)} == {10 * MS}  # whatever a send costs
+    assert set(lateness(reports)) == {100_000}  # measured when the send returned
 
 
 def test_window_is_half_open_and_repeat_caps_it() -> None:
     clock = FakeClock()
-    tally, _ = run_plan(plan_for(clock, every="1s", for_="3s"), clock)
-    assert tally.sent == 3  # at 0, 1 and 2 s, not at 3 s
+    reports, _ = pace(grid_for(clock, every="1s", for_="3s"), clock)
+    assert count(reports, pm.Kind.SENT) == 3  # at 0, 1 and 2 s, not at 3 s
     clock = FakeClock()
-    tally, _ = run_plan(plan_for(clock, every="1s", for_="10s", repeat=4), clock)
-    assert tally.sent == 4 and tally.planned == 4
+    grid = grid_for(clock, every="1s", for_="10s", repeat=4)
+    reports, _ = pace(grid, clock)
+    assert count(reports, pm.Kind.SENT) == 4 == grid.planned
     clock = FakeClock()
-    tally, _ = run_plan(plan_for(clock, every="1s", repeat=3), clock)
-    assert tally.sent == 3
+    reports, _ = pace(grid_for(clock, every="1s", repeat=3), clock)
+    assert count(reports, pm.Kind.SENT) == 3
 
 
 def test_until_ends_at_an_absolute_time() -> None:
     clock = FakeClock()
     end = sm.iso_utc(clock.wall_ns() + 2 * SEC + 500 * MS)
-    tally, _ = run_plan(plan_for(clock, every="1s", until=end), clock)
-    assert tally.sent == 3  # 0, 1 and 2 s are before the end
+    reports, _ = pace(grid_for(clock, every="1s", until=end), clock)
+    assert count(reports, pm.Kind.SENT) == 3  # 0, 1 and 2 s are before the end
 
 
 def test_a_send_that_overruns_skips_slots_instead_of_catching_up() -> None:
     clock = FakeClock()
     # the 5th send (slot 4) takes 35 ms: slots 5 and 6 are lost, slot 7 is reached 5 ms late
     # (half a period) and is sent
-    tally, began = run_plan(
-        plan_for(clock, every="10ms", for_="200ms"), clock, cost=lambda n: 35 * MS if n == 4 else 0
-    )
-    assert tally.skipped == 2 and tally.sent == 20 - 2
-    assert tally.overruns == 1
-    gaps = [b - a for a, b in itertools.pairwise(began)]
-    assert min(gaps) >= 5 * MS  # never closer than half a period: no burst to make up for it
-    assert tally.late_max_ns <= 5 * MS
+    grid = grid_for(clock, every="10ms", for_="200ms")
+    reports, began = pace(grid, clock, cost=lambda n: 35 * MS if n == 4 else 0)
+    assert count(reports, pm.Kind.SKIPPED) == 2 and count(reports, pm.Kind.SENT) == 20 - 2
+    assert min(b - a for a, b in itertools.pairwise(began)) >= 5 * MS  # never a burst
+    assert max(lateness(reports)) == 35 * MS  # the overrunning send itself
+    assert sorted(lateness(reports))[-2] <= 5 * MS
+
+
+def test_a_slow_send_never_puts_the_next_one_closer_than_half_a_period() -> None:
+    clock = FakeClock()
+    grid = grid_for(clock, every="10ms", for_="200ms")
+    _, began = pace(grid, clock, cost=lambda n: 14 * MS if n == 5 else 20_000)
+    assert min(b - a for a, b in itertools.pairwise(began)) >= 5 * MS
 
 
 def test_skipped_slots_do_not_count_toward_repeat() -> None:
     clock = FakeClock()
-    tally, _ = run_plan(
-        plan_for(clock, every="10ms", repeat=10), clock, cost=lambda n: 35 * MS if n == 2 else 0
-    )
-    assert tally.sent == 10 and tally.skipped == 2
+    grid = grid_for(clock, every="10ms", repeat=10)
+    reports, _ = pace(grid, clock, cost=lambda n: 35 * MS if n == 2 else 0)
+    assert count(reports, pm.Kind.SENT) == 10 and count(reports, pm.Kind.SKIPPED) == 2
 
 
 def test_a_stall_at_the_end_of_the_window_counts_only_slots_inside_it() -> None:
     clock = FakeClock()
-    tally, _ = run_plan(
-        plan_for(clock, every="10ms", for_="100ms"), clock, cost=lambda n: 500 * MS if n == 8 else 0
-    )
-    assert tally.sent == 9 and tally.skipped == 1  # only slot 9 was inside the window
+    grid = grid_for(clock, every="10ms", for_="100ms")
+    reports, _ = pace(grid, clock, cost=lambda n: 500 * MS if n == 8 else 0)
+    assert count(reports, pm.Kind.SENT) == 9 and count(reports, pm.Kind.SKIPPED) == 1
 
 
 def test_repeat_alone_is_a_burst_and_at_alone_is_one_packet() -> None:
     clock = FakeClock()
-    tally, began = run_plan(plan_for(clock, repeat=5), clock, cost=1_000)
-    assert tally.sent == 5 and tally.late_count == 0 and began == sorted(began)
+    reports, began = pace(grid_for(clock, repeat=5), clock, cost=1_000)
+    assert count(reports, pm.Kind.SENT) == 5 and began == sorted(began)
+    assert len(lateness(reports)) == 1  # only the first packet has a slot
     clock = FakeClock()
-    tally, _ = run_plan(plan_for(clock, at="+3s"), clock)
-    assert tally.sent == 1 and tally.planned == 1
+    grid = grid_for(clock, at="+3s")
+    reports, _ = pace(grid, clock)
+    assert count(reports, pm.Kind.SENT) == 1 == grid.planned
 
 
-def test_an_at_start_waits_for_the_wall_clock_then_runs_on_the_monotonic_one() -> None:
+@pytest.mark.parametrize(
+    "flags",
+    [
+        {"at": "+3s"},
+        {"at": "+0.9s"},
+        {"at": "+10s", "repeat": 3},
+        {"at": "+3s", "every": "100ms", "repeat": 3},
+    ],
+)
+def test_an_at_start_is_never_sent_early(flags: dict[str, Any]) -> None:
+    clock = FakeClock()
+    start_wall = clock.wall_ns() + sm.parse_time_arg(flags["at"], "--at").resolve(0)
+    grid = grid_for(clock, **flags)
+    reports, began = pace(grid, clock)
+    assert began and began[0] >= grid.start_mono
+    assert began[0] + clock.offset >= start_wall  # on the wall clock too
+    assert lateness(reports)[0] >= 0
+
+
+def test_an_at_start_waits_for_the_wall_clock_in_few_slices() -> None:
     clock = FakeClock()
     start_wall = clock.wall_ns() + 90 * SEC
-    plan = plan_for(clock, at=sm.iso_utc(start_wall), every="1s", repeat=3)
-    tally, began = run_plan(plan, clock)
-    assert tally.sent == 3
-    assert abs(clock.wall_ns() - start_wall - 2 * SEC) < 5 * MS  # 3 sends, the last at +2 s
-    assert began[1] - began[0] == SEC and clock.sleeps < 20  # long waits sleep in few slices
+    grid = grid_for(clock, at=sm.iso_utc(start_wall), every="1s", repeat=3)
+    assert clock.sleeps < 20 and grid.start_mono + clock.offset == start_wall // MS * MS
+    _, began = pace(grid, clock)
+    assert [b - began[0] for b in began] == [0, SEC, 2 * SEC]
 
 
-def test_progress_is_reported_after_every_send() -> None:
+def test_an_at_the_link_open_missed_stays_on_its_grid_and_reports_the_slots() -> None:
     clock = FakeClock()
-    seen: list[int] = []
-    run_plan(plan_for(clock, every="10ms", repeat=4), clock, progress=lambda t: seen.append(t.sent))
-    assert seen == [1, 2, 3, 4]
+    grid = grid_for(clock, 3 * SEC, at="+2s", every="100ms", repeat=5)
+    reports, began = pace(grid, clock)
+    assert count(reports, pm.Kind.SKIPPED) == 10  # the slots of the second the open overran
+    assert count(reports, pm.Kind.SENT) == 5
+    assert all((b - grid.start_mono) % (100 * MS) == 0 for b in began)  # on T's grid
+    clock = FakeClock()
+    grid = grid_for(clock, 3 * SEC, at="+2s")
+    reports, _ = pace(grid, clock)
+    assert lateness(reports) == [SEC]  # sent late, and says how late
+
+
+def test_an_until_window_the_open_shrank_is_refused_or_smaller() -> None:
+    clock = FakeClock()
+    assert grid_for(clock, 1_500 * MS, every="1s", until="+3s").planned == 2
+    for flags, opening in (
+        ({"every": "1s", "until": "+3s"}, 3_500 * MS),
+        ({"at": "+1s", "every": "100ms", "until": "+2s"}, 3 * SEC),
+        ({"at": "+1s", "every": "100ms", "for_": "1s"}, 3 * SEC),
+    ):
+        with pytest.raises(IronbirdError) as info:
+            grid_for(FakeClock(), opening, **flags)
+        assert info.value.code is Code.CLI_USAGE
+
+
+def test_a_timed_packet_of_a_skipped_slot_is_discarded_and_others_are_not() -> None:
+    clock = FakeClock()
+    grid = grid_for(clock, every="10ms", for_="100ms")
+    reports, _ = pace(grid, clock, cost=lambda n: 26 * MS if n == 2 else 0, timed=True)
+    assert count(reports, pm.Kind.SKIPPED) == 2 and count(reports, pm.Kind.DISCARDED) == 2
+    sent = [r.built.slot for r in reports if r.kind is pm.Kind.SENT and r.built is not None]
+    assert sent == [0, 1, 2, 5, 6, 7, 8, 9]  # each in the slot it carries the time of
+    clock = FakeClock()
+    grid = grid_for(clock, every="10ms", for_="100ms")
+    reports, _ = pace(grid, clock, cost=lambda n: 26 * MS if n == 2 else 0)
+    numbers = [r.built.number for r in reports if r.kind is pm.Kind.SENT and r.built is not None]
+    assert count(reports, pm.Kind.DISCARDED) == 0 and numbers == list(range(8))  # no gap
+
+
+def test_a_slot_with_no_packet_built_is_skipped_as_starved() -> None:
+    clock = FakeClock()
+    grid = grid_for(clock, every="10ms", for_="50ms")
+    reports, _ = pace(grid, clock, timed=True, slots=[0, 1, 3, 4])
+    starved = [r for r in reports if r.kind is pm.Kind.SKIPPED]
+    assert len(starved) == 1 and starved[0].starved and count(reports, pm.Kind.SENT) == 4
+
+
+# -- the pacer with its thread ----------------------------------------------------------------
+
+
+def run_pacer(
+    grid: sm.Grid,
+    *,
+    cancel_after_s: float | None = None,
+    abort_after_s: float | None = None,
+) -> tuple[list[Report], int, BaseException | None]:
+    """Run a real pacer over ``grid`` with a send that only counts; returns the reports, the
+    packets built, and what the run raised."""
+    reports: list[Report] = []
+    built: list[int] = []
+    wire: list[int] = []
+
+    def send(data: bytes, stop: threading.Event) -> bool:
+        wire.append(len(data))
+        return True
+
+    def build(number: int, slot: int) -> pm.Built[int]:
+        built.append(number)
+        return pm.Built(number, slot, b"x", number)
+
+    def handle(report: Report) -> BaseException | None:
+        reports.append(report)
+        return report.error
+
+    async def main() -> BaseException | None:
+        pacer: pm.SeriesPacer[int] = pm.SeriesPacer(
+            grid, send, pm.ThreadWaiter(pm.SPIN_NS), timed=False
+        )
+        task = asyncio.ensure_future(pacer.run(build, handle))
+        loop = asyncio.get_running_loop()
+        if cancel_after_s is not None:
+            loop.call_later(cancel_after_s, task.cancel)
+        if abort_after_s is not None:
+            refusal = IronbirdError(Code.TX_SEND, "refused")
+            loop.call_later(abort_after_s, pacer.abort, refusal)
+        try:
+            await task
+        except BaseException as exc:
+            return exc
+        return None
+
+    raised = asyncio.run(main())
+    assert len(wire) == sum(r.kind is pm.Kind.SENT for r in reports)
+    return reports, len(built), raised
+
+
+def live_grid(every_ms: int, for_ms: int) -> sm.Grid:
+    now = time.monotonic_ns() + 20 * MS
+    return sm.Grid(now, time.time_ns(), every_ms * MS, now + for_ms * MS, None, False)
+
+
+def test_the_pacer_thread_runs_a_series_and_accounts_for_every_packet() -> None:
+    reports, built, raised = run_pacer(live_grid(5, 300))
+    assert raised is None
+    sent = count(reports, pm.Kind.SENT)
+    assert sent >= 10 and sent + count(reports, pm.Kind.SKIPPED) == 60  # a loaded host skips
+    assert sent + count(reports, pm.Kind.UNSENT) == built  # nothing built is unaccounted for
+    assert count(reports, pm.Kind.UNSENT) <= 1
+
+
+def test_a_cancelled_pacer_stops_its_thread_and_reports_what_it_sent() -> None:
+    reports, built, raised = run_pacer(live_grid(5, 60_000), cancel_after_s=0.2)
+    assert isinstance(raised, asyncio.CancelledError)
+    assert reports and not any(r.kind is pm.Kind.DONE for r in reports)  # handled internally
+    assert count(reports, pm.Kind.SENT) + count(reports, pm.Kind.UNSENT) == built
+    assert count(reports, pm.Kind.SENT) >= 5
+
+
+def test_a_refusal_found_on_the_loop_ends_the_series_with_it() -> None:
+    reports, built, raised = run_pacer(live_grid(5, 60_000), abort_after_s=0.2)
+    assert isinstance(raised, IronbirdError) and raised.code is Code.TX_SEND
+    assert count(reports, pm.Kind.SENT) + count(reports, pm.Kind.UNSENT) == built
+
+
+def test_a_refusal_that_arrives_after_its_send_is_reported_not_cleared() -> None:
+    """A real link's ICMP refusal arrives one round trip after the send returned; the next
+    send of the series must not wipe it (it is reported as an earlier packet's)."""
+
+    async def main() -> None:
+        live = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        live.bind(("127.0.0.1", 0))
+        transport = UdpTransport(remote=Endpoint("127.0.0.1", live.getsockname()[1]))
+        await transport.open(None)
+        sender = await transport.thread_sender()
+        assert sender is not None
+        try:
+            sender.send(b"\x18\x90\xc0\x00\x00\x01\x00\xb6", threading.Event())
+            refused = ConnectionRefusedError(111, "Connection refused")
+            asyncio.get_running_loop().call_later(
+                0.01, setattr, transport, "_pending_error", refused
+            )
+            await asyncio.sleep(0.05)
+            sender.send(b"\x18\x90\xc0\x01\x00\x01\x00\xb6", threading.Event())
+            with pytest.raises(IronbirdError) as info:
+                transport.raise_earlier()
+            assert info.value.code is Code.TX_SEND
+        finally:
+            sender.close()
+            await transport.close()
+            live.close()
+
+    asyncio.run(main())
+
+
+# -- the ledger records of a series -----------------------------------------------------------
+
+
+class FakeLedger:
+    def __init__(self) -> None:
+        self.records: list[tuple[str, dict[str, Any]]] = []
+
+    def record_tx(self, event: str, subject: str, target: str = "", **fields: Any) -> None:
+        self.records.append((event, fields))
+
+
+def test_a_long_series_keeps_the_first_packets_and_counts_the_rest_in_windows() -> None:
+    ledger = FakeLedger()
+    now = [0.0]
+    series = TxSeries(ledger, full=5, window_s=10.0, clock=lambda: now[0])  # type: ignore[arg-type]
+    for n in range(1000):
+        now[0] = n * 0.1
+        result = "IB-TX-002" if n == 500 else ("unsent" if n == 999 else "sent")
+        series.record("NOOP", "fc", result=result, sent=result == "sent", size=8, sequence=n)
+    series.close()
+    full = [f for e, f in ledger.records if e == "tx.command"]
+    windows = [f for e, f in ledger.records if e == "tx.command.window"]
+    assert len(full) == 5 + 1  # the first five, and the failure
+    assert full[-1]["result"] == "IB-TX-002"
+    assert 9 <= len(windows) <= 11  # one per 10 s of 100 s
+    assert sum(w["sent"] for w in windows) + 5 == series.totals["sent"] == 998
+    assert sum(w["packets"] for w in windows) == 1000 - 6
+    assert windows[0]["first_seq"] == 5 and windows[-1]["last_seq"] == 999
 
 
 # -- the flags ---------------------------------------------------------------------------------
@@ -189,20 +445,29 @@ def usage_error(**flags: Any) -> IronbirdError:
         {"every": "1s", "until": "+10s", "for_": "10s"},  # two ends
         {"every": "1s", "repeat": 1},  # the period is never used
         {"every": "10s", "for_": "5s"},  # at most one packet
-        {"every": "100us", "repeat": 5},  # finer than the loop can keep
+        {"every": "100us", "repeat": 5},  # finer than the pacer is meant for
         {"every": "5", "repeat": 5},  # a bare number has no unit
         {"every": "1x", "repeat": 5},
         {"every": "-1s", "repeat": 5},
+        {"every": "1s1s", "repeat": 5},  # a unit twice
+        {"every": "30s1m", "repeat": 5},  # units out of order
+        {"every": "1ms1h", "repeat": 5},
+        {"every": "", "repeat": 5},
         {"repeat": 0},
         {"repeat": sm.MAX_SENDS + 1},
         {"every": "1ms", "for_": "1000h"},  # more packets than the limit
+        {"every": "1s", "for_": "9000h"},  # longer than a year
         {"at": "yesterday"},
         {"at": "2000-01-01T00:00:00Z"},  # in the past
         {"at": "+0s"},
+        {"at": "+70000000h"},  # past year 9999
+        {"at": "+999999999h999999999h"},
         {"at": "+10s", "every": "1s", "until": "+5s"},  # ends before it starts
         {"at": "+10s", "every": "10s", "until": "+15s"},  # one packet at most
         {"at": "+9999h"},  # a typo, not a plan
         {"at": "2026-13-45T25:00:00Z"},
+        {"every": "720h", "until": "9999-12-31T23:59:59Z"},  # an end years away
+        {"every": "720h", "repeat": 2, "until": "+70000000h"},
     ],
 )
 def test_contradictory_or_meaningless_flags_are_coded_usage_errors(flags: dict[str, Any]) -> None:
@@ -227,6 +492,61 @@ def test_durations() -> None:
     assert sm.parse_duration("250ms", "--every") == 250 * MS
     assert sm.parse_duration("1m30s", "--every") == 90 * SEC
     assert sm.parse_duration("1.5s", "--every") == 1500 * MS
+    assert sm.parse_duration("1h2m3s4ms", "--every") == (3723 * SEC) + 4 * MS
+
+
+@pytest.mark.parametrize("wall_ns", [0, -1, 10**30, -(10**30), 253_402_300_800 * SEC])
+def test_a_time_out_of_range_still_formats(wall_ns: int) -> None:
+    assert sm.iso_utc(wall_ns)
+
+
+# -- raw enum values: labels and hints --------------------------------------------------------
+
+
+def _codec_with_enum_array() -> Any:
+    """The mock codec with an enum on the elements of MOCK_LOAD_DATA's ``Entries`` (the JSON
+    CCDD has no spelling for that today; the codec still names such values by element)."""
+    from dataclasses import replace
+    from types import MappingProxyType
+
+    from ironbird.ccdd.json_adapter import parse_model
+    from ironbird.ccdd.model import CcddModel
+    from ironbird.codec import Codec
+    from ironbird.header import load_profile
+
+    model = parse_model(json.loads((EXAMPLES / "ccdd" / "mock.json").read_text()), "mock.json")
+    enum = MappingProxyType({"A": 1, "B": 2})
+    messages = tuple(
+        replace(
+            m,
+            fields=tuple(replace(f, enum=enum) if f.name == "Entries" else f for f in m.fields),
+        )
+        if m.name == "MOCK_LOAD_DATA"
+        else m
+        for m in model.messages
+    )
+    return Codec(
+        CcddModel.build(model.target, model.source, messages),
+        load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_cmd.toml"),
+        load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_tlm.toml"),
+    )
+
+
+def test_raw_enum_values_of_an_array_are_named_by_element() -> None:
+    codec = _codec_with_enum_array()
+    packet = codec.encode_command(
+        "MOCK_LOAD_DATA", {"Entries": [1, 9, 10], "Text": ""}, raw_enum=True
+    )
+    assert packet.raw_enums == (("Entries[1]", 9), ("Entries[2]", 10))
+
+
+def test_the_codec_names_no_cli_flag_unless_its_caller_does() -> None:
+    codec = _codec_with_enum_array()
+    for hint in ("", "use --raw-enum"):
+        with pytest.raises(IronbirdError) as info:
+            codec.encode_command("MOCK_LOAD_DATA", {"Entries": [9], "Text": ""}, enum_hint=hint)
+        assert info.value.code is Code.ENC_ARG
+        assert ("--raw-enum" in info.value.summary) == bool(hint)
 
 
 # -- ib send against a UDP sink ----------------------------------------------------------------
@@ -241,6 +561,7 @@ class Sink:
         self.sock.bind(("127.0.0.1", port))
         self.sock.settimeout(0.05)
         self.packets: list[tuple[int, bytes]] = []
+        self.walls: list[int] = []  # the wall-clock time each packet arrived
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -253,6 +574,7 @@ class Sink:
                 continue
             except OSError:
                 return
+            self.walls.append(time.time_ns())
             self.packets.append((time.monotonic_ns(), data))
 
     @property
@@ -346,22 +668,27 @@ def test_every_for_keeps_the_period_and_reports_lateness(
     assert 0 <= outcome["late_mean_ns"] <= outcome["late_max_ns"] < 25 * MS
 
 
-def test_at_waits_for_the_start_and_sends_once(
-    tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
+@pytest.mark.parametrize("extra", [[], ["--repeat", "3"]])
+def test_at_sends_at_the_start_never_before_it(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]], extra: list[str]
 ) -> None:
     config, port, env = setup
+    start = (math.ceil(time.time()) + 3) * SEC  # a whole second, absolute
     with sink_for(port) as sink:
-        began = time.monotonic_ns()
-        done = run_ib(tmp_path, ["-c", str(config), "send", "fc", "MOCK_NOOP", "--at", "+2s"], env)
+        done = run_ib(
+            tmp_path,
+            ["-c", str(config), "send", "fc", "MOCK_NOOP", "--at", sm.iso_utc(start), *extra],
+            env,
+        )
         assert done.returncode == 0, done.stderr
-        deadline = time.monotonic() + 5
-        while sink.count < 1 and time.monotonic() < deadline:
-            time.sleep(0.02)
         time.sleep(0.2)
-        assert sink.count == 1
-        assert sink.packets[0][0] - began >= 1_800 * MS  # not before the start time
-    plan = next(e for e in ledger_events(tmp_path) if e["event"] == "send.plan")
-    assert plan["mode"] == "at" and plan["start_utc"].endswith("Z")
+        assert sink.count == (3 if extra else 1)
+        assert sink.walls[0] >= start  # not a moment early
+    events = ledger_events(tmp_path)
+    plan = next(e for e in events if e["event"] == "send.plan")
+    outcome = next(e for e in events if e["event"] == "send.outcome")
+    assert plan["start_utc"].endswith("Z")
+    assert 0 <= outcome["start_late_ns"] < 500 * MS
 
 
 def test_usage_errors_exit_2_and_send_nothing(
@@ -374,6 +701,9 @@ def test_usage_errors_exit_2_and_send_nothing(
         ["--every", "1s", "--for", "5s", "--until", "+9s"],
         ["--at", "2001-01-01T00:00:00Z"],
         ["--repeat", "1", "--every", "1s"],
+        ["--at", "+70000000h"],
+        ["--every", "720h", "--until", "9999-12-31T23:59:59Z"],
+        ["--every", "1s1s", "--repeat", "2"],
     ]
     with sink_for(port) as sink:
         for flags in bad_flags:
@@ -423,7 +753,7 @@ def test_a_signal_stops_the_series_between_sends_with_a_summary(
         assert sink.count == settled  # nothing after the process ended
     assert "Traceback" not in proc.stderr
     outcome = next(e for e in ledger_events(tmp_path) if e["event"] == "send.outcome")
-    assert outcome["outcome"] == "interrupted" and abs(outcome["sent"] - settled) <= 1
+    assert outcome["outcome"] == "interrupted" and outcome["sent"] == settled  # exact
     assert consecutive(sink.sequences())
 
 
@@ -481,6 +811,62 @@ def test_a_dead_receiver_is_found_on_the_first_packet_of_a_fast_series(
     assert done.returncode == 1 and Code.TX_SEND.value in done.stderr
 
 
+@pytest.mark.parametrize(
+    "flags", [["--repeat", "2"], ["--at", "+0.5s"], ["--every", "1s", "--for", "3s"]]
+)
+def test_a_dead_receiver_is_found_for_any_series(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]], flags: list[str]
+) -> None:
+    config, _, env = setup  # nothing listens
+    done = run_ib(tmp_path, ["-c", str(config), "send", "fc", "MOCK_NOOP", *flags], env)
+    assert done.returncode == 1 and Code.TX_SEND.value in done.stderr
+    outcome = next(e for e in ledger_events(tmp_path) if e["event"] == "send.outcome")
+    assert outcome["outcome"] == "failed" and outcome["error"] == Code.TX_SEND.value
+
+
+def test_a_long_series_ledgers_its_first_packets_and_counts_the_rest(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
+) -> None:
+    config, port, env = setup
+    with sink_for(port) as sink:
+        done = run_ib(
+            tmp_path, ["-c", str(config), "send", "fc", "MOCK_NOOP", "--repeat", "700"], env
+        )
+        assert done.returncode == 0, done.stderr
+        time.sleep(0.2)
+        assert sink.count == 700
+    events = ledger_events(tmp_path)
+    full = [e for e in events if e["event"] == "tx.command"]
+    windows = [e for e in events if e["event"] == "tx.command.window"]
+    outcome = next(e for e in events if e["event"] == "send.outcome")
+    assert len(full) == 600 and all(e["sent"] for e in full)
+    assert sum(w["sent"] for w in windows) == 100
+    assert outcome["sent"] == 700 == outcome["totals"]["sent"]
+    assert outcome["last_sequence"] - outcome["first_sequence"] == 699
+
+
+def test_one_millisecond_period_runs_and_accounts_for_every_slot(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
+) -> None:
+    """Functional only: the timing targets are host-timing guards (tests/bench)."""
+    config, port, env = setup
+    with sink_for(port) as sink:
+        done = run_ib(
+            tmp_path,
+            ["-c", str(config), "send", "fc", "MOCK_NOOP", "--every", "1ms", "--for", "1s"],
+            env,
+        )
+        assert done.returncode == 0, done.stderr
+        time.sleep(0.3)
+        received = sink.count
+        assert consecutive(sink.sequences())
+    outcome = next(e for e in ledger_events(tmp_path) if e["event"] == "send.outcome")
+    assert outcome["planned"] == 1000 and outcome["sent"] > 0
+    assert outcome["sent"] + outcome["skipped"] == 1000
+    assert received == outcome["sent"]
+    assert outcome["pacer"]["direct"] is True
+
+
 # -- --raw-enum --------------------------------------------------------------------------------
 
 
@@ -521,29 +907,3 @@ def test_raw_enum_with_nothing_to_allow_is_a_usage_error(
         env,
     )
     assert done.returncode == 2 and Code.CLI_USAGE.value in done.stderr
-
-
-# -- performance -------------------------------------------------------------------------------
-
-
-def test_one_millisecond_period_is_sustained_on_loopback(
-    tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
-) -> None:
-    """The target is --every 1ms with lateness well under the period; the floors here are loose
-    because CI hosts are shared. The lateness figures come from the series' own ledger record."""
-    config, port, env = setup
-    with sink_for(port) as sink:
-        done = run_ib(
-            tmp_path,
-            ["-c", str(config), "send", "fc", "MOCK_NOOP", "--every", "1ms", "--for", "3s"],
-            env,
-        )
-        assert done.returncode == 0, done.stderr
-        time.sleep(0.3)
-        received = sink.count
-    outcome = next(e for e in ledger_events(tmp_path) if e["event"] == "send.outcome")
-    assert outcome["planned"] == 3000
-    assert outcome["sent"] + outcome["skipped"] <= 3000
-    assert outcome["sent"] >= 0.5 * 3000, outcome  # a shared host may preempt the spinning loop
-    assert received >= 0.9 * outcome["sent"]  # loopback drops almost nothing
-    assert outcome["late_mean_ns"] < 500_000, outcome

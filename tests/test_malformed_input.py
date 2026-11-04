@@ -404,3 +404,30 @@ def test_corpus_profiles_the_codec_cannot_drive_are_rejected_at_load(path: Path)
         Codec(empty, CMD_PROFILE, profile)
     assert info.value.code is Code.HDR_SCHEMA
     assert "\n" not in info.value.user_line()
+
+
+# -- send-mode arguments: ib send --at/--every/--for/--until --
+
+
+_SEND_TEXT = st.one_of(
+    st.text(max_size=40),
+    st.from_regex(r"\+?[0-9.]{1,14}(h|m|s|ms){0,3}[0-9.]{0,10}(h|m|s|ms)?", fullmatch=True),
+)
+
+
+@FUZZ
+@given(_SEND_TEXT, _SEND_TEXT)
+def test_send_mode_arguments_are_values_or_usage_errors(at: str, every: str) -> None:
+    from ironbird import sendmodes as sm
+
+    for parse in (
+        lambda: sm.parse_duration(every, "--every"),
+        lambda: sm.parse_time_arg(at, "--at"),
+        lambda: sm.resolve(
+            sm.parse_spec(at, None, every, at, None), 1_800_000_000 * sm.NS, 1_800_000_000 * sm.NS
+        ),
+    ):
+        try:
+            parse()
+        except IronbirdError as exc:
+            assert exc.code is Code.CLI_USAGE, exc

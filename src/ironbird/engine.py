@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import time
 import traceback
 from collections import deque
@@ -52,7 +53,9 @@ from ironbird.frame import (
 )
 from ironbird.ledger import Ledger
 from ironbird.notice import Level
+from ironbird.pacer import LeftThenFailed
 from ironbird.transport import LinkEnd, Receiver, Transport, TransportClosed, open_transport
+from ironbird.transport.udp import CONFIRM_WAIT_S
 
 MAX_TRACKED_MIDS: Final = 1024
 CONSUMER_QUEUE_FRAMES: Final = 16384
@@ -64,6 +67,8 @@ _RELEASE_EVERY: Final = 64  # offers between releases of the charges of frames a
 READ_BATCH_FRAMES: Final = 512  # most frames one ``next_batch`` hands a consumer
 _MAX_STREAMS: Final = MAX_STREAM_ID + 1
 OPEN_TIMEOUT_S: Final = 5.0  # longest a transport may take to open (name resolution, bind)
+HOP_POLL_S: Final = 0.05  # a pacer send through the loop re-checks that the loop still runs
+SETTLE_S: Final = CONFIRM_WAIT_S  # the end of a series waits this long for a refusal
 
 Reporter = Callable[..., None]  # Session.report: (error, *, context, level, evidence, sample)
 
@@ -533,6 +538,102 @@ class FrameDecoder:
         if self._report_checked:
             self._reject(frame, result)
         return result
+
+
+class _ThreadSender(Protocol):
+    target: object
+
+    def send(self, data: bytes, stop: object) -> bool: ...
+
+    def close(self) -> None: ...
+
+
+class SeriesLink:
+    """A link end held by a series of sends: how the pacer thread sends on it, and the loop's
+    side of each send (the TX frame for the sinks, the transport's counters, refusals).
+
+    A transport with a thread-safe send (UDP: a duplicate of its connected socket) is sent on
+    from the pacer thread directly. Any other is handed each packet through the loop
+    (``run_coroutine_threadsafe`` into :meth:`Engine.send`), which adds the loop's latency to
+    the packet; the series still keeps its slots and reports that lateness."""
+
+    def __init__(
+        self,
+        engine: Engine,
+        io: _LinkIO,
+        transport: Transport,
+        sender: _ThreadSender | None,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._engine = engine
+        self._io = io
+        self._transport = transport
+        self._sender = sender
+        self._loop = loop
+
+    @property
+    def direct(self) -> bool:
+        """Whether the pacer thread sends itself (else through the loop)."""
+        return self._sender is not None
+
+    def send(self, data: bytes, stop: threading.Event) -> bool:
+        """In the pacer thread: hand ``data`` to the link (:data:`ironbird.pacer.ThreadSend`)."""
+        sender = self._sender
+        if sender is not None:
+            return sender.send(data, stop)
+        left = threading.Event()
+        future = asyncio.run_coroutine_threadsafe(
+            self._engine.send(self._io.link, self._io.end, data, handed_off=left.set), self._loop
+        )
+        while True:
+            try:
+                future.result(timeout=HOP_POLL_S)
+            except TimeoutError:
+                if self._loop.is_closed():
+                    return left.is_set()
+                continue
+            except Exception as exc:
+                if left.is_set():
+                    raise LeftThenFailed(exc) from exc
+                raise
+            return True
+
+    def sent(self, data: bytes, time_ns: int) -> None:
+        """On the loop, for a packet the pacer thread sent directly at wall time ``time_ns``:
+        the sinks' TX frame and the transport's counters (a send through the loop did both)."""
+        if self._sender is None:
+            return
+        self._engine._ingest_tx(self._io, data, time_ns)
+        note = getattr(self._transport, "note_sent", None)
+        if note is not None:
+            note(len(data))
+
+    def error(self, exc: BaseException) -> BaseException:
+        """The coded error for what a send of the pacer thread raised."""
+        convert = getattr(self._transport, "thread_send_error", None)
+        if isinstance(exc, OSError) and convert is not None:
+            coded: BaseException = convert(exc)
+            return coded
+        return exc
+
+    def check(self) -> None:
+        """Raise, coded, a refusal the link holds for a packet sent earlier (UDP); a no-op for
+        a transport with no such notion."""
+        check = getattr(self._transport, "raise_earlier", None)
+        if check is not None:
+            check()
+
+    async def settle(self) -> None:
+        """Wait out the grace period for a refusal of the last packets, then :meth:`check`."""
+        if getattr(self._transport, "raise_earlier", None) is not None:
+            await asyncio.sleep(SETTLE_S)
+            self.check()
+
+    def close(self) -> None:
+        """Release the pacer thread's sender; call once the thread has stopped."""
+        sender, self._sender = self._sender, None
+        if sender is not None:
+            sender.close()
 
 
 class Engine:
@@ -1019,21 +1120,16 @@ class Engine:
         assert io.transport is not None
         return io.transport
 
-    async def open_for_send(self, link: Link, end: LinkEnd) -> None:
-        """Open the transport a later :meth:`send` out of ``end`` of ``link`` uses, so that the
-        first send of a timed series does not pay for the open (a serial port, a resolver)."""
+    async def series_link(self, link: Link, end: LinkEnd) -> SeriesLink:
+        """Open the transport of ``end`` of ``link`` (if it is not) and hold it for a series of
+        sends made by the pacer thread (:mod:`ironbird.pacer`). Errors are those of the open.
+        The caller closes the result once the series has ended."""
         io = self._io(link, end)
         async with io.lock:
-            await self._ensure_transport(io)
-
-    async def settle(self, link: Link, end: LinkEnd) -> None:
-        """Wait out the transport's short grace period for a refusal of what was just sent out
-        of ``end`` of ``link`` (a UDP port nobody listens on) and raise it, coded. A no-op for a
-        transport with no such notion, or none open."""
-        transport = self._io(link, end).transport
-        confirm = getattr(transport, "confirm", None)
-        if confirm is not None:
-            await confirm()
+            transport = await self._ensure_transport(io)
+        make = getattr(transport, "thread_sender", None)
+        sender = None if make is None else await make()
+        return SeriesLink(self, io, transport, sender, asyncio.get_running_loop())
 
     async def send(
         self,
@@ -1247,8 +1343,9 @@ class Engine:
                 if self._sinks:
                     sub.dropped_to_sinks += 1
 
-    def _ingest_tx(self, io: _LinkIO, data: bytes) -> None:
-        """A frame this process sent. Sinks see it; consumers of received frames do not."""
+    def _ingest_tx(self, io: _LinkIO, data: bytes, time_ns: int | None = None) -> None:
+        """A frame this process sent (at ``time_ns``, default now). Sinks see it; consumers of
+        received frames do not."""
         stream = io.tx_stream
         mid = io.codec.peek_mid(stream.kind, data)
         bits = FLAG_HAS_MID if mid is not None else 0
@@ -1256,7 +1353,7 @@ class Engine:
         self._seq += 1
         frame = Frame(
             self._seq,
-            time.time_ns(),
+            time.time_ns() if time_ns is None else time_ns,
             stream,
             sys.intern(io.tx_peer),
             mid,

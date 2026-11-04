@@ -54,13 +54,14 @@ from ironbird.engine import (
     FrameDecoder,
     FrameSink,
     MidStatSnapshot,
+    SeriesLink,
 )
 from ironbird.errors import MAX_SUMMARY_LEN, Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
 from ironbird.filter import Filter, FilterError, Matcher, compile_filter
 from ironbird.frame import SERIAL_TRANSPORT, Decoded, Frame, Stream
 from ironbird.header import HeaderProfile, ProfileKind, parse_profile_file, read_profile
-from ironbird.ledger import Ledger
+from ironbird.ledger import Ledger, TxSeries
 from ironbird.ledgertiers import Tier
 from ironbird.notice import Level, Notice, level_of
 from ironbird.sanitize import HEX_PREVIEW_BYTES, clean, hex_preview
@@ -89,6 +90,15 @@ class Route:
 def link_end(side: Side) -> LinkEnd:
     """The end of its link a process on ``side`` is."""
     return LinkEnd.SOURCE if side is Side.COMMANDER else LinkEnd.DESTINATION
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesTarget:
+    """Where the commands of a series of sends go: the route, its codec and its endpoint."""
+
+    route: Route
+    codec: Codec
+    endpoint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -562,17 +572,87 @@ class Session:
 
     # -- commander: send -----------------------------------------------------------
 
-    async def prepare_send(self, peer: str, *, link: str | None = None) -> None:
-        """Open the link a :meth:`send_command` to ``peer`` goes out on now, so the first send of
-        a timed series does not include the open. Errors are those of the send."""
+    def series_target(self, peer: str, *, link: str | None = None) -> SeriesTarget:
+        """Where the commands of a series of sends to ``peer`` go, resolved once."""
         route = self.route(peer, require=Side.COMMANDER, link_name=link)
-        await self._engine.open_for_send(route.link, link_end(route.side))
+        return SeriesTarget(route, self.codec_for(route.server.name), route.link.command_target)
 
-    async def settle_sends(self, peer: str, *, link: str | None = None) -> None:
-        """Wait out the link's grace period for a refusal of the packets just sent to ``peer``
-        and raise it as the send would have; for a series that cannot wait inside a send."""
-        route = self.route(peer, require=Side.COMMANDER, link_name=link)
-        await self._engine.settle(route.link, link_end(route.side))
+    async def series_link(self, target: SeriesTarget) -> SeriesLink:
+        """Open the link of ``target`` and hold it for the pacer thread (errors are those of
+        the open); the caller closes it when the series has ended."""
+        return await self._engine.series_link(target.route.link, link_end(target.route.side))
+
+    def build_command(
+        self,
+        target: SeriesTarget,
+        command: str,
+        args: Mapping[str, object] | None = None,
+        *,
+        tamper: Mapping[str, int] | None = None,
+        header: Mapping[str, int] | None = None,
+        allow_count_mismatch: bool = False,
+        raw_enum: bool = False,
+        enum_hint: str = "",
+        at_time: float | None = None,
+    ) -> EncodedPacket:
+        """Encode one packet of a series, with its own count, carrying ``at_time`` in its time
+        fields, and pass the ledger's transmit gate (``IB-LED-004``) for it. Nothing is
+        ledgered: the series wrote the arguments in its ``send.plan``, and
+        :meth:`record_series_packet` records the packet once its fate is known."""
+        encoded = target.codec.encode_command(
+            command,
+            args,
+            tamper=tamper,
+            header=header,
+            allow_count_mismatch=allow_count_mismatch,
+            raw_enum=raw_enum,
+            enum_hint=enum_hint,
+            at_time=at_time,
+        )
+        self.ledger.check_transmit(encoded.message.name, target.route.server.name)
+        return encoded
+
+    def record_series_packet(
+        self,
+        series: TxSeries,
+        target: SeriesTarget,
+        encoded: EncodedPacket,
+        *,
+        result: str,
+        sent: bool,
+    ) -> None:
+        """The ledger record of one packet of a series (see :class:`~ironbird.ledger.TxSeries`)."""
+        node = target.route.server.name
+        series.record(
+            encoded.message.name,
+            node,
+            result=result,
+            sent=sent,
+            size=len(encoded.data),
+            sequence=encoded.sequence,
+            node=node,
+            command=encoded.message.name,
+            mid=encoded.mid,
+            function_code=encoded.function_code,
+            endpoint=target.endpoint,
+            raw=encoded.data,
+        )
+
+    @staticmethod
+    def sent_command(target: SeriesTarget, encoded: EncodedPacket) -> SentCommand:
+        """What was sent, for the confirmation line."""
+        assert encoded.function_code is not None
+        return SentCommand(
+            node=target.route.server.name,
+            command=encoded.message.name,
+            mid=encoded.mid,
+            function_code=encoded.function_code,
+            sequence=encoded.sequence,
+            size=len(encoded.data),
+            data=encoded.data,
+            endpoint=target.endpoint,
+            transport=target.route.link.transport,
+        )
 
     async def send_command(
         self,
@@ -584,35 +664,30 @@ class Session:
         link: str | None = None,
         header: Mapping[str, int] | None = None,
         allow_count_mismatch: bool = False,
-        confirm: bool = True,
-        record_request: bool = True,
         raw_enum: bool = False,
+        enum_hint: str = "",
     ) -> SentCommand:
-        """Encode and send one command. ``confirm`` waits briefly after the hand-off for the
-        link to refuse it (a UDP port nobody listens on); a timed series leaves it off for the
-        packets whose period is shorter than that wait. ``record_request`` writes the
-        ``send.request`` record; a series writes the arguments once, in its ``send.plan``, and
-        leaves the per-packet ``tx.command`` record to say what went out. ``raw_enum`` (fault
-        injection) lets a value outside its field's enum through; ``send.fault`` records which."""
-        route = self.route(peer, require=Side.COMMANDER, link_name=link)
-        codec = self.codec_for(route.server.name)
-        endpoint = route.link.command_target
+        """Encode and send one command, and wait briefly after the hand-off for the link to
+        refuse it (a UDP port nobody listens on). ``raw_enum`` (fault injection) lets a value
+        outside its field's enum through; ``send.fault`` records which. ``enum_hint`` names the
+        caller's way to do that, for the refusal of such a value without it."""
+        target = self.series_target(peer, link=link)
+        route, codec, endpoint = target.route, target.codec, target.endpoint
         extra: dict[str, Any] = {"header": dict(header)} if header else {}
         if allow_count_mismatch:
             extra["allow_count_mismatch"] = True  # asked for; ``send.fault`` records what it did
         if raw_enum:
             extra["raw_enum"] = True  # asked for; ``send.fault`` records the values
-        if record_request:
-            self.ledger.record(
-                "action",
-                "send.request",
-                node=route.server.name,
-                command=command,
-                args=dict(args or {}),
-                tamper=dict(tamper or {}),
-                link=route.link.name,
-                **extra,
-            )
+        self.ledger.record(
+            "action",
+            "send.request",
+            node=route.server.name,
+            command=command,
+            args=dict(args or {}),
+            tamper=dict(tamper or {}),
+            link=route.link.name,
+            **extra,
+        )
         encoded = codec.encode_command(
             command,
             args,
@@ -620,8 +695,9 @@ class Session:
             header=header,
             allow_count_mismatch=allow_count_mismatch,
             raw_enum=raw_enum,
+            enum_hint=enum_hint,
         )
-        if encoded.raw_enums and record_request:  # a series ledgers them once, in its plan
+        if encoded.raw_enums:
             self.ledger.record(
                 "action",
                 "send.fault",
@@ -663,7 +739,7 @@ class Session:
                 route.link,
                 link_end(route.side),
                 encoded.data,
-                confirm=confirm,
+                confirm=True,
                 handed_off=handed_off,
             )
         except IronbirdError as exc:
@@ -694,18 +770,7 @@ class Session:
                 sent=attempt.went_out,
                 raw=encoded.data,
             )
-        assert encoded.function_code is not None
-        return SentCommand(
-            node=route.server.name,
-            command=encoded.message.name,
-            mid=encoded.mid,
-            function_code=encoded.function_code,
-            sequence=encoded.sequence,
-            size=len(encoded.data),
-            data=encoded.data,
-            endpoint=endpoint,
-            transport=route.link.transport,
-        )
+        return self.sent_command(target, encoded)
 
     # -- capture (raw frames) and decoding ---------------------------------------------
 

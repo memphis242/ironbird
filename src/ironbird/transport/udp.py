@@ -151,6 +151,26 @@ async def scan_kernel_drops(transports: Collection[UdpTransport]) -> None:
             transport.note_proc_drops(value)
 
 
+class UdpThreadSender:
+    """The pacer thread's send on a duplicate of a connected UDP socket (non-blocking, as the
+    original). Only the pacer thread sends on it during a series; :meth:`close` after it ends."""
+
+    __slots__ = ("_sock", "target")
+
+    def __init__(self, sock: socket.socket, target: Endpoint) -> None:
+        self._sock = sock
+        self.target = target
+
+    def send(self, data: bytes, stop: object) -> bool:
+        """Hand ``data`` to the kernel (raises the ``OSError``); ``stop`` is not consulted, as
+        the send never waits."""
+        self._sock.send(data)  # a datagram is sent whole or fails
+        return True
+
+    def close(self) -> None:
+        self._sock.close()
+
+
 class UdpTransport:
     """One UDP link end (see the module docstring)."""
 
@@ -647,6 +667,55 @@ class UdpTransport:
         await asyncio.sleep(CONFIRM_WAIT_S)
         self._raise_pending()
 
+    def raise_earlier(self) -> None:
+        """Raise, coded, a refusal still pending for a datagram sent earlier (a series of
+        sends, whose refusals arrive after the sends returned and must be reported, not
+        cleared by the next send as a single send's are)."""
+        target = self._remote or self._reply_to
+        assert target is not None
+        error, self._pending_error = self._pending_error, None
+        sock = self._tx
+        if error is None and sock is not None and not self._closed:
+            code = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if code:
+                error = OSError(code, os.strerror(code))
+        if error is not None:
+            raise self._send_error(target, error, earlier=True) from error
+
+    async def thread_sender(self) -> UdpThreadSender | None:
+        """A sender for the pacer thread: its own duplicate of the connected send socket (so a
+        close of this transport cannot hand its descriptor number to another file under a send
+        in flight). None for a transport with no connected send socket."""
+        if self._closed or self._remote is None:
+            return None
+        if self._tx is None:
+            async with self._tx_lock:
+                if self._tx is None:
+                    await self._open_tx()
+        assert self._tx is not None
+        try:
+            dup = self._tx.dup()
+        except OSError as exc:
+            raise self._open_error("open a socket for", self._remote, exc) from exc
+        return UdpThreadSender(dup, self._remote)
+
+    def note_sent(self, size: int) -> None:
+        """Count a datagram the pacer thread sent on this transport's socket."""
+        self._tx_total += 1
+        self._tx_bytes += size
+
+    def thread_send_error(self, exc: OSError) -> IronbirdError:
+        """The coded error of a failed send of the pacer thread. A refusal there is one the
+        socket held for an earlier datagram: the kernel reports it on the next send, which
+        it fails."""
+        target = self._remote or self._reply_to
+        assert target is not None
+        if isinstance(exc, BlockingIOError):
+            return IronbirdError(
+                Code.TX_SEND, f"send to udp {target} failed: kernel send buffer full", cause=exc
+            )
+        return self._send_error(target, exc, earlier=isinstance(exc, ConnectionRefusedError))
+
     async def send(
         self,
         data: bytes,
@@ -668,10 +737,11 @@ class UdpTransport:
             self._raise_pending()
 
     @staticmethod
-    def _send_error(target: Endpoint, exc: OSError) -> IronbirdError:
+    def _send_error(target: Endpoint, exc: OSError, *, earlier: bool = False) -> IronbirdError:
         if isinstance(exc, ConnectionRefusedError):
+            which = "; an earlier packet of the series was refused" if earlier else ""
             summary = (
-                f"nothing is listening at udp {target} (connection refused); start the "
+                f"nothing is listening at udp {target} (connection refused{which}); start the "
                 "receiver (ib respond, or the flight software) or check the endpoint in the config"
             )
         else:
