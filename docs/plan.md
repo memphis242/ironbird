@@ -4566,7 +4566,21 @@ its options:
      for the spinning version; README "Send modes"); a period under `[send] spin_below_us` (0, off)
      ends each wait with a 75 us spin (median 7 us at 1 ms, for about spin / period more CPU).
      The loop builds the packets ahead (bounded queue, no earlier than 20 ms before the slot, so the
-     ledger's transmit gate and a header time field are current) and handles the thread's reports.
+     ledger's transmit gate and a header time field are current, and only for slots the thread can still
+     serve: it publishes the slot it takes before the packet leaves the queue, a timed series starts from
+     the slot nearest now, and a packet not tied to a slot is built only while slots remain in the window,
+     so a complete series leaves no count built and unsent) and handles the thread's reports. The loop's
+     work never delays a wait or a send, but the thread shares the GIL: the switch interval is lowered
+     (0.2 ms) for the life of a series and restored (measured: 61-68 of 300 slots skipped at 10 ms under 8
+     ms Python bursts, 1-5 after; 808 of 2000 at 1 ms under 3 ms bursts, about 100 after). The thread is
+     started with `sigmask.start_thread`; a start that fails is `IB-SYS-001`.
+   - Accounting: the thread publishes the packet in flight; a send through the loop (serial) is cancelled
+     by the stop and answers whether the head of the packet is on the line; a send that ignores the stop
+     for 5 s is abandoned and its packet is ledgered `unconfirmed`. Consecutive starved slots are one
+     report; a handler error during the wind-down does not skip the rest of it. A burst on a full UDP send
+     buffer waits up to 2 s for room. `send.fault` is ledgered once per series; `-v` samples a fast
+     series' packets (2 a second) instead of printing each; a signal after the series ended still names
+     its count (`cli.signal` `series_*`).
    - An overrunning slot is skipped (not caught up) when its send cannot start within half a period of
      its deadline; a slot with no packet built is skipped as `starved`. Lateness is measured in the
      thread when the send returns. A header that carries the send time makes each packet valid for its

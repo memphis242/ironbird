@@ -20,14 +20,35 @@ period) or is late by up to a millisecond plus the loop's backlog. The pacer thr
 
 The loop builds the packets ahead into a bounded queue (each fully encoded, with its own count)
 and handles what the pacer reports back (sent, skipped, failed): ledger records, progress lines
-and errors stay on the loop, and the loop's own latency is never added to a packet. A packet is
-built no earlier than :data:`AHEAD_NS` before its slot, so the ledger's transmit gate and the
-time a packet carries are current. The pacer never blocks on the queue: a slot whose packet is
-not there at its deadline is skipped (``starved``) and reported.
+and errors stay on the loop, so the loop's work never delays the pacer's wait or its send call
+(a link with no thread-safe send is the exception: see above). The pacer thread does share the
+interpreter lock with the loop and the other helper threads, though: coming out of its sleep it
+waits for the lock for as long as another thread runs Python code, up to the interpreter's
+switch interval (5 ms by default, which at a 10 ms period is half a slot). For the life of a
+series the switch interval is therefore lowered to :data:`SWITCH_INTERVAL_S` and restored after
+(``sys.setswitchinterval``; it is process-wide). That bounds the wait, it does not remove it: a
+thread that holds the lock through a long C call still delays the pacer, and the lateness the
+series reports includes any such wait.
+
+A packet is built no earlier than :data:`AHEAD_NS` before its slot, so the ledger's transmit
+gate and the time a packet carries are current. The pacer never blocks on the queue: a slot
+whose packet is not there at its deadline is skipped (``starved``) and reported, consecutive
+starved slots as one report.
 
 A packet whose header carries the send time (``time_seconds``/``time_subseconds``) is built for
 one slot and carries that slot's time; when that slot is skipped it is discarded (its count goes
 unused, and its ledger record says so). Any other packet is sent in the next slot instead.
+
+The loop builds only packets that can be sent: never for a slot the thread has passed or is
+passing (the thread publishes the next slot it will serve the moment it takes a packet), and,
+for a packet that is not tied to a slot, never more than the slots left in the window. A packet
+is left unsent only by a skip near the end or by a stop.
+
+Every packet is accounted for. The thread publishes the packet it is sending; a send is asked
+to return when ``stop`` is set (the loop's own stops it through the loop), and the loop joins
+the thread before :meth:`SeriesPacer.run` returns. A send that ignores ``stop`` for
+:data:`DONE_TIMEOUT_S` is abandoned (the one way the thread outlives ``run``): the packet it is
+sending is reported as UNCONFIRMED, since whether it left is not known.
 """
 
 from __future__ import annotations
@@ -45,7 +66,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Final, Generic, Protocol, TypeVar
 
+from ironbird.errors import Code, IronbirdError
 from ironbird.sendmodes import NS, Grid
+from ironbird.sigmask import start_thread
 
 TIMER_SLACK_NS: Final = 1_000
 PR_SET_TIMERSLACK: Final = 29
@@ -57,6 +80,7 @@ MAX_AHEAD: Final = 64  # packets built and waiting for their slots, at most
 BURST_AHEAD: Final = 8  # ... in a back-to-back series
 READY_POLL_S: Final = 0.1  # a burst's wait for its next packet re-checks the stop this often
 DONE_TIMEOUT_S: Final = 5.0  # a stopped pacer that has not finished by then is abandoned
+SWITCH_INTERVAL_S: Final = 0.0002  # the GIL switch interval for the life of a series
 
 T = TypeVar("T")
 
@@ -76,6 +100,7 @@ class Kind(Enum):
     SKIPPED = "skipped"  # ``slots`` slots passed with nothing sent
     DISCARDED = "discarded"  # a timed packet whose slot was skipped
     UNSENT = "unsent"  # built, still queued when the series ended
+    UNCONFIRMED = "unconfirmed"  # in flight when the pacer was abandoned: left or not, unknown
     FAILED = "failed"  # the send raised (``error``); the pacer stops
     DONE = "done"  # the pacer thread is finished
 
@@ -187,7 +212,7 @@ class SeriesPacer(Generic[T]):
         self._reports: deque[Report[T]] = deque()
         self._stop = threading.Event()
         self._ready = threading.Event()  # a packet was queued (a burst waits for it)
-        self._slot = 0  # the slot the thread is at: the builder does not build behind it
+        self._slot = 0  # the next slot the thread will serve: the builder does not build behind it
         self._posted = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake = asyncio.Event()
@@ -196,6 +221,10 @@ class SeriesPacer(Generic[T]):
         self._dropped = 0  # built packets that will never be sent (discarded)
         self._sent = 0
         self._next_slot = 0
+        self._starved_run = 0  # consecutive starved slots not yet reported (thread only)
+        self._flight_lock = threading.Lock()  # guards the next three: the packet in flight
+        self._inflight: Built[T] | None = None  # popped by the thread, not yet reported
+        self._abandoned = False  # the loop gave up on the thread: it reports no more
         self._failure: BaseException | None = None  # found on the loop (see :meth:`abort`)
         self.facts: dict[str, Any] = {}  # how the thread ran (its waiter's setup)
 
@@ -212,12 +241,32 @@ class SeriesPacer(Generic[T]):
         """Pace the series to its end, calling ``build`` for the packets and ``handle`` for
         each report, in order. Raises the error of a FAILED report or of ``build``; however it
         ends, the thread is stopped and every report (and every packet left unsent) is handled
-        before it returns."""
+        before it returns, even if ``handle`` raised on one of them (the first such error is
+        raised when nothing else is, else it is attached to the error that is). ``IB-SYS-001``
+        if the thread cannot be started. The interpreter's switch interval is lowered for the
+        life of the series (see the module)."""
+        previous = sys.getswitchinterval()
+        sys.setswitchinterval(min(previous, SWITCH_INTERVAL_S))
+        try:
+            await self._run(build, handle)
+        finally:
+            sys.setswitchinterval(previous)
+
+    async def _run(self, build: Build[T], handle: Handle[T]) -> None:
         loop = asyncio.get_running_loop()
         self._loop = loop
         thread = threading.Thread(target=self._pace, name="ib-pacer", daemon=True)
-        thread.start()
+        try:
+            start_thread(thread)
+        except RuntimeError as exc:  # the system's thread or process limit
+            raise IronbirdError(
+                Code.SYS_RESOURCE,
+                f"could not start the pacer thread ({exc}): the limit on threads or processes "
+                "may be reached; close other programs or raise it ('ulimit -u')",
+                cause=exc,
+            ) from exc
         timer: asyncio.TimerHandle | None = None
+        raised: BaseException | None = None
         try:
             while True:
                 failure = self._drain(handle) or self._failure
@@ -233,25 +282,62 @@ class SeriesPacer(Generic[T]):
                     timer = loop.call_later(delay, self._wake.set)
                 await self._wake.wait()
                 self._wake.clear()
+        except BaseException as exc:
+            raised = exc
+            raise
         finally:
             if timer is not None:
                 timer.cancel()
-            self._stop.set()
-            self._ready.set()
-            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
-                async with asyncio.timeout(DONE_TIMEOUT_S):
-                    while not self._done:
-                        self._drain(handle)
-                        if not self._done:
-                            await self._wake.wait()
-                            self._wake.clear()
-            if self._done:
-                thread.join()
-            self._drain(handle)
-            while self._queue:
-                handle(Report(Kind.UNSENT, self._queue.popleft()))
+            errors = await self._wind_down(thread, handle)
+            if errors and raised is None:
+                raise errors[0]
+            for error in errors:  # a bug in the handler must not replace why the series ended
+                assert raised is not None
+                raised.add_note(f"while the pacer was being wound down: {error!r}")
 
-    def _drain(self, handle: Handle[T]) -> BaseException | None:
+    async def _wind_down(self, thread: threading.Thread, handle: Handle[T]) -> list[Exception]:
+        """Stop the thread and join it, then account for everything it did not: every report
+        and every packet still queued (UNSENT) or in flight if the thread had to be abandoned
+        (UNCONFIRMED). One report that ``handle`` raises on does not stop the rest being
+        handled; the errors are returned."""
+        errors: list[Exception] = []
+        self._stop.set()
+        self._ready.set()
+        with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+            async with asyncio.timeout(DONE_TIMEOUT_S):
+                while not self._done:
+                    self._drain(handle, errors)
+                    if not self._done:
+                        await self._wake.wait()
+                        self._wake.clear()
+        flight: Built[T] | None = None
+        if self._done:
+            thread.join()
+        else:
+            with self._flight_lock:  # what the thread reports from here on is dropped
+                self._abandoned = True
+                flight = self._inflight
+        self._drain(handle, errors)
+        if flight is not None:
+            self._handle_guarded(handle, Report(Kind.UNCONFIRMED, flight), errors)
+        while self._queue:
+            queued = self._queue.popleft()
+            if queued is not flight:
+                self._handle_guarded(handle, Report(Kind.UNSENT, queued), errors)
+        return errors
+
+    @staticmethod
+    def _handle_guarded(handle: Handle[T], report: Report[T], errors: list[Exception]) -> None:
+        try:
+            handle(report)
+        except Exception as exc:
+            errors.append(exc)
+
+    def _drain(
+        self, handle: Handle[T], errors: list[Exception] | None = None
+    ) -> BaseException | None:
+        """Handle the reports that came in; returns the error of the first FAILED one. With
+        ``errors``, an exception of ``handle`` is collected there and the rest still handled."""
         failure: BaseException | None = None
         while self._reports:
             report = self._reports.popleft()
@@ -265,25 +351,35 @@ class SeriesPacer(Generic[T]):
                     self._sent += 1
                 case _:
                     pass
-            error = handle(report)
+            error: BaseException | None = None
+            if errors is None:
+                error = handle(report)
+            else:
+                try:
+                    error = handle(report)
+                except Exception as exc:
+                    errors.append(exc)
             if failure is None and report.kind is Kind.FAILED:
                 failure = error if error is not None else report.error
         return failure
 
     def _fill(self, build: Build[T]) -> float | None:
         """Build the packets that are due; returns the seconds until the next one is, or None
-        when nothing is to be built until the pacer reports again."""
+        when nothing is to be built until the pacer reports again.
+
+        A periodic series builds from the first slot the thread can still serve: not behind
+        the slot it is at, nor behind the slot nearest to now (the thread skips to that one if
+        it is late). A timed packet is built for the next such slot; any other is sent in the
+        next slot not covered by those queued, so none is built that no slot is left for."""
         grid = self._grid
         depth = BURST_AHEAD if grid.every is None else MAX_AHEAD
         while len(self._queue) < depth:
             if grid.cap is not None and self._built - self._dropped >= grid.cap:
                 return None
-            now = time.monotonic_ns()
+            now = self._waiter.mono_ns()
             if grid.every is not None:
-                # A timed packet is built for the next slot; any other covers the next slot
-                # not covered by those queued (the pacer sends it whatever slot it reaches).
-                ahead = self._slot + len(self._queue)
-                slot = max(self._next_slot, self._slot) if self._timed else ahead
+                floor = max(self._slot, grid.nearest(now))
+                slot = max(self._next_slot, floor) if self._timed else floor + len(self._queue)
                 if not grid.in_window(slot):
                     return None
                 due = grid.deadline(slot) - AHEAD_NS
@@ -306,8 +402,7 @@ class SeriesPacer(Generic[T]):
 
     # -- the pacer thread -------------------------------------------------------------------
 
-    def _post(self, report: Report[T]) -> None:
-        self._reports.append(report)
+    def _wake_loop(self) -> None:
         if self._posted:
             return
         self._posted = True
@@ -316,16 +411,52 @@ class SeriesPacer(Generic[T]):
         with contextlib.suppress(RuntimeError):  # the loop is closed: nobody waits any more
             loop.call_soon_threadsafe(self._on_posted)
 
+    def _flush_starved(self) -> None:
+        """Report the consecutive starved slots so far as one SKIPPED report."""
+        run, self._starved_run = self._starved_run, 0
+        if run:
+            self._post(Report(Kind.SKIPPED, slots=run, starved=True))
+
+    def _post(self, report: Report[T]) -> None:
+        self._flush_starved()
+        self._reports.append(report)
+        self._wake_loop()
+
+    def _land(self, built: Built[T], report: Report[T] | None) -> None:
+        """The packet in flight is resolved: report it, or (``None``: the send stopped before
+        it left) put it back at the head of the queue. Once the loop has abandoned the thread
+        the packet is the loop's to report, and nothing is."""
+        self._flush_starved()
+        with self._flight_lock:
+            self._inflight = None
+            if self._abandoned:
+                return
+            if report is None:
+                self._queue.appendleft(built)
+                return
+            self._reports.append(report)
+        self._wake_loop()
+
     def _pace(self) -> None:
         try:
             self.facts.update(self._waiter.setup())
             self._pace_slots()
         except BaseException as exc:  # a fault of the pacer itself: it ends the series, coded
-            self._post(Report(Kind.FAILED, error=exc))
+            flight = self._inflight
+            if flight is None:
+                self._post(Report(Kind.FAILED, error=exc))
+            else:
+                self._land(flight, Report(Kind.FAILED, flight, error=exc))
         finally:
             self._post(Report(Kind.DONE))
 
     def _pace_slots(self) -> None:
+        try:
+            self._serve_slots()
+        finally:
+            self._flush_starved()
+
+    def _serve_slots(self) -> None:
         grid, waiter, stop = self._grid, self._waiter, self._stop
         slot = sent = 0
         while not stop.is_set():
@@ -340,30 +471,33 @@ class SeriesPacer(Generic[T]):
                 to = grid.nearest(now)
                 assert to > slot, "a slot more than half a period late is passed over"
                 self._post(Report(Kind.SKIPPED, slots=grid.lost(slot, to)))
-                slot = to
+                slot = self._slot = to
                 continue
+            if grid.every is not None:
+                self._slot = slot + 1  # published before the packet is taken (see the module)
             built = self._take(slot)
             if built is None:
                 if grid.every is None:
                     if not self._await_packet():
                         return
                     continue
-                self._post(Report(Kind.SKIPPED, slots=1, starved=True))
+                self._starved_run += 1
                 slot += 1
                 continue
             try:
                 went = self._send(built.data, stop)
             except LeftThenFailed as exc:
-                self._post(Report(Kind.FAILED, built, went_out=True, error=exc.cause))
+                self._land(built, Report(Kind.FAILED, built, went_out=True, error=exc.cause))
                 return
             except Exception as exc:
-                self._post(Report(Kind.FAILED, built, error=exc))
+                self._land(built, Report(Kind.FAILED, built, error=exc))
                 return
             after = waiter.mono_ns()
             if not went:
-                self._queue.appendleft(built)  # stopped before it left: reported as unsent
+                self._land(built, None)  # stopped before it left: reported as unsent
                 return
-            self._post(
+            self._land(
+                built,
                 Report(
                     Kind.SENT,
                     built,
@@ -371,7 +505,7 @@ class SeriesPacer(Generic[T]):
                     took_ns=after - now,
                     mono_ns=after,
                     went_out=True,
-                )
+                ),
             )
             sent += 1
             if grid.every is not None:
@@ -379,12 +513,15 @@ class SeriesPacer(Generic[T]):
 
     def _take(self, slot: int) -> Built[T] | None:
         """The packet for ``slot``: the next one, or for a timed series the one built for it
-        (those built for earlier, skipped slots are discarded)."""
+        (those built for earlier, skipped slots are discarded). The packet is published as in
+        flight before it leaves the queue, so it is always in one or the other."""
         queue = self._queue
         while queue:
             head = queue[0]
             if not self._timed or self._grid.every is None or head.slot == slot:
-                return queue.popleft()
+                self._inflight = head
+                queue.popleft()
+                return head
             if head.slot > slot:
                 return None
             self._post(Report(Kind.DISCARDED, queue.popleft()))

@@ -620,8 +620,10 @@ class Session:
         *,
         result: str,
         sent: bool,
+        at_ns: int | None = None,
     ) -> None:
-        """The ledger record of one packet of a series (see :class:`~ironbird.ledger.TxSeries`)."""
+        """The ledger record of one packet of a series (see :class:`~ironbird.ledger.TxSeries`);
+        ``at_ns``: the wall-clock time it was sent, for the series' windows."""
         node = target.route.server.name
         series.record(
             encoded.message.name,
@@ -630,6 +632,7 @@ class Session:
             sent=sent,
             size=len(encoded.data),
             sequence=encoded.sequence,
+            at_ns=at_ns,
             node=node,
             command=encoded.message.name,
             mid=encoded.mid,
@@ -653,6 +656,36 @@ class Session:
             endpoint=target.endpoint,
             transport=target.route.link.transport,
         )
+
+    def record_send_faults(self, node: str, encoded: EncodedPacket) -> None:
+        """Ledger the faults injected into ``encoded`` (``send.fault``): raw enum values, and
+        the count or length fields that disagree with the data they describe."""
+        if encoded.raw_enums:
+            self.ledger.record(
+                "action",
+                "send.fault",
+                node=node,
+                command=encoded.message.name,
+                fault="raw_enum",
+                fields=[{"field": name, "value": value} for name, value in encoded.raw_enums],
+            )
+        if encoded.count_faults:  # the values that went out and the ones the data implied
+            self.ledger.record(
+                "action",
+                "send.fault",
+                node=node,
+                command=encoded.message.name,
+                fault="count_mismatch",
+                fields=[
+                    {
+                        "field": f.field,
+                        "given": f.given,
+                        "implied": f.implied,
+                        "unit": "elements" if f.unit is VarUnit.COUNT else "bytes",
+                    }
+                    for f in encoded.count_faults
+                ],
+            )
 
     async def send_command(
         self,
@@ -697,32 +730,7 @@ class Session:
             raw_enum=raw_enum,
             enum_hint=enum_hint,
         )
-        if encoded.raw_enums:
-            self.ledger.record(
-                "action",
-                "send.fault",
-                node=route.server.name,
-                command=encoded.message.name,
-                fault="raw_enum",
-                fields=[{"field": name, "value": value} for name, value in encoded.raw_enums],
-            )
-        if encoded.count_faults:  # the values that went out and the ones the data implied
-            self.ledger.record(
-                "action",
-                "send.fault",
-                node=route.server.name,
-                command=encoded.message.name,
-                fault="count_mismatch",
-                fields=[
-                    {
-                        "field": f.field,
-                        "given": f.given,
-                        "implied": f.implied,
-                        "unit": "elements" if f.unit is VarUnit.COUNT else "bytes",
-                    }
-                    for f in encoded.count_faults
-                ],
-            )
+        self.record_send_faults(route.server.name, encoded)
         self.ledger.check_transmit(encoded.message.name, route.server.name)
         attempt = TxAttempt(encoded.message.name)
         self._last_tx = attempt

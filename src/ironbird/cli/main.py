@@ -393,8 +393,10 @@ class _Run:
     retention: Retention | None = None
     # an output complete under its final name, as "the export was written to X" (for a signal)
     wrote: str | None = None
-    # how far a series of sends (``ib send --repeat/--every``) got, for a signal's notice
-    batch: str | None = None
+    # the series of sends (``ib send --repeat/--every``) under way or just ended, kept current
+    # by the series for a signal's notice and for the loss of stdout
+    series: Tally | None = None
+    series_command: str = ""
 
 
 Body = Callable[[Session, SystemConfig, "_Run"], Awaitable[int]]
@@ -533,8 +535,13 @@ def _interrupt_notice(name: str, signum: int, run: _Run) -> str:
         if run.wrote is not None:
             return f"interrupted ({sig}) after {run.wrote}"
         return f"interrupted ({sig})"
-    if run.batch is not None:
-        return f"interrupted ({sig}) after {run.batch}"
+    if run.series is not None:
+        done = run.series
+        ended = f" (series {done.outcome})" if done.outcome else ""
+        return (
+            f"interrupted ({sig}) after {done.sent} of {done.planned} "
+            f"{term(run.series_command)} sends{ended}"
+        )
     if tx is None:
         return f"interrupted ({sig}): no command was built, so nothing was sent"
     if tx.went_out:
@@ -596,6 +603,9 @@ def _record_signal(
         notice=notice,
         tx_command=tx.command if tx else None,
         tx_went_out=tx.went_out if tx else None,
+        series_sent=run.series.sent if run.series else None,
+        series_planned=run.series.planned if run.series else None,
+        series_outcome=(run.series.outcome or None) if run.series else None,
     )
     if not direct:
         console.err(notice)
@@ -646,6 +656,8 @@ def _stdout_loss(console: Console, name: str, run: _Run) -> IronbirdError | None
         return None
     tx = run.session.last_tx if run.session is not None else None
     sent = f"; {tx.command} was sent" if name == "send" and tx is not None and tx.went_out else ""
+    if name == "send" and run.series is not None:
+        sent = f"; {run.series.sent} of {run.series.planned} {term(run.series_command)} sent"
     if out.unavailable:
         summary = f"stdout is closed: {out.lost} line(s) of output could not be shown{sent}"
     else:
@@ -1567,12 +1579,15 @@ async def _send_series(
     open_ns = time.monotonic_ns() - opening
     now_wall = time.time_ns()
     tally = Tally(planned=plan.planned(plan.start_wall_ns or now_wall))
+    run.series, run.series_command = tally, command  # a signal from here on reports the count
     rate = None if plan.every_ns is None else NS_PER_S / plan.every_ns
-    show_each = (
-        show_hex
-        or (rate is not None and rate <= SEND_LINE_MAX_RATE)
-        or (rate is None and tally.planned <= SEND_LINE_MAX_BURST)
+    # A line per packet for a slow series; a faster one prints progress lines, and under -v a
+    # sample of its packets (with the hex), at most SEND_LINE_MAX_RATE a second.
+    show_each = (rate is not None and rate <= SEND_LINE_MAX_RATE) or (
+        rate is None and tally.planned <= SEND_LINE_MAX_BURST
     )
+    sample_gap_s = 1 / SEND_LINE_MAX_RATE
+    next_sample = 0.0
     session.ledger.record(
         "action",
         "send.plan",
@@ -1617,6 +1632,8 @@ async def _send_series(
             enum_hint=RAW_ENUM_HINT,
             at_time=stamp_ns / NS_PER_S,
         )
+        if number == 0:  # the faults injected are those of the request: ledgered once
+            session.record_send_faults(target.route.server.name, encoded)
         return Built(number, slot, encoded.data, encoded)
 
     def check_refusal() -> None:
@@ -1639,14 +1656,23 @@ async def _send_series(
             f"progress: sent {tally.sent} of {tally.planned}" + (f", {extra}" if extra else "")
         )
 
+    def note_sent(encoded: EncodedPacket, mono_ns: int) -> SentCommand:
+        """Count a packet that left (a SENT report, or one that failed after it left)."""
+        tally.count_sent(encoded.sequence, mono_ns)
+        sent = session.sent_command(target, encoded)
+        last[:] = [sent]
+        return sent
+
     def on_sent(report: Report[EncodedPacket]) -> None:
-        nonlocal check
+        nonlocal check, next_sample
         assert report.built is not None and grid is not None
         encoded = report.built.item
-        link.sent(encoded.data, time.time_ns() - (time.monotonic_ns() - report.mono_ns))
-        session.record_series_packet(series, target, encoded, result="sent", sent=True)
-        tally.sent += 1
-        tally.last_mono_ns = report.mono_ns
+        sent_wall = time.time_ns() - (time.monotonic_ns() - report.mono_ns)
+        link.sent(encoded.data, sent_wall)
+        session.record_series_packet(
+            series, target, encoded, result="sent", sent=True, at_ns=sent_wall
+        )
+        sent = note_sent(encoded, report.mono_ns)
         tally.send_max_ns = max(tally.send_max_ns, report.took_ns)
         if plan.every_ns is not None and report.took_ns > plan.every_ns:
             tally.overruns += 1
@@ -1654,12 +1680,11 @@ async def _send_series(
             tally.start_late_ns = report.mono_ns - grid.start_mono
         if report.late_ns is not None and plan.every_ns is not None:
             tally.note_late(report.late_ns)
-        if tally.first_sequence is None:
-            tally.first_sequence = encoded.sequence
-        tally.last_sequence = encoded.sequence
-        sent = session.sent_command(target, encoded)
-        last[:] = [sent]
-        if show_each:
+        line = show_each
+        if not line and show_hex and time.monotonic() >= next_sample:
+            next_sample = time.monotonic() + sample_gap_s
+            line = True
+        if line:
             run.console.out(_sent_line(sent, faults, tally.sent))
             if show_hex:
                 run.console.out(f"  hex: {sent.data.hex(' ')}")
@@ -1676,12 +1701,16 @@ async def _send_series(
                 tally.skipped += report.slots
                 if report.starved:
                     tally.starved += report.slots
-            case Kind.DISCARDED | Kind.UNSENT:
+            case Kind.DISCARDED | Kind.UNSENT | Kind.UNCONFIRMED:
                 assert built is not None
-                skipped = report.kind is Kind.DISCARDED
-                tally.discarded += skipped
-                tally.unsent += not skipped
-                result = "skipped" if skipped else "unsent"
+                result = {
+                    Kind.DISCARDED: "skipped",
+                    Kind.UNSENT: "unsent",
+                    Kind.UNCONFIRMED: "unconfirmed",
+                }[report.kind]
+                tally.discarded += report.kind is Kind.DISCARDED
+                tally.unsent += report.kind is Kind.UNSENT
+                tally.unconfirmed += report.kind is Kind.UNCONFIRMED
                 session.record_series_packet(series, target, built.item, result=result, sent=False)
             case Kind.FAILED:
                 assert report.error is not None
@@ -1695,7 +1724,8 @@ async def _send_series(
                     session.record_series_packet(
                         series, target, built.item, result=result, sent=report.went_out
                     )
-                    tally.sent += report.went_out
+                    if report.went_out:
+                        note_sent(built.item, time.monotonic_ns())
                 return error
             case Kind.DONE:
                 pass
@@ -1718,6 +1748,7 @@ async def _send_series(
     def finish(outcome: str, **more: Any) -> None:
         if check is not None:
             check.cancel()
+        tally.outcome = outcome
         if pacer is not None:
             tally.pacer.update(pacer.facts)
         series.close()
@@ -1747,7 +1778,6 @@ async def _send_series(
         finally:
             link.close()
     except asyncio.CancelledError:
-        run.batch = f"{tally.sent} of {tally.planned} {term(command)} sends"
         finish("interrupted")
         raise
     except IronbirdError as exc:

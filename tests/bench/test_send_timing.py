@@ -1,5 +1,6 @@
 """Host-timing guard for ``ib send --every``: the pacer thread keeps a 1 ms period on a quiet
-host, and a 10 ms period costs little CPU.
+host, a 10 ms period costs little CPU, a 50 ms period stays within half a period, and a helper
+thread busy in Python costs the pacer few slots.
 
 These measure the host as much as the tool, so they skip under xdist and run, enforced, in the
 serial CI step ``pytest tests/bench -n0``. Each prints its numbers. The figures come from the
@@ -9,22 +10,27 @@ returns) and from the child's CPU time, net of a single send's (interpreter star
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 from hosttiming import needs_a_quiet_host
+from ironbird import pacer, sendmodes
 from recutil import CLI_MAIN
 from replayutil import child_env, write_config_58k
 
 SKIPPED_SHARE_MAX = 0.02  # of the slots at 1 ms
 LATE_MEAN_MAX_NS = 100_000  # mean lateness at 1 ms
 CPU_SHARE_MAX_10MS = 0.10  # of one core, at a 10 ms period
+LATE_MAX_50MS_NS = 25_000_000  # the longest send, at a 50 ms period (half a period)
+SKIPPED_SHARE_MAX_BUSY = 0.10  # of the slots at 10 ms, with a helper thread busy in Python
 
 
 class _Sink:
@@ -113,3 +119,83 @@ def test_a_ten_millisecond_period_costs_little_cpu(tmp_path: Path) -> None:
     share = (cpu - start_up) / 5
     print(f"\n10 ms: CPU {share:.1%} of a core (start-up {start_up:.2f} s excluded)")
     assert share < CPU_SHARE_MAX_10MS
+
+
+@needs_a_quiet_host
+def test_a_fifty_millisecond_period_stays_within_half_a_period(tmp_path: Path) -> None:
+    config, port, _ = write_config_58k(tmp_path)
+    env = child_env(tmp_path)
+    sink = _Sink(port)
+    try:
+        _send(tmp_path, config, env, "--every", "50ms", "--for", "2s")
+    finally:
+        sink.close()
+    outcome = _outcome(tmp_path)
+    print(
+        f"\n50 ms: sent {outcome['sent']} of {outcome['planned']}, lateness mean "
+        f"{outcome['late_mean_ns'] / 1000:.1f} us max {outcome['late_max_ns'] / 1000:.1f} us"
+    )
+    assert outcome["planned"] == 40 and outcome["sent"] + outcome["skipped"] == 40
+    assert outcome["skipped"] <= 2 and outcome["late_max_ns"] < LATE_MAX_50MS_NS, outcome
+
+
+def _busy_thread_series(every_ms: int, slots: int, burst_ms: int, interval_s: float) -> int:
+    """Run a series of ``slots`` sends that do nothing, while another thread runs Python in
+    ``burst_ms`` bursts, with the pacer lowering the switch interval to ``interval_s``; returns
+    the slots skipped."""
+    ms = 1_000_000
+    stop = threading.Event()
+
+    def hog() -> None:
+        while not stop.is_set():
+            end = time.perf_counter_ns() + burst_ms * ms
+            while time.perf_counter_ns() < end:
+                pass
+            time.sleep(0.004)
+
+    skipped = 0
+
+    def handle(report: pacer.Report[int]) -> BaseException | None:
+        nonlocal skipped
+        skipped += report.slots if report.kind is pacer.Kind.SKIPPED else 0
+        return report.error
+
+    async def main() -> None:
+        start = time.monotonic_ns() + 20 * ms
+        grid = sendmodes.Grid(
+            start, time.time_ns(), every_ms * ms, start + slots * every_ms * ms, None, False
+        )
+        series: pacer.SeriesPacer[int] = pacer.SeriesPacer(
+            grid, lambda data, stop: True, pacer.ThreadWaiter(0), timed=False
+        )
+        await series.run(lambda n, slot: pacer.Built(n, slot, b"x", n), handle)
+
+    previous = pacer.SWITCH_INTERVAL_S
+    pacer.SWITCH_INTERVAL_S = interval_s
+    thread = threading.Thread(target=hog, daemon=True)
+    thread.start()
+    try:
+        asyncio.run(main())
+    finally:
+        pacer.SWITCH_INTERVAL_S = previous
+        stop.set()
+        thread.join(5)
+    return skipped
+
+
+@needs_a_quiet_host
+def test_a_busy_python_thread_costs_the_pacer_little() -> None:
+    """Another thread running Python in 8 ms bursts holds the interpreter lock for up to the
+    switch interval after the pacer wakes: at the default 5 ms that skips about a fifth of the
+    slots of a 10 ms period; the series' lowered interval keeps it to a few."""
+    default = _busy_thread_series(10, 300, 8, 1.0)  # not lowered: min(5 ms, 1 s)
+    lowered = _busy_thread_series(10, 300, 8, pacer.SWITCH_INTERVAL_S)
+    print(f"\n10 ms under 8 ms bursts: skipped {default} of 300 (5 ms switch), {lowered} (lowered)")
+    assert lowered <= SKIPPED_SHARE_MAX_BUSY * 300
+    assert lowered < default
+
+
+def test_the_bench_helper_leaves_the_switch_interval_alone() -> None:
+    before = sys.getswitchinterval()
+    _busy_thread_series(10, 5, 0, pacer.SWITCH_INTERVAL_S)
+    assert sys.getswitchinterval() == before

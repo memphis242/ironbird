@@ -477,6 +477,7 @@ class Tally:
     starved: int = 0  # of the skipped: no packet was built in time
     discarded: int = 0  # packets built for a slot that was then skipped (their counts unused)
     unsent: int = 0  # packets built ahead and never sent when the series ended
+    unconfirmed: int = 0  # in flight when the pacer was abandoned: left or not, unknown
     overruns: int = 0  # send calls that took longer than the period
     late_count: int = 0
     late_sum_ns: int = 0
@@ -488,6 +489,7 @@ class Tally:
     first_sequence: int | None = None
     last_sequence: int | None = None
     pacer: dict[str, Any] = field(default_factory=dict)  # how the pacer ran (timer slack, spin)
+    outcome: str = ""  # "complete", "interrupted" or "failed" once the series has ended
 
     @property
     def late_mean_ns(self) -> int:
@@ -496,6 +498,15 @@ class Tally:
     @property
     def elapsed_ns(self) -> int:
         return max(self.last_mono_ns - self.first_mono_ns, 0)
+
+    def count_sent(self, sequence: int | None, mono_ns: int) -> None:
+        """Count a packet that left the process (it was sent, or was sent and the send then
+        failed): the totals, the first and last count used, and when the last one left."""
+        self.sent += 1
+        self.last_mono_ns = mono_ns
+        if self.first_sequence is None:
+            self.first_sequence = sequence
+        self.last_sequence = sequence
 
     def note_late(self, late_ns: int) -> None:
         self.late_count += 1
@@ -527,6 +538,7 @@ def outcome_fields(tally: Tally, outcome: str) -> dict[str, Any]:
         "starved": tally.starved,
         "discarded": tally.discarded,
         "unsent": tally.unsent,
+        "unconfirmed": tally.unconfirmed,
         "overruns": tally.overruns,
         "late_max_ns": tally.late_max_ns,
         "late_mean_ns": tally.late_mean_ns,
@@ -554,4 +566,6 @@ def timing_text(tally: Tally, every_ns: int | None) -> str:
         parts.append(text)
     if tally.overruns:
         parts.append(f"{tally.overruns} send(s) took longer than the period")
+    if tally.unconfirmed:
+        parts.append(f"{tally.unconfirmed} packet(s) in flight: not known whether they left")
     return ", ".join(parts)

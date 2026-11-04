@@ -457,12 +457,15 @@ class TxSeries:
         sent: bool,
         size: int,
         sequence: int | None,
+        at_ns: int | None = None,
         **fields: Any,
     ) -> None:
-        """One packet of the series (``result`` "sent", "skipped", "unsent" or an error code)."""
+        """One packet of the series (``result`` "sent", "skipped", "unsent", "unconfirmed" or an
+        error code). ``at_ns``: when it was sent (wall clock), for the window it is counted in;
+        else now."""
         self.totals[result] = self.totals.get(result, 0) + 1
         self._subject, self._target = subject, target
-        failed = result not in {"sent", "skipped", "unsent"}
+        failed = result not in {"sent", "skipped", "unsent"}  # "unconfirmed" is one
         if failed or self._full_left > 0:
             self._full_left = max(self._full_left - 1, 0)
             self._ledger.record_tx(
@@ -482,14 +485,15 @@ class TxSeries:
         if window.count and now - window.started >= self._window_s:
             self.close()
             window = self._window
+        stamp = time.time_ns() if at_ns is None else at_ns
         if not window.count:
             window.started = now
-            window.first_ns = time.time_ns()
+            window.first_ns = stamp
             window.first_seq = sequence
         window.count += 1
         window.bytes += size if sent else 0
         window.by_result[result] = window.by_result.get(result, 0) + 1
-        window.last_ns = time.time_ns()
+        window.last_ns = stamp
         window.last_seq = sequence
 
     def close(self) -> None:

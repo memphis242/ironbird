@@ -30,9 +30,11 @@ import errno
 import functools
 import ipaddress
 import os
+import select
 import socket
 import struct
 import sys
+import threading
 import time
 from collections.abc import Callable, Collection, Iterable, Mapping
 from types import MappingProxyType
@@ -53,6 +55,8 @@ from ironbird.transport.base import (
 
 RCVBUF_BYTES: Final = 4 * 1024 * 1024
 CONFIRM_WAIT_S: Final = 0.05
+SEND_WAIT_S: Final = 2.0  # a thread send on a full kernel buffer waits this long for room
+SEND_POLL_S: Final = 0.02  # ... re-checking its stop this often
 BATCH: Final = 256  # datagrams read per wakeup before yielding to the loop
 SOURCE_CACHE_SIZE: Final = 64  # peers whose text form is remembered (bounded: peers are untrusted)
 MAX_DATAGRAM: Final = 65536
@@ -161,11 +165,32 @@ class UdpThreadSender:
         self._sock = sock
         self.target = target
 
-    def send(self, data: bytes, stop: object) -> bool:
-        """Hand ``data`` to the kernel (raises the ``OSError``); ``stop`` is not consulted, as
-        the send never waits."""
-        self._sock.send(data)  # a datagram is sent whole or fails
-        return True
+    def send(self, data: bytes, stop: threading.Event) -> bool:
+        """Hand ``data`` to the kernel (raises the ``OSError``). A full kernel send buffer (a
+        burst on a slow or shaped link) is waited out for up to :data:`SEND_WAIT_S`, then raises
+        ``BlockingIOError``; False if ``stop`` is set while waiting (nothing was sent)."""
+        give_up = 0.0
+        while True:
+            try:
+                self._sock.send(data)  # a datagram is sent whole or fails
+            except BlockingIOError:
+                now = time.monotonic()
+                give_up = give_up or now + SEND_WAIT_S
+                if now >= give_up:
+                    raise
+                if stop.is_set():
+                    return False
+                self._wait_writable(min(SEND_POLL_S, give_up - now))
+                continue
+            return True
+
+    def _wait_writable(self, seconds: float) -> None:
+        if hasattr(select, "poll"):
+            poller = select.poll()
+            poller.register(self._sock, select.POLLOUT)
+            poller.poll(max(round(seconds * 1000), 1))
+        else:  # pragma: no cover - platforms with no poll
+            select.select([], [self._sock], [], seconds)
 
     def close(self) -> None:
         self._sock.close()

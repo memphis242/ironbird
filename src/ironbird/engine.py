@@ -23,6 +23,7 @@ sends and receives.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 import threading
 import time
@@ -67,7 +68,7 @@ _RELEASE_EVERY: Final = 64  # offers between releases of the charges of frames a
 READ_BATCH_FRAMES: Final = 512  # most frames one ``next_batch`` hands a consumer
 _MAX_STREAMS: Final = MAX_STREAM_ID + 1
 OPEN_TIMEOUT_S: Final = 5.0  # longest a transport may take to open (name resolution, bind)
-HOP_POLL_S: Final = 0.05  # a pacer send through the loop re-checks that the loop still runs
+HOP_POLL_S: Final = 0.005  # a pacer send through the loop re-checks its stop this often
 SETTLE_S: Final = CONFIRM_WAIT_S  # the end of a series waits this long for a refusal
 
 Reporter = Callable[..., None]  # Session.report: (error, *, context, level, evidence, sample)
@@ -543,9 +544,36 @@ class FrameDecoder:
 class _ThreadSender(Protocol):
     target: object
 
-    def send(self, data: bytes, stop: object) -> bool: ...
+    def send(self, data: bytes, stop: threading.Event) -> bool: ...
 
     def close(self) -> None: ...
+
+
+class _Hop:
+    """One packet handed from the pacer thread to the loop: the task that sends it there, and
+    what the thread needs to know of its end (``left``: the link took the packet)."""
+
+    __slots__ = ("cancelled", "done", "error", "left", "task")
+
+    def __init__(self) -> None:
+        self.task: asyncio.Task[None] | None = None
+        self.done = threading.Event()
+        self.left = threading.Event()
+        self.error: BaseException | None = None
+        self.cancelled = False
+
+    def finished(self, task: asyncio.Task[None]) -> None:
+        """On the loop: the send task ended."""
+        if task.cancelled():
+            self.cancelled = True
+        else:
+            self.error = task.exception()
+        self.done.set()
+
+    def cancel(self) -> None:
+        """On the loop: stop the send (a no-op once it has ended)."""
+        if self.task is not None:
+            self.task.cancel()
 
 
 class SeriesLink:
@@ -577,26 +605,40 @@ class SeriesLink:
         return self._sender is not None
 
     def send(self, data: bytes, stop: threading.Event) -> bool:
-        """In the pacer thread: hand ``data`` to the link (:data:`ironbird.pacer.ThreadSend`)."""
+        """In the pacer thread: hand ``data`` to the link (:data:`ironbird.pacer.ThreadSend`).
+
+        Through the loop, ``stop`` cancels the send there; the transport then reports whether
+        any of the packet went out (serial: the head of it on the line is sent), and the answer
+        is that. The send task ends before this returns, so nothing is left in flight."""
         sender = self._sender
         if sender is not None:
             return sender.send(data, stop)
-        left = threading.Event()
-        future = asyncio.run_coroutine_threadsafe(
-            self._engine.send(self._io.link, self._io.end, data, handed_off=left.set), self._loop
-        )
-        while True:
-            try:
-                future.result(timeout=HOP_POLL_S)
-            except TimeoutError:
-                if self._loop.is_closed():
-                    return left.is_set()
-                continue
-            except Exception as exc:
-                if left.is_set():
-                    raise LeftThenFailed(exc) from exc
-                raise
-            return True
+        loop, hop = self._loop, _Hop()
+
+        async def send() -> None:
+            await self._engine.send(self._io.link, self._io.end, data, handed_off=hop.left.set)
+
+        def start() -> None:
+            hop.task = loop.create_task(send())
+            hop.task.add_done_callback(hop.finished)
+
+        try:
+            loop.call_soon_threadsafe(start)
+        except RuntimeError:  # the loop is closed: nothing was handed to the link
+            return False
+        cancelling = False
+        while not hop.done.wait(HOP_POLL_S):
+            if loop.is_closed():
+                return hop.left.is_set()
+            if stop.is_set() and not cancelling:
+                cancelling = True
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(hop.cancel)
+        if hop.error is not None:
+            if hop.left.is_set():
+                raise LeftThenFailed(hop.error) from hop.error
+            raise hop.error
+        return not hop.cancelled or hop.left.is_set()
 
     def sent(self, data: bytes, time_ns: int) -> None:
         """On the loop, for a packet the pacer thread sent directly at wall time ``time_ns``:

@@ -154,9 +154,16 @@ ib send fc MOCK_NOOP --at +30s --every 1ms --for 10s  # a timed burst
   monotonic clock when the series starts (a clock step during the series is not followed). The packets
   are sent by a dedicated **pacer thread**: it sleeps to each deadline (`clock_nanosleep` on the
   monotonic clock, with its timer slack lowered to 1 us by `prctl(PR_SET_TIMERSLACK)`, which needs no
-  privilege) and hands the packet to the socket itself, so the event loop's latency is never added to a
-  packet. The loop builds the packets ahead (no earlier than 20 ms before their slots, each fully encoded
-  with its own count) and handles what the thread reports. Nothing spins by default. Measured on a busy
+  privilege) and hands the packet to the socket itself, so the event loop's work never delays the wait or
+  the send. (The thread still shares the interpreter lock with the loop and the other helper threads:
+  coming out of its sleep it waits for the lock while another thread runs Python code, by default up to
+  5 ms, half a slot at 10 ms. For the life of a series the switch interval is lowered to 0.2 ms and then
+  restored; with a helper thread running 8 ms Python bursts against a 10 ms period, that took skipped
+  slots from 61-68 of 300 to 1-5, and from 808 of 2000 to about 100 for a 1 ms period against 3 ms
+  bursts. It bounds the wait, it does not remove it, and the lateness the series reports includes any
+  that is left.) The loop builds the packets ahead (no earlier than 20 ms before their slots, each fully
+  encoded with its own count, and only for slots that can still be served) and handles what the thread
+  reports. Nothing spins by default. Measured on a busy
   4-core host (load about 4.5), by the receiver's kernel timestamps: `--every 1ms` puts packets on the
   wire with a median jitter of 23 us (99th percentile 170 us) at 26% of a core, where the spinning
   pacer this replaced showed 185 us (360 us) at 100%; at 10 ms the series costs 6% of a core (12%
@@ -166,7 +173,7 @@ ib send fc MOCK_NOOP --at +30s --every 1ms --for 10s  # a timed burst
   on from the thread
   (its own duplicate of the socket); a serial link is handed each packet through the event loop, which
   adds that loop's latency to it. A slot whose packet is not built in time (a loop stalled for 20 ms)
-  is skipped and counted as `starved`. A header time field (`time_seconds`, `time_subseconds`)
+  is skipped and counted as `starved` (consecutive ones as one). A header time field (`time_seconds`, `time_subseconds`)
   carries the packet's slot time (in a burst, the time it was built, at most a few packets ahead).
 - **Overruns skip, they do not catch up.** A slot whose send cannot start within half a period of its
   deadline (a slow link, a stalled host) is skipped and counted, and the series carries on at the slot
@@ -180,11 +187,14 @@ ib send fc MOCK_NOOP --at +30s --every 1ms --for 10s  # a timed burst
   packet to the kernel, measured in the pacer thread; the summary gives the maximum and mean (and, for
   `--at`, how late the first packet left), the ledger the same.
 - **Output.** One line announces the plan (stderr). A series of at most 2 packets per second (or at most
-  10 back to back), or any series under `-v`, prints a line per packet (with `-v`, the hex); a faster one
-  prints a `progress:` line on stderr every 5 s, so a 1 kHz series does not flood the terminal. The run
+  10 back to back) prints a line per packet (with `-v`, the hex); a faster one prints a `progress:` line
+  on stderr every 5 s, so a 1 kHz series does not flood the terminal, and under `-v` also a sample of its
+  packets (with the hex), at most 2 a second. The run
   ends with `complete: sent N of M ..., skipped S, lateness max ... mean ...` on stdout. The series
   exits 0 however many slots it skipped; a script that needs the cadence reads `skipped` in
   `send.outcome`.
+- **A full send buffer** (a burst on a slow or shaped link) is waited out, up to 2 s, before the send
+  counts as failed.
 - **Errors.** A send that fails (`IB-TX-002`, a closed port, a ledger that refuses commands) **stops the
   series** with its coded error, exit 1, after the summary: a link that failed once will fail again, and a
   series with holes in it is harder to read than one that stopped. A UDP refusal (nothing listening) is
@@ -194,14 +204,21 @@ ib send fc MOCK_NOOP --at +30s --every 1ms --for 10s  # a timed burst
   of the series was refused").
 - **Signals.** Ctrl-C, SIGTERM and SIGHUP stop the series (the pacer thread is stopped and joined
   first, so the count sent is exact), print the summary and exit 128+n. Waiting for `--at` is
-  interrupted at once, with nothing sent.
+  interrupted at once, with nothing sent. A signal that arrives after the series ended (while the
+  session closes) still reports how many were sent: the notice and the `cli.signal` record carry the
+  series' count (`series_sent`, `series_planned`, `series_outcome`). A send through the event loop
+  (serial) is cancelled by the stop; if it cannot be (the thread does not finish within 5 s), the packet
+  in flight is ledgered as `unconfirmed` and counted so in `send.outcome`: whether it left is unknown.
+  A thread that cannot be started is `IB-SYS-001`.
 - **Ledger.** `send.plan` (mode, start and end in UTC, period, count, the arguments, whether a zone was
-  assumed, how long the link took to open), then the packets: the first 600 each get their own
+  assumed, how long the link took to open), `send.fault` once for the faults the packets inject (raw enum
+  values, count or length fields that disagree with the data, as for a single send), then the packets: the first 600 each get their own
   `tx.command` (as a single `send`'s, the arguments not repeated); after them, packets are counted into
   one `tx.command.window` record per 10 s (packets, bytes, results, first and last time and sequence),
-  so a 1 kHz series for a day does not fill the ledger's disk; a packet whose send failed always gets its
-  own record. `send.outcome` comes last (`complete`, `interrupted` or `failed`, with sent, planned,
-  skipped, starved, discarded, unsent, overruns, maximum and mean lateness, the `--at` start lateness,
+  so a 1 kHz series for a day does not fill the ledger's disk (a window's first and last times are the
+  times its packets were sent); a packet whose send failed or whose fate is unknown always gets its own
+  record. `send.outcome` comes last (`complete`, `interrupted` or `failed`, with sent, planned,
+  skipped, starved, discarded, unsent, unconfirmed, overruns, maximum and mean lateness, the `--at` start lateness,
   the longest send, elapsed time, the first and last sequence count sent, exact totals by result, and
   how the pacer ran: `timer_slack_ns`, or `timer_slack_error` when the slack could not be lowered),
   however the series ends.
