@@ -547,7 +547,7 @@ def test_the_pool_and_the_helpers_it_starts_are_made_with_the_shutdown_signals_b
     pool = pexport.WorkerPool(definitions, 2)
     try:
         # a job that no worker will accept is enough to start one
-        ticket = pool.submit(job_of())
+        ticket = pool.submit(job_of(), pexport.poolframe.NO_LAYOUTS)
         assert ticket is not None
     finally:
         pool.close(abnormal=True)
@@ -574,8 +574,8 @@ job = pexport.Job(0, Path("x"), 0, None, True, pexport.Seed({}, {}, 0, 0), None,
     pexport.Shape(pexport.ExportFormat.TEXT, None, frozenset(), None, (), False, False, False,
                   False), (0, 0), 1, 1)
 try:
-    pool.submit(job)
-    pool.submit(job)
+    pool.submit(job, pexport.poolframe.NO_LAYOUTS)
+    pool.submit(job, pexport.poolframe.NO_LAYOUTS)
 finally:
     pool.close(abnormal=True)
 json.dump(seen, sys.stdout)
@@ -615,7 +615,8 @@ from ironbird.recording import pexport
 signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT, signal.SIGHUP, signal.SIGTERM])
 os.kill(os.getpid(), signal.SIGINT)
 os.kill(os.getpid(), signal.SIGHUP)
-pexport._init_worker(pexport.EmbeddedDefinitions(Path("x"), {}, "", (), {}, 2048, ""), os.getppid())
+pexport._settle(os.getppid())
+pexport._build(pexport.EmbeddedDefinitions(Path("x"), {}, "", (), {}, 2048, ""))
 print(*(signal.getsignal(s) == signal.SIG_IGN for s in (signal.SIGINT, signal.SIGHUP)))
 """
 
