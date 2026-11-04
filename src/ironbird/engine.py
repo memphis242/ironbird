@@ -1000,6 +1000,30 @@ class Engine:
         if failure is not None:
             raise failure
 
+    async def prepare_send(self, link: Link, end: LinkEnd) -> None:
+        """Open what :meth:`send` on ``end`` of ``link`` would open (the transport, a connected
+        send socket), so a send that follows hands its bytes to the kernel without waiting on
+        name resolution or a bind. Raises the coded error such a send would."""
+        transport = await self._sending_transport(self._io(link, end))
+        await transport.prepare_send()
+
+    async def _sending_transport(self, io: _LinkIO) -> Transport:
+        async with io.lock:
+            if self._closed:
+                raise IronbirdError(
+                    Code.TX_SEND, "not sent: the session is closing (not a link failure)"
+                )
+            if io.transport is None:
+                transport = self._new_transport(io)
+                try:
+                    await self._open_transport(io, transport, None)
+                except _Closing:
+                    raise IronbirdError(
+                        Code.TX_SEND, "not sent: the session is closing (not a link failure)"
+                    ) from None
+                io.transport = transport
+            return io.transport
+
     async def send(
         self,
         link: Link,
@@ -1028,21 +1052,7 @@ class Engine:
 
         closed: TransportClosed | None = None
         for _ in range(2):
-            async with io.lock:
-                if self._closed:
-                    raise IronbirdError(
-                        Code.TX_SEND, "not sent: the session is closing (not a link failure)"
-                    )
-                if io.transport is None:
-                    transport = self._new_transport(io)
-                    try:
-                        await self._open_transport(io, transport, None)
-                    except _Closing:
-                        raise IronbirdError(
-                            Code.TX_SEND, "not sent: the session is closing (not a link failure)"
-                        ) from None
-                    io.transport = transport
-                transport = io.transport
+            transport = await self._sending_transport(io)
             try:
                 await transport.send(data, confirm=confirm, handed_off=out)
             except TransportClosed as exc:

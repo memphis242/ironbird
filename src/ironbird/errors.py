@@ -82,9 +82,12 @@ class Code(StrEnum):
     RET_TARGET = "IB-RET-005"  # --until-under cannot be reached: the rest is protected
     RET_UNSAFE = "IB-RET-006"  # directory writable by others without the sticky bit
     # Sequence counts
-    SEQ_RESET = "IB-SEQ-001"  # the sequence-count state file is invalid: counting restarts at 0
+    SEQ_RESET = "IB-SEQ-001"  # the durable sequence file is invalid: moved aside and rebuilt
     SEQ_UNSAVED = "IB-SEQ-002"  # the sequence counts cannot be kept on disk: counted in memory
     SEQ_STATE = "IB-SEQ-003"  # ib seq cannot read or change the stored sequence counts
+    SEQ_LIVE = "IB-SEQ-004"  # the live sequence table was rebuilt (other boot, damaged, replaced)
+    SEQ_FULL = "IB-SEQ-005"  # no room for another stream's sequence count: nothing sent
+    SEQ_TAKE = "IB-SEQ-006"  # no sequence count could be taken (lock wait, I/O): nothing sent
     # Output
     OUT_DROPPED = "IB-OUT-001"  # output lines dropped because stdout/stderr is not draining
     OUT_LOST = "IB-OUT-002"  # final tally: output lines dropped, abandoned or never deliverable
@@ -143,6 +146,7 @@ WARNING_CODES: Final[frozenset[Code]] = frozenset(
         Code.EXP_OMITTED,
         Code.SEQ_RESET,
         Code.SEQ_UNSAVED,
+        Code.SEQ_LIVE,
     }
 )
 

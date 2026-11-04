@@ -695,6 +695,9 @@ class SerialTransport:
         if idle is not None and not idle.done():
             idle.set_result(None)
 
+    async def prepare_send(self) -> None:
+        """Nothing to open: the device is open for both directions from :meth:`open`."""
+
     async def send(
         self,
         data: bytes,

@@ -92,7 +92,7 @@ pointer names the part too: `[ledger n=1234 file=<stamp>-<session>.p0003]`.
 | `ib nodes` | List nodes, aliases and links, and check every definition file | below |
 | `ib find TEXT` | Search commands and telemetry by name, MID or description | below |
 | `ib send NODE CMD [name=value ...]` | Encode and send one command | below |
-| `ib seq show [NODE]`, `ib seq reset NODE [MID]\|--all` | Show or reset the stored sequence counts | below |
+| `ib seq show [NODE]`, `ib seq reset NODE [MID]\|--all` | Show or reset the shared sequence counts | below |
 | `ib listen NODE [--where EXPR] [--record PATH]` | Decode and print incoming packets | Filtering |
 | `ib events [--min-type T] [--where EXPR]` | Print only cFS events from every telemetry link | below |
 | `ib respond --as NODE` | Act as a flight node: answer commands with configured telemetry | below |
@@ -109,24 +109,36 @@ done, so a "sent" line is never mistaken for a clean send; the packet's ledger r
 the length field's range, since it would wrap to an unrelated size.
 
 **Sequence counts** (`ib send`, `ib respond`): the CCSDS sequence count of the packets ironbird
-builds is kept between runs, per target node and message ID, in `sequence-state.json` in the state
-directory (`IRONBIRD_STATE_DIR`, else `$XDG_STATE_HOME/ironbird`). Two `ib send` runs therefore send
-`seq 0` and `seq 1`, and the counts wrap at the width of the header profile's sequence field. A file
-lock keeps concurrent `ib send` and `ib respond` processes from handing out the same count. Each process
-reserves 64 counts at a time (one write and sync per 64 packets, not per packet), so a crash can skip
-counts but never repeat one, and concurrent processes interleave by block rather than by time.
+builds is shared by every ironbird process and kept between runs, per target node and message ID, in
+the state directory (`IRONBIRD_STATE_DIR`, else `$XDG_STATE_HOME/ironbird`). Two `ib send` runs send
+`seq 0` and `seq 1`, two concurrent `ib send` loops on one MID together send 0, 1, 2, ... with no gaps,
+and the counts wrap at the width of the header profile's sequence field.
 
+- How: a small table, `sequence-live`, holds the next count of each stream; every count is taken under a
+  file lock in microseconds, so counts are exact and in take order across processes. Over UDP the lock is
+  held until the packet is handed to the kernel, so packets reach the wire in count order too; over serial
+  it is released once the count is taken (a serial device is one process's), so the order is exact per
+  process. `sequence-state.json` holds a synced ceiling up to 64 counts ahead: a crashed process loses
+  nothing, and a power loss skips at most 64 counts of a stream, never repeating one.
 - `ib send NODE CMD --sequence N` sends that one packet with count `N` (decimal or `0x`; it must fit
   the sequence field, and the profile must have one, else `IB-ENC-002`, exit 2, nothing sent) and
-  continues from it: the next send is `N+1`.
-- `ib seq show [NODE]` lists the stored counts (the next count each stream hands out; a running
-  `ib respond` shows the end of its reserved block). `ib seq reset NODE MID` forgets one stream,
-  `ib seq reset NODE` all streams of a node, `ib seq reset --all` everything, so the next send starts at
-  0 again (for example after the flight computer reboots). `MID` is a number or a message name. Nothing is
-  sent, the reset is ledgered, and bare `ib seq reset` is a usage error (exit 2) so nothing is wiped by accident.
-- The file is treated like any input from outside: an invalid, oversized or forged one is
-  `warning IB-SEQ-001` and counting restarts at 0; a state directory that cannot hold it (read-only, full,
-  no file locks) is one `warning IB-SEQ-002` per process and the counts then restart at 0 in every process.
+  continues from it: the next send, from any process, is `N+1`.
+- `ib seq show [NODE]` lists the value the next packet of each stream carries (`-v` adds the unreduced count
+  and the stored ceiling); it only reads, so an invalid file is left as it is for you to inspect.
+  `ib seq reset NODE MID` forgets one stream, `ib seq reset NODE` all streams of a node, `ib seq reset --all`
+  everything, so the next send starts at 0 again (for example after the flight computer reboots), in a running
+  `ib respond` too. `MID` is a number or a message name. Nothing is sent, the reset is ledgered, and bare
+  `ib seq reset` is a usage error (exit 2) so nothing is wiped by accident.
+- The files are treated like any input from outside. An invalid `sequence-state.json` is `warning
+  IB-SEQ-001`: the next send moves it aside to `sequence-state.json.invalid` and rebuilds it from the live
+  table. A damaged or foreign `sequence-live`, or one from before a reboot, is `warning IB-SEQ-004` and is
+  rebuilt from the stored ceilings. Keep one state directory per host: a table written by another host is
+  rebuilt each time (counts stay unique, with gaps of up to 64).
+- A state directory that cannot hold the counts at all (read-only, full, no file locks) is one `warning
+  IB-SEQ-002` per process, and the counts then restart at 0 in every process, as it says. Once counting from
+  the files, a count that cannot be taken (a lock held for over 10 s by a stopped process or a hung disk, a
+  write error) fails the send with `IB-SEQ-006` and nothing is sent: a count is never repeated to keep going.
+  Up to 4096 streams keep counts; another one is refused with `IB-SEQ-005` (reset the ones no longer used).
 
 ## The ledger under load, a full disk, and retention
 

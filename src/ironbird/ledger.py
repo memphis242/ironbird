@@ -156,12 +156,18 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "events.start": Tier.ESSENTIAL,
         "events.stop": Tier.ESSENTIAL,
         "codec.loaded": Tier.ESSENTIAL,
-        # one per block of sequence counts (64 packets), or per damaged or unusable state file
+        # sequence counts: one per raised ceiling (at most one per 32 packets of a stream), per
+        # seat or reset, or per damaged, rebuilt or unusable state file
         "seq.reset": Tier.ESSENTIAL,  # ib seq reset: a user action, what it removed
-        "sequence.reserve": Tier.ESSENTIAL,
-        "sequence.release": Tier.ESSENTIAL,
-        "sequence.release_failed": Tier.ESSENTIAL,
+        "sequence.extend": Tier.ESSENTIAL,
+        "sequence.forget": Tier.ESSENTIAL,
         "sequence.reset": Tier.ESSENTIAL,
+        "sequence.rebuilt": Tier.ESSENTIAL,
+        "sequence.live_created": Tier.ESSENTIAL,
+        "sequence.compacted": Tier.ESSENTIAL,
+        "sequence.reopened": Tier.ESSENTIAL,
+        "sequence.full": Tier.ESSENTIAL,
+        "sequence.ahead_failed": Tier.ESSENTIAL,
         "sequence.memory_only": Tier.ESSENTIAL,
         "sink.detached": Tier.ESSENTIAL,
         "output.pipe_closed": Tier.ESSENTIAL,

@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Final, NoReturn, Protocol, cast, final
+from typing import Final, NoReturn, cast, final
 
 from ironbird import header as hdr
 from ironbird.ccdd.model import (
@@ -502,17 +502,29 @@ def _element_packer(field: FieldDef) -> struct.Struct:
 CAP_ADVICE: Final = " (ironbird.max_packet_bytes); raise it or shrink the message"
 
 
-class SequenceSource(Protocol):
-    """Where a codec gets the sequence counts of the packets it builds when they must outlive
-    it (:class:`ironbird.seqstate.NodeSequences`). A count is not reduced to a field width."""
+@final
+@dataclass(frozen=True, slots=True)
+class PreparedPacket:
+    """A message encoded and checked up to its sequence count: :meth:`Codec.frame` finishes it.
 
-    def take(self, kind: str, mid: int) -> int:
-        """The next count of the ``kind`` ("command" or "telemetry") message with this MID."""
-        ...
+    Everything that depends only on the message, its values and the header values is done and
+    checked here, so a sender takes a count (:mod:`ironbird.seqstate`) only for a packet that
+    will be built."""
 
-    def seat(self, kind: str, mid: int, value: int) -> None:
-        """Make ``value`` the last count handed out: the next one is ``value + 1``."""
-        ...
+    message: Message
+    payload: bytes
+    inputs: Mapping[str, int]  # header input fields: the message's, the function code, given
+    tamper: Mapping[str, int] | None
+    count_faults: tuple[CountFault, ...]
+    sequenced: bool  # the profile has a sequence field, so framing takes a count
+
+    @property
+    def mid(self) -> int:
+        return self.message.mid
+
+    @property
+    def kind(self) -> MessageKind:
+        return self.message.kind
 
 
 class Codec:
@@ -547,8 +559,7 @@ class Codec:
                 MessageKind.TELEMETRY: telemetry_profile,
             }
         )
-        self._sequence: dict[tuple[str, int], int] = {}
-        self._source: SequenceSource | None = None
+        self._sequence: dict[tuple[MessageKind, int], int] = {}  # counts kept in memory
         self._command_mids: frozenset[int] = frozenset(m for m, _ in model.commands_by_key)
         self._payload_bounds: Mapping[MessageKind, Mapping[int, tuple[int, int]]] = (
             MappingProxyType(
@@ -702,23 +713,21 @@ class Codec:
         """Restart every in-memory per-MID sequence counter at zero."""
         self._sequence.clear()
 
-    def use_sequence_source(self, source: SequenceSource) -> None:
-        """Take sequence counts from ``source`` (kept across processes) from now on, instead of
-        counting in memory from zero."""
-        self._source = source
-
-    def _next_sequence(self, kind: MessageKind, mid: int) -> int:
-        if self._source is not None:
-            return self._source.take(kind.value, mid)
-        value = self._sequence.get((kind.value, mid), 0)
-        self._sequence[(kind.value, mid)] = value + 1
-        return value
-
-    def _seat_sequence(self, kind: MessageKind, mid: int, value: int) -> None:
-        if self._source is not None:
-            self._source.seat(kind.value, mid, value)
-        else:
-            self._sequence[(kind.value, mid)] = value + 1
+    def check_sequence(self, kind: MessageKind, value: int) -> None:
+        """Refuse (``IB-ENC-002``) a sequence count set by hand that the ``kind`` profile's
+        sequence field cannot hold, or a profile without such a field."""
+        profile = self._profiles[kind]
+        field = profile.sequence_field
+        if field is None:
+            raise IronbirdError(
+                Code.ENC_ARG, f"profile {profile.name} has no sequence field to set"
+            )
+        if not 0 <= value <= field.mask:
+            raise IronbirdError(
+                Code.ENC_ARG,
+                f"sequence {value} does not fit the {field.bits}-bit sequence field "
+                f"(0..{field.mask})",
+            )
 
     # -- encode ----------------------------------------------------------------------
 
@@ -835,54 +844,58 @@ class Codec:
         assert allow_count_mismatch or not faults
         return bytes(buf), tuple(faults)
 
-    def _frame(
+    def _prepare(
         self,
         msg: Message,
         payload: bytes,
         inputs: Mapping[str, int],
         tamper: Mapping[str, int] | None,
         header: Mapping[str, int] | None,
-        faults: tuple[CountFault, ...] = (),
-        sequence: int | None = None,
-    ) -> EncodedPacket:
+        faults: tuple[CountFault, ...],
+    ) -> PreparedPacket:
         profile = self._profiles[msg.kind]
         values: dict[str, int] = {**msg.header}
         if header:
             self._check_header_values(profile, header, "header")
             values.update(header)
         values.update(inputs)
+        return PreparedPacket(
+            msg,
+            payload,
+            MappingProxyType(values),
+            MappingProxyType(dict(tamper)) if tamper else None,
+            faults,
+            profile.sequence_field is not None,
+        )
+
+    def frame(self, prepared: PreparedPacket, count: int | None = None) -> EncodedPacket:
+        """The packet with its header: ``count`` (any size, reduced to the sequence field) or,
+        when ``None``, the next count this codec keeps in memory for the message's MID."""
+        msg = prepared.message
+        profile = self._profiles[msg.kind]
         field = profile.sequence_field
-        if sequence is not None:
-            if field is None:
-                raise IronbirdError(
-                    Code.ENC_ARG, f"profile {profile.name} has no sequence field to set"
-                )
-            if not 0 <= sequence <= field.mask:
-                raise IronbirdError(
-                    Code.ENC_ARG,
-                    f"sequence {sequence} does not fit the {field.bits}-bit sequence field "
-                    f"(0..{field.mask})",
-                )
-            counter = sequence
+        assert count is None or count >= 0
+        if field is None:
+            counter = 0
+        elif count is None:
+            counter = self._sequence.get((msg.kind, msg.mid), 0)
+            self._sequence[(msg.kind, msg.mid)] = counter + 1
         else:
-            counter = self._next_sequence(msg.kind, msg.mid) if field is not None else 0
+            counter = count
         data = hdr.pack(
             profile,
-            payload,
+            prepared.payload,
             mid=msg.mid,
-            inputs=values,
+            inputs=prepared.inputs,
             sequence=counter,
             now=self._clock(),
-            tamper=tamper,
+            tamper=prepared.tamper,
         )
         assert (
             len(data) <= self.max_packet_bytes
         )  # guaranteed by _validate_fit (+ tamper keeps size)
-        if field is None:
-            return EncodedPacket(data, msg, msg.mid, None, msg.function_code, faults)
-        if sequence is not None:  # the counter goes on from the value set
-            self._seat_sequence(msg.kind, msg.mid, sequence)
-        return EncodedPacket(data, msg, msg.mid, counter & field.mask, msg.function_code, faults)
+        sequence = counter & field.mask if field is not None else None
+        return EncodedPacket(data, msg, msg.mid, sequence, msg.function_code, prepared.count_faults)
 
     def encode_command(
         self,
@@ -900,8 +913,29 @@ class Codec:
         that disagrees is refused unless ``allow_count_mismatch`` (fault injection).
 
         ``sequence`` sets the packet's sequence field (``IB-ENC-002`` when it does not fit or the
-        profile has none) and re-seats the MID's counter there: the next packet gets
-        ``sequence + 1``."""
+        profile has none) and re-seats the MID's in-memory counter there: the next packet gets
+        ``sequence + 1``. Counts kept across processes are the sender's (:meth:`frame`)."""
+        prepared = self.prepare_command(
+            name, args, tamper=tamper, header=header, allow_count_mismatch=allow_count_mismatch
+        )
+        if sequence is None:
+            return self.frame(prepared)
+        self.check_sequence(MessageKind.COMMAND, sequence)
+        encoded = self.frame(prepared, sequence)
+        self._sequence[(MessageKind.COMMAND, prepared.mid)] = sequence + 1
+        return encoded
+
+    def prepare_command(
+        self,
+        name: str,
+        args: Mapping[str, object] | None = None,
+        *,
+        tamper: Mapping[str, int] | None = None,
+        header: Mapping[str, int] | None = None,
+        allow_count_mismatch: bool = False,
+    ) -> PreparedPacket:
+        """:meth:`encode_command` up to the sequence count: every refusal it can make about the
+        message, its arguments and the header values is made here."""
         msg = self._lookup(name, MessageKind.COMMAND)
         payload, faults = self._encode_payload(
             msg,
@@ -912,14 +946,8 @@ class Codec:
         )
         profile = self._profiles[MessageKind.COMMAND]
         assert profile.function_code_field is not None and msg.function_code is not None
-        return self._frame(
-            msg,
-            payload,
-            {profile.function_code_field: msg.function_code},
-            tamper,
-            header,
-            faults,
-            sequence,
+        return self._prepare(
+            msg, payload, {profile.function_code_field: msg.function_code}, tamper, header, faults
         )
 
     def encode_telemetry(
@@ -934,11 +962,31 @@ class Codec:
         """Encode telemetry; fields not given are zero-filled. ``header`` and
         ``allow_count_mismatch`` are as for :meth:`encode_command`; a refusal does not name the
         ``send`` option, which a telemetry sender (``respond``) does not have."""
+        return self.frame(
+            self.prepare_telemetry(
+                name,
+                values,
+                tamper=tamper,
+                header=header,
+                allow_count_mismatch=allow_count_mismatch,
+            )
+        )
+
+    def prepare_telemetry(
+        self,
+        name: str,
+        values: Mapping[str, object] | None = None,
+        *,
+        tamper: Mapping[str, int] | None = None,
+        header: Mapping[str, int] | None = None,
+        allow_count_mismatch: bool = False,
+    ) -> PreparedPacket:
+        """:meth:`encode_telemetry` up to the sequence count (see :meth:`prepare_command`)."""
         msg = self._lookup(name, MessageKind.TELEMETRY)
         payload, faults = self._encode_payload(
             msg, values or {}, strict=False, allow_count_mismatch=allow_count_mismatch
         )
-        return self._frame(msg, payload, {}, tamper, header, faults)
+        return self._prepare(msg, payload, {}, tamper, header, faults)
 
     # -- check and decode (the boundary) -------------------------------------------
 

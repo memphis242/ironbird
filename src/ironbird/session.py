@@ -43,7 +43,7 @@ from ironbird.codec import (
     coerce_variable,
     echo_incompatibility,
 )
-from ironbird.config import Link, Node, ResponseRule, SystemConfig
+from ironbird.config import UDP_TRANSPORT, Link, Node, ResponseRule, SystemConfig
 from ironbird.engine import (
     DISPLAY,
     EVENT_STREAM,
@@ -64,7 +64,7 @@ from ironbird.ledger import Ledger
 from ironbird.ledgertiers import Tier
 from ironbird.notice import Level, Notice, level_of
 from ironbird.sanitize import HEX_PREVIEW_BYTES, clean, hex_preview
-from ironbird.seqstate import SequenceStore
+from ironbird.seqstate import Lease, NodeSequences, SequenceStore
 from ironbird.transport import LinkEnd
 
 TICK_S: Final = 1.0
@@ -166,7 +166,6 @@ class Session:
         ledger.set_notifier(notify)
         self._codecs: dict[str, Codec] = {}
         self._sequences: SequenceStore | None = None
-        self._counted: set[str] = set()  # nodes whose codec takes persistent sequence counts
         self._definitions: dict[str, DefinitionBytes] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._last_tx: TxAttempt | None = None
@@ -244,9 +243,11 @@ class Session:
             await self._engine.close()
         finally:
             try:
-                if self._sequences is not None:
-                    self._sequences.close()
-                self.flush_notices()
+                try:
+                    if self._sequences is not None:
+                        await self._sequences.aclose()
+                finally:
+                    self.flush_notices()
             finally:
                 self.ledger.settle()
                 self.ledger.flush()
@@ -454,20 +455,19 @@ class Session:
         self._definitions[node_name] = definitions
         return codec
 
-    def _count_persistently(self, node_name: str, codec: Codec) -> None:
-        """Make ``codec`` take its sequence counts from the state directory (shared with every
-        other ironbird process), unless the ledger, and so the state directory, is off."""
-        if node_name in self._counted or not self.ledger.enabled:
-            return
-        self._counted.add(node_name)
+    def sequences(self, node_name: str) -> NodeSequences:
+        """The sequence counts of the packets sent to (or as) ``node_name``, shared with every
+        other ironbird process through the state directory. With the ledger off there is no
+        state directory: the counts are kept in memory, as ``IB-SEQ-002`` says at the first."""
         if self._sequences is None:
             ledger = self.ledger
             self._sequences = SequenceStore(
-                ledger.directory,
+                ledger.directory if ledger.enabled else None,
                 report=self.report,
                 record=lambda event, fields: ledger.record("state", event, **fields),
+                unusable="the ledger is off, so there is no state directory",
             )
-        codec.use_sequence_source(self._sequences.for_node(node_name))
+        return self._sequences.for_node(node_name)
 
     def _profile_of_kind(
         self, node_name: str, key: str, path: Path, data: bytes, kind: ProfileKind
@@ -596,7 +596,6 @@ class Session:
     ) -> SentCommand:
         route = self.route(peer, require=Side.COMMANDER, link_name=link)
         codec = self.codec_for(route.server.name)
-        self._count_persistently(route.server.name, codec)
         endpoint = route.link.command_target
         extra: dict[str, Any] = {"header": dict(header)} if header else {}
         if allow_count_mismatch:
@@ -613,20 +612,18 @@ class Session:
             link=route.link.name,
             **extra,
         )
-        encoded = codec.encode_command(
-            command,
-            args,
-            tamper=tamper,
-            header=header,
-            allow_count_mismatch=allow_count_mismatch,
-            sequence=sequence,
+        prepared = codec.prepare_command(
+            command, args, tamper=tamper, header=header, allow_count_mismatch=allow_count_mismatch
         )
-        if encoded.count_faults:  # the values that went out and the ones the data implied
+        if sequence is not None:
+            codec.check_sequence(MessageKind.COMMAND, sequence)
+        message = prepared.message
+        if prepared.count_faults:  # the values that go out and the ones the data implied
             self.ledger.record(
                 "action",
                 "send.fault",
                 node=route.server.name,
-                command=encoded.message.name,
+                command=message.name,
                 fault="count_mismatch",
                 fields=[
                     {
@@ -635,29 +632,54 @@ class Session:
                         "implied": f.implied,
                         "unit": "elements" if f.unit is VarUnit.COUNT else "bytes",
                     }
-                    for f in encoded.count_faults
+                    for f in prepared.count_faults
                 ],
             )
-        self.ledger.check_transmit(encoded.message.name, route.server.name)
-        attempt = TxAttempt(encoded.message.name)
+        self.ledger.check_transmit(message.name, route.server.name)
+        attempt = TxAttempt(message.name)
         self._last_tx = attempt
         result = "not_sent"
+        end = link_end(route.side)
+        encoded: EncodedPacket | None = None
+        lease: Lease | None = None
+        framing = False  # a refusal while framing is the command's, like one while encoding
 
         def handed_off() -> None:
             nonlocal attempt, result
             attempt = replace(attempt, went_out=True)
             self._last_tx = attempt
             result = "sent"
+            if lease is not None:
+                lease.release()  # on the wire: the next take, in any process, may go ahead
 
         try:
+            await self._engine.prepare_send(route.link, end)
+            if sequence is not None:  # the count is known: a refused frame seats nothing
+                framing = True
+                encoded = codec.frame(prepared, sequence)
+                framing = False
+            if prepared.sequenced:
+                lease = await self.sequences(route.server.name).lease(
+                    "command",
+                    prepared.mid,
+                    seat=sequence,
+                    span_send=route.link.transport == UDP_TRANSPORT,
+                )
+            if encoded is None:
+                framing = True
+                encoded = codec.frame(prepared, None if lease is None else lease.count)
+                framing = False
+            if lease is not None:
+                lease.commit()
             await self._engine.send(
-                route.link, link_end(route.side), encoded.data, confirm=True, handed_off=handed_off
+                route.link, end, encoded.data, confirm=True, handed_off=handed_off
             )
         except IronbirdError as exc:
             result = exc.code.value
-            exc.details += ("\n" if exc.details else "") + (
-                f"packet ({len(encoded.data)} bytes) hex: {hex_preview(encoded.data)}"
-            )
+            if encoded is not None:
+                exc.details += ("\n" if exc.details else "") + (
+                    f"packet ({len(encoded.data)} bytes) hex: {hex_preview(encoded.data)}"
+                )
             raise
         except asyncio.CancelledError:
             result = "sent" if attempt.went_out else "cancelled"
@@ -666,21 +688,28 @@ class Session:
             result = type(exc).__name__
             raise
         finally:
-            self.ledger.record_tx(
-                "tx.command",
-                encoded.message.name,
-                route.server.name,
-                node=route.server.name,
-                command=encoded.message.name,
-                mid=encoded.mid,
-                function_code=encoded.function_code,
-                sequence=encoded.sequence,
-                size=len(encoded.data),
-                endpoint=endpoint,
-                result=result,
-                sent=attempt.went_out,
-                raw=encoded.data,
-            )
+            if lease is not None:
+                lease.release()
+            if not framing:
+                packet: dict[str, Any] = (
+                    {"sequence": encoded.sequence, "size": len(encoded.data), "raw": encoded.data}
+                    if encoded is not None
+                    else {"sequence": None}
+                )
+                self.ledger.record_tx(
+                    "tx.command",
+                    message.name,
+                    route.server.name,
+                    node=route.server.name,
+                    command=message.name,
+                    mid=prepared.mid,
+                    function_code=message.function_code,
+                    endpoint=endpoint,
+                    result=result,
+                    sent=attempt.went_out,
+                    **packet,
+                )
+        assert encoded is not None  # every path that leaves the try without it raised
         assert encoded.function_code is not None
         return SentCommand(
             node=route.server.name,
@@ -1051,7 +1080,8 @@ class Session:
         chosen = route.link
         codec = self.codec_for(self.node.name)
         rules = _validate_rules(self.node, codec, self.config)
-        self._count_persistently(self.node.name, codec)  # after the rules' trial encodes
+        sequences = self.sequences(self.node.name)
+        sequences.store.keep_ahead()  # a long-lived sender: no reply waits for a sync
         capture = await self.capture([route], consumer=RESPONDER)
         self.ledger.record(
             "action",
@@ -1061,7 +1091,7 @@ class Session:
             reply_to=chosen.telemetry_target,
             rules=len(rules),
         )
-        return Responder(self, route, codec, capture, rules)
+        return Responder(self, route, codec, capture, rules, sequences)
 
 
 def _mids_text(mids: frozenset[int]) -> str:
@@ -1444,11 +1474,13 @@ class Responder:
         codec: Codec,
         capture: Capture,
         rules: Mapping[str, ResponseRule],
+        sequences: NodeSequences,
     ) -> None:
         self._session = session
         self._route = route
         self._codec = codec
         self._capture = capture
+        self._sequences = sequences
         self._decoder = session.decoder(report_checked=False)
         self._rules = rules
         self._accepted = 0
@@ -1531,15 +1563,36 @@ class Responder:
         if session.ledger.withhold_reply():
             return None  # on_full = "refuse_commands" and the ledger is stalled: counted, not sent
         try:
-            encoded = self._codec.encode_telemetry(rule.reply, values)
+            prepared = self._codec.prepare_telemetry(rule.reply, values)
         except IronbirdError as exc:
             session.report(_rule_failure(self._codec, rule, values, exc))
             return None
+        link = self._route.link
+        lease: Lease | None = None
         try:
-            await session._engine.send(self._route.link, link_end(self._route.side), encoded.data)
+            if prepared.sequenced:
+                lease = await self._sequences.lease(
+                    "telemetry", prepared.mid, span_send=link.transport == UDP_TRANSPORT
+                )
+            try:
+                encoded = self._codec.frame(prepared, None if lease is None else lease.count)
+            except IronbirdError as exc:
+                session.report(_rule_failure(self._codec, rule, values, exc))
+                return None
+            if lease is not None:
+                lease.commit()
+            await session._engine.send(
+                link,
+                link_end(self._route.side),
+                encoded.data,
+                handed_off=None if lease is None else lease.release,
+            )
         except IronbirdError as exc:
             session.report(exc)
             return None
+        finally:
+            if lease is not None:
+                lease.release()
         session.ledger.record_reply(
             encoded.message.name,
             size=len(encoded.data),

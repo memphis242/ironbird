@@ -1399,6 +1399,22 @@ def _sequence_store(session: Session) -> SequenceStore:
     )
 
 
+def _sequence_masks(session: Session, config: SystemConfig) -> dict[tuple[str, str], int]:
+    """The sequence field mask of each configured node's command and telemetry profile, by
+    ``(node stem, kind)``; a node whose definitions do not load is left out (shown unmasked)."""
+    masks: dict[tuple[str, str], int] = {}
+    for name in config.nodes:
+        try:
+            codec = session.codec_for(name)
+        except IronbirdError:
+            continue
+        for kind in (MessageKind.COMMAND, MessageKind.TELEMETRY):
+            field = codec.profile(kind).sequence_field
+            if field is not None:
+                masks[(node_stem(name), kind.value)] = field.mask
+    return masks
+
+
 def _seq_mid(session: Session, node: str, text: str) -> int:
     """A MID given as a number or as the name of a message of ``node``."""
     try:
@@ -1416,8 +1432,8 @@ def _seq_mid(session: Session, node: str, text: str) -> int:
     return value
 
 
-def _seq_row(row: tuple[str, str, int, int]) -> str:
-    stem, kind, mid, _next = row
+def _seq_row(row: tuple[str, str, int, int] | tuple[str, str, int, int, int]) -> str:
+    stem, kind, mid = row[:3]
     return f"{term(stem)} {kind} 0x{mid:04X}"
 
 
@@ -1427,13 +1443,13 @@ def seq_show(
     node: Annotated[str | None, typer.Argument(help="Only this node (name or alias).")] = None,
     verbose: VerboseOption = False,
 ) -> None:
-    """List the stored sequence counts: per node, kind and MID, the next count to be handed out
-    (counts wrap at the header's sequence field width; a count a crashed process had reserved
-    but not used shows as a higher one)."""
+    """List the stored sequence counts: per node, kind and MID, the sequence field value the
+    next packet gets (with --verbose also the unreduced count and the stored ceiling). Reads
+    only: no file is created or changed, an invalid one included."""
 
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
         wanted = config.resolve(node).name if node is not None else None
-        rows = _sequence_store(session).stored()
+        rows = await _sequence_store(session).stored()
         if wanted is not None:
             rows = [r for r in rows if r[0] == node_stem(wanted)]
         if not rows:
@@ -1441,9 +1457,13 @@ def seq_show(
                 "no stored sequence counts" + (f" for {term(wanted)}" if wanted else "")
             )
             return 0
-        run.console.out("NODE KIND MID NEXT")
+        masks = _sequence_masks(session, config)
+        run.console.out("NODE KIND MID NEXT" + (" COUNT CEILING" if run.verbose else ""))
         for row in rows:
-            run.console.out(f"{_seq_row(row)} {row[3]}")
+            mask = masks.get((row[0], row[1]))
+            shown = str(row[3] & mask) if mask is not None else f"{row[3]} (no profile)"
+            extra = f" {row[3]} {row[4]}" if run.verbose else ""
+            run.console.out(f"{_seq_row(row)} {shown}{extra}")
         return 0
 
     _run(ctx, None, verbose, body, "seq.show")
@@ -1473,7 +1493,7 @@ def seq_reset(
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
         target = config.resolve(node).name if node is not None else None
         wanted = _seq_mid(session, target, mid) if target is not None and mid is not None else None
-        gone = _sequence_store(session).forget(target, wanted)
+        gone = await _sequence_store(session).forget(target, wanted)
         session.ledger.record(
             "action",
             "seq.reset",

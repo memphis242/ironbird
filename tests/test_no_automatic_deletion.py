@@ -75,9 +75,13 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
     ("ledgerstore.py", "overwrite"): {"LedgerStore._pwrite_all"},
     ("retnotices.py", "overwrite"): {"Notices._transaction"},
     ("ledger.py", "overwrite"): {"Ledger._append_final"},
-    # the sequence state's lock file, opened read-write for flock and never written to (the
-    # state itself is replaced whole through TempOutput)
-    ("seqstate.py", "overwrite"): {""},
+    # the sequence counts: the lock files opened read-write for flock (the durable file itself
+    # is replaced whole through TempOutput), the live table's slots rewritten in place, the
+    # table emptied in place when it is rebuilt (it is never synced: a cache of the durable
+    # ceilings), and an invalid durable file moved aside to its one evidence slot
+    ("seqstate.py", "overwrite"): {"", "_pwrite_all"},
+    ("seqstate.py", "truncation"): {"_Table.wipe"},
+    ("seqstate.py", "rename"): {"_Files._write_durable"},
     # a salvage's own leftover temporary file, picked up again and appended to (checked first);
     # a directory export's member whose descriptor was given up, appended to again (the inode is
     # checked against the one created)

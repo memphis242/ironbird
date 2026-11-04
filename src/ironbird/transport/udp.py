@@ -647,6 +647,13 @@ class UdpTransport:
         await asyncio.sleep(CONFIRM_WAIT_S)
         self._raise_pending()
 
+    async def prepare_send(self) -> None:
+        """Open the connected send socket that a listener's first send would open."""
+        if self._tx is None and self._remote is not None and not self._closed:
+            async with self._tx_lock:
+                if self._tx is None:
+                    await self._open_tx()
+
     async def send(
         self,
         data: bytes,
@@ -655,10 +662,7 @@ class UdpTransport:
         handed_off: Callable[[], None] | None = None,
     ) -> None:
         """Send one datagram; with ``confirm`` also wait for a refusal. Fire-and-forget else."""
-        if self._tx is None and self._remote is not None and not self._closed:
-            async with self._tx_lock:
-                if self._tx is None:
-                    await self._open_tx()
+        await self.prepare_send()
         self.send_nowait(data)
         if handed_off is not None:
             handed_off()

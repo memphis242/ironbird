@@ -1,107 +1,193 @@
-"""``sequence-state.json``: the CCSDS sequence counts of sent packets, kept across processes.
+"""CCSDS sequence counts of sent packets: exact, in take order, shared by every ironbird process.
 
-A count is per ``(node, kind, MID)``: ``node`` is the flight node the packets are for (the
+A count is per stream ``(node, kind, MID)``: ``node`` is the flight node the packets are for (the
 target of ``ib send``, the node ``ib respond`` acts as), ``kind`` is command or telemetry and
 ``MID`` is the full message ID. MID rather than the profile's APID because a header layout is
 user-definable (the profile names which fields come from the MID, and no field is "the APID"),
 and because a receiver that checks counts per message ID (cFE's software bus does) sees an
 unbroken series per MID either way. Two MIDs that share an APID count independently.
 
-The file holds, per key, the *reservation mark*: the lowest count no process has handed out or
-reserved yet. A process takes a block of :data:`BLOCK` counts under the lock, advances the mark
-past it and hands the counts out of memory, so a burst of sends costs one lock, one temporary
-file and two ``fsync`` calls per block, not per packet. The mark is durable (file and directory
-synced) before the first count of its block is used, so a crash can only skip the unused rest of a
-block, never reuse a count; skipping is allowed. A process that ends cleanly gives its unused
-counts back when its block is still the newest reservation (the mark equals the end of its block),
-so successive ``ib send`` runs count 0, 1, 2, ...; when another process reserved meanwhile the
-unused counts are left as a gap. Counts handed out by concurrent processes are unique but
-interleave by block, not by time.
+Two files in the state directory hold the counts.
 
-The file is replaced whole (:class:`~ironbird.atomicfile.TempOutput`), never rewritten in
-place, so a crash leaves the old or the new content. The lock is ``flock`` on a separate
-:data:`LOCK_NAME` file, because the state file's inode changes at every replacement.
+- :data:`LIVE_NAME`, the *live table*: a fixed binary layout (:data:`HEAD_BYTES` of header, then
+  :data:`LIVE_SLOTS` slots of :data:`SLOT_BYTES`, open addressing on a hash of the key). A slot
+  holds a stream's key, the next count to hand out and its *ceiling*. Every count is taken under
+  ``flock`` on this file by reading and rewriting one slot, so counts are exact and in take order
+  across processes, and ``ib seq reset`` or ``--sequence`` from any process is seen by the next
+  take of every process. The file is never synced: it lives in the page cache, which outlives
+  any process, so a process crash loses nothing. The header names the boot it was written in
+  (``/proc/sys/kernel/random/boot_id``); a table from another boot, whose page cache a power loss
+  may have dropped, is rebuilt from the durable ceilings.
+- :data:`STATE_NAME`, the *durable ceilings*: per stream, a count above every count ever handed
+  out. It is replaced whole (:class:`~ironbird.atomicfile.TempOutput`, file and directory synced)
+  under its own lock :data:`LOCK_NAME` *before* a slot's ceiling is raised to the new value, and
+  is at most :data:`BLOCK` above the next count, so a power loss skips at most :data:`BLOCK`
+  counts of a stream and never reuses one.
 
-The file is *untrusted* on read: opened ``O_NOFOLLOW | O_NONBLOCK`` and checked with ``fstat``
-(regular, ours, one link), at most :data:`MAX_BYTES`, strict schema, at most :data:`MAX_ENTRIES`
-keys of at most :data:`MAX_KEY_LEN` characters, marks integers in ``[0, 2**64)``. Anything else
-is ``IB-SEQ-001``: the file is treated as empty and the counts restart at 0 (the file is
-replaced at the next reservation). A state directory that cannot be used (read-only, no file
-locks, a lock held for more than a second, a name that cannot be replaced) is ``IB-SEQ-002``,
-once: the counts are then kept in memory, restarting at 0 in every process.
+Invariant, per stream: ``next <= ceiling <= durable`` (a missing durable entry counts as 0).
+Only a holder of the durable lock changes a slot's ceiling or the table's layout (insert,
+rebuild, reset); a take only moves ``next`` up to the ceiling. Lock order is durable, then live;
+the live lock is never held across a sync or a wait for the durable lock.
+
+Off the event loop: a take on the loop is a non-blocking ``flock``, one ``fstatat`` (the live
+file must still be the one this process opened), and a ``pread`` and ``pwrite`` of one slot.
+Everything that can block (raising a ceiling, which syncs; inserting a stream; rebuilding;
+opening the files) runs in a worker thread (:class:`~ironbird.offloop.OffLoop`) whose lock waits
+are bounded by :data:`LOCK_WAIT_S`; a contended live lock is waited for on the loop with
+``asyncio.sleep``. A long-lived sender (:meth:`SequenceStore.keep_ahead`, ``ib respond``) raises a
+ceiling in the background once half a step is left, so its takes do not wait for a sync.
+
+Failure paths. A lock that cannot be had within the bound, or a state file that cannot be read
+or replaced once the store is open, fails the take (``IB-SEQ-006``, nothing is sent): a count is
+never handed out unrecorded. Only a state directory that cannot be used *from the start*
+(read-only, full, no file locks, a planted file in the way, no boot id) makes the process count
+in memory (``IB-SEQ-002``, once), restarting at 0 as the message says. :data:`MAX_STREAMS`
+streams fill the durable file; another one is refused (``IB-SEQ-005``, ledgered), never evicted.
+
+Both files are *untrusted* on read. :data:`STATE_NAME` is opened ``O_NOFOLLOW | O_NONBLOCK`` and
+checked with ``fstat`` (regular, ours, one link), at most :data:`MAX_BYTES`, strict schema, at
+most :data:`MAX_STREAMS` keys in the key alphabet of at most :data:`MAX_KEY_LEN` characters,
+ceilings in ``[0, MAX_COUNT)``. An invalid one is ``IB-SEQ-001``: a send or reset moves it aside
+to :data:`INVALID_NAME` (one slot, the newest kept) and rebuilds it from the live table; ``ib
+seq show`` leaves it untouched. :data:`LIVE_NAME` must be a regular file of ours with one link;
+a wrong size, magic, version, header checksum or boot, or a damaged slot (checksum, alphabet,
+``next > ceiling``), rebuilds the table (``IB-SEQ-004``), so every stream carries on from its
+durable ceiling.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import errno
 import fcntl
+import functools
 import hashlib
 import json
 import os
+import re
 import stat
+import struct
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+import uuid
+import zlib
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import Any, Final, TypeVar
+from typing import Any, Final, Literal, TypeVar
 
 from ironbird.atomicfile import TempOutput
 from ironbird.errors import Code, IronbirdError
-from ironbird.fsops import (
-    INSPECT_FLAGS,
-    REAL_FS,
-    FileSystem,
-    close_quietly,
-)
+from ironbird.fsops import INSPECT_FLAGS, REAL_FS, FileSystem, close_quietly, read_capped
+from ironbird.offloop import OffLoop, OffLoopBusy
 
 STATE_NAME: Final = "sequence-state.json"
 LOCK_NAME: Final = "sequence-state.lock"
+LIVE_NAME: Final = "sequence-live"
+INVALID_NAME: Final = STATE_NAME + ".invalid"
 SCHEMA: Final = 1
-MAX_BYTES: Final = 32768
-MAX_ENTRIES: Final = 128
-MAX_KEY_LEN: Final = 120
-SPAN: Final = 1 << 64  # marks are kept modulo this; any sequence field is narrower
-BLOCK: Final = 64  # counts reserved per lock, write and sync
-LOCK_TRIES: Final = 100  # x 10 ms: the one-second bound on waiting for another process
-LOCK_STEP_S: Final = 0.01
-_LOCK_FLAGS: Final = (
+MAX_STREAMS: Final = 4096  # streams with a stored count, all nodes together
+MAX_KEY_LEN: Final = 64
+MAX_BYTES: Final = 384 * 1024
+MAX_COUNT: Final = 1 << 63  # stored counts and ceilings stay below this; any field is narrower
+SPAN: Final = 1 << 64  # what one slot field holds
+BLOCK: Final = 64  # the step: a durable ceiling is at most this far above the next count
+AHEAD_AT: Final = BLOCK // 2  # a long-lived sender raises a ceiling when this many are left
+LOCK_WAIT_S: Final = 10.0  # the bound on every wait for a lock of the state files
+LIVE_SLOTS: Final = 2 * MAX_STREAMS  # load at most one half: short probes
+LIVE_MAGIC: Final = b"IBSQLIV1"
+LIVE_VERSION: Final = 1
+PROBE_ON_LOOP: Final = 16  # slots a take on the loop reads to find a stream it has not cached
+BOOT_ID_PATH: Final = Path("/proc/sys/kernel/random/boot_id")
+
+# header: magic, version, slot count, slot size, flags (0), boot id, host; then its CRC-32
+_HEAD_BODY: Final = struct.Struct("<8sIIII16s64s20x")
+_CRC: Final = struct.Struct("<I")
+HEAD_BYTES: Final = _HEAD_BODY.size + _CRC.size
+# slot: key (ASCII, NUL padded), next, ceiling; then its CRC-32 and four zero bytes
+_SLOT_BODY: Final = struct.Struct(f"<{MAX_KEY_LEN}sQQ")
+_COUNTS: Final = struct.Struct("<QQ")
+SLOT_BYTES: Final = _SLOT_BODY.size + _CRC.size + 4
+LIVE_BYTES: Final = HEAD_BYTES + LIVE_SLOTS * SLOT_BYTES
+_EMPTY_SLOT: Final = bytes(SLOT_BYTES)
+_PAD: Final = b"\0\0\0\0"
+
+assert HEAD_BYTES == 128 and SLOT_BYTES == 88, "the live layout is fixed"
+assert MAX_STREAMS * (MAX_KEY_LEN + 24) + 32 <= MAX_BYTES, "a full durable file fits its cap"
+assert LIVE_SLOTS >= 2 * MAX_STREAMS and LIVE_SLOTS & (LIVE_SLOTS - 1) == 0
+assert BLOCK >= 2 and 0 < AHEAD_AT < BLOCK and MAX_COUNT + 4 * BLOCK < SPAN
+
+_OPEN_FLAGS: Final = (
     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 )
-
-assert MAX_ENTRIES * (MAX_KEY_LEN + 32) + 64 <= MAX_BYTES, "a full file fits the size cap"
+_BUSY: Final = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EINTR})
+# what makes a state directory unusable from the start, so that counting in memory is the only way
+_UNUSABLE: Final = frozenset(
+    {
+        errno.EROFS,
+        errno.EACCES,
+        errno.EPERM,
+        errno.ENOLCK,
+        errno.EOPNOTSUPP,
+        errno.ENOSPC,
+        errno.EDQUOT,
+        errno.ENOTDIR,
+        errno.EISDIR,
+        errno.ELOOP,
+        errno.EEXIST,
+        errno.EINVAL,
+    }
+)
 
 _T = TypeVar("_T")
+Row = tuple[str, str, int, int]  # (node stem, kind, MID, next count)
+Stored = tuple[str, str, int, int, int]  # (node stem, kind, MID, next count, durable ceiling)
 
-
-_STEM_LIMIT: Final = MAX_KEY_LEN - 32  # room for "/telemetry/0x" and a 64-bit MID
 _KINDS: Final = ("command", "telemetry")
+_KEY_RE: Final = re.compile(rf"[A-Za-z0-9_~/\-]{{1,{MAX_KEY_LEN}}}")
+_STEM_RE: Final = re.compile(r"[A-Za-z0-9_\-]{1,32}")  # what a configured node name can be
+_STEM_LIMIT: Final = MAX_KEY_LEN - len("/telemetry/0x") - 16  # room for a 64-bit MID
+assert _STEM_LIMIT >= 32
 
 
 def node_stem(node: str) -> str:
-    """The node's part of a key. A long node name is cut and tagged with a digest, so two names
-    never share a stem and a key stays within :data:`MAX_KEY_LEN`."""
-    if len(node) <= _STEM_LIMIT:
+    """The node's part of a key: the name itself when it is a configured node name. Any other
+    text is cut to the key alphabet and tagged with a digest, so two names never share a stem."""
+    if _STEM_RE.fullmatch(node):
         return node
     digest = hashlib.sha256(node.encode("utf-8", "surrogatepass")).hexdigest()[:16]
-    return node[: _STEM_LIMIT - 17] + "~" + digest
+    return re.sub(r"[^A-Za-z0-9_\-]", "", node)[: _STEM_LIMIT - 17] + "~" + digest
 
 
 def key_of(node: str, kind: str, mid: int) -> str:
     """The state key of a stream: ``<node>/<kind>/<mid in hex>``."""
     assert kind in _KINDS and 0 <= mid < SPAN
-    return f"{node_stem(node)}/{kind}/{mid:#06x}"
+    key = f"{node_stem(node)}/{kind}/{mid:#06x}"
+    assert _KEY_RE.fullmatch(key), key
+    return key
 
 
 def parse_key(key: str) -> tuple[str, str, int] | None:
-    """``(node stem, kind, MID)`` of a key, or ``None`` for a key this module did not write."""
+    """``(node stem, kind, MID)`` of a key spelled exactly as :func:`key_of` writes it."""
     stem, _, rest = key.rpartition("/")
     stem, _, kind = stem.rpartition("/")
     if not stem or kind not in _KINDS or not rest.startswith("0x"):
         return None
     try:
-        return stem, kind, int(rest, 16)
+        mid = int(rest, 16)
     except ValueError:
         return None
+    if mid >= SPAN or rest != f"{mid:#06x}" or not _KEY_RE.fullmatch(key):
+        return None  # one stream has one spelling
+    return stem, kind, mid
+
+
+def stream_text(key: str) -> str:
+    """A key as a message names it: ``fc command 0x1890``."""
+    parsed = parse_key(key)
+    return f"{parsed[0]} {parsed[1]} 0x{parsed[2]:04X}" if parsed else key
 
 
 def _refuse(token: str) -> object:
@@ -109,8 +195,8 @@ def _refuse(token: str) -> object:
 
 
 def parse_state(raw: bytes) -> dict[str, int] | None:
-    """The marks a file holds, or ``None`` for anything that is not exactly
-    ``{"v": 1, "next": {"<key>": <int in [0, 2**64)>, ...}}`` within the size limits."""
+    """The durable ceilings a file holds, or ``None`` for anything that is not exactly
+    ``{"v": 1, "next": {"<key>": <int in [0, MAX_COUNT)>, ...}}`` within the limits."""
     if not raw or len(raw) > MAX_BYTES:
         return None
     try:
@@ -120,275 +206,407 @@ def parse_state(raw: bytes) -> dict[str, int] | None:
     if not isinstance(data, dict) or set(data) != {"v", "next"} or data["v"] != SCHEMA:
         return None
     marks = data["next"]
-    if not isinstance(marks, dict) or len(marks) > MAX_ENTRIES:
+    if not isinstance(marks, dict) or len(marks) > MAX_STREAMS:
         return None
     out: dict[str, int] = {}
     for key, value in marks.items():
-        if not isinstance(key, str) or not key or len(key) > MAX_KEY_LEN:
+        if not isinstance(key, str) or not _KEY_RE.fullmatch(key):
             return None
-        if type(value) is not int or not 0 <= value < SPAN:
+        if type(value) is not int or not 0 <= value < MAX_COUNT:
             return None
         out[key] = value
     return out
 
 
 def render_state(marks: Mapping[str, int]) -> bytes:
-    """The file's content; the least recently reserved keys go first when there are too many."""
-    kept = dict(list(marks.items())[-MAX_ENTRIES:])
-    while True:
-        data = json.dumps({"v": SCHEMA, "next": kept}, separators=(",", ":")).encode("ascii")
-        if len(data) < MAX_BYTES or not kept:  # keys of escaped characters can be long
-            return data + b"\n"
-        kept.pop(next(iter(kept)))
+    """The durable file's content. Never drops a key: the caller keeps to :data:`MAX_STREAMS`."""
+    assert len(marks) <= MAX_STREAMS
+    assert all(_KEY_RE.fullmatch(k) and 0 <= v < SPAN for k, v in marks.items())
+    data = json.dumps({"v": SCHEMA, "next": dict(sorted(marks.items()))}, separators=(",", ":"))
+    out = data.encode("ascii") + b"\n"
+    assert len(out) <= MAX_BYTES  # the key alphabet needs no escapes
+    return out
+
+
+def read_boot_id() -> bytes:
+    """16 bytes that name this boot of the machine. Raises ``OSError`` when there are none."""
+    raw = read_capped(BOOT_ID_PATH, 64)
+    try:
+        return uuid.UUID(raw.decode("ascii").strip()).bytes
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise OSError(errno.EINVAL, f"{BOOT_ID_PATH} holds no boot id") from exc
+
+
+def _host() -> bytes:
+    return os.uname().nodename.encode("utf-8", "replace")[:64]
+
+
+# -- the live table's layout ---------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Slot:
+    key: str  # "" for an empty slot
+    next: int
+    ceiling: int
+
+
+_EMPTY: Final = _Slot("", 0, 0)
+
+
+class _Garbage(Exception):
+    """A slot of the live table that no ironbird process wrote."""
+
+
+def _pack_slot(key: str, next_: int, ceiling: int) -> bytes:
+    assert _KEY_RE.fullmatch(key) and 0 <= next_ <= ceiling < SPAN
+    body = _SLOT_BODY.pack(key.encode("ascii"), next_, ceiling)
+    return body + _CRC.pack(zlib.crc32(body)) + _PAD
+
+
+def _unpack_slot(raw: bytes) -> _Slot:
+    if raw == _EMPTY_SLOT:
+        return _EMPTY
+    if len(raw) != SLOT_BYTES or raw[-4:] != _PAD:
+        raise _Garbage
+    body = raw[: _SLOT_BODY.size]
+    if _CRC.unpack_from(raw, _SLOT_BODY.size)[0] != zlib.crc32(body):
+        raise _Garbage
+    padded, next_, ceiling = _SLOT_BODY.unpack(body)
+    try:
+        key = padded.rstrip(b"\0").decode("ascii")
+    except UnicodeDecodeError:
+        raise _Garbage from None
+    if not _KEY_RE.fullmatch(key) or not next_ <= ceiling < MAX_COUNT + 4 * BLOCK:
+        raise _Garbage
+    return _Slot(key, next_, ceiling)
+
+
+@functools.lru_cache(maxsize=1024)
+def _padded(key: str) -> bytes:
+    """A key as a slot holds it (the take on the loop compares and writes it as bytes)."""
+    assert _KEY_RE.fullmatch(key)
+    return key.encode("ascii").ljust(MAX_KEY_LEN, b"\0")
+
+
+def _own_slot(raw: bytes, padded: bytes) -> tuple[int, int] | None:
+    """``(next, ceiling)`` of a slot that holds the key ``padded``, checked as
+    :func:`_unpack_slot` checks it; ``None`` for any other slot (including a damaged one)."""
+    if len(raw) != SLOT_BYTES or not raw.startswith(padded) or raw[-4:] != _PAD:
+        return None
+    if _CRC.unpack_from(raw, _SLOT_BODY.size)[0] != zlib.crc32(raw[: _SLOT_BODY.size]):
+        return None
+    next_, ceiling = _COUNTS.unpack_from(raw, MAX_KEY_LEN)
+    if not next_ <= ceiling < MAX_COUNT + 4 * BLOCK:
+        return None
+    return next_, ceiling
+
+
+def _pack_own_slot(padded: bytes, next_: int, ceiling: int) -> bytes:
+    assert len(padded) == MAX_KEY_LEN and 0 <= next_ <= ceiling < SPAN
+    body = padded + _COUNTS.pack(next_, ceiling)
+    return body + _CRC.pack(zlib.crc32(body)) + _PAD
+
+
+def _home(key: str) -> int:
+    digest = hashlib.blake2b(key.encode("ascii"), digest_size=8).digest()
+    return int.from_bytes(digest, "little") & (LIVE_SLOTS - 1)
+
+
+def _offset(index: int) -> int:
+    assert 0 <= index < LIVE_SLOTS
+    return HEAD_BYTES + index * SLOT_BYTES
+
+
+def _pack_head(boot: bytes) -> bytes:
+    assert len(boot) == 16
+    body = _HEAD_BODY.pack(LIVE_MAGIC, LIVE_VERSION, LIVE_SLOTS, SLOT_BYTES, 0, boot, _host())
+    return body + _CRC.pack(zlib.crc32(body))
+
+
+def _backoff(step: float, waited: float) -> float:
+    """The next pause of a poll for a lock: short while the holder is likely a take or a sync
+    (microseconds to milliseconds), longer once it has held on for a while."""
+    if waited < 0.1:
+        return min(max(step * 2, 50e-6), 1e-3)
+    return 0.01
+
+
+def _pwrite_all(fs: FileSystem, fd: int, data: bytes, offset: int) -> None:
+    view = memoryview(data)
+    done = 0
+    while done < len(view):
+        count = fs.pwrite(fd, view[done:], offset + done)
+        if count <= 0:
+            raise OSError(errno.EIO, "write made no progress")
+        done += count
+
+
+class _Table:
+    """The live table behind one descriptor whose ``flock`` the caller holds."""
+
+    def __init__(self, fs: FileSystem, fd: int) -> None:
+        self._fs: Final = fs
+        self._fd: Final = fd
+
+    def problem(self, boot: bytes) -> str | None:
+        """Why the table cannot be used as it is: ``""`` for a new (empty) file, a phrase for a
+        foreign, damaged or stale one, ``None`` when it is good."""
+        size = self._fs.fstat(self._fd).st_size
+        if size == 0:
+            return ""
+        if size != LIVE_BYTES:
+            return f"is {size} bytes, not {LIVE_BYTES}"
+        raw = self._fs.pread(self._fd, HEAD_BYTES, 0)
+        if len(raw) != HEAD_BYTES:
+            return "is not a sequence table"
+        body = raw[: _HEAD_BODY.size]
+        magic, version, slots, slot_size, flags, written, host = _HEAD_BODY.unpack(body)
+        if _CRC.unpack_from(raw, _HEAD_BODY.size)[0] != zlib.crc32(body):
+            return "is not a sequence table"
+        if magic != LIVE_MAGIC or flags != 0:
+            return "is not a sequence table"
+        if (version, slots, slot_size) != (LIVE_VERSION, LIVE_SLOTS, SLOT_BYTES):
+            return "is a sequence table of another version"
+        if written != boot:
+            if host.rstrip(b"\0") != _host():
+                return "was written on another host (keep one state directory per host)"
+            return "is from an earlier boot of this machine"
+        return None
+
+    def read(self, index: int) -> _Slot:
+        return _unpack_slot(self._fs.pread(self._fd, SLOT_BYTES, _offset(index)))
+
+    def write(self, index: int, key: str, next_: int, ceiling: int) -> None:
+        _pwrite_all(self._fs, self._fd, _pack_slot(key, next_, ceiling), _offset(index))
+
+    def find(self, key: str) -> tuple[int, _Slot]:
+        """The slot of ``key``, or the empty slot where it would go (``(-1, _EMPTY)`` when the
+        table is full). Raises :class:`_Garbage` at a damaged slot on the way."""
+        home = _home(key)
+        for step in range(LIVE_SLOTS):
+            index = (home + step) & (LIVE_SLOTS - 1)
+            slot = self.read(index)
+            if not slot.key or slot.key == key:
+                return index, slot
+        return -1, _EMPTY
+
+    def entries(self) -> dict[str, tuple[int, _Slot]]:
+        """Every stream in the table. Raises :class:`_Garbage` when any slot is damaged."""
+        raw = self._fs.pread(self._fd, LIVE_BYTES - HEAD_BYTES, HEAD_BYTES)
+        if len(raw) != LIVE_BYTES - HEAD_BYTES:
+            raise _Garbage
+        out: dict[str, tuple[int, _Slot]] = {}
+        for index in range(LIVE_SLOTS):
+            start = index * SLOT_BYTES
+            slot = _unpack_slot(raw[start : start + SLOT_BYTES])
+            if slot.key:
+                if slot.key in out:
+                    raise _Garbage  # one stream, two slots
+                out[slot.key] = (index, slot)
+        return out
+
+    def wipe(self, boot: bytes) -> None:
+        """Every slot empty, the header this boot's."""
+        self._fs.ftruncate(self._fd, 0)
+        self._fs.ftruncate(self._fd, LIVE_BYTES)
+        _pwrite_all(self._fs, self._fd, _pack_head(boot), 0)
+
+
+# -- worker-thread transactions ------------------------------------------------------------
+
+
+class _LockTimeout(Exception):
+    def __init__(self, name: str) -> None:
+        super().__init__(f"{name} stayed locked by another process")
+        self.name = name
+
+
+class _Unusable(Exception):
+    """The state directory cannot hold the counts at all (decided when the store opens)."""
+
+    def __init__(self, why: str, cause: BaseException) -> None:
+        super().__init__(why)
+        self.why = why
+        self.cause = cause
+
+
+class _Full(Exception):
+    def __init__(self, key: str) -> None:
+        super().__init__(key)
+        self.key = key
+
+
+@dataclass(frozen=True, slots=True)
+class _Config:
+    directory: Path
+    fs: FileSystem
+    block: int
+    boot_id: Callable[[], bytes]
 
 
 @dataclass(slots=True)
-class _Block:
-    next: int  # the next count to hand out
-    end: int  # one past the last count reserved for this process
+class _Durable:
+    marks: dict[str, int]
+    invalid: str | None = None  # why the file on disk was refused
+    details: str = ""
 
 
-class SequenceStore:
-    """The counts of one process. Not thread-safe: one event loop uses it."""
+@dataclass(frozen=True, slots=True)
+class _Main:
+    """The descriptors a take on the loop uses: the directory and the live table."""
 
-    def __init__(
-        self,
-        directory: Path,
-        *,
-        report: Callable[[IronbirdError], None],
-        record: Callable[[str, dict[str, Any]], object] = lambda event, fields: None,
-        fs: FileSystem = REAL_FS,
-        block: int = BLOCK,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
-        assert block > 0
-        self._directory: Final = directory
-        self._report: Final = report
-        self._record: Final = record
-        self._fs: Final = fs
-        self._block: Final = block
-        self._sleep: Final = sleep
-        self._blocks: dict[str, _Block] = {}
-        self._memory: dict[str, int] = {}
-        self._persist = True
-        self._saw_invalid = False  # the file read in this transaction was invalid
+    dir_fd: int
+    fd: int
+    ident: tuple[int, int]  # (st_dev, st_ino) of the live file
+
+
+@dataclass(slots=True)
+class _Plan:
+    index: int
+    before: _Slot
+    durable: int  # the stream's durable ceiling before the transaction
+    ceiling: int  # the new ceiling, durable before any slot holds it
+    seat_next: int | None = None
+
+
+@dataclass(slots=True)
+class _Outcome:
+    result: Any = None
+    failure: BaseException | None = None
+    events: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    warnings: list[IronbirdError] = field(default_factory=list)
+
+
+def _check_ours(fs: FileSystem, fd: int, name: str) -> os.stat_result:
+    st = fs.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
+        raise OSError(errno.EPERM, f"{name} is not a plain file of this user")
+    return st
+
+
+class _Files:
+    """The state files as one worker-thread transaction sees them. It owns every descriptor it
+    opens (except the ones :meth:`open_main` hands to the loop) and gives its records and
+    warnings back with the outcome, for the loop to deliver."""
+
+    def __init__(self, cfg: _Config, deadline: float, out: _Outcome) -> None:
+        self._cfg: Final = cfg
+        self._deadline: Final = deadline
+        self._out: Final = out
+        self._durable_held = False
+        self._boot: bytes | None = None
 
     @property
-    def persistent(self) -> bool:
-        """Whether counts still come from the state file (``False`` after ``IB-SEQ-002``)."""
-        return self._persist
+    def boot(self) -> bytes:
+        if self._boot is None:
+            self._boot = self._cfg.boot_id()
+        return self._boot
 
-    def for_node(self, node: str) -> NodeSequences:
-        return NodeSequences(self, node)
+    def _event(self, event: str, **fields: Any) -> None:
+        self._out.events.append((event, fields))
 
-    # -- the two operations -----------------------------------------------------------
-
-    def take(self, key: str) -> int:
-        """The next count of ``key`` (not reduced to a field width)."""
-        if self._persist:
-            block = self._blocks.get(key)
-            if block is None or block.next >= block.end:
-                start = self._reserve(key, None)
-                if start is not None:
-                    block = self._blocks[key] = _Block(start, start + self._block)
-            if self._persist:
-                assert block is not None and block.next < block.end
-                block.next += 1
-                return block.next - 1
-        return self._take_memory(key)
-
-    def seat(self, key: str, value: int) -> None:
-        """Make ``value`` the last count handed out: the next :meth:`take` gives ``value + 1``."""
-        assert 0 <= value < SPAN
-        if self._persist:
-            start = self._reserve(key, value + 1)
-            if start is not None:
-                self._blocks[key] = _Block(start, start + self._block)
+    def _flock(self, fd: int, operation: int, name: str) -> None:
+        started = time.monotonic()
+        step = 0.0
+        while True:
+            try:
+                self._cfg.fs.flock(fd, operation | fcntl.LOCK_NB)
                 return
-        self._memory[key] = value + 1
-        self._blocks.pop(key, None)
+            except OSError as exc:
+                if exc.errno not in _BUSY:
+                    raise
+            now = time.monotonic()
+            if now >= self._deadline:
+                raise _LockTimeout(name)
+            step = _backoff(step, now - started)
+            time.sleep(min(step, self._deadline - now))
 
-    def _take_memory(self, key: str) -> int:
-        count = self._memory.get(key)
-        if count is None:  # carries on from the reserved block, if there was one
-            block = self._blocks.get(key)
-            count = block.next if block is not None else 0
-        self._memory[key] = count + 1
-        return count
-
-    def close(self) -> None:
-        """Give back the counts no packet used, where nobody reserved after this process."""
-        if not self._persist or not self._blocks:
-            return
-        held = {key: block for key, block in self._blocks.items() if block.next < block.end}
-        self._blocks.clear()
-        if not held:
-            return
-
-        def release(marks: dict[str, int]) -> list[str]:
-            given: list[str] = []
-            for key, block in held.items():
-                if marks.get(key) == block.end % SPAN:
-                    marks[key] = block.next % SPAN
-                    given.append(key)
-            return given
-
+    def _present(self) -> bool:
         try:
-            given = self._transact(release)
-        except OSError as exc:
-            # skipped counts are harmless and nothing the user can act on: ledgered only
-            self._record("sequence.release_failed", {"reason": _reason(exc)})
-            return
-        self._record("sequence.release", {"keys": given})
+            fd = self._cfg.fs.open_dir(self._cfg.directory)
+        except FileNotFoundError:
+            return False
+        close_quietly(self._cfg.fs, fd)
+        return True
 
-    # -- inspection and reset (ib seq) --------------------------------------------------
-
-    def stored(self) -> list[tuple[str, str, int, int]]:
-        """Every stored stream as ``(node stem, kind, MID, mark)``, sorted. Raises
-        :class:`IronbirdError` (``IB-SEQ-003``) when the file cannot be read."""
-        marks = self._ask(dict)
-        found = [(*parsed, mark) for key, mark in marks.items() if (parsed := parse_key(key))]
-        return sorted(found)
-
-    def forget(
-        self, node: str | None = None, mid: int | None = None
-    ) -> list[tuple[str, str, int, int]]:
-        """Remove the stored counts of the streams of ``node`` (all nodes when ``None``), of MID
-        ``mid`` (all MIDs when ``None``), so the next send of each starts at 0, for a store that
-        holds no block of its own (the command line's). Returns what was removed as in
-        :meth:`stored`. Raises :class:`IronbirdError` (``IB-SEQ-003``)."""
-        stem = None if node is None else node_stem(node)
-
-        def drop(marks: dict[str, int]) -> list[tuple[str, str, int, int]]:
-            gone: list[tuple[str, str, int, int]] = []
-            for key in list(marks):
-                parsed = parse_key(key)
-                if stem is None and mid is None:
-                    chosen = True  # everything, a key of another writer included
-                elif parsed is None:
-                    chosen = False
-                else:
-                    chosen = (stem is None or parsed[0] == stem) and (
-                        mid is None or parsed[2] == mid
-                    )
-                if chosen:
-                    mark = marks.pop(key)
-                    if parsed is not None:
-                        gone.append((*parsed, mark))
-            return sorted(gone)
-
-        return self._ask(drop)
-
-    def _ask(self, change: Callable[[dict[str, int]], _T]) -> _T:
+    @contextmanager
+    def _durable_lock(self) -> Generator[int]:
+        """The durable lock, held for the block; yields the directory descriptor."""
+        fs = self._cfg.fs
+        fs.mkdir_p(self._cfg.directory)
+        dir_fd = fs.open_dir(self._cfg.directory)
         try:
-            return self._transact(change)
-        except OSError as exc:
-            raise IronbirdError(
-                Code.SEQ_STATE,
-                f"cannot use the sequence counts in {self._directory} ({_reason(exc)}); "
-                "check the directory or set IRONBIRD_STATE_DIR",
-                details=f"{type(exc).__name__}: {exc}",
-                cause=exc,
-            ) from exc
-
-    # -- the state file ---------------------------------------------------------------
-
-    def _reserve(self, key: str, start: int | None) -> int | None:
-        """Reserve a block for ``key`` in the file and return its first count: the mark, or
-        ``start`` when given (the mark then moves to the end of the block from there). ``None``
-        when the file cannot be used; counting then goes on in memory."""
-
-        def reserve(marks: dict[str, int]) -> int:
-            first = marks.get(key, 0) if start is None else start
-            marks.pop(key, None)  # the newest reservation goes last: the oldest drop first
-            marks[key] = (first + self._block) % SPAN
-            return first
-
-        try:
-            first = self._transact(reserve)
-        except OSError as exc:
-            self._fall_back(exc)
-            return None
-        self._record(
-            "sequence.reserve", {"key": key, "first": first, "count": self._block, "seat": start}
-        )
-        return first
-
-    def _fall_back(self, exc: BaseException) -> None:
-        self._persist = False
-        why = _reason(exc)
-        self._record("sequence.memory_only", {"directory": str(self._directory), "reason": why})
-        self._report(
-            IronbirdError(
-                Code.SEQ_UNSAVED,
-                f"cannot keep sequence counts in {self._directory} ({why}); counting in memory, "
-                "so every ib process starts at 0 (set IRONBIRD_STATE_DIR to a writable "
-                "directory)",
-                details=f"{type(exc).__name__}: {exc}",
-                cause=exc,
-            )
-        )
-
-    def _transact(self, change: Callable[[dict[str, int]], _T]) -> _T:
-        """Under the lock: read the marks, apply ``change``, and replace the file if it changed
-        them. Raises ``OSError`` when the directory, the lock or the replacement fails."""
-        fs = self._fs
-        fs.mkdir_p(self._directory)
-        dir_fd = fs.open_dir(self._directory)
-        lock_fd = -1
-        try:
-            lock_fd = self._lock(dir_fd)
-            self._saw_invalid = False
-            marks = self._read(dir_fd)
-            before = dict(marks)
-            result = change(marks)
-            if self._saw_invalid or marks != before or list(marks) != list(before):
-                self._write(marks)  # an invalid file is replaced by what is valid now
-            return result
-        finally:
-            if lock_fd >= 0:
+            lock_fd = fs.open_at(dir_fd, LOCK_NAME, _OPEN_FLAGS, 0o600)
+            try:
+                _check_ours(fs, lock_fd, LOCK_NAME)
+                self._flock(lock_fd, fcntl.LOCK_EX, LOCK_NAME)
+                self._durable_held = True
+                try:
+                    yield dir_fd
+                finally:
+                    self._durable_held = False
+            finally:
                 close_quietly(fs, lock_fd)  # closing the descriptor releases the lock
+        finally:
             close_quietly(fs, dir_fd)
 
-    def _lock(self, dir_fd: int) -> int:
-        fs = self._fs
-        fd = fs.open_at(dir_fd, LOCK_NAME, _LOCK_FLAGS, 0o600)
+    def _open_live(self, dir_fd: int) -> tuple[int, os.stat_result]:
+        fs = self._cfg.fs
+        fd = fs.open_at(dir_fd, LIVE_NAME, _OPEN_FLAGS, 0o600)
         try:
-            st = fs.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
-                raise OSError(errno.EPERM, f"{LOCK_NAME} is not a regular file of this user")
-            for _ in range(LOCK_TRIES):
-                try:
-                    fs.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except OSError as exc:
-                    if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-                        self._sleep(LOCK_STEP_S)
-                        continue
-                    raise  # no usable lock here: handing out counts unlocked could repeat them
-                return fd
-            raise OSError(errno.ETIMEDOUT, "another process held the lock for over a second")
+            return fd, _check_ours(fs, fd, LIVE_NAME)
         except BaseException:
             close_quietly(fs, fd)
             raise
 
-    def _read(self, dir_fd: int) -> dict[str, int]:
-        """The marks in the file; an invalid file is reported (``IB-SEQ-001``) and counts as
-        empty, a missing one is just empty."""
-        fs = self._fs
+    @contextmanager
+    def _table(self, dir_fd: int) -> Generator[_Table]:
+        """The live table under its lock, rebuilt first when it cannot be used as it is."""
+        assert self._durable_held, "the table's layout changes only under the durable lock"
+        fs = self._cfg.fs
+        fd, _ = self._open_live(dir_fd)
+        try:
+            self._flock(fd, fcntl.LOCK_EX, LIVE_NAME)
+            table = _Table(fs, fd)
+            why = table.problem(self.boot)
+            if why is not None:
+                self._rebuild(table, why)
+            yield table
+        finally:
+            close_quietly(fs, fd)
+
+    def _rebuild(self, table: _Table, why: str) -> None:
+        table.wipe(self.boot)
+        path = self._cfg.directory / LIVE_NAME
+        if not why:
+            self._event("sequence.live_created", path=str(path))
+            return
+        self._event("sequence.rebuilt", path=str(path), why=why)
+        self._out.warnings.append(
+            IronbirdError(
+                Code.SEQ_LIVE,
+                f"{path} {why}; rebuilt, so every stream carries on from its stored ceiling (up "
+                f"to {self._cfg.block} counts skipped per stream)",
+            )
+        )
+
+    def _read_durable(self, dir_fd: int, *, inspect: bool = False) -> _Durable:
+        fs = self._cfg.fs
         try:
             fd = fs.open_at(dir_fd, STATE_NAME, INSPECT_FLAGS)
         except FileNotFoundError:
-            return {}
+            return _Durable({})
         except OSError as exc:
-            if exc.errno == errno.ELOOP:  # a symbolic link
-                return self._invalid("is a symbolic link")
+            if exc.errno == errno.ELOOP:
+                return self._invalid("is a symbolic link", "", inspect)
             raise
         try:
             st = fs.fstat(fd)
             if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
-                return self._invalid("is not a plain file of this user")
+                return self._invalid("is not a plain file of this user", "", inspect)
             if st.st_size > MAX_BYTES:
-                return self._invalid(f"is over {MAX_BYTES} bytes")
+                return self._invalid(f"is over {MAX_BYTES} bytes", f"{st.st_size} bytes", inspect)
             raw = fs.pread(fd, MAX_BYTES + 1, 0)
         finally:
             close_quietly(fs, fd)
@@ -396,45 +614,751 @@ class SequenceStore:
         if marks is None:
             digest = hashlib.sha256(raw).hexdigest()[:16]
             return self._invalid(
-                "is not valid sequence state", f"{len(raw)} bytes, sha256 {digest}..."
+                "is not valid sequence state", f"{len(raw)} bytes, sha256 {digest}...", inspect
             )
-        return marks
+        return _Durable(marks)
 
-    def _invalid(self, why: str, details: str = "") -> dict[str, int]:
-        path = self._directory / STATE_NAME
-        self._saw_invalid = True
-        self._record("sequence.reset", {"path": str(path), "why": why, "details": details})
-        self._report(
-            IronbirdError(
-                Code.SEQ_RESET,
-                f"{path} {why}; sequence counts restart at 0 and the file is recreated",
-                details=details,
+    def _invalid(self, why: str, details: str, inspect: bool) -> _Durable:
+        if inspect:
+            path = self._cfg.directory / STATE_NAME
+            self._out.warnings.append(
+                IronbirdError(
+                    Code.SEQ_RESET,
+                    f"{path} {why}; left as it is (the next send moves it aside to "
+                    f"{INVALID_NAME}); the counts shown come from the live table",
+                    details=details,
+                )
             )
-        )
-        return {}
+        return _Durable({}, why, details)
 
-    def _write(self, marks: Mapping[str, int]) -> None:
-        data = render_state(marks)
-        with TempOutput(self._directory / STATE_NAME, force=True, fs=self._fs) as out:
-            out.write(data)
+    def _write_durable(self, dir_fd: int, durable: _Durable, marks: Mapping[str, int]) -> None:
+        """Replace the durable file (synced). An invalid one is first moved aside, as evidence."""
+        fs = self._cfg.fs
+        path = self._cfg.directory / STATE_NAME
+        if durable.invalid is not None:
+            with contextlib.suppress(FileNotFoundError):  # gone meanwhile: nothing to keep
+                fs.rename_at(dir_fd, STATE_NAME, INVALID_NAME)
+            self._event(
+                "sequence.reset",
+                path=str(path),
+                why=durable.invalid,
+                details=durable.details,
+                aside=str(self._cfg.directory / INVALID_NAME),
+                kept=len(marks),
+            )
+            self._out.warnings.append(
+                IronbirdError(
+                    Code.SEQ_RESET,
+                    f"{path} {durable.invalid}; moved aside to {INVALID_NAME} and rebuilt from "
+                    "the live table (a stream not sent on since boot restarts at 0)",
+                    details=durable.details,
+                )
+            )
+            durable.invalid = None
+        with TempOutput(path, force=True, fs=fs) as out:
+            out.write(render_state(marks))
             out.commit()
 
+    @staticmethod
+    def _recover(durable: _Durable, table: _Table) -> dict[str, int]:
+        """The durable ceilings, rebuilt from the live table when the file was refused."""
+        if durable.invalid is None:
+            return dict(durable.marks)
+        try:
+            entries = table.entries()
+        except _Garbage:
+            return {}
+        live = sorted(((s.ceiling, k) for k, (_, s) in entries.items() if s.ceiling), reverse=True)
+        return {key: ceiling for ceiling, key in live[:MAX_STREAMS]}
 
-def _reason(exc: BaseException) -> str:
-    if isinstance(exc, OSError):
-        return exc.strerror or type(exc).__name__
-    return str(exc) or type(exc).__name__
+    def _locate(self, table: _Table, key: str, marks: Mapping[str, int]) -> tuple[int, _Slot]:
+        """The slot of ``key``, inserted at its durable ceiling when new (next equal to the
+        ceiling, so a take waits for this transaction to raise it). A damaged slot rebuilds the
+        table; a full table drops the streams that hold nothing (reset ones) and tries again."""
+        for _ in range(3):
+            try:
+                index, slot = table.find(key)
+            except _Garbage:
+                self._rebuild(table, "has a damaged slot")
+                continue
+            if slot.key:
+                return index, slot
+            if index < 0:
+                self._compact(table)
+                continue
+            start = marks.get(key, 0)
+            table.write(index, key, start, start)
+            return index, _Slot(key, start, start)
+        raise _Full(key)
+
+    def _compact(self, table: _Table) -> None:
+        try:
+            kept = [(k, s) for k, (_, s) in table.entries().items() if s.ceiling]
+        except _Garbage:
+            kept = []
+        table.wipe(self.boot)
+        for key, slot in kept:
+            index, empty = table.find(key)
+            assert index >= 0 and not empty.key  # fewer streams than slots
+            table.write(index, key, slot.next, slot.ceiling)
+        self._event("sequence.compacted", kept=len(kept))
+
+    # -- the transactions --------------------------------------------------------------
+
+    def open_main(self) -> _Main:
+        """The descriptors for takes on the loop, with the live table checked (rebuilt under
+        the durable lock when needed). Raises :class:`_Unusable` for a directory that cannot
+        hold the counts at all."""
+        fs = self._cfg.fs
+        try:
+            _ = self.boot  # no boot id, no way to tell a stale table from a live one
+            fs.mkdir_p(self._cfg.directory)
+            dir_fd = fs.open_dir(self._cfg.directory)
+        except OSError as exc:
+            raise _unusable(exc) from exc
+        try:
+            fd, st = self._open_live(dir_fd)
+            try:
+                lock_fd = fs.open_at(dir_fd, LOCK_NAME, _OPEN_FLAGS, 0o600)
+                try:
+                    _check_ours(fs, lock_fd, LOCK_NAME)
+                finally:
+                    close_quietly(fs, lock_fd)
+                self._flock(fd, fcntl.LOCK_SH, LIVE_NAME)
+                try:
+                    why = _Table(fs, fd).problem(self.boot)
+                finally:
+                    fs.flock(fd, fcntl.LOCK_UN)
+                if why is not None:
+                    with self._durable_lock() as locked, self._table(locked):
+                        pass  # rebuilt by _table, under both locks
+                return _Main(dir_fd, fd, (st.st_dev, st.st_ino))
+            except BaseException:
+                close_quietly(fs, fd)
+                raise
+        except OSError as exc:
+            close_quietly(fs, dir_fd)
+            raise _unusable(exc) from exc
+        except BaseException:
+            close_quietly(fs, dir_fd)
+            raise
+
+    def extend(
+        self,
+        keys: Sequence[str],
+        *,
+        need: str | None = None,
+        seat: tuple[str, int] | None = None,
+        ahead: bool = False,
+    ) -> dict[str, int]:
+        """Raise the ceilings of ``keys``: of ``need`` when it has no count left, of the others
+        when ``ahead`` and half a step or less is left; ``seat`` ``(key, n)`` makes the stream
+        hand out ``n + 1`` next. The durable file is replaced (synced) before any slot holds a
+        new ceiling. Returns the slot index of every key."""
+        block = self._cfg.block
+        indices: dict[str, int] = {}
+        with self._durable_lock() as dir_fd:
+            durable = self._read_durable(dir_fd)
+            plans: dict[str, _Plan] = {}
+            with self._table(dir_fd) as table:
+                marks = self._recover(durable, table)
+                for key in keys:
+                    if key not in marks and len(marks) >= MAX_STREAMS:
+                        raise _Full(key)
+                    index, slot = self._locate(table, key, marks)
+                    indices[key] = index
+                    old = marks.get(key, 0)
+                    if seat is not None and seat[0] == key:
+                        first = seat[1] + 1
+                        plans[key] = _Plan(index, slot, old, first + block, first)
+                        continue
+                    left = slot.ceiling - slot.next
+                    if (key == need and left > 0) or (ahead and left > AHEAD_AT):
+                        continue  # raised by another process meanwhile
+                    start = slot.next if slot.ceiling == old else max(slot.next, old)
+                    plans[key] = _Plan(index, slot, old, max(old, start + block))
+            if not plans and durable.invalid is None:
+                return indices
+            for key, plan in plans.items():
+                marks[key] = plan.ceiling
+            self._write_durable(dir_fd, durable, marks)
+            with self._table(dir_fd) as table:
+                for key, plan in plans.items():
+                    index, now = self._locate(table, key, marks)
+                    indices[key] = index
+                    if plan.seat_next is not None:
+                        first = plan.seat_next
+                    elif now.ceiling == plan.durable == plan.before.ceiling:
+                        first = now.next  # contiguous: this table holds the newest step
+                    else:
+                        first = max(now.next, plan.durable)  # another table took up to it
+                    table.write(index, key, first, max(plan.ceiling, first))
+            self._event(
+                "sequence.extend",
+                why="seat" if seat else "ahead" if ahead else "need",
+                streams=[
+                    {"key": k, "from": p.durable, "to": p.ceiling, "next": p.before.next}
+                    for k, p in plans.items()
+                ],
+            )
+        return indices
+
+    def forget(self, stem: str | None, mid: int | None) -> list[Row]:
+        """Drop the stored counts of the chosen streams (everything when both are ``None``, a
+        key of another writer included), so the next take of each starts at 0, in every process
+        at once. Returns what was dropped, with the count each would have handed out next."""
+        if not self._present():
+            return []
+        everything = stem is None and mid is None
+        with self._durable_lock() as dir_fd:
+            durable = self._read_durable(dir_fd)
+            with self._table(dir_fd) as table:
+                marks = self._recover(durable, table)
+                try:
+                    live = table.entries()
+                except _Garbage:
+                    self._rebuild(table, "has a damaged slot")
+                    live = {}
+            gone: list[Row] = []
+            chosen: list[str] = []
+            for key in sorted(set(marks) | {k for k, (_, s) in live.items() if s.ceiling}):
+                parsed = parse_key(key)
+                if parsed is None:
+                    picked = everything
+                else:
+                    picked = (stem is None or parsed[0] == stem) and (
+                        mid is None or parsed[2] == mid
+                    )
+                if not picked:
+                    continue
+                chosen.append(key)
+                if parsed is not None:
+                    nxt = live[key][1].next if key in live else marks.get(key, 0)
+                    gone.append((*parsed, nxt))
+            for key in chosen:
+                marks.pop(key, None)
+            if chosen or durable.invalid is not None:
+                self._write_durable(dir_fd, durable, marks)
+            with self._table(dir_fd) as table:
+                if everything:
+                    table.wipe(self.boot)
+                else:
+                    for key in chosen:
+                        try:
+                            index, slot = table.find(key)
+                        except _Garbage:
+                            self._rebuild(table, "has a damaged slot")
+                            break
+                        if slot.key == key:
+                            table.write(index, key, 0, 0)
+            self._event("sequence.forget", streams=chosen)
+        return gone
+
+    def snapshot(self) -> list[Stored]:
+        """Every stored stream, read only: no file is created, replaced or written."""
+        fs = self._cfg.fs
+        try:
+            dir_fd = fs.open_dir(self._cfg.directory)
+        except FileNotFoundError:
+            return []
+        live: dict[str, tuple[int, _Slot]] = {}
+        try:
+            durable = self._read_durable(dir_fd, inspect=True)
+            try:
+                fd = fs.open_at(dir_fd, LIVE_NAME, INSPECT_FLAGS)
+            except FileNotFoundError:
+                fd = -1
+            if fd >= 0:
+                try:
+                    _check_ours(fs, fd, LIVE_NAME)
+                    self._flock(fd, fcntl.LOCK_SH, LIVE_NAME)
+                    table = _Table(fs, fd)
+                    if table.problem(self.boot) is None:
+                        try:
+                            live = table.entries()
+                        except _Garbage:
+                            live = {}
+                finally:
+                    close_quietly(fs, fd)
+        finally:
+            close_quietly(fs, dir_fd)
+        rows: list[Stored] = []
+        for key in sorted(set(durable.marks) | {k for k, (_, s) in live.items() if s.ceiling}):
+            parsed = parse_key(key)
+            if parsed is None:
+                continue
+            ceiling = durable.marks.get(key, 0)
+            nxt = live[key][1].next if key in live else ceiling
+            rows.append((*parsed, nxt, ceiling))
+        return rows
+
+
+def _unusable(exc: OSError) -> BaseException:
+    if exc.errno in _UNUSABLE:
+        return _Unusable(exc.strerror or type(exc).__name__, exc)
+    return exc
+
+
+def _extend_ahead(keys: Sequence[str], files: _Files) -> dict[str, int]:
+    return files.extend(keys, ahead=True)
+
+
+def _run(cfg: _Config, deadline: float, work: Callable[[_Files], Any]) -> _Outcome:
+    out = _Outcome()
+    try:
+        out.result = work(_Files(cfg, deadline, out))
+    except BaseException as exc:  # handed to the loop, with the records made on the way
+        out.failure = exc
+    return out
+
+
+# -- the store -----------------------------------------------------------------------------
+
+
+class Lease:
+    """One count of one stream, held from the take to the send.
+
+    :attr:`count` is the count to put in the packet (not reduced to a field width). The take's
+    lock is held until :meth:`release`, or with ``span_send`` off until :meth:`commit`, so a
+    sender that hands its packet to the kernel before releasing puts packets on the wire in take
+    order. :meth:`commit` spends the count; a lease released without it hands out nothing."""
+
+    __slots__ = (
+        "_ceiling",
+        "_committed",
+        "_index",
+        "_key",
+        "_released",
+        "_span",
+        "_store",
+        "count",
+    )
+
+    def __init__(
+        self,
+        store: SequenceStore,
+        key: str,
+        count: int,
+        *,
+        index: int | None,
+        ceiling: int,
+        span_send: bool,
+    ) -> None:
+        self._store: Final = store
+        self._key: Final = key
+        self.count: Final = count
+        self._index: Final = index  # the slot to write at commit; None: nothing to write
+        self._ceiling: Final = ceiling
+        self._span: Final = span_send
+        self._committed = False
+        self._released = False
+
+    def commit(self) -> None:
+        """The count is spent from here: the stream's next take gives ``count + 1``. Raises
+        ``IB-SEQ-006`` when the count cannot be recorded; send nothing then."""
+        assert not self._committed and not self._released
+        self._committed = True
+        self._store._commit(self._key, self.count, self._index, self._ceiling)
+        if not self._span:
+            self._store._unlock_main()
+
+    def release(self) -> None:
+        """Let the next take go ahead. Safe to call more than once."""
+        if not self._released:
+            self._released = True
+            self._store._end_lease()
+
+
+class _UnusableError(Exception):
+    def __init__(self, why: str, cause: BaseException) -> None:
+        super().__init__(why)
+        self.why = why
+        self.cause = cause
+
+
+class SequenceStore:
+    """The counts of one process, taken on its event loop. With ``directory`` ``None`` (no
+    state directory) it counts in memory and says so once, giving ``unusable`` as the reason."""
+
+    def __init__(
+        self,
+        directory: Path | None,
+        *,
+        report: Callable[[IronbirdError], None],
+        record: Callable[[str, dict[str, Any]], object] = lambda event, fields: None,
+        fs: FileSystem = REAL_FS,
+        block: int = BLOCK,
+        lock_wait_s: float = LOCK_WAIT_S,
+        boot_id: Callable[[], bytes] = read_boot_id,
+        unusable: str = "no state directory",
+    ) -> None:
+        assert block >= 2 and lock_wait_s > 0
+        self._directory: Final = directory
+        self._report: Final = report
+        self._record: Final = record
+        self._fs: Final = fs
+        self._wait: Final = lock_wait_s
+        self._cfg: Final = _Config(directory, fs, block, boot_id) if directory is not None else None
+        self._offloop: Final[OffLoop[_Outcome]] = OffLoop("sequence-state", 4)
+        self._turn: Final = asyncio.Lock()
+        self._main: _Main | None = None
+        self._main_locked = False
+        self._index: dict[str, int] = {}  # the slot of each stream, checked at every take
+        self._memory: dict[str, int] | None = None
+        self._memory_why: Final = unusable
+        self._opened = False  # open once: from then on no falling back to memory
+        self._ahead = False
+        self._pending: set[str] = set()  # streams to raise ahead (bounded by the streams used)
+        self._raising: frozenset[str] = frozenset()  # what the running raise ahead covers
+        self._prefetch: asyncio.Task[None] | None = None
+
+    @property
+    def persistent(self) -> bool:
+        """Whether counts come from the state directory (``False`` after ``IB-SEQ-002``)."""
+        return self._memory is None and self._cfg is not None
+
+    def for_node(self, node: str) -> NodeSequences:
+        return NodeSequences(self, node)
+
+    def keep_ahead(self) -> None:
+        """Raise ceilings in the background before they are reached (a long-lived sender)."""
+        self._ahead = True
+
+    # -- taking a count ------------------------------------------------------------------
+
+    async def lease(self, key: str, *, seat: int | None = None, span_send: bool = True) -> Lease:
+        """The next count of ``key``, or ``seat`` when given (the stream then goes on from
+        ``seat + 1`` in every process). Raises ``IB-SEQ-005`` or ``IB-SEQ-006``, handing out
+        nothing. Release the lease once the packet is handed off or given up."""
+        assert seat is None or 0 <= seat < MAX_COUNT
+        deadline = time.monotonic() + self._wait
+        if self._turn.locked():  # another send of this process holds it: wait, bounded
+            try:
+                async with asyncio.timeout(self._wait):
+                    await self._turn.acquire()
+            except TimeoutError:
+                raise self._busy(key, "the previous send of this process did not finish") from None
+        else:
+            await self._turn.acquire()  # free: taken without suspending
+        try:
+            return await self._take(key, seat, span_send, deadline)
+        except BaseException:
+            self._end_lease()
+            raise
+
+    async def _take(self, key: str, seat: int | None, span_send: bool, deadline: float) -> Lease:
+        if not await self._ready(key, deadline):
+            assert self._memory is not None
+            count = self._memory.get(key, 0) if seat is None else seat
+            self._memory[key] = count  # commit moves it on
+            return Lease(self, key, count, index=None, ceiling=0, span_send=span_send)
+        if seat is not None:
+            indices = await self._work(key, deadline, lambda f: f.extend([key], seat=(key, seat)))
+            self._remember(indices)
+            await self._lock_main(key, deadline)
+            return Lease(self, key, seat, index=None, ceiling=0, span_send=span_send)
+        while True:
+            await self._lock_main(key, deadline)
+            taken = self._try_take(key)
+            if not isinstance(taken, str):
+                index, count, ceiling = taken
+                return Lease(self, key, count, index=index, ceiling=ceiling, span_send=span_send)
+            self._unlock_main()
+            if taken == "reopen":
+                await self._reopen(key, deadline)
+                continue
+            task = self._prefetch
+            if key in self._raising and task is not None and not task.done():
+                await asyncio.wait({task}, timeout=max(0.0, deadline - time.monotonic()))
+                continue  # raised ahead meanwhile: no second worker contending for the lock
+            self._remember(await self._work(key, deadline, lambda f: f.extend([key], need=key)))
+
+    def _try_take(self, key: str) -> tuple[int, int, int] | Literal["slow", "reopen"]:
+        """Under the live lock: ``(slot, count, ceiling)`` from the stream's slot; ``"slow"``
+        when a worker must act first (a stream not found nearby, no count left, a damaged slot);
+        ``"reopen"`` when the live file is no longer the one this process holds."""
+        main, fs = self._main, self._fs
+        assert main is not None and self._main_locked
+        try:
+            st = fs.stat_at(main.dir_fd, LIVE_NAME)
+            if (st.st_dev, st.st_ino) != main.ident:
+                return "reopen"
+            slot = _EMPTY
+            index = self._index.get(key)
+            if index is not None:
+                raw = fs.pread(main.fd, SLOT_BYTES, _offset(index))
+                own = _own_slot(raw, _padded(key))
+                if own is not None:
+                    if own[0] >= own[1]:
+                        return "slow"
+                    return index, own[0], own[1]
+                slot = _unpack_slot(raw)  # another stream's slot now, or a damaged one
+                index = None
+            if index is None:
+                home = _home(key)
+                for step in range(PROBE_ON_LOOP):
+                    at = (home + step) & (LIVE_SLOTS - 1)
+                    slot = _unpack_slot(fs.pread(main.fd, SLOT_BYTES, _offset(at)))
+                    if not slot.key:
+                        return "slow"
+                    if slot.key == key:
+                        index = at
+                        break
+                else:
+                    return "slow"
+                self._remember({key: index})
+        except FileNotFoundError:
+            return "reopen"
+        except _Garbage:
+            return "slow"
+        except OSError as exc:
+            raise self._failed(key, exc) from exc
+        if slot.next >= slot.ceiling:
+            return "slow"
+        return index, slot.next, slot.ceiling
+
+    def _remember(self, indices: Mapping[str, int]) -> None:
+        if len(self._index) + len(indices) > LIVE_SLOTS:
+            self._index.clear()  # bounded; a stale entry only costs a probe
+        self._index.update(indices)
+
+    def _commit(self, key: str, count: int, index: int | None, ceiling: int) -> None:
+        if self._memory is not None:
+            self._memory[key] = count + 1
+            return
+        if index is None:
+            return  # seated: the worker wrote the slot
+        main = self._main
+        assert main is not None and self._main_locked and count < ceiling
+        try:
+            data = _pack_own_slot(_padded(key), count + 1, ceiling)
+            _pwrite_all(self._fs, main.fd, data, _offset(index))
+        except OSError as exc:
+            raise self._failed(key, exc) from exc
+        if self._ahead and ceiling - (count + 1) <= AHEAD_AT:
+            self._queue_ahead(key)
+
+    def _unlock_main(self) -> None:
+        main = self._main
+        if self._main_locked and main is not None:
+            self._main_locked = False
+            with contextlib.suppress(OSError):  # only a closed descriptor fails; closing unlocked
+                self._fs.flock(main.fd, fcntl.LOCK_UN)
+
+    def _end_lease(self) -> None:
+        self._unlock_main()
+        if self._turn.locked():
+            self._turn.release()
+
+    async def _lock_main(self, key: str, deadline: float) -> None:
+        main = self._main
+        assert main is not None and not self._main_locked
+        started = time.monotonic()
+        step = 0.0
+        while True:
+            try:
+                self._fs.flock(main.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._main_locked = True
+                return
+            except OSError as exc:
+                if exc.errno not in _BUSY:
+                    raise self._failed(key, exc) from exc
+            now = time.monotonic()
+            if now >= deadline:
+                raise self._busy(key, f"{LIVE_NAME} stayed locked by another process")
+            step = _backoff(step, now - started)
+            await asyncio.sleep(min(step, deadline - now))
+
+    # -- opening, workers ------------------------------------------------------------------
+
+    async def _ready(self, key: str, deadline: float) -> bool:
+        """``True`` once the files are open for takes, ``False`` when counting in memory."""
+        if self._memory is not None:
+            return False
+        if self._main is not None:
+            return True
+        if self._cfg is None:
+            self._to_memory(self._memory_why, None)
+            return False
+        try:
+            self._main = await self._work(key, deadline, lambda f: f.open_main())
+        except _UnusableError as exc:
+            if self._opened:  # counts were handed out from the files: memory could repeat them
+                raise self._failed(key, exc.cause) from exc.cause
+            self._to_memory(exc.why, exc.cause)
+            return False
+        self._opened = True
+        return True
+
+    async def _reopen(self, key: str, deadline: float) -> None:
+        old = self._main
+        assert old is not None and not self._main_locked
+        self._main = None
+        self._index.clear()
+        close_quietly(self._fs, old.fd)
+        close_quietly(self._fs, old.dir_fd)
+        self._record("sequence.reopened", {"path": str(self._directory)})
+        self._report(
+            IronbirdError(
+                Code.SEQ_LIVE,
+                f"{self._directory}/{LIVE_NAME} was removed or replaced while in use; counts "
+                "carry on from the stored ceilings",
+            )
+        )
+        if not await self._ready(key, deadline):
+            raise AssertionError("open once, never memory")  # pragma: no cover
+
+    def _to_memory(self, why: str, cause: BaseException | None) -> None:
+        self._memory = {}
+        where = self._directory if self._directory is not None else "the state directory"
+        self._record("sequence.memory_only", {"directory": str(where), "reason": why})
+        self._report(
+            IronbirdError(
+                Code.SEQ_UNSAVED,
+                f"cannot keep sequence counts in {where} ({why}); counting in memory, so every "
+                "ib process starts at 0 (set IRONBIRD_STATE_DIR to a writable directory)",
+                details=f"{type(cause).__name__}: {cause}" if cause is not None else "",
+                cause=cause,
+            )
+        )
+
+    async def _call(self, deadline: float, work: Callable[[_Files], _T]) -> _T:
+        """``work`` in a worker thread. Its records and warnings are delivered here, then its
+        result is returned or its failure raised (:class:`_Unusable` as ``_UnusableError``)."""
+        cfg = self._cfg
+        assert cfg is not None
+        out = await self._offloop.call(lambda: _run(cfg, deadline, work))
+        for event, fields in out.events:
+            self._record(event, fields)
+        for warning in out.warnings:
+            self._report(warning)
+        if out.failure is not None:
+            if isinstance(out.failure, _Unusable):
+                raise _UnusableError(out.failure.why, out.failure.cause)
+            raise out.failure
+        return out.result  # type: ignore[no-any-return]
+
+    async def _work(self, key: str, deadline: float, work: Callable[[_Files], _T]) -> _T:
+        """:meth:`_call` for a take: every failure becomes the take's coded error."""
+        try:
+            return await self._call(deadline, work)
+        except _UnusableError:
+            raise
+        except _LockTimeout as exc:
+            raise self._busy(key, str(exc)) from exc
+        except _Full as exc:
+            self._record("sequence.full", {"key": exc.key, "streams": MAX_STREAMS})
+            raise IronbirdError(
+                Code.SEQ_FULL,
+                f"no sequence count for {stream_text(key)}: {MAX_STREAMS} streams already have "
+                "stored counts; nothing sent (ib seq reset the streams no longer used)",
+            ) from exc
+        except (OSError, OffLoopBusy, RuntimeError) as exc:
+            raise self._failed(key, exc) from exc
+
+    def _busy(self, key: str, what: str) -> IronbirdError:
+        return IronbirdError(
+            Code.SEQ_TAKE,
+            f"no sequence count for {stream_text(key)}: {what} within {self._wait:g} s; nothing "
+            "sent (is another ib process stopped, or the disk hung?)",
+        )
+
+    def _failed(self, key: str, exc: BaseException) -> IronbirdError:
+        why = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+        return IronbirdError(
+            Code.SEQ_TAKE,
+            f"no sequence count for {stream_text(key)} ({why or type(exc).__name__}); nothing "
+            f"sent: check {self._directory} or set IRONBIRD_STATE_DIR",
+            details=f"{type(exc).__name__}: {exc}",
+            cause=exc,
+        )
+
+    # -- keeping ahead ---------------------------------------------------------------------
+
+    def _queue_ahead(self, key: str) -> None:
+        self._pending.add(key)
+        if self._prefetch is None or self._prefetch.done():
+            self._prefetch = asyncio.get_running_loop().create_task(
+                self._run_ahead(), name="sequence-ahead"
+            )
+
+    async def _run_ahead(self) -> None:
+        while self._pending:
+            keys = sorted(self._pending)
+            self._pending.clear()
+            self._raising = frozenset(keys)
+            deadline = time.monotonic() + self._wait
+            try:
+                self._remember(await self._call(deadline, partial(_extend_ahead, keys)))
+            except Exception as exc:  # a take that then finds no count left reports it, coded
+                self._record(
+                    "sequence.ahead_failed",
+                    {"keys": keys, "reason": f"{type(exc).__name__}: {exc}"},
+                )
+            finally:
+                self._raising = frozenset()
+
+    # -- inspection and reset (ib seq) -----------------------------------------------------
+
+    async def stored(self) -> list[Stored]:
+        """Every stored stream, sorted, read without changing any file. Raises ``IB-SEQ-003``."""
+        return await self._ask(lambda f: f.snapshot())
+
+    async def forget(self, node: str | None = None, mid: int | None = None) -> list[Row]:
+        """Drop the stored counts of the streams of ``node`` (all nodes when ``None``) and MID
+        ``mid`` (all MIDs when ``None``): the next take of each, in every process, starts at 0.
+        Returns what was dropped. Raises ``IB-SEQ-003``."""
+        stem = None if node is None else node_stem(node)
+        return await self._ask(lambda f: f.forget(stem, mid))
+
+    async def _ask(self, work: Callable[[_Files], _T]) -> _T:
+        if self._cfg is None:
+            raise IronbirdError(
+                Code.SEQ_STATE,
+                "no usable state directory to keep sequence counts in; set IRONBIRD_STATE_DIR "
+                "to a writable directory",
+            )
+        try:
+            return await self._call(time.monotonic() + self._wait, work)
+        except (OSError, OffLoopBusy, RuntimeError, _LockTimeout, _UnusableError, _Full) as exc:
+            cause: BaseException = exc.cause if isinstance(exc, _UnusableError) else exc
+            why = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+            raise IronbirdError(
+                Code.SEQ_STATE,
+                f"cannot use the sequence counts in {self._directory} ({why}); check the "
+                "directory or set IRONBIRD_STATE_DIR",
+                details=f"{type(cause).__name__}: {cause}",
+                cause=cause,
+            ) from exc
+
+    async def aclose(self) -> None:
+        """Let a background raise finish (bounded), then close the files. Nothing is given back:
+        a stream's next take, in any process, goes on from where this process stopped."""
+        task = self._prefetch
+        if task is not None and not task.done():
+            await asyncio.wait({task}, timeout=self._wait)
+            if not task.done():
+                task.cancel()  # its worker ends on its own; at most a step is skipped
+        self._unlock_main()
+        main, self._main = self._main, None
+        if main is not None:
+            close_quietly(self._fs, main.fd)
+            close_quietly(self._fs, main.dir_fd)
 
 
 class NodeSequences:
-    """The store as one node's codec sees it (see :class:`ironbird.codec.SequenceSource`)."""
+    """The store as one node's sender sees it."""
 
     def __init__(self, store: SequenceStore, node: str) -> None:
         self._store: Final = store
         self._node: Final = node
 
-    def take(self, kind: str, mid: int) -> int:
-        return self._store.take(key_of(self._node, kind, mid))
+    @property
+    def store(self) -> SequenceStore:
+        return self._store
 
-    def seat(self, kind: str, mid: int, value: int) -> None:
-        self._store.seat(key_of(self._node, kind, mid), value)
+    async def lease(
+        self, kind: str, mid: int, *, seat: int | None = None, span_send: bool = True
+    ) -> Lease:
+        key = key_of(self._node, kind, mid)
+        return await self._store.lease(key, seat=seat, span_send=span_send)
