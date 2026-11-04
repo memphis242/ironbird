@@ -4,12 +4,14 @@ temporary output when a signal comes, a worker dies, or the parent is killed."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -234,6 +236,7 @@ def alive(pid: int) -> bool:
 def stopped(pid: int) -> bool:
     """Every thread of ``pid`` is stopped by a job-control signal (a signal sent now waits)."""
     states = []
+    assert Path(f"/proc/{pid}/task").is_dir(), f"process {pid} is gone (no /proc/{pid}/task)"
     for task in Path(f"/proc/{pid}/task").iterdir():
         try:
             states.append((task / "stat").read_text().rsplit(")", 1)[1].split()[0])
@@ -276,6 +279,22 @@ def semaphores() -> set[str]:
     return {p.name for p in shm.glob("sem.mp-*")} if shm.is_dir() else set()
 
 
+JOBS = 3
+_LIVE: list[Stalled] = []
+
+
+@pytest.fixture(autouse=True)
+def _reap_stalled() -> Iterator[None]:
+    """Whatever a test leaves of its stalled exports (it failed before ``finish``) is let go and
+    killed, so no parent or worker outlives the test."""
+    _LIVE.clear()
+    yield
+    runs = list(_LIVE)
+    _LIVE.clear()
+    for run in runs:
+        run.reap()
+
+
 class Stalled:
     """An export of a large recording with the parent held at its first write."""
 
@@ -306,7 +325,7 @@ class Stalled:
                 "-o",
                 str(self.out),
                 "--jobs",
-                "3",
+                str(JOBS),
             ],
             env={**env, "IB_TEST_MARK": str(self.mark), "IB_TEST_GO": str(self.go)},
             stdout=subprocess.DEVNULL,
@@ -315,11 +334,35 @@ class Stalled:
             start_new_session=new_session,
             cwd=tmp_path,
         )
+        self.new_session = new_session
+        self.workers: list[int] = []
+        self.tmp_path = tmp_path
+        _LIVE.append(self)
         wait_until(lambda: self.mark.exists() or self.proc.poll() is not None, what="the stall")
         assert self.proc.poll() is None, "the export ended before the stall"
-        wait_until(lambda: len(workers_of(self.proc.pid)) >= 2, what="the workers")
+        wait_until(lambda: len(workers_of(self.proc.pid)) >= JOBS, what="the workers")
         self.workers = workers_of(self.proc.pid)
-        self.tmp_path = tmp_path
+
+    def reap(self) -> None:
+        """Let the parent go, then kill the run's process group (a run in its own session) or the
+        parent and its workers (a run in the test's own group, which is not to be signalled)."""
+        with contextlib.suppress(OSError):
+            self.go.write_text("go")
+        running = self.proc.poll() is None
+        victims = workers_of(self.proc.pid) if running else []
+        if self.new_session:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.proc.pid, signal.SIGKILL)
+        elif running:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(self.proc.pid, signal.SIGKILL)
+            for pid in victims:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            self.proc.wait(timeout=10)
+        if self.proc.stderr is not None:
+            self.proc.stderr.close()
 
     def temporaries(self) -> list[str]:
         return sorted(p.name for p in self.tmp_path.iterdir() if p.name.endswith(".tmp"))
@@ -388,7 +431,8 @@ def test_ctrl_c_at_a_terminal_reaches_every_process_and_only_the_parent_acts(
         assert all(alive(p) for p in run.workers), "a worker acted on the interrupt"
         assert not any(signal.SIGINT in pending(p) for p in run.workers), "nothing left to act"
     finally:
-        os.kill(run.proc.pid, signal.SIGCONT)
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(run.proc.pid, signal.SIGCONT)
     err = run.finish()
     assert run.proc.returncode == 130, err
     assert "Traceback" not in err
