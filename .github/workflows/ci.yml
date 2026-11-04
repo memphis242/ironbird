@@ -540,6 +540,7 @@ jobs:
           - {target: recording, seconds: 900}    # the recording reader, scan and info
           - {target: replay, seconds: 900}       # replay and the definitions a recording embeds
           - {target: export, seconds: 900}       # export to CSV, text and JSONL
+          - {target: poolframe, seconds: 600}    # the export pool's wire format, worker replies
           - {target: filter, seconds: 600}       # the filter language
           - {target: config, seconds: 600}       # config TOML
           - {target: header_profile, seconds: 600}  # header-profile TOML
