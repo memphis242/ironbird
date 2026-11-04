@@ -9,9 +9,11 @@ on stderr, frames in the recording), never for a fixed time.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
+import termios
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -27,7 +29,7 @@ from ironbird.recording.format import MarkKind
 from ironbird.recording.reader import RecordingReader
 from recutil import Proc, run_ib
 from serialutil import CODEC, hk, serial_config
-from support.ptybridge import PtyBridge
+from support.ptybridge import PtyBridge, PtyDevice
 
 
 @pytest.fixture
@@ -62,6 +64,21 @@ def wait_until(
             assert proc.popen.poll() is None, f"exited while waiting for {what}:\n{proc.stderr}"
         assert time.monotonic() < deadline, f"timed out waiting for {what}"
         time.sleep(0.02)
+
+
+def buffered_until_still(line: PtyDevice, settle_s: float = 0.4) -> int:
+    """The bytes waiting unread on ``line`` once they have stopped growing: the writer is
+    stalled on a full buffer."""
+    last, since = -1, time.monotonic()
+    deadline = since + 30
+    while time.monotonic() < deadline:
+        waiting = int.from_bytes(fcntl.ioctl(line.master, termios.FIONREAD, b"\0\0\0\0"), "little")
+        if waiting != last or waiting == 0:
+            last, since = waiting, time.monotonic()
+        elif time.monotonic() - since >= settle_s:
+            return waiting
+        time.sleep(0.02)
+    raise AssertionError("the line never stalled")
 
 
 def frames_of(path: Path) -> list[Any]:
@@ -126,6 +143,56 @@ def test_ib_send_goes_out_over_the_line_and_the_responder_decodes_it(
     assert len(on_the_line) == len(noop()) == 8
     decoded = CODEC.decode(MessageKind.COMMAND, on_the_line)
     assert not isinstance(decoded, DecodeError) and decoded.message.name == "MOCK_NOOP"
+
+
+def test_a_periodic_series_goes_out_over_the_line_through_the_loop(
+    tmp_path: Path, bridge: PtyBridge, configs: dict[str, Path], env: dict[str, str]
+) -> None:
+    """A serial link has no thread-safe send: the pacer hands each packet through the loop."""
+    env = {**env, "IRONBIRD_STATE_DIR": str(tmp_path / "state")}
+    argv = ["-c", str(configs["ground"]), "send", "fc", "MOCK_NOOP", "--every", "20ms"]
+    sent = run_ib(tmp_path, [*argv, "--repeat", "5"], env)
+    assert sent.returncode == 0, sent.stderr
+    wait_until(lambda: len(bridge.log("b")) >= 5 * len(noop()), "five packets on the line")
+    outcome = next(
+        json.loads(line)
+        for path in (tmp_path / "state").glob("*.jsonl")
+        for line in path.read_text().splitlines()
+        if '"send.outcome"' in line
+    )
+    assert outcome["sent"] == 5 and outcome["pacer"]["direct"] is False
+
+
+def test_a_signal_with_a_packet_part_way_onto_a_stalled_line_marks_and_names_that_packet(
+    tmp_path: Path, env: dict[str, str]
+) -> None:
+    """Nobody reads the line, so its buffer fills and a send stops with only the head of its
+    packet on the line. The stop cuts that send; the ledger says which packet was cut, and the
+    error that reports its discarded tail names the same packet."""
+    env = {**env, "IRONBIRD_STATE_DIR": str(tmp_path / "state")}
+    entries, size = ",".join(str(n) for n in range(64)), 388
+    line = PtyDevice(tmp_path / "tty")
+    try:
+        config = serial_config(tmp_path, "ground.toml", line.path, "ground")
+        argv = ["-c", str(config), "send", "fc", "MOCK_LOAD_DATA", f"Entries={entries}"]
+        proc = Proc(tmp_path, "send", [*argv, f"Text={'x' * 122}", "--repeat", "100000000"], env)
+        try:
+            proc.wait_for("sending")
+            held = buffered_until_still(line)
+            if held % size == 0:
+                pytest.skip("the line filled at a packet boundary: no packet is part way")
+            proc.popen.send_signal(signal.SIGINT)
+        finally:
+            code = proc.finish()
+    finally:
+        line.close()
+    assert code == 128 + int(signal.SIGINT), proc.stderr
+    events = ledger_events(tmp_path)
+    sent = [e for e in events if e["event"] == "tx.command" and e["result"] == "sent"]
+    cut = [e for e in sent if e.get("cut")]
+    assert len(cut) == 1 and cut[0] is sent[-1]  # the last packet sent, and only it
+    torn = [e for e in events if e["event"] == Code.TX_SEND.value and "torn" in e["summary"]]
+    assert len(torn) == 1 and f"sequence count {cut[0]['sequence']}" in torn[0]["summary"]
 
 
 def test_a_second_process_on_a_device_in_use_is_told_it_is_locked(

@@ -18,6 +18,7 @@ import resource
 import shlex
 import signal
 import sys
+import threading
 import time
 import traceback
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
@@ -42,7 +43,7 @@ from ironbird.cli.output import (
     line_codec,
     write_within,
 )
-from ironbird.codec import Codec, parse_ascii_int
+from ironbird.codec import Codec, EncodedPacket, PreparedPacket, parse_ascii_int
 from ironbird.config import (
     MAX_EXPORT_JOBS,
     ExportConfig,
@@ -52,12 +53,13 @@ from ironbird.config import (
     find_config,
     load_config,
 )
-from ironbird.engine import RECORDER
+from ironbird.engine import RECORDER, SETTLE_S
 from ironbird.errors import Code, IronbirdError, counted
 from ironbird.filter import Filter
 from ironbird.fsops import REAL_FS
-from ironbird.ledger import ExitReport, Ledger, default_state_dir
+from ironbird.ledger import ExitReport, Ledger, TxSeries, default_state_dir
 from ironbird.notice import Level, Notice
+from ironbird.pacer import SPIN_NS, Built, Kind, Report, SeriesPacer, ThreadWaiter
 from ironbird.recording import inspect as rec_inspect
 from ironbird.recording.defs import (
     EXPORT_HINT,
@@ -112,8 +114,22 @@ from ironbird.retention import LONG_COMMANDS
 from ironbird.retnotices import Notices
 from ironbird.retservice import Retention
 from ironbird.sanitize import hex_preview
+from ironbird.sendmodes import (
+    Grid,
+    SendPlan,
+    SystemClock,
+    Tally,
+    fmt_ns,
+    iso_utc,
+    outcome_fields,
+    parse_spec,
+    plan_fields,
+    resolve,
+    start_grid,
+    timing_text,
+)
 from ironbird.seqstate import SequenceStore, node_stem
-from ironbird.session import Route, Session, Side
+from ironbird.session import Route, SentCommand, Session, Side
 from ironbird.sigmask import (
     HANDLED_SIGNALS,
     Hold,
@@ -129,6 +145,11 @@ EXIT_OUTPUT_LOST: Final = 4  # the command completed but stdout lines were lost
 EXIT_DAMAGED_INPUT: Final = 5  # output produced, but the input recording was damaged mid-file
 EXIT_UNLOGGED: Final = 6  # a command or reply went out but its ledger record was never written
 STATUS_INTERVAL_S: Final = 5.0  # ``ib record`` status line on stderr
+NS_PER_S: Final = 1_000_000_000
+RAW_ENUM_HINT: Final = "use --raw-enum"
+RAW_ENUM_SHOWN: Final = 3  # raw enum values named in a confirmation line
+SEND_LINE_MAX_RATE: Final = 2.0  # a series up to this many packets/s prints a line for each
+SEND_LINE_MAX_BURST: Final = 10  # a back-to-back series of at most this many does too
 MAX_TIMEOUT_S: Final = 365 * 24 * 3600.0
 OUTPUT_POLL_S: Final = 0.5
 DRAIN_NOTICE_S: Final = 2.0  # waiting this long for the reader of stdout earns one notice
@@ -383,6 +404,10 @@ class _Run:
     retention: Retention | None = None
     # an output complete under its final name, as "the export was written to X" (for a signal)
     wrote: str | None = None
+    # the series of sends (``ib send --repeat/--every``) under way or just ended, kept current
+    # by the series for a signal's notice and for the loss of stdout
+    series: Tally | None = None
+    series_command: str = ""
 
 
 Body = Callable[[Session, SystemConfig, "_Run"], Awaitable[int]]
@@ -514,6 +539,11 @@ async def _main_body(glob: Globals, ledger: Ledger, body: Body, run: _Run) -> in
         return exc.exit_code
 
 
+def _packet_label(command: str, sequence: int | None) -> str:
+    """How an error names a packet of a series: its command and sequence count."""
+    return command if sequence is None else f"{command} sequence count {sequence}"
+
+
 def _interrupt_notice(name: str, signum: int, run: _Run) -> str:
     sig = signal.Signals(signum).name
     tx = run.session.last_tx if run.session is not None else None
@@ -521,6 +551,14 @@ def _interrupt_notice(name: str, signum: int, run: _Run) -> str:
         if run.wrote is not None:
             return f"interrupted ({sig}) after {run.wrote}"
         return f"interrupted ({sig})"
+    if run.series is not None:
+        done = run.series
+        # An interrupted series says so in "interrupted (SIGINT)"; any other end is added.
+        ended = f" (series {done.outcome})" if done.outcome not in ("", "interrupted") else ""
+        return (
+            f"interrupted ({sig}) after {done.sent} of {done.planned} "
+            f"{term(run.series_command)} sends{ended}"
+        )
     if tx is None:
         return f"interrupted ({sig}): no command was built, so nothing was sent"
     if tx.went_out:
@@ -582,6 +620,9 @@ def _record_signal(
         notice=notice,
         tx_command=tx.command if tx else None,
         tx_went_out=tx.went_out if tx else None,
+        series_sent=run.series.sent if run.series else None,
+        series_planned=run.series.planned if run.series else None,
+        series_outcome=(run.series.outcome or None) if run.series else None,
     )
     if not direct:
         console.err(notice)
@@ -632,6 +673,8 @@ def _stdout_loss(console: Console, name: str, run: _Run) -> IronbirdError | None
         return None
     tx = run.session.last_tx if run.session is not None else None
     sent = f"; {tx.command} was sent" if name == "send" and tx is not None and tx.went_out else ""
+    if name == "send" and run.series is not None:
+        sent = f"; {run.series.sent} of {run.series.planned} {term(run.series_command)} sent"
     if out.unavailable:
         summary = f"stdout is closed: {out.lost} line(s) of output could not be shown{sent}"
     else:
@@ -1310,14 +1353,66 @@ def send(
             "data of the variable-length field it sizes.",
         ),
     ] = False,
+    raw_enum: Annotated[
+        bool,
+        typer.Option(
+            "--raw-enum",
+            help="Fault injection: accept an integer outside the field's CCDD enum list for "
+            "this invocation (the CCDD key allow_raw does it for every send).",
+        ),
+    ] = False,
+    at: Annotated[
+        str | None,
+        typer.Option(
+            "--at",
+            metavar="TIME",
+            help="Start at this time: UTC such as 2026-11-04T12:00:00Z (a time with no zone is "
+            "UTC, never local) or an offset from now such as +10s. Must be in the future.",
+        ),
+    ] = None,
+    repeat: Annotated[
+        int | None,
+        typer.Option(
+            "--repeat",
+            metavar="N",
+            help="Send N packets. With --every, a cap on the packets; alone, back to back.",
+        ),
+    ] = None,
+    every: Annotated[
+        str | None,
+        typer.Option(
+            "--every",
+            metavar="DURATION",
+            help="Send one packet per period (1ms, 250ms, 1.5s, 2m; at least 1ms). Needs "
+            "--repeat, --for or --until to end it; the first one reached does.",
+        ),
+    ] = None,
+    until: Annotated[
+        str | None,
+        typer.Option(
+            "--until",
+            metavar="TIME",
+            help="With --every: stop sending at this time (as --at; a packet is sent only "
+            "before it).",
+        ),
+    ] = None,
+    for_: Annotated[
+        str | None,
+        typer.Option(
+            "--for",
+            metavar="DURATION",
+            help="With --every: stop sending this long after the first packet.",
+        ),
+    ] = None,
     sequence: Annotated[
         str | None,
         typer.Option(
             "--sequence",
             metavar="N",
             help="Send with sequence count N (within the header's sequence field) and count on "
-            "from it: the next send gets N+1. Without it the count continues from the last "
-            "send to this node and MID, kept in the state directory across invocations.",
+            "from it: the next send gets N+1. In a series it is the first packet's count. "
+            "Without it the count continues from the last send to this node and MID, kept in "
+            "the state directory across invocations.",
         ),
     ] = None,
     as_node: AsOption = None,
@@ -1326,9 +1421,18 @@ def send(
     """Encode and send one command; print a one-line confirmation.
 
     A variable-length argument is a list (Entries=1,2,3 or Entries=[1,2,3]), text, or hex for
-    bytes; its count or length argument is filled in when left out."""
+    bytes; its count or length argument is filled in when left out.
+
+    Send modes: --at starts later, --repeat N sends N packets, --every P with --repeat,
+    --for or --until sends periodically (see README, "Send modes"). A series ends with a
+    summary of what was sent and skipped and how late the packets were."""
+    invoked_wall_ns = time.time_ns()  # what an offset such as +10s counts from
+
+    def check_modes(_: Session) -> None:
+        resolve(parse_spec(at, repeat, every, until, for_), invoked_wall_ns, time.time_ns())
 
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
+        spec = parse_spec(at, repeat, every, until, for_)
         parsed = _parse_args(args)
         header_values = _parse_header_values(header)
         sequence_value = _parse_sequence(sequence)
@@ -1350,6 +1454,61 @@ def send(
                 f"--allow-count-mismatch needs a command with a count or length field; "
                 f"{term(command[:64])} has none",
             )
+        raw_values: tuple[tuple[str, int], ...] = ()
+        prepared: PreparedPacket | None = None
+        if raw_enum or spec.is_series:  # refused now, not at the start time of a series
+            prepared = codec.prepare_command(
+                command,
+                parsed,
+                tamper=tamper,
+                header=header_values,
+                allow_count_mismatch=allow_count_mismatch,
+                raw_enum=raw_enum,
+                enum_hint=RAW_ENUM_HINT,
+            )
+            raw_values = prepared.raw_enums
+            if sequence_value is not None:
+                codec.check_sequence(MessageKind.COMMAND, sequence_value)
+        if raw_enum and not raw_values:
+            raise IronbirdError(
+                Code.CLI_USAGE,
+                f"--raw-enum needs an argument outside its field's enum list; every argument "
+                f"of {term(command[:64])} is a named value or not an enum field",
+            )
+        faults = [
+            text
+            for text in (
+                "bad checksum" if bad_checksum else "",
+                f"length {length_delta:+d}" if length_delta is not None else "",
+                "count/length mismatch allowed" if allow_count_mismatch else "",
+                "raw enum value " + _raw_enum_text(raw_values) if raw_values else "",
+            )
+            if text
+        ]
+        if spec.is_series:
+            assert prepared is not None
+            plan = resolve(spec, invoked_wall_ns, time.time_ns())
+            return await _send_series(
+                session,
+                config,
+                run,
+                plan,
+                _SeriesRequest(
+                    node=node,
+                    command=command,
+                    args=parsed,
+                    tamper=tamper,
+                    header=header_values,
+                    link=link,
+                    allow_count_mismatch=allow_count_mismatch,
+                    raw_enum=raw_enum,
+                    raw_values=raw_values,
+                    prepared=prepared,
+                    sequence=sequence_value,
+                ),
+                faults=faults,
+                show_hex=session_verbose(ctx, verbose),
+            )
         sent = await session.send_command(
             node,
             command,
@@ -1358,29 +1517,379 @@ def send(
             link=link,
             header=header_values,
             allow_count_mismatch=allow_count_mismatch,
+            raw_enum=raw_enum,
+            enum_hint=RAW_ENUM_HINT,
             sequence=sequence_value,
         )
-        faults = [
-            text
-            for text in (
-                "bad checksum" if bad_checksum else "",
-                f"length {length_delta:+d}" if length_delta is not None else "",
-                "count/length mismatch allowed" if allow_count_mismatch else "",
-            )
-            if text
-        ]
-        seq_text = "" if sent.sequence is None else f" seq {sent.sequence}"
-        run.console.out(
-            f"sent {term(sent.command)} to {term(sent.node)} via "
-            f"{term(sent.transport)} {term(sent.endpoint)} "
-            f"(mid 0x{sent.mid:04X} fc {sent.function_code}{seq_text}, "
-            f"{sent.size} bytes)" + (f" [fault injected: {', '.join(faults)}]" if faults else "")
-        )
+        run.console.out(_sent_line(sent, faults))
         if session_verbose(ctx, verbose):
             run.console.out(f"  hex: {sent.data.hex(' ')}")
         return 0
 
-    _run(ctx, as_node, verbose, body, "send", transmits=True)
+    _run(ctx, as_node, verbose, body, "send", transmits=True, precheck=check_modes)
+
+
+def _raw_enum_text(values: Sequence[tuple[str, int]]) -> str:
+    """``mode=9, Entries[2]=10 +3 more``: the first few raw enum values of a command."""
+    shown = ", ".join(f"{term(n, 40)}={v}" for n, v in values[:RAW_ENUM_SHOWN])
+    rest = len(values) - RAW_ENUM_SHOWN
+    return shown + (f" +{rest} more" if rest > 0 else "")
+
+
+def _sent_line(sent: SentCommand, faults: Sequence[str], number: int | None = None) -> str:
+    seq_text = "" if sent.sequence is None else f" seq {sent.sequence}"
+    nth = "" if number is None else f" #{number}"
+    return (
+        f"sent{nth} {term(sent.command)} to {term(sent.node)} via "
+        f"{term(sent.transport)} {term(sent.endpoint)} "
+        f"(mid 0x{sent.mid:04X} fc {sent.function_code}{seq_text}, "
+        f"{sent.size} bytes)" + (f" [fault injected: {', '.join(faults)}]" if faults else "")
+    )
+
+
+def _series_plan_text(
+    plan: SendPlan, planned: int, command: str, node: str, *, now_wall_ns: int, open_ns: int
+) -> str:
+    """The one line announcing a series, with the times in UTC, and an ``--at`` the open of
+    the link made late."""
+    what = f"{planned} x {term(command)} to {term(node)}"
+    if plan.every_ns is not None:
+        what += f", one every {fmt_ns(plan.every_ns)}"
+    elif planned > 1:
+        what += ", back to back"
+    if plan.start_wall_ns is not None:
+        wait = plan.start_wall_ns - now_wall_ns
+        if wait >= 0:
+            when = f" starting at {iso_utc(plan.start_wall_ns)} UTC (in {fmt_ns(wait)})"
+        else:
+            when = (
+                f" from {iso_utc(plan.start_wall_ns)} UTC, missed by {fmt_ns(-wait)}: the link "
+                f"took {fmt_ns(open_ns)} to open"
+            )
+        if plan.assumed_utc:
+            when += "; a time with no zone is read as UTC"
+    else:
+        when = " starting now"
+    return f"sending {what}{when}"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _SeriesRequest:
+    """The command of a series, as typed and checked."""
+
+    node: str
+    command: str
+    args: Mapping[str, object]
+    tamper: Mapping[str, int]
+    header: Mapping[str, int]
+    link: str | None
+    allow_count_mismatch: bool
+    raw_enum: bool
+    raw_values: tuple[tuple[str, int], ...]
+    prepared: PreparedPacket  # encoded and checked once; each packet adds its count and time
+    sequence: int | None  # ``--sequence``: the count of the first packet
+
+    def ledger_fields(self) -> dict[str, object]:
+        fields: dict[str, object] = {
+            "args": dict(self.args),
+            "tamper": dict(self.tamper),
+            "header": dict(self.header),
+            "link": self.link,
+            "allow_count_mismatch": self.allow_count_mismatch,
+            "raw_enums": [{"field": n, "value": v} for n, v in self.raw_values],
+        }
+        if self.sequence is not None:
+            fields["sequence_set"] = self.sequence  # asked for; each packet's record has its count
+        return fields
+
+
+async def _send_series(
+    session: Session,
+    config: SystemConfig,
+    run: _Run,
+    plan: SendPlan,
+    req: _SeriesRequest,
+    *,
+    faults: Sequence[str],
+    show_hex: bool,
+) -> int:
+    """Run a series of sends (see :mod:`ironbird.sendmodes` and :mod:`ironbird.pacer`) and
+    report how it went.
+
+    The ledger gets ``send.plan`` first (the arguments, once), each packet's records (see
+    :class:`~ironbird.ledger.TxSeries`), and ``send.outcome`` last, however the series ends. A
+    send that fails, or a refusal the link reports for any packet of the series (checked within
+    :data:`~ironbird.engine.SETTLE_S` of every send, and once after the last), ends the series
+    with its coded error (exit 1, after the summary); a signal ends it with the summary and exit
+    128+n. The pacer thread is stopped before either is reported, so the count sent is exact.
+
+    The count of each packet is its own: the stream's next count in the state directory
+    (:mod:`ironbird.seqstate`), taken as the packet is built, so the counts are unique and
+    persistent across processes and invocations. Packets of two processes sending on one stream
+    interleave on the wire, each process's in count order. A packet built and not sent (skipped,
+    unsent, unconfirmed) has spent its count. ``--sequence`` seats the first packet's count; the
+    counts used are in each packet's record and in ``send.outcome``.
+    """
+    command, node = req.command, req.node
+    target = session.series_target(node, link=req.link)
+    opening = time.monotonic_ns()
+    link = await session.series_link(target)  # the link opens here, before any packet is built
+    open_ns = time.monotonic_ns() - opening
+    now_wall = time.time_ns()
+    tally = Tally(planned=plan.planned(plan.start_wall_ns or now_wall))
+    run.series, run.series_command = tally, command  # a signal from here on reports the count
+    rate = None if plan.every_ns is None else NS_PER_S / plan.every_ns
+    # A line per packet for a slow series; a faster one prints progress lines, and under -v a
+    # sample of its packets (with the hex), at most SEND_LINE_MAX_RATE a second.
+    show_each = (rate is not None and rate <= SEND_LINE_MAX_RATE) or (
+        rate is None and tally.planned <= SEND_LINE_MAX_BURST
+    )
+    sample_gap_s = 1 / SEND_LINE_MAX_RATE
+    next_sample = 0.0
+    session.ledger.record(
+        "action",
+        "send.plan",
+        node=node,
+        command=command,
+        request=req.ledger_fields(),
+        open_ns=open_ns,
+        **plan_fields(plan, tally.planned),
+    )
+    run.console.err(
+        _series_plan_text(plan, tally.planned, command, node, now_wall_ns=now_wall, open_ns=open_ns)
+    )
+    spin_below_ns = config.send.spin_below_us * 1000
+    spins = plan.every_ns is None or plan.every_ns < spin_below_ns
+    tally.pacer = {
+        "direct": link.direct,
+        "spin_below_us": config.send.spin_below_us,
+        "spin_ns": SPIN_NS if spins else 0,
+    }
+    series = TxSeries(session.ledger)
+    timed = target.codec.command_carries_time
+    loop = asyncio.get_running_loop()
+    last: list[SentCommand] = []
+    next_status = time.monotonic() + STATUS_INTERVAL_S
+    grid: Grid | None = None
+    pacer: SeriesPacer[EncodedPacket] | None = None
+    check: asyncio.TimerHandle | None = None
+    refused: list[IronbirdError] = []  # a refusal found on the loop, the first only
+
+    def wake() -> None:
+        if pacer is not None:
+            pacer.wake()
+
+    counts = session.series_counts(target, req.prepared, seat=req.sequence, wake=wake)
+    faults_recorded = False
+
+    def build(number: int, slot: int) -> Built[EncodedPacket] | None:
+        nonlocal faults_recorded
+        assert grid is not None
+        # A packet carries its slot's time (or, built late, the time it was built).
+        stamp_ns = max(grid.slot_wall_ns(slot), time.time_ns())
+        encoded = session.build_command(target, req.prepared, counts, at_time=stamp_ns / NS_PER_S)
+        if encoded is None:  # its count is being taken; the pacer builds again when it is there
+            return None
+        if not faults_recorded:  # the faults injected are those of the request: ledgered once
+            faults_recorded = True
+            session.record_send_faults(target.route.server.name, req.prepared)
+        return Built(number, slot, encoded.data, encoded)
+
+    def check_refusal() -> None:
+        nonlocal check
+        check = None
+        try:
+            link.check()
+        except IronbirdError as exc:
+            refused[:] = refused or [exc]
+            if pacer is not None:
+                pacer.abort(exc)
+
+    def progress() -> None:
+        nonlocal next_status
+        if show_each or time.monotonic() < next_status:
+            return
+        next_status = time.monotonic() + STATUS_INTERVAL_S
+        extra = timing_text(tally, plan.every_ns)
+        run.console.err(
+            f"progress: sent {tally.sent} of {tally.planned}" + (f", {extra}" if extra else "")
+        )
+
+    def note_sent(encoded: EncodedPacket, mono_ns: int) -> SentCommand:
+        """Count a packet that left (a SENT report, or one that failed after it left)."""
+        tally.count_sent(encoded.sequence, mono_ns)
+        sent = session.sent_command(target, encoded)
+        last[:] = [sent]
+        return sent
+
+    def on_sent(report: Report[EncodedPacket]) -> None:
+        nonlocal check, next_sample
+        assert report.built is not None and grid is not None
+        encoded = report.built.item
+        sent_wall = time.time_ns() - (time.monotonic_ns() - report.mono_ns)
+        link.sent(encoded.data, sent_wall)
+        # A send the stop cut short with the head of the packet on the line: the rest follows
+        # from the transport's buffer, and is reported torn (naming the packet) if the line does
+        # not take it.
+        cut = link.cut is encoded.data
+        session.record_series_packet(
+            series,
+            target,
+            encoded,
+            result="sent",
+            sent=True,
+            at_ns=sent_wall,
+            **({"cut": True} if cut else {}),
+        )
+        sent = note_sent(encoded, report.mono_ns)
+        tally.send_max_ns = max(tally.send_max_ns, report.took_ns)
+        if plan.every_ns is not None and report.took_ns > plan.every_ns:
+            tally.overruns += 1
+        if tally.sent == 1 and grid.at:
+            tally.start_late_ns = report.mono_ns - grid.start_mono
+        if report.late_ns is not None and plan.every_ns is not None:
+            tally.note_late(report.late_ns)
+        line = show_each
+        if not line and show_hex and time.monotonic() >= next_sample:
+            next_sample = time.monotonic() + sample_gap_s
+            line = True
+        if line:
+            run.console.out(_sent_line(sent, faults, tally.sent))
+            if show_hex:
+                run.console.out(f"  hex: {sent.data.hex(' ')}")
+        if check is None:
+            check = loop.call_later(SETTLE_S, check_refusal)
+        progress()
+
+    def handle(report: Report[EncodedPacket]) -> BaseException | None:
+        built = report.built
+        match report.kind:
+            case Kind.SENT:
+                on_sent(report)
+            case Kind.SKIPPED:
+                tally.skipped += report.slots
+                if report.starved:
+                    tally.starved += report.slots
+            case Kind.DISCARDED | Kind.UNSENT | Kind.UNCONFIRMED:
+                assert built is not None
+                result = {
+                    Kind.DISCARDED: "skipped",
+                    Kind.UNSENT: "unsent",
+                    Kind.UNCONFIRMED: "unconfirmed",
+                }[report.kind]
+                tally.discarded += report.kind is Kind.DISCARDED
+                tally.unsent += report.kind is Kind.UNSENT
+                tally.unconfirmed += report.kind is Kind.UNCONFIRMED
+                session.record_series_packet(series, target, built.item, result=result, sent=False)
+            case Kind.ABANDONED:
+                assert isinstance(report.error, IronbirdError)
+                session.report(report.error, context="pacer")
+            case Kind.FAILED:
+                assert report.error is not None
+                error = link.error(report.error)
+                if built is not None:
+                    if isinstance(error, IronbirdError):
+                        error.details += ("\n" if error.details else "") + (
+                            f"packet ({len(built.data)} bytes) hex: {hex_preview(built.data)}"
+                        )
+                    result = error.code.value if isinstance(error, IronbirdError) else "error"
+                    session.record_series_packet(
+                        series, target, built.item, result=result, sent=report.went_out
+                    )
+                    if report.went_out:
+                        note_sent(built.item, time.monotonic_ns())
+                return error
+            case Kind.DONE:
+                pass
+        return None
+
+    def late_failure(report: Report[EncodedPacket]) -> None:
+        """In the abandoned pacer thread: a failure that came too late for the series."""
+        assert report.error is not None
+        error = link.error(report.error)
+        coded = (
+            error
+            if isinstance(error, IronbirdError)
+            else IronbirdError(Code.INTERNAL, f"send failed: {error!r}", cause=error)
+        )
+        packet = ""
+        if report.built is not None:
+            packet = f" ({_packet_label(command, report.built.item.sequence)})"
+        session.ledger.post(
+            "error",
+            coded.code.value,
+            summary=f"late failure of the abandoned pacer thread{packet}: {coded.summary}",
+            details=coded.detail_text(),
+            late=True,
+        )
+
+    def label() -> str:
+        """What the transport names a packet by in its errors (the packet being sent)."""
+        flight = pacer.in_flight if pacer is not None else None
+        return "" if flight is None else _packet_label(command, flight.item.sequence)
+
+    def send(data: bytes, stop: threading.Event) -> bool:
+        return link.send(data, stop, label=label())
+
+    def summary(outcome: str) -> str:
+        where = ""
+        if last:
+            where = (
+                f" to {term(last[0].node)} via {term(last[0].transport)} {term(last[0].endpoint)}"
+            )
+        elapsed = f" in {fmt_ns(tally.elapsed_ns)}" if tally.sent else ""
+        extra = timing_text(tally, plan.every_ns)
+        return (
+            f"{outcome}: sent {tally.sent} of {tally.planned} {term(command)}{where}{elapsed}"
+            + (f"; {extra}" if extra else "")
+            + (f" [fault injected: {', '.join(faults)}]" if faults else "")
+        )
+
+    def finish(outcome: str, **more: Any) -> None:
+        if check is not None:
+            check.cancel()
+        tally.outcome = outcome
+        if pacer is not None:
+            tally.pacer.update(pacer.facts)
+        series.close()
+        session.ledger.record(
+            "state",
+            "send.outcome",
+            **outcome_fields(tally, outcome),
+            totals=dict(series.totals),
+            **more,
+        )
+        run.console.out(summary(outcome))
+
+    try:
+        try:
+            grid = await start_grid(plan, SystemClock())
+            tally.planned = grid.planned
+            tally.first_mono_ns = tally.last_mono_ns = grid.start_mono
+            waiter = ThreadWaiter(SPIN_NS if spins else 0)
+            pacer = SeriesPacer(grid, send, waiter, timed=timed, late=late_failure)
+            await pacer.run(build, handle)
+            if check is not None:
+                check.cancel()
+                check = None
+            if refused:
+                raise refused[0]
+            await link.settle()
+        finally:
+            link.close()
+            if counts is not None:
+                await counts.aclose()
+    except asyncio.CancelledError:
+        finish("interrupted")
+        raise
+    except IronbirdError as exc:
+        finish("failed", error=exc.code.value)
+        raise
+    except Exception:
+        finish("failed", error=Code.INTERNAL.value)
+        raise
+    finish("complete")
+    return 0
 
 
 def _sequence_store(session: Session) -> SequenceStore:

@@ -39,6 +39,7 @@ from ironbird.codec import (
     Codec,
     DecodedPacket,
     EncodedPacket,
+    PreparedPacket,
     coerce_value,
     coerce_variable,
     echo_incompatibility,
@@ -54,17 +55,18 @@ from ironbird.engine import (
     FrameDecoder,
     FrameSink,
     MidStatSnapshot,
+    SeriesLink,
 )
 from ironbird.errors import MAX_SUMMARY_LEN, Code, DecodeError, IronbirdError
 from ironbird.events import Event, extract_event
 from ironbird.filter import Filter, FilterError, Matcher, compile_filter
 from ironbird.frame import SERIAL_TRANSPORT, Decoded, Frame, Stream
 from ironbird.header import HeaderProfile, ProfileKind, parse_profile_file, read_profile
-from ironbird.ledger import Ledger
+from ironbird.ledger import Ledger, TxSeries
 from ironbird.ledgertiers import Tier
 from ironbird.notice import Level, Notice, level_of
 from ironbird.sanitize import HEX_PREVIEW_BYTES, clean, hex_preview
-from ironbird.seqstate import Lease, NodeSequences, SequenceStore
+from ironbird.seqstate import Lease, NodeSequences, SequenceStore, SeriesCounts
 from ironbird.transport import LinkEnd, TransportClosed
 
 TICK_S: Final = 1.0
@@ -90,6 +92,15 @@ class Route:
 def link_end(side: Side) -> LinkEnd:
     """The end of its link a process on ``side`` is."""
     return LinkEnd.SOURCE if side is Side.COMMANDER else LinkEnd.DESTINATION
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesTarget:
+    """Where the commands of a series of sends go: the route, its codec and its endpoint."""
+
+    route: Route
+    codec: Codec
+    endpoint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -584,6 +595,134 @@ class Session:
 
     # -- commander: send -----------------------------------------------------------
 
+    def series_target(self, peer: str, *, link: str | None = None) -> SeriesTarget:
+        """Where the commands of a series of sends to ``peer`` go, resolved once."""
+        route = self.route(peer, require=Side.COMMANDER, link_name=link)
+        return SeriesTarget(route, self.codec_for(route.server.name), route.link.command_target)
+
+    async def series_link(self, target: SeriesTarget) -> SeriesLink:
+        """Open the link of ``target`` and hold it for the pacer thread (errors are those of
+        the open); the caller closes it when the series has ended."""
+        return await self._engine.series_link(target.route.link, link_end(target.route.side))
+
+    def series_counts(
+        self,
+        target: SeriesTarget,
+        prepared: PreparedPacket,
+        *,
+        seat: int | None,
+        wake: Callable[[], None],
+    ) -> SeriesCounts | None:
+        """The sequence counts of a series of ``prepared`` (taken from the state directory, as
+        for a single send), or ``None`` when the header has no sequence field. ``seat``
+        (``--sequence``) is the first packet's count; ``wake`` is called when a count that had
+        to be waited for is there (see :class:`~ironbird.seqstate.SeriesCounts`)."""
+        if not prepared.sequenced:
+            return None
+        return self.sequences(target.route.server.name).series(
+            "command", prepared.mid, seat=seat, wake=wake
+        )
+
+    def build_command(
+        self,
+        target: SeriesTarget,
+        prepared: PreparedPacket,
+        counts: SeriesCounts | None,
+        *,
+        at_time: float,
+    ) -> EncodedPacket | None:
+        """Frame one packet of a series: pass the ledger's transmit gate (``IB-LED-004``), take
+        its count from ``counts`` and carry ``at_time`` in its time fields. ``None`` while the
+        count is being waited for (nothing is spent; ask again once ``counts`` has woken the
+        caller). Nothing is ledgered: the series wrote the arguments in its ``send.plan``, and
+        :meth:`record_series_packet` records the packet once its fate is known."""
+        self.ledger.check_transmit(prepared.message.name, target.route.server.name)
+        count = None
+        if counts is not None:
+            count = counts.next()
+            if count is None:
+                return None
+        return target.codec.frame(prepared, count, at_time=at_time)
+
+    def record_series_packet(
+        self,
+        series: TxSeries,
+        target: SeriesTarget,
+        encoded: EncodedPacket,
+        *,
+        result: str,
+        sent: bool,
+        at_ns: int | None = None,
+        **fields: Any,
+    ) -> None:
+        """The ledger record of one packet of a series (see :class:`~ironbird.ledger.TxSeries`);
+        ``at_ns``: the wall-clock time it was sent, for the series' windows; ``fields`` are
+        added to the record."""
+        node = target.route.server.name
+        series.record(
+            encoded.message.name,
+            node,
+            result=result,
+            sent=sent,
+            size=len(encoded.data),
+            sequence=encoded.sequence,
+            at_ns=at_ns,
+            node=node,
+            command=encoded.message.name,
+            mid=encoded.mid,
+            function_code=encoded.function_code,
+            endpoint=target.endpoint,
+            raw=encoded.data,
+            **fields,
+        )
+
+    @staticmethod
+    def sent_command(target: SeriesTarget, encoded: EncodedPacket) -> SentCommand:
+        """What was sent, for the confirmation line."""
+        assert encoded.function_code is not None
+        return SentCommand(
+            node=target.route.server.name,
+            command=encoded.message.name,
+            mid=encoded.mid,
+            function_code=encoded.function_code,
+            sequence=encoded.sequence,
+            size=len(encoded.data),
+            data=encoded.data,
+            endpoint=target.endpoint,
+            transport=target.route.link.transport,
+        )
+
+    def record_send_faults(self, node: str, prepared: PreparedPacket) -> None:
+        """Ledger the faults injected into ``prepared`` (``send.fault``): raw enum values, and
+        the count or length fields that disagree with the data they describe."""
+        message = prepared.message
+        if prepared.raw_enums:
+            self.ledger.record(
+                "action",
+                "send.fault",
+                node=node,
+                command=message.name,
+                fault="raw_enum",
+                fields=[{"field": name, "value": value} for name, value in prepared.raw_enums],
+            )
+        if prepared.count_faults:  # the values that go out and the ones the data implied
+            self.ledger.record(
+                "action",
+                "send.fault",
+                node=node,
+                command=message.name,
+                fault="count_mismatch",
+                fields=[
+                    {
+                        "field": f.field,
+                        "given": f.given,
+                        "implied": f.implied,
+                        "unit": "elements" if f.unit is VarUnit.COUNT else "bytes",
+                    }
+                    for f in prepared.count_faults
+                ],
+            )
+
     async def send_command(
         self,
         peer: str,
@@ -594,14 +733,23 @@ class Session:
         link: str | None = None,
         header: Mapping[str, int] | None = None,
         allow_count_mismatch: bool = False,
+        raw_enum: bool = False,
+        enum_hint: str = "",
         sequence: int | None = None,
     ) -> SentCommand:
-        route = self.route(peer, require=Side.COMMANDER, link_name=link)
-        codec = self.codec_for(route.server.name)
-        endpoint = route.link.command_target
+        """Encode and send one command, and wait briefly after the hand-off for the link to
+        refuse it (a UDP port nobody listens on). ``raw_enum`` (fault injection) lets a value
+        outside its field's enum through; ``send.fault`` records which. ``enum_hint`` names the
+        caller's way to do that, for the refusal of such a value without it. The packet's
+        sequence count is the stream's next one in the state directory, or ``sequence`` (the
+        stream then goes on from ``sequence + 1``)."""
+        target = self.series_target(peer, link=link)
+        route, codec, endpoint = target.route, target.codec, target.endpoint
         extra: dict[str, Any] = {"header": dict(header)} if header else {}
         if allow_count_mismatch:
             extra["allow_count_mismatch"] = True  # asked for; ``send.fault`` records what it did
+        if raw_enum:
+            extra["raw_enum"] = True  # asked for; ``send.fault`` records the values
         if sequence is not None:
             extra["sequence_set"] = sequence  # asked for; ``tx.command`` has the count sent
         self.ledger.record(
@@ -615,28 +763,18 @@ class Session:
             **extra,
         )
         prepared = codec.prepare_command(
-            command, args, tamper=tamper, header=header, allow_count_mismatch=allow_count_mismatch
+            command,
+            args,
+            tamper=tamper,
+            header=header,
+            allow_count_mismatch=allow_count_mismatch,
+            raw_enum=raw_enum,
+            enum_hint=enum_hint,
         )
         if sequence is not None:
             codec.check_sequence(MessageKind.COMMAND, sequence)
         message = prepared.message
-        if prepared.count_faults:  # the values that go out and the ones the data implied
-            self.ledger.record(
-                "action",
-                "send.fault",
-                node=route.server.name,
-                command=message.name,
-                fault="count_mismatch",
-                fields=[
-                    {
-                        "field": f.field,
-                        "given": f.given,
-                        "implied": f.implied,
-                        "unit": "elements" if f.unit is VarUnit.COUNT else "bytes",
-                    }
-                    for f in prepared.count_faults
-                ],
-            )
+        self.record_send_faults(route.server.name, prepared)
         self.ledger.check_transmit(message.name, route.server.name)
         attempt = TxAttempt(message.name)
         self._last_tx = attempt
@@ -730,18 +868,7 @@ class Session:
                     **packet,
                 )
         assert encoded is not None  # every path that leaves the try without it raised
-        assert encoded.function_code is not None
-        return SentCommand(
-            node=route.server.name,
-            command=encoded.message.name,
-            mid=encoded.mid,
-            function_code=encoded.function_code,
-            sequence=encoded.sequence,
-            size=len(encoded.data),
-            data=encoded.data,
-            endpoint=endpoint,
-            transport=route.link.transport,
-        )
+        return self.sent_command(target, encoded)
 
     # -- capture (raw frames) and decoding ---------------------------------------------
 

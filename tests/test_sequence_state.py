@@ -1686,3 +1686,244 @@ def test_n6_a_responder_start_leaves_its_reply_ceilings_stored(
 ) -> None:
     marks = _marks(tmp_path / "state")
     assert marks and all("/telemetry/" in key for key in marks)
+
+
+# -- the counts of a series of sends (PR 40 with PR 41's pacer) ------------------------------
+
+
+async def _series_counts(counts: Any, wanted: int, wake: asyncio.Event) -> list[int]:
+    """Collect ``wanted`` counts as a builder on the loop does: ask, and when told to wait, wait
+    for the wake before asking again."""
+    got: list[int] = []
+    while len(got) < wanted:
+        count = counts.next()
+        if count is None:
+            await asyncio.wait_for(wake.wait(), 10)
+            wake.clear()
+            continue
+        got.append(count)
+    return got
+
+
+def _series(store: SequenceStore, wake: asyncio.Event, seat: int | None = None) -> Any:
+    return store.for_node("fc").series("command", 0x1890, seat=seat, wake=wake.set)
+
+
+def test_a_series_takes_its_counts_without_waiting_and_continues_the_streams(
+    tmp_path: Path,
+) -> None:
+    """B1: a series framed its packets with the codec's in-memory counter, restarting at 0."""
+
+    async def scenario() -> tuple[list[int], list[int]]:
+        store = _store(tmp_path)
+        assert await _takes(store, 3) == [0, 1, 2]  # an earlier send
+        wake = asyncio.Event()
+        counts = _series(store, wake)
+        # past the ceilings, the first take of the series included
+        got = await _series_counts(counts, 3 * BLOCK, wake)
+        await counts.aclose()
+        after = await _takes(store, 2)
+        await store.aclose()
+        return got, after
+
+    got, after = _run(scenario())
+    assert got == list(range(3, 3 + 3 * BLOCK)) and after == [3 + 3 * BLOCK, 4 + 3 * BLOCK]
+
+
+def test_a_take_that_would_wait_is_none_and_never_blocks_the_loop(tmp_path: Path) -> None:
+    """The fast take is a non-blocking flock and one slot: a lock another process holds, a
+    send of this process mid-take, files not yet open and an empty ceiling all answer ``None``
+    at once; the series' task takes the count, and the loop keeps running meanwhile."""
+
+    async def scenario() -> None:
+        store, other = _store(tmp_path), _store(tmp_path)
+        assert store.take_now(KEY) is None  # the files are not open yet
+        assert await store.take(KEY) == 0
+        assert store.take_now(KEY) == 1
+        lease = await other.lease(KEY)  # the other process holds the live lock
+        assert store.take_now(KEY) is None
+        lease.commit()
+        lease.release()
+        assert store.take_now(KEY) == 3
+        mine = await store.lease(KEY)  # a send of this process holds its turn
+        assert store.take_now(KEY) is None
+        mine.release()  # given back unspent
+        for expected in range(4, BLOCK):  # to the ceiling...
+            assert store.take_now(KEY) == expected
+        assert store.take_now(KEY) is None  # ...where a worker must raise it
+        assert await store.take(KEY) == BLOCK
+        # the contended series take waits in its task, and the loop runs on
+        held = await other.lease(KEY)
+        wake = asyncio.Event()
+        counts = _series(store, wake)
+        assert counts.next() is None
+        await asyncio.sleep(0.05)
+        assert not wake.is_set()
+        held.commit()
+        held.release()
+        await asyncio.wait_for(wake.wait(), 10)
+        assert counts.next() == BLOCK + 2
+        await counts.aclose()
+        await store.aclose()
+        await other.aclose()
+
+    _run(scenario())
+
+
+def test_series_of_two_processes_take_unique_counts_in_each_ones_order(tmp_path: Path) -> None:
+    async def scenario() -> tuple[list[int], list[int]]:
+        one, two = _store(tmp_path), _store(tmp_path)
+        wake_one, wake_two = asyncio.Event(), asyncio.Event()
+        counts_one, counts_two = _series(one, wake_one), _series(two, wake_two)
+
+        async def run(counts: Any, wake: asyncio.Event) -> list[int]:
+            got: list[int] = []
+            while len(got) < 200:
+                count = counts.next()
+                if count is None:
+                    await asyncio.wait_for(wake.wait(), 10)
+                    wake.clear()
+                    continue
+                got.append(count)
+                if len(got) % 7 == 0:
+                    await asyncio.sleep(0)
+            return got
+
+        results = await asyncio.gather(run(counts_one, wake_one), run(counts_two, wake_two))
+        for counts in (counts_one, counts_two):
+            await counts.aclose()
+        await one.aclose()
+        await two.aclose()
+        return results[0], results[1]
+
+    first, second = _run(scenario())
+    assert first == sorted(first) and second == sorted(second)
+    assert sorted(first + second) == list(range(400))  # unique, no restart at 0, no gap
+
+
+def test_a_seat_sets_the_first_count_of_a_series_only(tmp_path: Path) -> None:
+    async def scenario() -> list[int]:
+        store = _store(tmp_path)
+        assert await _takes(store, 5) == [0, 1, 2, 3, 4]
+        wake = asyncio.Event()
+        counts = _series(store, wake, seat=100)
+        got = await _series_counts(counts, 70, wake)  # past a ceiling too
+        await counts.aclose()
+        got += await _takes(store, 1)
+        await store.aclose()
+        return got
+
+    assert _run(scenario()) == [*range(100, 170), 170]
+
+
+def test_a_reset_during_a_series_restarts_it_at_zero_in_every_process(tmp_path: Path) -> None:
+    async def scenario() -> list[int]:
+        store, admin = _store(tmp_path), _store(tmp_path)
+        wake = asyncio.Event()
+        counts = _series(store, wake)
+        got: list[int] = []
+        for _ in range(100):
+            count = counts.next()
+            while count is None:
+                await asyncio.wait_for(wake.wait(), 10)
+                wake.clear()
+                count = counts.next()
+            got.append(count)
+            if len(got) == 40:
+                assert await admin.forget("fc", 0x1890)
+        await counts.aclose()
+        await store.aclose()
+        await admin.aclose()
+        return got
+
+    got = _run(scenario())
+    assert got[:40] == list(range(40)) and got[40:] == list(range(60))
+
+
+def test_a_failed_take_ends_the_series_with_the_coded_error_and_nothing_is_left_unretrieved(
+    tmp_path: Path,
+) -> None:
+    fs = FaultFs()
+
+    async def scenario() -> None:
+        store = _store(tmp_path, fs=fs)
+        assert await _takes(store, 1) == [0]
+        wake = asyncio.Event()
+        counts = _series(store, wake)
+        fs.fail("pwrite", errno.EIO, times=1)
+        failure: IronbirdError | None = None
+        for _ in range(3):
+            try:
+                if counts.next() is None:
+                    await asyncio.wait_for(wake.wait(), 10)
+                    wake.clear()
+            except IronbirdError as exc:
+                failure = exc
+                break
+        assert failure is not None and failure.code is Code.SEQ_TAKE
+        await counts.aclose()
+        await store.aclose()
+
+    _run(scenario())
+
+
+def test_a_series_that_ends_while_a_take_waits_cancels_it_and_frees_the_lock(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, other = _store(tmp_path), _store(tmp_path)
+        assert await _takes(store, 1) == [0]
+        held = await other.lease(KEY)
+        wake = asyncio.Event()
+        counts = _series(store, wake)
+        assert counts.next() is None  # waiting for the lock the other process holds
+        await counts.aclose()
+        held.commit()
+        held.release()
+        assert await _takes(store, 1) == [2]  # nothing of the ended series holds a lock or a turn
+        await store.aclose()
+        await other.aclose()
+
+    _run(scenario())
+
+
+def test_without_a_state_directory_a_series_counts_in_memory(tmp_path: Path) -> None:
+    async def scenario() -> list[int]:
+        store = _store(None)
+        wake = asyncio.Event()
+        counts = _series(store, wake)
+        got = await _series_counts(counts, 5, wake)
+        await counts.aclose()
+        return got
+
+    assert _run(scenario()) == [0, 1, 2, 3, 4]
+
+
+def test_packets_built_and_never_sent_have_spent_their_counts(
+    tmp_path: Path, mock_config_path: Path
+) -> None:
+    """Built-but-unsent packets (unsent, skipped, unconfirmed) keep their counts: the next
+    send, in any process, goes on above them."""
+    config = load_config(mock_config_path)
+    ledger = Ledger(tmp_path / "ledger", session_id="series-spent")
+    session = Session(config, role="ground", ledger=ledger, notify=lambda _n: None)
+
+    async def scenario() -> list[int | None]:
+        target = session.series_target("fc")
+        prepared = target.codec.prepare_command("MOCK_NOOP")
+        wake = asyncio.Event()
+        counts = session.series_counts(target, prepared, seat=None, wake=wake.set)
+        assert counts is not None
+        built: list[int | None] = []
+        while len(built) < 3:
+            encoded = session.build_command(target, prepared, counts, at_time=1.0)
+            if encoded is None:
+                await asyncio.wait_for(wake.wait(), 10)
+                wake.clear()
+                continue
+            built.append(encoded.sequence)
+        await counts.aclose()
+        sent = await _takes(session.sequences("fc").store, 1, key_of("fc", "command", prepared.mid))
+        return [*built, *sent]
+
+    assert _run(scenario()) == [0, 1, 2, 3]

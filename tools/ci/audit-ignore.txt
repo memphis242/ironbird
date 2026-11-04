@@ -1,8 +1,2 @@
 # Advisories tools/ci/audit-deps.sh accepts, one per line: "ID  # reason". A line without a reason
 # is an error. Re-check every entry whenever the pinned package moves; delete it once fixed.
-
-# pytest <= 9.0.2: predictable /tmp/pytest-of-{user} directories let a local user on a shared
-# UNIX host cause a denial of service. pytest is a development-only dependency, CI runners and
-# the EL8 containers are single-user, and pyproject.toml holds pytest below 9 (the pytest-benchmark
-# note beside it). Fix: 9.0.3, once the suite and the benchmark gates are verified on pytest 9.
-PYSEC-2026-1845  # dev-only test runner on single-user hosts; fixed in pytest 9.0.3, bump pending

@@ -83,6 +83,7 @@ class FakeTransport:
         *,
         confirm: bool = False,
         handed_off: Callable[[], None] | None = None,
+        label: str = "",
     ) -> None:
         if handed_off is not None:
             handed_off()

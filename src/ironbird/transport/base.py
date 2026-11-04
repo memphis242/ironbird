@@ -107,9 +107,12 @@ class Transport(Protocol):
         *,
         confirm: bool = False,
         handed_off: Callable[[], None] | None = None,
+        label: str = "",
     ) -> None:
         """Send one packet. ``handed_off`` is called as soon as the bytes have left the
-        process; ``confirm`` then also waits for the transport to report a refusal."""
+        process; ``confirm`` then also waits for the transport to report a refusal. ``label``
+        names the packet (command and sequence count) in an error that is reported about it
+        later, when its sender no longer waits."""
         ...
 
     def stats(self) -> TransportStats: ...

@@ -91,7 +91,7 @@ pointer names the part too: `[ledger n=1234 file=<stamp>-<session>.p0003]`.
 |---------|--------------|---------|
 | `ib nodes` | List nodes, aliases and links, and check every definition file | below |
 | `ib find TEXT` | Search commands and telemetry by name, MID or description | below |
-| `ib send NODE CMD [name=value ...]` | Encode and send one command | below |
+| `ib send NODE CMD [name=value ...] [--sequence N] [--at T] [--repeat N] [--every D (--for D\|--until T)]` | Encode and send a command: once, at a time, N times or periodically | below |
 | `ib seq show [NODE]`, `ib seq reset NODE [MID]\|--all` | Show or reset the shared sequence counts | below |
 | `ib listen NODE [--where EXPR] [--record PATH]` | Decode and print incoming packets | Filtering |
 | `ib events [--min-type T] [--where EXPR]` | Print only cFS events from every telemetry link | below |
@@ -102,11 +102,131 @@ pointer names the part too: `[ledger n=1234 file=<stamp>-<session>.p0003]`.
 | `ib replay FILE... [--where EXPR] [--from T] [--to T] [--follow]` | Play a recording back as `listen` shows it | Replay |
 | `ib export FILE... [-o OUT] [--format csv\|text\|jsonl] [--jobs N]` | Export a recording to tables, text or JSON Lines | Export |
 
-**Fault injection** (`ib send`): `--bad-checksum`, `--length-delta N` and `--allow-count-mismatch` send
-a deliberately broken packet. The confirmation line ends with `[fault injected: ...]` naming what was
+**Fault injection** (`ib send`): `--bad-checksum`, `--length-delta N`, `--allow-count-mismatch` and
+`--raw-enum` send a deliberately broken packet. The confirmation line ends with `[fault injected: ...]` naming what was
 done, so a "sent" line is never mistaken for a clean send; the packet's ledger record says the same.
 `--length-delta` is refused (`IB-HDR-003`, exit 2, nothing sent) when the changed value would leave
-the length field's range, since it would wrap to an unrelated size.
+the length field's range, since it would wrap to an unrelated size. `--raw-enum` lets an integer outside
+a field's CCDD `enum` through for this invocation (without it the value is refused with `IB-ENC-002`,
+whose message names the flag; a CCDD field with `"allow_raw": true` accepts any value, always). The
+line says `[fault injected: raw enum value mode=9]` (an array element by its index, `Entries[2]=10`;
+the first three values, then `+N more`), the ledger gets a `send.fault` record with
+`fault = "raw_enum"` and the field and value, and in a repeat/every run it applies to every packet
+(the values are in the series' `send.plan`). The flag is a usage error (`IB-CLI-001`) when no argument
+is outside its enum, so it cannot be left on by habit.
+
+### Send modes
+
+```bash
+ib send fc MOCK_NOOP --repeat 5                       # five packets back to back
+ib send fc MOCK_NOOP --at +10s                        # once, ten seconds from now
+ib send fc MOCK_NOOP --at 2026-11-04T12:00:00Z        # once, at a UTC time
+ib send fc MOCK_NOOP --every 250ms --for 1m           # four a second for a minute
+ib send fc MOCK_NOOP --every 1s --until 2026-11-04T12:05:00Z --repeat 100   # whichever ends first
+ib send fc MOCK_NOOP --at +30s --every 1ms --for 10s  # a timed burst
+```
+
+- **Times** (`--at`, `--until`) are ISO 8601 with seconds, or an offset such as `+10s`, `+1m30s`,
+  `+250ms` counted from the moment `ib` started (it reads the clock once its command line is parsed,
+  after interpreter start-up, typically 0.3 s after Enter). **A time with no zone is UTC**, never local
+  time (`2026-11-04T12:00:00` is `...Z`); write `+02:00` for another zone. The plan line and the ledger
+  show the start in UTC and say when a zone was assumed. A start in the past (or `+0s`) is refused, as
+  is a start, an end or an offset more than a year ahead. **Durations** (`--every`, `--for`) are `250ms`,
+  `1.5s`, `2m`, `1m30s` (units `h m s ms`, largest first, each at most once: `30s1m` and `1s1s` are
+  refused, as is a bare `5`, whose unit could be anything); `--for` is at most a year.
+- **Combining.** `--repeat N` alone sends N packets back to back, each as soon as the previous one
+  left. `--every P` sends one per period (at least 1 ms) and needs an end: `--repeat N` (a cap),
+  `--for D` (counted from the first slot) or `--until T`; with several, the first reached ends the
+  series. The window is half open: `--every 1s --for 3s` sends at 0, 1 and 2 s. `--at` delays the
+  start of any of these. Refused with `IB-CLI-001` (exit 2), before anything is opened or sent:
+  `--every` with no end, `--for`/`--until` without `--every`, `--for` with `--until`, `--repeat 1` with
+  `--every`, a window not longer than the period (one packet at most), an end not after the start, more
+  than 100,000,000 packets. A bad argument is refused up front too, not when a scheduled start arrives.
+- **The start.** The link is opened first, then the series starts. With `--at`, the start and the window
+  are fixed by the clock before the open: a link that takes longer to open than the time left makes the
+  first slots late, and they are skipped and counted on T's grid (with no `--every`, the packet goes late
+  and the summary says by how much); the plan line names the miss and the open time, and a window that
+  passed entirely during the open is refused (`IB-CLI-001`, nothing sent). With no `--at` the series
+  starts 20 ms after the link is open, so the first packet is built ahead of its slot; a `--until` window
+  shrinks by the open time, and one left no longer than the period is refused the same way.
+- **Timing.** One process, one open link and one codec serve the whole series. Deadlines are absolute
+  points on the monotonic clock (`start + k * period`), so nothing drifts; a wall-clock `--at` is
+  followed through clock steps until the last second before it, and a `--until` end is fixed on the
+  monotonic clock when the series starts (a clock step during the series is not followed). The packets
+  are sent by a dedicated **pacer thread**: it sleeps to each deadline (`clock_nanosleep` on the
+  monotonic clock, with its timer slack lowered to 1 us by `prctl(PR_SET_TIMERSLACK)`, which needs no
+  privilege) and hands the packet to the socket itself, so the event loop's work never delays the wait or
+  the send. (The thread still shares the interpreter lock with the loop and the other helper threads:
+  coming out of its sleep it waits for the lock while another thread runs Python code, by default up to
+  5 ms, half a slot at 10 ms. For the life of a series the switch interval is lowered to 0.2 ms and then
+  restored (series that overlap in one process share the lowering: the last one restores it); with a helper thread running 8 ms Python bursts against a 10 ms period, that took skipped
+  slots from 61-68 of 300 to 1-5, and from 808 of 2000 to about 100 for a 1 ms period against 3 ms
+  bursts. It bounds the wait, it does not remove it, and the lateness the series reports includes any
+  that is left.) The loop builds the packets ahead (no earlier than 20 ms before their slots, each fully
+  encoded with its own count, and only for slots that can still be served) and handles what the thread
+  reports. Nothing spins by default. Measured on a busy
+  4-core host (load about 4.5), by the receiver's kernel timestamps: `--every 1ms` puts packets on the
+  wire with a median jitter of 23 us (99th percentile 170 us) at 26% of a core, where the spinning
+  pacer this replaced showed 185 us (360 us) at 100%; at 10 ms the series costs 6% of a core (12%
+  before), at 100 ms 3% (3%). A period under `[send] spin_below_us` (0, off, by default) ends each
+  wait with a 75 us spin, which absorbs the thread's wake-up latency (at 1 ms: median 7 us, 99th
+  percentile 110 us, 30% of a core); the wait for an `--at` start always ends that way. A UDP link is sent
+  on from the thread
+  (its own duplicate of the socket); a serial link is handed each packet through the event loop, which
+  adds that loop's latency to it. A slot whose packet is not built in time (a loop stalled for 20 ms)
+  is skipped and counted as `starved` (consecutive ones as one). A header time field (`time_seconds`, `time_subseconds`)
+  carries the packet's slot time (in a burst, the time it was built, at most a few packets ahead).
+- **Overruns skip, they do not catch up.** A slot whose send cannot start within half a period of its
+  deadline (a slow link, a stalled host) is skipped and counted, and the series carries on at the slot
+  nearest to now. Catching up would send the missed packets back to back, loading a slow link or
+  vehicle further and putting packets at times nobody asked for. Consecutive sends therefore start at
+  least half a period apart. A skipped slot does not count toward `--repeat` (N packets are sent) but is
+  lost from a `--for`/`--until` window. A packet whose header carries its slot's time is discarded with
+  its slot (its count goes unused, which its ledger record says); any other is sent in the next slot,
+  so this process's counts on the wire stay consecutive. The summary says how many slots were skipped.
+- **Lateness** is the time from a slot's deadline to the return of the send call that handed its
+  packet to the kernel, measured in the pacer thread; the summary gives the maximum and mean (and, for
+  `--at`, how late the first packet left), the ledger the same.
+- **Output.** One line announces the plan (stderr). A series of at most 2 packets per second (or at most
+  10 back to back) prints a line per packet (with `-v`, the hex); a faster one prints a `progress:` line
+  on stderr every 5 s, so a 1 kHz series does not flood the terminal, and under `-v` also a sample of its
+  packets (with the hex), at most 2 a second. The run
+  ends with `complete: sent N of M ..., skipped S, lateness max ... mean ...` on stdout. The series
+  exits 0 however many slots it skipped; a script that needs the cadence reads `skipped` in
+  `send.outcome`.
+- **A full send buffer** (a burst on a slow or shaped link) is waited out, up to 2 s, before the send
+  counts as failed (`IB-TX-002`, which says it waited and to slow the series or check the link).
+- **Errors.** A send that fails (`IB-TX-002`, a closed port, a ledger that refuses commands) **stops the
+  series** with its coded error, exit 1, after the summary: a link that failed once will fail again, and a
+  series with holes in it is harder to read than one that stopped. A UDP refusal (nothing listening) is
+  reported by the OS after the send returned, one round trip later; in a series it is never cleared by
+  the next send: the next send fails with it, the loop checks for one within 50 ms of every send, and
+  once more 50 ms after the last, and any of these stops the series with `IB-TX-002` ("an earlier packet
+  of the series was refused").
+- **Signals.** Ctrl-C, SIGTERM and SIGHUP stop the series (the pacer thread is stopped and joined
+  first, so the count sent is exact), print the summary and exit 128+n. Waiting for `--at` is
+  interrupted at once, with nothing sent. A signal that arrives after the series ended (while the
+  session closes) still reports how many were sent: the notice and the `cli.signal` record carry the
+  series' count (`series_sent`, `series_planned`, `series_outcome`). A send through the event loop
+  (serial) is cancelled by the stop; a packet with only its head on the line then counts as sent, its
+  `tx.command` carries `cut: true`, and if the line does not take the rest, the `IB-TX-002` torn-packet
+  error names it by command and sequence count. If a send cannot be stopped (the thread does not finish
+  within 5 s), the pacer thread is abandoned with a coded `IB-TX-002` to the ledger and the
+  console, the packet in flight is ledgered as `unconfirmed` and counted so in `send.outcome` (whether it
+  left is unknown), and a failure the abandoned thread reports later is ledgered when it comes.
+  A thread that cannot be started is `IB-SYS-001`.
+- **Ledger.** `send.plan` (mode, start and end in UTC, period, count, the arguments, whether a zone was
+  assumed, how long the link took to open), `send.fault` once for the faults the packets inject (raw enum
+  values, count or length fields that disagree with the data, as for a single send), then the packets: the first 600 each get their own
+  `tx.command` (as a single `send`'s, the arguments not repeated); after them, packets are counted into
+  one `tx.command.window` record per 10 s (packets, bytes, results, first and last time and sequence),
+  so a 1 kHz series for a day does not fill the ledger's disk (a window's first and last times are the
+  times its packets were sent); a packet whose send failed or whose fate is unknown always gets its own
+  record. `send.outcome` comes last (`complete`, `interrupted` or `failed`, with sent, planned,
+  skipped, starved, discarded, unsent, unconfirmed, overruns, maximum and mean lateness, the `--at` start lateness,
+  the longest send, elapsed time, the first and last sequence count sent, exact totals by result, and
+  how the pacer ran: `timer_slack_ns`, or `timer_slack_error` when the slack could not be lowered),
+  however the series ends.
 
 **Sequence counts** (`ib send`, `ib respond`): the CCSDS sequence count of the packets ironbird
 builds is shared by every ironbird process and kept between runs, per target node and message ID, in
@@ -122,7 +242,19 @@ and the counts wrap at the width of the header profile's sequence field.
   nothing, and a power loss skips at most 64 counts of a stream, never repeating one.
 - `ib send NODE CMD --sequence N` sends that one packet with count `N` (decimal or `0x`; it must fit
   the sequence field, and the profile must have one, else `IB-ENC-002`, exit 2, nothing sent) and
-  continues from it: the next send, from any process, is `N+1`.
+  continues from it: the next send, from any process, is `N+1`. In a series (`--repeat`, `--every`,
+  `--at`) it is the first packet's count and the rest go on from it.
+- A series takes each packet's count when it builds the packet (up to 20 ms before its slot), on the event
+  loop and without waiting when it can: the same file lock and slot as a single send, held for microseconds
+  and released at once. When a take would wait (the first of a series, a ceiling to raise, another process
+  holding the lock) a task takes it and the slot is built when it is there; a slot whose packet is still
+  missing at its deadline is skipped like any other. The pacer thread never takes a count. So a series
+  continues the count of the sends before it, the next send continues the series, and a reset during a
+  series restarts it at 0, as for single sends. Two processes sending on one stream, series or not, get
+  unique counts, but only within one process do the packets reach the kernel in count order (as with two
+  processes on one serial line): their packets interleave on the wire, each process's in its own count
+  order. A packet built and not sent (skipped, unsent, unconfirmed, or a timed packet whose slot was
+  skipped) has spent its count, so the stream shows a gap there; its record in the ledger says so.
 - `ib seq show [NODE]` lists the value the next packet of each stream carries (`-v` adds the unreduced count
   and the stored ceiling); it only reads, so an invalid file is left as it is for you to inspect.
   `ib seq reset NODE MID` forgets one stream, `ib seq reset NODE` all streams of a node, `ib seq reset --all`
@@ -648,11 +780,12 @@ Argument text is checked, never repaired, and every refusal is `IB-ENC-002` nami
 - A list is `1,2,3`, `[1, 2, 3]` or `1 2 3`. With commas every element must be present
   (`1,,2` is refused as `Entries[1]`; one trailing comma is allowed).
 - `char[N]` and `char[]` text is ASCII and carries no NUL, because decode ends text at a NUL.
-- An integer that no name of a command field's `enum` gives is refused (telemetry from `ib respond` is not restricted). A CCDD field that is meant to carry
-  other values in its type's range says so with `"allow_raw": true` next to its `enum`.
+- An integer that no name of a command field's `enum` gives is refused (telemetry from `ib respond` is not
+  restricted). A CCDD field that is meant to carry other values in its type's range says so with
+  `"allow_raw": true` next to its `enum`; `ib send --raw-enum` sends one deliberately, once (fault injection).
 - `seq N` in the `send` line, the ledger's `sequence` and `SentCommand.sequence` are the value in the
   packet's sequence field (wrapped at the field width); a profile with no sequence field reports none.
-  The sequence count starts at 0 in every process (see the plan's deferral on a persistent count).
+  The count is the stream's next one in the state directory (see "Sequence counts"), a series' packets included.
 
 ## Filtering with --where
 
@@ -770,6 +903,7 @@ Sizes are bytes or `"64MiB"`, durations `"10min"`. Defaults are in the second co
 | | `keep_recent`, `warn_interval`, `scan_interval` | 10, 24h, 10min |
 | `[export]` | `jobs` | one per core, 1 to 64 (1: never use workers) |
 | | `pool_min_bytes`, `range_bytes` | 8MiB (0: always use workers), 4MiB (a multiple of 8, 4KiB to 256MiB) |
+| `[send]` | `spin_below_us` | 0, off (0 to 1000000): a `--every` period below this (microseconds) ends each wait with a 75 us spin |
 
 Environment: `IRONBIRD_CONFIG`, `IRONBIRD_STATE_DIR` (ledger; absolute), `IRONBIRD_RECORD_DIR`
 (recordings), `XDG_STATE_HOME`, `XDG_DATA_HOME`.
@@ -787,10 +921,17 @@ Shipped files:
 ```bash
 pytest -n auto
 ruff check . && ruff format --check .
-pyright
+pyright                                # strict on src/, strict minus style rules on tests/ ([tool.pyright])
 mypy                                   # strict, src/ only (config: [tool.mypy])
 bandit -c pyproject.toml -r src        # security lint; a skip is `# nosec B301  # reason`
+tools/coverage.sh -n auto              # branch coverage of src/ironbird; fails under fail_under
 ```
+
+The strict analyses (mypy, pyright strict, bandit) cover `src/` only; test code is held to a lower
+bar and needs only to be correct, deterministic and readable. CI enforces coverage in the `coverage`
+job (the same `tools/coverage.sh`, run from a venv; it writes a per-run `.pth` hook into the venv's
+site-packages and removes it on exit) and uploads the HTML/XML report as the `coverage-report`
+artifact. Add `--ignore=tests/cfs` to skip the real-cFS tests, as CI does.
 
 Packaging and dependency checks (the CI `package` job and the weekly `audit` / `el8-audit` jobs):
 

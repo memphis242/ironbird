@@ -282,6 +282,20 @@ class ExportConfig:
     range_bytes: int = DEFAULT_RANGE_BYTES
 
 
+DEFAULT_SPIN_BELOW_US: Final = 0  # spin-free: measured to keep 1 ms without it
+MAX_SPIN_BELOW_US: Final = 1_000_000
+
+
+@dataclass(frozen=True, slots=True)
+class SendConfig:
+    """The ``[send]`` table: how a series of sends (``ib send --every``) is paced.
+    ``spin_below_us``: a period shorter than this (microseconds) ends each wait of the pacer
+    thread with a short spin, which costs CPU and absorbs the thread's wake-up latency; 0 (the
+    default) never spins in a periodic series."""
+
+    spin_below_us: int = DEFAULT_SPIN_BELOW_US
+
+
 @dataclass(frozen=True, slots=True)
 class SystemConfig:
     path: Path
@@ -293,6 +307,7 @@ class SystemConfig:
     ledger: LedgerConfig = LedgerConfig()
     retention: RetentionConfig = RetentionConfig()
     export: ExportConfig = ExportConfig()
+    send: SendConfig = SendConfig()
     sha256: str | None = None  # of the bytes load_config parsed; None for a config built elsewhere
 
     def resolve(self, name_or_alias: str) -> Node:
@@ -754,6 +769,17 @@ def _parse_export(ctx: _Ctx, raw: object) -> ExportConfig:
     )
 
 
+def _parse_send(ctx: _Ctx, raw: object) -> SendConfig:
+    if not isinstance(raw, dict):
+        raise ctx.fail("send", "must be a table")
+    ctx.keys(raw, "send", {"spin_below_us"}, set())
+    if "spin_below_us" not in raw:
+        return SendConfig()
+    return SendConfig(
+        spin_below_us=_config_int(ctx, raw, "spin_below_us", "send", 0, MAX_SPIN_BELOW_US)
+    )
+
+
 def _device_key(device: str) -> str:
     """The device path with ``//``, ``/./`` and a trailing ``/`` removed, so two spellings of
     one path are one device. Symlinks are not followed: the transport compares the device
@@ -948,7 +974,7 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
     ctx.keys(
         data,
         "",
-        {"ironbird", "nodes", "links", "recording", "ledger", "retention", "export"},
+        {"ironbird", "nodes", "links", "recording", "ledger", "retention", "export", "send"},
         {"nodes"},
     )
 
@@ -1064,6 +1090,7 @@ def parse_config(data: Mapping[str, Any], path: Path) -> SystemConfig:
         if "retention" in data
         else RetentionConfig(),
         export=_parse_export(ctx, data["export"]) if "export" in data else ExportConfig(),
+        send=_parse_send(ctx, data["send"]) if "send" in data else SendConfig(),
     )
 
 

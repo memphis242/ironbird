@@ -40,6 +40,16 @@ the loop is never blocked and the wait ends within a poll of the holder's releas
 sender (:meth:`SequenceStore.keep_ahead`, ``ib respond``) raises a ceiling in the background once
 half a step is left, so its takes do not wait for a sync.
 
+A series of sends (``ib send --repeat/--every/--at``) builds its packets ahead of their slots on
+the loop and sends them from the pacer thread, so it cannot hold a lease from take to hand-off.
+It takes each packet's count when the packet is built, without waiting
+(:meth:`SequenceStore.take_now`: the take above, committed and released at once) or, when that
+would wait, in a task the series resumes from (:class:`SeriesCounts`); the pacer thread never
+takes. Counts are unique and persistent across processes, but are handed to the kernel in count
+order only within one process: two processes running series on one stream interleave their
+packets, each in its own count order, as two processes on one serial line do. A packet built and
+never sent (discarded, unsent, or a series that ended) spends its count: a gap.
+
 Failure paths. A lock that cannot be had within the bound, a worker that does not answer within
 it, or a state file that cannot be read or replaced once the store is open, fails the take
 (``IB-SEQ-006``, nothing is sent): a count is never handed out unrecorded. Only a state directory
@@ -1263,6 +1273,49 @@ class SequenceStore:
             self._end_lease()
             raise
 
+    def take_now(self, key: str) -> int | None:
+        """The next count of ``key``, spent, taken without waiting: a non-blocking ``flock``, one
+        ``fstatat`` and a ``pread`` and ``pwrite`` of one slot (or the in-memory count). ``None``
+        when it would have to wait: the files are not open yet, a send of this process holds its
+        turn, another process holds the live lock, the slot has no count left under its ceiling
+        or was not found nearby, or the live file was replaced. Call :meth:`take` then. Raises
+        ``IB-SEQ-006`` when a file operation fails. Only on the event loop."""
+        if self._memory is not None:
+            count = self._memory.get(key, 0)
+            self._memory[key] = count + 1
+            return count
+        main = self._main
+        if main is None or self._turn.locked():
+            return None
+        assert not self._main_locked
+        try:
+            self._fs.flock(main.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in _BUSY:
+                return None
+            raise self._failed(key, exc) from exc
+        self._main_locked = True
+        try:
+            taken = self._try_take(key)
+            if isinstance(taken, str):
+                return None
+            index, count, ceiling = taken
+            self._commit(key, count, index, ceiling)
+            return count
+        finally:
+            self._unlock_main()
+
+    async def take(self, key: str, *, seat: int | None = None) -> int:
+        """The next count of ``key`` (``seat`` when given: the stream goes on from ``seat + 1``),
+        spent: :meth:`lease` and :meth:`Lease.commit` with nothing held after. Raises what they
+        raise."""
+        lease = await self.lease(key, seat=seat, span_send=False)
+        try:
+            lease.commit()
+        finally:
+            lease.release()
+        return lease.count
+
     async def _enter(self, key: str) -> None:
         """This process's turn to take (one send at a time holds the lock of the live table)."""
         if self._turn.locked():  # another send of this process holds it: wait, bounded
@@ -1697,3 +1750,61 @@ class NodeSequences:
     async def preraise(self, kind: str, mids: Iterable[int]) -> None:
         """:meth:`SequenceStore.preraise` for the streams of ``kind`` and ``mids``."""
         await self._store.preraise([key_of(self._node, kind, mid) for mid in mids])
+
+    def series(
+        self, kind: str, mid: int, *, seat: int | None, wake: Callable[[], None]
+    ) -> SeriesCounts:
+        """The counts of one series of ``kind`` packets with ``mid`` (see :class:`SeriesCounts`).
+        A series is long-lived, so ceilings are raised in the background."""
+        self._store.keep_ahead()
+        return SeriesCounts(self._store, key_of(self._node, kind, mid), seat=seat, wake=wake)
+
+
+class SeriesCounts:
+    """The counts of the packets of one series, one per :meth:`next`, on the event loop.
+
+    A count is taken without waiting when it can be (:meth:`SequenceStore.take_now`). When it
+    cannot (the first packet of a series, a ceiling to raise, a contended lock, the seat of
+    ``--sequence`` for the first packet), a task takes it and ``wake`` is called when that
+    task ends; :meth:`next` returns ``None`` until then and the caller asks again after the
+    wake. A failed take is raised by the :meth:`next` that collects it, ``IB-SEQ-005`` or
+    ``IB-SEQ-006``, with nothing taken."""
+
+    def __init__(
+        self, store: SequenceStore, key: str, *, seat: int | None, wake: Callable[[], None]
+    ) -> None:
+        self._store: Final = store
+        self._key: Final = key
+        self._seat = seat  # for the first packet only
+        self._wake: Final = wake
+        self._task: asyncio.Task[int] | None = None
+
+    def next(self) -> int | None:
+        """The count for the next packet, spent; ``None`` while it is being taken (``wake``
+        follows)."""
+        task = self._task
+        if task is not None:
+            if not task.done():
+                return None
+            self._task = None
+            return task.result()
+        seat, self._seat = self._seat, None
+        if seat is None:
+            count = self._store.take_now(self._key)
+            if count is not None:
+                return count
+        self._task = asyncio.get_running_loop().create_task(
+            self._store.take(self._key, seat=seat), name="sequence-series-take"
+        )
+        self._task.add_done_callback(lambda _: self._wake())
+        return None
+
+    async def aclose(self) -> None:
+        """End a take still running (its count, if it is taken, is not used: a gap) and collect
+        its outcome, so nothing is left unretrieved."""
+        task, self._task = self._task, None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

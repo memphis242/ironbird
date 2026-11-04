@@ -304,7 +304,10 @@ Tests:
     keeps each key small and GitHub evicts least-recently-used keys; revisit if pip caches get evicted.
   - Deferred: a `keep_recent` survival invariant in `fuzz_retention.py`'s recovering scan - which parts
     recovery may legitimately remove (reserves, damaged parts) needs a retention-owner decision first.
-- tools/coverage.sh is not run in CI yet, so `fail_under` is advisory: deferred because a measured full-suite run in CI needs its own job budget and a user decision on gating merges on it.
+- Branch coverage of `src/ironbird` gates CI: the `coverage` job runs `tools/coverage.sh -n auto` (real-cFS tests skipped) and fails under `fail_under` in `pyproject.toml`.
+  - Deferred: pytest keeps a predictable `/tmp/pytest-of-USER` base dir even after 9.0.3 (symlinks are
+    refused, but another user can pre-create it and make `tmp_path` tests fail). On shared SSH hosts run
+    tests with `--basetemp` or a private `TMPDIR`.
 - E2E: the mock flight node is sent malformed commands, and the ground side is sent
   malformed telemetry, at rate, asserting the engine keeps capturing and the errors
   coalesce.
@@ -4425,6 +4428,24 @@ listed as deferred.
       `sequence.exhausted`, `sequence.ahead_failed`, `sequence.memory_only`; all essential.
     - *Respond.* The responder's telemetry replies count the same way, keyed by the node it acts as; the
       trial encodes made while validating the rules count in the codec's memory, so they take no count.
+    - *A series of sends (`--repeat/--every/--at`, merged with PR #41).* Each packet's count is taken from
+      the store when the pacer's `build()` encodes the packet ahead (on the loop, never in the pacer
+      thread): `SequenceStore.take_now` is the existing non-blocking take (a `LOCK_NB` flock, one
+      `fstatat`, one slot `pread`/`pwrite`) committed and released at once, and the packet is framed with
+      that count (`Codec.frame`, the series' arguments encoded and checked once by
+      `Codec.prepare_command`). When the take would wait (files not open yet, a ceiling to raise, a slot
+      to insert, the lock held by another process, a send of this process holding its turn) `build()`
+      returns nothing, a task (`SeriesCounts`) takes the count with the ordinary bounded `lease`, and
+      its completion wakes the pacer (`SeriesPacer.wake`), which builds that slot again; the loop is
+      never blocked and a slot still without a packet at its deadline is skipped as starved. Series
+      ask for background ceiling raises (`keep_ahead`), so a long series rarely waits on a sync.
+      `--sequence N` is the first packet's count (seated by the task); an unusable value is refused
+      before the series starts. Counts are unique and persistent; cross-process wire order is
+      guaranteed only within one process (as for serial): two processes' series interleave, each in its
+      own count order. A built-but-unsent packet (discarded, unsent, unconfirmed, a series that ended)
+      has spent its count (a gap) and is ledgered as such with its sequence. Tests:
+      `tests/test_sequence_state.py` (`SeriesCounts`, spent counts) and `tests/test_send_modes.py`
+      (continuing, `--sequence` with `--every`, two concurrent series, a reset during a series).
     - *Known limits (documented, not fixed).*
         - *Network file systems.* `$XDG_STATE_HOME` defaults under `$HOME`, which is often NFS on lab
           servers. Each take's `flock`, `fstatat`, `pread` and `pwrite` are then RPCs on the event loop (a
@@ -4677,6 +4698,75 @@ its options:
    mockups are the reference until the TUI exists.
 4. TUI command composer with tiered search and argument entry.
 5. Send modes: scheduled at T, repeat N, every M ms/s until T or for duration.
+   **Done for `ib send` (`send/modes`)**: `--at`, `--repeat`, `--every` with `--for`/`--until`, and
+   `--raw-enum`; the flags, timing model and decisions are in the README's "Send modes" section, in
+   `src/ironbird/sendmodes.py` (plan, slots) and `src/ironbird/pacer.py` (the pacer thread). Decisions:
+   - Absolute monotonic deadlines (no drift); a wall-clock `--at` re-read until the last second, `--until`
+     fixed on the monotonic clock at the start; zone-less times are UTC; offsets, `--for` and ends are
+     bounded to a year at parse time.
+   - The link is opened before the start. With `--at` the start and window are fixed before the open (an
+     open that overruns T skips the slots on T's grid, counted; a non-periodic `--at` goes late and says
+     so); with no `--at` the series starts when the link is open, and a `--until` window left no longer
+     than the period is refused (`IB-CLI-001`, nothing sent).
+   - Pacing is spin-free: a dedicated pacer thread sleeps to each deadline (`Event.wait`, then
+     `time.sleep` for the last 2 ms, timer slack lowered to 1 us with `prctl(PR_SET_TIMERSLACK)`, ledgered
+     when unavailable) and sends from the thread (UDP: a duplicate of the connected socket; serial:
+     through the loop). Nothing spins by default (measured on a busy 4-core host: `--every 1ms` on the
+     wire with a median jitter of 23 us, p99 170 us, at 26% of a core, against 185 us, 360 us and 100%
+     for the spinning version; README "Send modes"); a period under `[send] spin_below_us` (0, off)
+     ends each wait with a 75 us spin (median 7 us at 1 ms, for about spin / period more CPU).
+     The loop builds the packets ahead (bounded queue, no earlier than 20 ms before the slot, so the
+     ledger's transmit gate and a header time field are current, and only for slots the thread can still
+     serve: it publishes the slot it takes before the packet leaves the queue, a timed series starts from
+     the slot nearest now, and a packet not tied to a slot is built only while slots remain in the window,
+     so a complete series leaves no count built and unsent, except through a skip in the last 20 ms of
+     the window, which can leave up to a build-ahead's worth of packets built and unsent, each ledgered
+     `unsent`; the loop reads the queue depth before the slot the thread publishes, so an interleaving
+     can only defer a build, never add one) and handles the thread's reports. The loop's
+     work never delays a wait or a send, but the thread shares the GIL: the switch interval is lowered
+     (0.2 ms) for the life of a series and restored by the last series running in the process (a
+     refcount under a lock; the interval is process-wide) (measured: 61-68 of 300 slots skipped at 10 ms under 8
+     ms Python bursts, 1-5 after; 808 of 2000 at 1 ms under 3 ms bursts, about 100 after). The thread is
+     started with `sigmask.start_thread`; a start that fails is `IB-SYS-001`.
+   - Accounting: the thread publishes the packet in flight; a send through the loop (serial) is cancelled
+     by the stop and answers whether the head of the packet is on the line; a send that ignores the stop
+     for 5 s is abandoned: a coded `IB-TX-002` is ledgered and shown, its packet is ledgered `unconfirmed`,
+     and a failure the abandoned thread reports later is ledgered (`late: true`), not dropped. A send
+     the stop cut with only the head of its packet on the line is sent, marked `cut: true` in its
+     `tx.command`, and the torn-packet error (`IB-TX-002`) names it by command and sequence count; the
+     signal notice shows the series' end only when it was not the interruption itself; a UDP send buffer
+     still full after the 2 s wait says so and what to do. Consecutive starved slots are one
+     report; a handler error during the wind-down does not skip the rest of it. A burst on a full UDP send
+     buffer waits up to 2 s for room. `send.fault` is ledgered once per series; `-v` samples a fast
+     series' packets (2 a second) instead of printing each; a signal after the series ended still names
+     its count (`cli.signal` `series_*`).
+   - An overrunning slot is skipped (not caught up) when its send cannot start within half a period of
+     its deadline; a slot with no packet built is skipped as `starved`. Lateness is measured in the
+     thread when the send returns. A header that carries the send time makes each packet valid for its
+     own slot only (discarded with it, its count unused and ledgered); any other packet moves to the
+     next slot, so one process's counts on the wire stay consecutive.
+   - A failed send stops the series (exit 1). UDP refusals of a series are never cleared by the next
+     send: the next send fails with them, the loop checks within 50 ms of every send, and once after
+     the last.
+   - Ledger: the arguments once in `send.plan`; the first 600 packets each in a `tx.command`, then one
+     `tx.command.window` per 10 s (as `respond.replies`), every failure in full; exact totals and the
+     first and last count in `send.outcome`.
+   - Every packet takes its own count from the persistent counter (`send/sequence`, PR #40), when the
+     builder encodes it (see "A series of sends" under the sequence counts): a seated first count
+     (`--sequence N`) applies to packet 0 only (each later packet takes the next count) and is recorded in
+     `send.plan.request` as `sequence_set`. Counts of packets built and never sent (the end of a series, a
+     skipped timed slot) are ledgered as `unsent`/`skipped` with their sequence.
+
+   Remaining in Stage 5: replay to the wire (`ib replay --send`, D5), the TUI commanding page and its
+   scheduling UI, send modes for `ib respond`. **Deferred (PR #41 review, N7):** a distinct exit status
+   or a `--max-skipped` threshold for a series whose cadence degraded (today it exits 0 and
+   `send.outcome` says how many slots were skipped; the threshold wants a user decision on its form),
+   and an up-front check that a serial link's baud rate carries one packet per period (framing and
+   escaping make the wire size data-dependent; the lateness and skips report it today). The persistent
+   sequence counter is `send/sequence` (PR #40), merged with this stage. **Deferred (PR #41 round 3, outside
+   this PR, both predate it):** a SIGINT that arrives before the interpreter installs its signal
+   handlers ends the process with the default action (exit -2, nothing sent); and a stdout whose read end is closed gives no `IB-OUT` output-lost notice for a single
+   send or a series, which exit 0.
 6. xlsx export, optional semantic search (local sentence-transformer as an extra),
    1553 transport when hardware is available.
 
@@ -4699,6 +4789,21 @@ its options:
 
 CI gates beyond ruff, pyright and the tests (`.github/workflows/ci.yml`):
 
+- **Test code is held to a lower bar than `src/`** (CLAUDE.md Testing Guidelines). The strict analyses
+  apply to `src/` only: mypy strict, pyright strict, bandit and the full ruff rule set. Tests get
+  pyright strict minus its style and API-hygiene rules (an `executionEnvironments` entry for `tests`
+  in `[tool.pyright]` turns those off; `reportUnnecessaryComparison`, `reportUnnecessaryContains`
+  and `reportUnusedVariable` stay on because they expose vacuous tests), ruff's correctness rules
+  (F, B, E9, ...) with a few fixture-oriented security/style rules relaxed in `per-file-ignores`,
+  and no mypy (mypy stays on `src/` only).
+- **coverage** (`coverage` job): `tools/coverage.sh -n auto --ignore=tests/cfs` on a fresh venv (the
+  script refuses a non-virtualenv Python and installs its per-run `.pth` hook, a single self-contained
+  line with no helper module and so no bytecode, in the venv's site-packages, removing it on exit;
+  the job checks nothing is left behind), branch coverage of `src/ironbird`, failing under
+  `[tool.coverage.report] fail_under`. A job of its own keeps `checks` fast. The HTML and XML reports
+  are uploaded as the `coverage-report` artifact. `fail_under` sits a small margin under the measured
+  total (95.28% branch in CI, `fail_under = 94`), which absorbs timing-skipped paths; re-measure and
+  move it when the suite changes materially.
 - **mypy** (strict, `src/` only; `[tool.mypy]`) and **bandit** (`src/`; `[tool.bandit]`) run in the
   `checks` job. Every bandit skip is inline with a reason (`# nosec B301  # reason`; the only global
   skip is B101, because asserts are the assertive-programming tool).
@@ -4715,10 +4820,6 @@ CI gates beyond ruff, pyright and the tests (`.github/workflows/ci.yml`):
 
 Deferred (decisions open):
 
-- pytest is held below 9 and so carries PYSEC-2026-1845 (fixed in 9.0.3; accepted in
-  `tools/ci/audit-ignore.txt`). Verify pytest-benchmark and xdist on pytest 9, bump, drop the entry.
-- mypy does not yet cover `tests/` (pyright strict does): about 85 findings, mostly monkeypatching of
-  module attributes and re-exported names, to be cleaned up in a dedicated pass.
 - `recording/pexport.py` unpickles the export worker's replies in the parent. The pipe is private and
   the worker is the tool's own process, but a worker that a decoder bug compromised could then run
   code in the parent. Replacing pickle with a fixed binary framing removes that class (design change).
