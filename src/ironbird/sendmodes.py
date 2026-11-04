@@ -411,15 +411,32 @@ class Grid:
         return total if self.cap is None else min(self.cap, total)
 
 
-async def wait_for_wall(clock: Clock, target_wall_ns: int) -> int:
-    """Wait until the wall clock is within :data:`WALL_FINE_NS` of ``target_wall_ns``; returns
-    that instant on the monotonic clock, which is in the past if the target already is. Sleeps
-    in slices that re-read the wall clock, so a step of it during a long wait is followed."""
+async def wait_for_wall(clock: Clock, target_wall_ns: int, fine_ns: int = WALL_FINE_NS) -> int:
+    """Wait until the wall clock is within ``fine_ns`` of ``target_wall_ns``; returns that
+    instant on the monotonic clock, which is in the past if the target already is. Sleeps in
+    slices that re-read the wall clock, so a step of it during a long wait is followed."""
+    assert fine_ns > 0
     while True:
         remaining = target_wall_ns - clock.wall_ns()
-        if remaining <= WALL_FINE_NS:
+        if remaining <= fine_ns:
             return clock.mono_ns() + remaining
-        await clock.sleep(min((remaining - WALL_FINE_NS // 2) / NS, WALL_SLICE_S))
+        await clock.sleep(min((remaining - fine_ns // 2) / NS, WALL_SLICE_S))
+
+
+def check_open_window(plan: SendPlan, start_wall_ns: int) -> None:
+    """``IB-CLI-001``, with nothing sent, when ``plan`` has no ``--at`` and its ``--until`` window,
+    which starts at ``start_wall_ns``, is not longer than ``--every``: the link took the time the
+    window was accepted with (see the module's "The start")."""
+    every, until = plan.every_ns, plan.until_wall_ns
+    if every is None or plan.start_wall_ns is not None or until is None:
+        return
+    window = until - start_wall_ns
+    if window <= every:
+        raise _usage(
+            f"--until {iso_utc(until)} leaves {fmt_ns(max(window, 0))} once the "
+            f"link is open, not longer than --every {fmt_ns(every)}: nothing was sent; give a "
+            "later --until, or --for"
+        )
 
 
 async def start_grid(plan: SendPlan, clock: Clock) -> Grid:
@@ -434,19 +451,8 @@ async def start_grid(plan: SendPlan, clock: Clock) -> Grid:
     else:
         start_wall = clock.wall_ns() + START_LEAD_NS
         start_mono = clock.mono_ns() + START_LEAD_NS
+    check_open_window(plan, start_wall)
     window = plan.window_ns(start_wall)
-    if (
-        every is not None
-        and plan.start_wall_ns is None
-        and plan.until_wall_ns is not None
-        and window is not None
-        and window <= every
-    ):
-        raise _usage(
-            f"--until {iso_utc(plan.until_wall_ns)} leaves {fmt_ns(max(window, 0))} once the "
-            f"link is open, not longer than --every {fmt_ns(every)}: nothing was sent; give a "
-            "later --until, or --for"
-        )
     grid = Grid(
         start_mono,
         start_wall,

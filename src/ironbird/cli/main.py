@@ -115,10 +115,12 @@ from ironbird.retnotices import Notices
 from ironbird.retservice import Retention
 from ironbird.sanitize import hex_preview
 from ironbird.sendmodes import (
+    START_LEAD_NS,
     Grid,
     SendPlan,
     SystemClock,
     Tally,
+    check_open_window,
     fmt_ns,
     iso_utc,
     outcome_fields,
@@ -127,8 +129,9 @@ from ironbird.sendmodes import (
     resolve,
     start_grid,
     timing_text,
+    wait_for_wall,
 )
-from ironbird.seqstate import SequenceStore, node_stem
+from ironbird.seqstate import PRIME_TAKE_WITHIN_S, SequenceStore, SeriesCounts, node_stem
 from ironbird.session import Route, SentCommand, Session, Side
 from ironbird.sigmask import (
     HANDLED_SIGNALS,
@@ -146,6 +149,7 @@ EXIT_DAMAGED_INPUT: Final = 5  # output produced, but the input recording was da
 EXIT_UNLOGGED: Final = 6  # a command or reply went out but its ledger record was never written
 STATUS_INTERVAL_S: Final = 5.0  # ``ib record`` status line on stderr
 NS_PER_S: Final = 1_000_000_000
+PRIME_FINE_NS: Final = 5_000_000  # how closely the second phase of a series' prime is timed
 RAW_ENUM_HINT: Final = "use --raw-enum"
 RAW_ENUM_SHOWN: Final = 3  # raw enum values named in a confirmation line
 SEND_LINE_MAX_RATE: Final = 2.0  # a series up to this many packets/s prints a line for each
@@ -1636,6 +1640,8 @@ async def _send_series(
     link = await session.series_link(target)  # the link opens here, before any packet is built
     open_ns = time.monotonic_ns() - opening
     now_wall = time.time_ns()
+    # the same refusal as start_grid's, before anything is planned from a window the open closed
+    check_open_window(plan, now_wall + START_LEAD_NS)
     tally = Tally(planned=plan.planned(plan.start_wall_ns or now_wall))
     run.series, run.series_command = tally, command  # a signal from here on reports the count
     rate = None if plan.every_ns is None else NS_PER_S / plan.every_ns
@@ -1865,11 +1871,8 @@ async def _send_series(
 
     try:
         try:
-            if counts is not None:  # opened, seated and taken before the wait, not at its end
-                started = plan.start_wall_ns
-                await counts.prime(
-                    0.0 if started is None else (started - time.time_ns()) / NS_PER_S
-                )
+            if counts is not None:
+                await _prime_counts(session, counts, plan.start_wall_ns)
             grid = await start_grid(plan, SystemClock())
             tally.planned = grid.planned
             tally.first_mono_ns = tally.last_mono_ns = grid.start_mono
@@ -1897,6 +1900,24 @@ async def _send_series(
         raise
     finish("complete")
     return 0
+
+
+async def _prime_counts(session: Session, counts: SeriesCounts, start_wall_ns: int | None) -> None:
+    """Get the series' first counts ready before its start, in two phases: at launch the files
+    are opened and the ceiling raised (a failure there is a warning when the start is far
+    enough to try again), and :data:`~ironbird.seqstate.PRIME_TAKE_WITHIN_S` before the start
+    ``--sequence`` is seated and the first counts reserved, where a failure is the coded error,
+    before anything is sent."""
+    lead_s = 0.0 if start_wall_ns is None else (start_wall_ns - time.time_ns()) / NS_PER_S
+    problem = await counts.prime_open(lead_s)
+    if problem is not None:
+        session.report(problem, context="series prime", level=Level.WARNING)
+    if lead_s > PRIME_TAKE_WITHIN_S:
+        assert start_wall_ns is not None
+        await wait_for_wall(
+            SystemClock(), start_wall_ns - round(PRIME_TAKE_WITHIN_S * NS_PER_S), PRIME_FINE_NS
+        )
+    await counts.prime_take()
 
 
 def _sequence_store(session: Session) -> SequenceStore:

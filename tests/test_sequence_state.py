@@ -49,6 +49,7 @@ from ironbird.seqstate import (
     MAX_KEY_LEN,
     MAX_STEP,
     MAX_STREAMS,
+    PRIME_TAKE_WITHIN_S,
     SLOT_BYTES,
     STATE_NAME,
     SequenceStore,
@@ -2080,7 +2081,8 @@ def test_prime_takes_the_first_counts_before_the_start_with_no_sync_left_for_the
         store = _store(tmp_path)
         wake = asyncio.Event()
         counts = _series(store, wake, seat=7)
-        await counts.prime(0.5)
+        assert await counts.prime_open(0.5) is None  # a near start: all of it is phase two
+        await counts.prime_take()
         durable = os.open(tmp_path / LOCK_NAME, os.O_RDWR)
         fcntl.flock(durable, fcntl.LOCK_EX)  # another process is syncing
         try:
@@ -2094,23 +2096,24 @@ def test_prime_takes_the_first_counts_before_the_start_with_no_sync_left_for_the
     assert _run(scenario()) == [7, 8, 9, 10, 11]
 
 
-def test_prime_of_a_distant_start_opens_the_store_and_leaves_the_counts_to_the_builds(
+def test_prime_of_a_distant_start_opens_at_launch_and_takes_in_the_second_phase(
     tmp_path: Path,
 ) -> None:
     """A count taken hours ahead would be passed by every send that came meanwhile, and a seat
-    written now would be undone by them: a start beyond the window only opens the store and
-    raises the ceiling, so the first take at the start needs no sync."""
+    written then would be undone by them: the first phase only opens the store and raises the
+    ceiling, so that the counts of the second phase, taken near the start, need no sync."""
 
     async def scenario() -> tuple[list[int | None], int]:
         store = _store(tmp_path)
         other = _store(tmp_path)
         wake = asyncio.Event()
         counts = _series(store, wake)
-        await counts.prime(3600)
+        assert await counts.prime_open(3600) is None
         meanwhile = await _takes(other, 3)  # sends before the series starts
         durable = os.open(tmp_path / LOCK_NAME, os.O_RDWR)
         fcntl.flock(durable, fcntl.LOCK_EX)
         try:
+            await counts.prime_take()
             got = [counts.next() for _ in range(2)]
         finally:
             os.close(durable)
@@ -2131,14 +2134,92 @@ def test_prime_that_cannot_take_a_count_fails_with_the_takes_coded_error(tmp_pat
         fcntl.flock(holder, fcntl.LOCK_EX)
         counts = _series(store, asyncio.Event())
         try:
+            assert await counts.prime_open(0.0) is None  # nothing to open for a start now
             with pytest.raises(IronbirdError) as info:
-                await counts.prime(0.0)
+                await counts.prime_take()
         finally:
             os.close(holder)
         await store.aclose()
         return info.value
 
     assert _run(scenario()).code is Code.SEQ_TAKE
+
+
+def test_a_far_start_whose_open_fails_is_returned_not_raised_and_phase_two_retries(
+    tmp_path: Path,
+) -> None:
+    """N5 (round 4): a busy lock at launch is no reason to refuse a start that is far away. The
+    first phase returns the coded error for the caller to ledger as a warning; the second phase
+    takes the counts once the lock is free, and fails with the coded error only if it is not."""
+
+    async def scenario() -> tuple[IronbirdError | None, list[int | None]]:
+        store = _store(tmp_path, wait=0.3)
+        await _takes(store, 1)
+        holder = os_open_live(tmp_path)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        counts = _series(store, asyncio.Event(), seat=50)
+        try:
+            problem = await counts.prime_open(30.0)
+            with pytest.raises(IronbirdError) as info:
+                await counts.prime_take()  # still held: the coded error, before anything is sent
+            assert info.value.code is Code.SEQ_TAKE
+        finally:
+            os.close(holder)
+        await counts.prime_take()  # free again: the retry takes the seat
+        got = [counts.next() for _ in range(3)]
+        await counts.aclose()
+        await store.aclose()
+        return problem, got
+
+    problem, got = _run(scenario())
+    assert problem is not None and problem.code is Code.SEQ_TAKE
+    assert got == [50, 51, 52]
+
+
+def test_the_first_phase_gives_up_when_the_second_is_due(tmp_path: Path) -> None:
+    """The open waits for a lock no longer than the time left before the second phase."""
+
+    async def scenario() -> tuple[IronbirdError | None, float]:
+        store = _store(tmp_path, wait=10.0)
+        await _takes(store, 1)
+        holder = os_open_live(tmp_path)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        counts = _series(store, asyncio.Event())
+        started = time.monotonic()
+        try:
+            problem = await counts.prime_open(PRIME_TAKE_WITHIN_S + 0.2)
+        finally:
+            os.close(holder)
+        took = time.monotonic() - started
+        await counts.aclose()
+        await store.aclose()
+        return problem, took
+
+    problem, took = _run(scenario())
+    assert problem is not None and problem.code is Code.SEQ_TAKE
+    assert took < 3.0, took
+
+
+def test_the_step_of_a_short_burst_is_the_packets_it_plans_not_the_most(tmp_path: Path) -> None:
+    """N2 (round 4): a `--repeat 2` raised the ceiling by 4096, a quarter of a 14-bit field,
+    which a power loss then skips."""
+    assert step_for(None, 2) == BLOCK
+    assert step_for(None, 1000) == 1000
+    assert step_for(None, 10**6) == MAX_STEP == step_for(None)
+    assert step_for(1000.0, 100) == 100 and step_for(1000.0) == 500
+
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        counts = store.for_node("fc").series(
+            "command", 0x1890, seat=None, wake=lambda: None, per_second=None, planned=2
+        )
+        assert await counts.prime_open(0.0) is None
+        await counts.prime_take()
+        await counts.aclose()
+        await store.aclose()
+
+    _run(scenario())
+    assert _marks(tmp_path)[KEY] <= BLOCK + 2
 
 
 def _stick_a_raise_on_the_live_lock(store: SequenceStore, directory: Path) -> int:

@@ -13,6 +13,7 @@ import asyncio
 import itertools
 import json
 import math
+import os
 import signal
 import socket
 import subprocess
@@ -1904,6 +1905,86 @@ def test_a_series_prepares_its_counts_before_it_waits_for_its_start(
 
     raised = [e for e in events if e["event"] == "sequence.extend"]
     assert raised and at(raised[0]) < start - 0.5, "the ceiling was raised at the start itself"
+
+
+def test_an_until_window_the_link_open_closed_is_a_usage_error_not_an_internal_one(
+    tmp_path: Path,
+    setup: tuple[Path, int, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S1 (PR 40 round 4): `--every X --until T` accepted at parse time, whose window the link
+    open then closed, planned no packets and tripped an assertion (IB-INT-001). The open is
+    delayed here by a fixed time instead of raced."""
+    from typer.testing import CliRunner
+
+    from ironbird.cli.main import app
+    from ironbird.session import Session
+
+    config, port, env = setup
+    for name in ("IRONBIRD_STATE_DIR", "IRONBIRD_RECORD_DIR"):
+        monkeypatch.setenv(name, env[name])
+    monkeypatch.delenv("IRONBIRD_CONFIG", raising=False)
+    real = Session.series_link
+
+    async def slow_open(self: Session, target: Any) -> Any:
+        await asyncio.sleep(0.5)  # longer than the window left at parse time
+        return await real(self, target)
+
+    monkeypatch.setattr(Session, "series_link", slow_open)
+    until = sm.iso_utc(time.time_ns() + 300 * MS)
+    with sink_for(port) as sink:
+        result = CliRunner().invoke(
+            app, ["-c", str(config), "send", "fc", "MOCK_NOOP", "--every", "1ms", "--until", until]
+        )
+        time.sleep(0.1)
+        assert sink.count == 0
+    assert result.exit_code == 2, result.output
+    assert Code.CLI_USAGE.value in result.output and Code.INTERNAL.value not in result.output
+
+
+def test_a_far_start_takes_its_seat_before_the_start_not_at_it(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
+) -> None:
+    """S2 (PR 40 round 4): beyond 2 s the seat of `--sequence` (a durable write and sync) and the
+    first reservation ran 20 ms before the first slot, so another process holding the durable
+    lock then held the first packet back. They are done 2 s before the start."""
+    import fcntl
+
+    config, port, env = setup
+    hold_s = 0.4
+    with sink_for(port) as sink:
+        start = time.time() + 4.0
+        proc, _ = ib_send(
+            tmp_path,
+            config,
+            env,
+            "MOCK_NOOP",
+            "--at",
+            sm.iso_utc(int(start * SEC)),
+            "--every",
+            "5ms",
+            "--repeat",
+            "10",
+            "--sequence",
+            "100",
+        )
+        state = tmp_path / "state"
+        while not (state / "sequence-state.lock").exists() and proc.popen.poll() is None:
+            time.sleep(0.01)  # the series created it when it opened the state
+        fd = os.open(state / "sequence-state.lock", os.O_RDWR)
+        try:
+            while time.time() < start - 0.025:
+                time.sleep(0.001)
+            fcntl.flock(fd, fcntl.LOCK_EX)  # another process syncing around the start
+            time.sleep(hold_s)
+        finally:
+            os.close(fd)
+        done = proc.finish()
+        assert done == 0, proc.stderr
+        wait_for_packets(sink, 10)
+        assert sink.sequences() == list(range(100, 110))
+        first = sink.walls[0] / SEC - start
+    assert first < hold_s / 2, f"the first packet came {first * 1000:.0f} ms after its start"
 
 
 def test_two_series_at_once_to_one_node_and_mid_take_unique_counts_with_no_restart(

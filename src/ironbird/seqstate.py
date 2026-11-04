@@ -129,7 +129,7 @@ STEP_WINDOW_S: Final = 0.5  # a series raises a ceiling by this much of its own 
 AHEAD_AT: Final = BLOCK // 2  # a long-lived sender raises a ceiling when this many are left
 BATCH_WINDOW_S: Final = 0.02  # a series reserves this much of its rate in counts at a time
 MAX_BATCH: Final = 32  # ...and at most this many (a burst reserves this many)
-PRIME_TAKE_WITHIN_S: Final = 2.0  # a series that starts this soon takes its first count at once
+PRIME_TAKE_WITHIN_S: Final = 2.0  # a series takes its first counts this long before its start
 CLOSE_WAIT_S: Final = 0.25  # how long closing the store waits for a raise in the background
 LOCK_WAIT_S: Final = 10.0  # the bound on every wait for a lock of the state files
 CALL_GRACE_S: Final = 0.25  # how long past its own bound the loop waits for a worker's answer
@@ -233,15 +233,18 @@ def stream_text(key: str) -> str:
     return f"{parsed[0]} {parsed[1]} 0x{parsed[2]:04X}" if parsed else key
 
 
-def step_for(per_second: float | None) -> int:
+def step_for(per_second: float | None, planned: int | None = None) -> int:
     """The step of a stream sent at about ``per_second`` packets a second (``None``: as fast as
-    they go): the counts a ceiling is raised by in one sync. That is :data:`STEP_WINDOW_S` of the
-    rate, at least :data:`BLOCK` and at most :data:`MAX_STEP`, so a series is raised a few times
-    a second at most, and a power loss skips no more than this many counts of its stream."""
+    they go), ``planned`` of them when that is known: how far a durable ceiling is above the
+    counts handed out when it is raised. That is :data:`STEP_WINDOW_S` of the rate, at least
+    :data:`BLOCK` and at most :data:`MAX_STEP`, and no more than the packets still planned
+    (but never below :data:`BLOCK`). A raise starts when half a step is left, so a series syncs
+    a few times a second, and a power loss skips no more than this many counts of its stream."""
+    cap = MAX_STEP if planned is None else min(MAX_STEP, max(BLOCK, planned))
     if per_second is None:
-        return MAX_STEP
+        return cap
     assert per_second > 0
-    return min(MAX_STEP, max(BLOCK, math.ceil(per_second * STEP_WINDOW_S)))
+    return min(cap, max(BLOCK, math.ceil(per_second * STEP_WINDOW_S)))
 
 
 def batch_for(per_second: float | None) -> int:
@@ -1862,9 +1865,9 @@ class NodeSequences:
         """The counts of one series of ``kind`` packets with ``mid`` (see :class:`SeriesCounts`),
         sent at about ``per_second`` packets a second (``None``: back to back), ``planned`` of
         them when that is known. A series is long-lived, so ceilings are raised in the
-        background, by a step that fits its rate (:func:`step_for`)."""
+        background, by a step that fits its rate and its length (:func:`step_for`)."""
         key = key_of(self._node, kind, mid)
-        self._store.keep_ahead(key, step_for(per_second))
+        self._store.keep_ahead(key, step_for(per_second, planned))
         return SeriesCounts(
             self._store, key, seat=seat, wake=wake, batch=batch_for(per_second), planned=planned
         )
@@ -1914,20 +1917,39 @@ class SeriesCounts:
         self._at, self._end = got.start, got.stop
         self._reserved += len(got)
 
-    async def prime(self, start_in_s: float) -> None:
-        """Get ready for the first packet while the series waits for its start, so that no file
-        is opened and no sync waited for at the start itself. A start within
-        :data:`PRIME_TAKE_WITHIN_S` reserves the first counts now (``--sequence`` seated), and
-        :meth:`next` hands them out; a later one opens the store and raises the stream's
-        ceiling, and the counts are taken as the packets are built (a count taken hours ahead
-        would be passed by every send that came meanwhile). Raises ``IB-SEQ-005`` or
-        ``IB-SEQ-006``, with nothing sent."""
+    async def prime_open(self, start_in_s: float) -> IronbirdError | None:
+        """Phase one of getting ready for the first packet, at launch: open the files and raise
+        the stream's ceiling, so that the take of phase two does not have to wait for a sync. It
+        is only done for a start more than :data:`PRIME_TAKE_WITHIN_S` away (a nearer one has
+        phase two do both at once), and there it is an optimization: a failure, or no answer
+        before phase two is due, is returned (``IB-SEQ-005`` or ``IB-SEQ-006``) for the caller to
+        ledger as a warning, and phase two tries again. Nothing is sent."""
         assert self._reserved == 0 and self._task is None
         if start_in_s <= PRIME_TAKE_WITHIN_S:
-            seat, self._seat = self._seat, None
-            self._hold(await self._store.reserve(self._key, self._want(), seat=seat))
-        else:
-            await self._store.preraise([self._key])
+            return None
+        try:
+            async with asyncio.timeout(start_in_s - PRIME_TAKE_WITHIN_S):
+                await self._store.preraise([self._key])
+        except IronbirdError as exc:
+            return exc
+        except TimeoutError:
+            return IronbirdError(
+                Code.SEQ_TAKE,
+                f"the sequence state files did not answer for {stream_text(self._key)} before "
+                "the start is due; the count is taken then",
+            )
+        return None
+
+    async def prime_take(self) -> None:
+        """Phase two, shortly before the start (:data:`PRIME_TAKE_WITHIN_S`; at once for a
+        start no later): seat ``--sequence`` and reserve the first counts, which :meth:`next`
+        then hands out, so that no file is opened and no sync waited for at the start itself (a
+        count taken hours ahead would be passed by every send that came meanwhile). Raises
+        ``IB-SEQ-005`` or ``IB-SEQ-006``, with nothing sent."""
+        assert self._reserved == 0 and self._task is None
+        got = await self._store.reserve(self._key, self._want(), seat=self._seat)
+        self._seat = None  # seated: kept until then, so a failed take can be tried again
+        self._hold(got)
 
     def next(self) -> int | None:
         """The count for the next packet, spent; ``None`` while it is being taken (``wake``

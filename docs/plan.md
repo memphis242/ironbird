@@ -4466,16 +4466,20 @@ listed as deferred.
       deadline is skipped as starved. (The worker threads that raise a ceiling do share the interpreter
       and the CPU with the loop; see "Measured" for what that costs.)
       A series asks for background ceiling raises (`keep_ahead`) by a step sized to its rate
-      (`step_for`: half a second of it, 64 to 4096, a burst 4096), so a series syncs a few times a second
-      and not every 32 packets, which cost a burst two thirds of its rate. Right after the link opens,
-      before the `--at` wait, `SeriesCounts.prime` opens the store, seats `--sequence` and reserves the
-      first counts when the start is within 2 s (`PRIME_TAKE_WITHIN_S`; a count taken hours ahead would be
-      passed by every send meanwhile), or only opens the store and raises the ceiling when it is later; a
-      failure is the take's coded error, before anything is sent. `--sequence N` is the first packet's
+      (`step_for`: half a second of it, 64 to 4096, a burst 4096, and no more than the packets it plans, so a
+      `--repeat 2` raises by 64), so a series syncs a few times a second and not every 32 packets, which
+      cost a burst two thirds of its rate. A series gets ready in two phases (`SeriesCounts.prime_open`,
+      `prime_take`): right after the link opens it opens the store and raises the ceiling (for a start
+      more than 2 s away; a failure or a lock held past the time left is a ledgered warning, since it is
+      only an optimization, and the second phase retries), and `PRIME_TAKE_WITHIN_S` (2 s) before the start
+      it seats `--sequence` and reserves the first counts (a count taken hours ahead would be passed by
+      every send meanwhile); a failure then is the take's coded error, before anything is sent. So the
+      durable sync of a seat is never in the last 20 ms before the first slot. `--sequence N` is the first packet's
       count; an unusable value is refused before the series starts. Counts are unique and persistent;
       cross-process wire order is guaranteed only within one process (as for serial): two processes' series
-      interleave, each in its own count order, and a single send's count can reach the kernel up to 20 ms
-      before a series' lower one. A reserved or built-but-unsent count (discarded, unsent, unconfirmed,
+      interleave, each in its own count order, and a single send's count can reach the kernel before a
+      series' lower one: by up to the batch plus the 20 ms build-ahead (about 40 ms at 1 ms, 30 ms at
+      10 ms), and by up to 2 s for the counts taken ahead of the start. A reserved or built-but-unsent count (discarded, unsent, unconfirmed,
       left over at the end or at an interrupt) is spent (a gap), and a built packet is ledgered as such
       with its sequence. An interrupted series leaves about 40 counts of gap at a 1 ms period (reserved
       plus built ahead; at most `MAX_BATCH` + 8 for a burst), so every Ctrl-C advances the stream by about

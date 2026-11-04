@@ -242,9 +242,9 @@ and the counts wrap at the width of the header profile's sequence field.
   only within their own process. Over serial the lock is released once the count is taken (a serial device is
   one process's), so the order is exact per process. `sequence-state.json` holds a synced ceiling one *step*
   ahead of the next count: 64 counts for a single send or a responder, and for a series about half a second
-  of its rate (up to 4096, which a burst uses), so that a series syncs a few times a second, not every few
-  dozen packets. A crashed process loses nothing, and a power loss skips at most one step of a stream (a
-  gap of up to 64 counts, or 4096 for a fast series), never repeating a count.
+  of its rate (up to 4096, which a burst uses, and no more than the packets it plans, never under 64), so that
+  a series syncs a few times a second, not every few dozen packets. A crashed process loses nothing, and a power loss skips at most one step of a stream (a
+  gap of up to 64 counts, or 4096 for a fast series or a long burst), never repeating a count.
 - `ib send NODE CMD --sequence N` sends that one packet with count `N` (decimal or `0x`; it must fit
   the sequence field, and the profile must have one, else `IB-ENC-002`, exit 2, nothing sent) and
   continues from it: the next send, from any process, is `N+1`. In a series (`--repeat`, `--every`,
@@ -254,20 +254,26 @@ and the counts wrap at the width of the header profile's sequence field.
   event loop and without waiting when it can: the same file lock and slot as a single send, held for
   microseconds and released at once. When a take would wait (a ceiling to raise, another process holding
   the lock) a task takes it and the slot is built when it is there; a slot whose packet is still missing
-  at its deadline is skipped like any other. The pacer thread never takes a count. A series starting
-  within 2 s opens the state, seats `--sequence` and takes its first counts before it waits for its start,
-  so the first packet is not held up by a sync; a later start opens the state and raises the ceiling
-  then, and takes the counts as it builds the packets. So a series continues the count of the sends
+  at its deadline is skipped like any other. The pacer thread never takes a count. A series gets
+  ready in two phases so that its first packet is not held up by a sync: at launch it opens the state and
+  raises the ceiling, and 2 s before a start that is further away (at once for a nearer one) it seats
+  `--sequence` and takes its first counts. A busy or failing state at launch is not fatal for a start more
+  than 2 s away, since that phase is an optimization: it is ledgered as a warning (and shown) and the
+  second phase tries again; a failure then is the coded error (`IB-SEQ-005`, `IB-SEQ-006`), exit 1, before
+  anything is sent. The counts are never taken hours ahead, which every send meanwhile would pass. So a series continues the count of the sends
   before it and the next send continues the series. Two processes sending on one stream, series or not,
   get unique counts, but only within one process do the packets reach the kernel in count order (as with
   two processes on one serial line): their packets interleave on the wire, each process's in its own count
-  order, and a single send's count can reach the kernel up to 20 ms before a series' lower one. A count
+  order, and a single send's count can reach the kernel before a series' lower one: by up to the batch plus the
+  20 ms build-ahead (about 40 ms at a 1 ms period, 30 ms at 10 ms), and by up to 2 s for the counts the
+  series took ahead of its start. A count
   reserved or built and not sent (skipped, unsent, unconfirmed, a timed packet whose slot was skipped, or
   left over when the series ends or is interrupted) is spent, so the stream shows a gap there; the ledger
   record of a built packet says so. An interrupted series at 1 ms leaves a gap of up to about 40 counts
   (what it had reserved and built ahead), on top of the power-loss bound above; each Ctrl-C costs that.
   `ib seq reset` is seen by a series at its next reservation, so up to those same 40 or so of its packets
-  can still go out with the old counts before it restarts at 0; a single send sees a reset at once.
+  (the first ones, up to 2 s old, for a series that has not started) can still go out with the old counts
+  before it restarts at 0; a single send sees a reset at once.
 - `ib seq show [NODE]` lists the value the next packet of each stream carries (`-v` adds the unreduced count
   and the stored ceiling); it only reads, so an invalid file is left as it is for you to inspect.
   `ib seq reset NODE MID` forgets one stream, `ib seq reset NODE` all streams of a node, `ib seq reset --all`
