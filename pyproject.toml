@@ -18,10 +18,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "coverage>=7.10",  # patch = ["subprocess"] and the [tool.coverage] section below
-    "pytest>=9.0.3,<10",  # 9.0.3 fixes PYSEC-2026-1845 (predictable /tmp/pytest-of-USER directory)
+    "pytest>=9.0.3,<10",  # 9.0.3 hardens PYSEC-2026-1845 (symlinks refused); the dir name stays predictable, use --basetemp on shared hosts
     "pytest-xdist>=3.5,<4",
     "hypothesis>=6.100,<7",
-    "pytest-benchmark>=4.0,<6",
+    "pytest-benchmark>=5.3.1,<6",
     "ruff>=0.5,<0.18",  # lint and format rules change between minor releases
     "pyright[nodejs]>=1.1.370,<1.2",  # nodejs extra: the Node pyright runs on comes from PyPI
     "mypy>=1.11,<3",  # second type checker: catches what pyright's inference lets through
