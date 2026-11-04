@@ -474,31 +474,77 @@ def test_no_proc_scan_while_the_kernel_counter_rides_on_datagrams(
     assert seen == [0], "an idle listener with SO_RXQ_OVFL must not read /proc/net/udp"
 
 
+def first_quiet_ticks(reads: list[int]) -> list[bool]:
+    """On which ticks a tail scan is due, from the datagrams read by each tick: the first tick
+    that finds the count unchanged after a tick that found it grown."""
+    due: list[bool] = []
+    before, traffic = 0, False
+    for read in reads:
+        grew = read != before
+        due.append(traffic and not grew)
+        before, traffic = read, grew
+    return due
+
+
+# The quiet ticks a burst is watched for once it is read: its tail scan and five that make none.
+QUIET_TICKS = 6
+
+
 def test_tail_of_a_burst_is_scanned_once_after_the_traffic_stops(
     run_session: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """With SO_RXQ_OVFL the drops ride on the datagrams read, so /proc/net/udp is read only for
+    the tail of a burst: on the first tick that finds the socket quiet after traffic, never while
+    datagrams are being read and never again while it stays quiet. The scenario waits on ticks,
+    not wall time (draining a burst takes many ticks on a loaded host or under coverage tracing),
+    and the verdict of every tick is checked against what that tick saw."""
     probe = ScanProbe()
     monkeypatch.setattr(udp, "read_proc_drops", probe)
     monkeypatch.setattr("ironbird.session.TICK_S", 0.05)
-    seen: list[int] = []
+    watched: list[UdpTransport] = []
+    reads: list[int] = []  # per tick of the listener: the datagrams it had read by then
+    verdicts: list[bool] = []  # ... and whether that tick found a scan due
+    made: list[tuple[int, int]] = []  # (scans made, scans due) as the listener is closed
+    kernel_scan_due = UdpTransport.kernel_scan_due
+
+    def recorded(self: UdpTransport) -> bool:
+        verdict = kernel_scan_due(self)
+        if watched and self is watched[0]:
+            reads.append(self.stats().rx_frames)
+            verdicts.append(verdict)
+        return verdict
+
+    monkeypatch.setattr(UdpTransport, "kernel_scan_due", recorded)
+
+    def settled() -> bool:
+        """The burst was read and the latest ``QUIET_TICKS`` ticks found nothing more."""
+        last = reads[-QUIET_TICKS - 1 :]
+        return len(last) == QUIET_TICKS + 1 and last[0] > 0 and len(set(last)) == 1
 
     async def scenario(ground: Session, *_: Any) -> None:
         listener = await ground.listen("fc")
-        if not transport_of(listener).overflow_counter_active:
+        transport = transport_of(listener)
+        if not transport.overflow_counter_active:
             await listener.close()
             pytest.skip("SO_RXQ_OVFL is not available on this kernel")
+        watched.append(transport)
         addr = listener.local_address
         assert addr is not None
         raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         for _i in range(2000):
             raw.sendto(bytes(1000), addr)
         raw.close()
-        await asyncio.sleep(0.6)
-        seen.append(len(probe.threads))
+        deadline = time.monotonic() + 20.0
+        while not settled():
+            assert time.monotonic() < deadline, f"the burst never settled: reads per tick {reads}"
+            await asyncio.sleep(0.01)
+        made.append((len(probe.threads), sum(verdicts)))  # the close makes one more
         await listener.close()
 
     run_session(scenario)
-    assert 1 <= seen[0] <= 2, seen
+    assert verdicts == first_quiet_ticks(reads), list(zip(reads, verdicts, strict=True))
+    assert made[0][1] >= 1, "the tail of the burst was scanned"
+    assert made[0][0] == made[0][1], f"each scan due was made, and no other: {made}"
 
 
 def test_proc_scan_without_the_kernel_counter_runs_off_the_loop_once_per_tick(

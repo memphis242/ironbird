@@ -231,6 +231,39 @@ def alive(pid: int) -> bool:
     return text.rsplit(")", 1)[1].split()[0] != "Z"
 
 
+def stopped(pid: int) -> bool:
+    """Every thread of ``pid`` is stopped by a job-control signal (a signal sent now waits)."""
+    states = []
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        try:
+            states.append((task / "stat").read_text().rsplit(")", 1)[1].split()[0])
+        except OSError:
+            continue  # a thread that ended
+    return bool(states) and all(state == "T" for state in states)
+
+
+def signal_set(pid: int, *fields: str) -> set[int]:
+    """The signals in the ``fields`` masks of ``/proc/PID/status`` (none once it is gone)."""
+    try:
+        lines = Path(f"/proc/{pid}/status").read_text().splitlines()
+    except OSError:
+        return set()
+    mask = 0
+    for line in lines:
+        name, _, value = line.partition(":")
+        if name in fields:
+            mask |= int(value, 16)
+    return {n for n in range(1, mask.bit_length() + 1) if mask >> (n - 1) & 1}
+
+
+def pending(pid: int) -> set[int]:
+    return signal_set(pid, "SigPnd", "ShdPnd")
+
+
+def ignored(pid: int) -> set[int]:
+    return signal_set(pid, "SigIgn")
+
+
 def wait_until(predicate: Any, timeout: float = 20.0, what: str = "") -> None:
     deadline = time.monotonic() + timeout
     while not predicate():
@@ -333,11 +366,29 @@ def test_ctrl_c_at_a_terminal_reaches_every_process_and_only_the_parent_acts(
     tmp_path: Path, env: dict[str, str], config: Path, big: Path
 ) -> None:
     """SIGINT goes to the whole foreground process group: the workers ignore it, the parent ends
-    the export (130), terminates them and leaves nothing."""
+    the export (130), terminates them and leaves nothing.
+
+    The parent is held stopped while the group is interrupted, so nothing but a worker itself
+    can end a worker in that window: the interrupt waits, pending, in the parent, and each worker
+    is seen to ignore it (one still starting has it blocked, and drops it as it sets it ignored).
+    Only then is the parent let go to act on it."""
     run = Stalled(tmp_path, env, config, big, "text", new_session=True)
-    os.killpg(os.getpgid(run.proc.pid), signal.SIGINT)
-    time.sleep(0.3)
-    assert all(alive(p) for p in run.workers) or run.proc.poll() is not None
+    group = os.getpgid(run.proc.pid)
+    assert all(os.getpgid(p) == group for p in run.workers), "the workers share the group"
+    os.kill(run.proc.pid, signal.SIGSTOP)
+    try:
+        wait_until(lambda: stopped(run.proc.pid), what="the parent to stop")
+        os.killpg(group, signal.SIGINT)
+        assert signal.SIGINT in pending(run.proc.pid), "the interrupt waits in the parent"
+        for pid in run.workers:
+            wait_until(
+                lambda pid=pid: not alive(pid) or signal.SIGINT in ignored(pid),
+                what=f"worker {pid} to ignore SIGINT",
+            )
+        assert all(alive(p) for p in run.workers), "a worker acted on the interrupt"
+        assert not any(signal.SIGINT in pending(p) for p in run.workers), "nothing left to act"
+    finally:
+        os.kill(run.proc.pid, signal.SIGCONT)
     err = run.finish()
     assert run.proc.returncode == 130, err
     assert "Traceback" not in err
