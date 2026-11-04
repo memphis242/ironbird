@@ -116,9 +116,9 @@ and the counts wrap at the width of the header profile's sequence field.
 
 - How: a small table, `sequence-live`, holds the next count of each stream; every count is taken under a
   file lock in microseconds, so counts are exact and in take order across processes. Over UDP the lock is
-  held until the packet is handed to the kernel, so packets reach the wire in count order too; over serial
-  it is released once the count is taken (a serial device is one process's), so the order is exact per
-  process. `sequence-state.json` holds a synced ceiling up to 64 counts ahead: a crashed process loses
+  held until the packet is handed to the kernel, so packets are handed to the kernel in count order (what a
+  network does to them after that, on a multi-queue NIC for one, is not ours); over serial it is released once
+  the count is taken (a serial device is one process's), so the order is exact per process. `sequence-state.json` holds a synced ceiling up to 64 counts ahead: a crashed process loses
   nothing, and a power loss skips at most 64 counts of a stream, never repeating one.
 - `ib send NODE CMD --sequence N` sends that one packet with count `N` (decimal or `0x`; it must fit
   the sequence field, and the profile must have one, else `IB-ENC-002`, exit 2, nothing sent) and
@@ -133,11 +133,15 @@ and the counts wrap at the width of the header profile's sequence field.
   IB-SEQ-001`: the next send moves it aside to `sequence-state.json.invalid` and rebuilds it from the live
   table. A damaged or foreign `sequence-live`, or one from before a reboot, is `warning IB-SEQ-004` and is
   rebuilt from the stored ceilings. Keep one state directory per host: a table written by another host is
-  rebuilt each time (counts stay unique, with gaps of up to 64).
+  rebuilt each time (counts stay unique, with gaps of up to 64). A `sequence-state.json` that is gone, or older
+  than the table beside it, is brought up to the table; one that is refused only because it is a hard link or
+  another user's file still counts as a floor, so a stray copy can make counts skip but never repeat.
 - A state directory that cannot hold the counts at all (read-only, full, no file locks) is one `warning
-  IB-SEQ-002` per process, and the counts then restart at 0 in every process, as it says. Once counting from
-  the files, a count that cannot be taken (a lock held for over 10 s by a stopped process or a hung disk, a
-  write error) fails the send with `IB-SEQ-006` and nothing is sent: a count is never repeated to keep going.
+  IB-SEQ-002` per process. The process then counts in memory, above every stored count it can still read in the
+  directory (it starts at 0 only when nothing is readable), and its own counts are not kept, so two processes
+  in that state repeat each other. Once counting from the files, a count that cannot be taken (a lock held for
+  over 10 s by a stopped process or a hung disk, a worker that does not answer in that time, a write error)
+  fails the send with `IB-SEQ-006` and nothing is sent: a count is never repeated to keep going.
   Up to 4096 streams keep counts; another one is refused with `IB-SEQ-005` (reset the ones no longer used).
 
 ## The ledger under load, a full disk, and retention

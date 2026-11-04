@@ -4,8 +4,8 @@
 Two stores in one test stand for two processes: each opens its own descriptions of the files, so
 ``flock`` keeps them apart as it keeps processes apart. Real ``ib`` processes against a real
 ``ib respond`` check what reaches the wire. No assertion is made on the wording of a message,
-only on its code. Each regression test names the review finding it reproduces (PR 40: B1-B4,
-S1-S4, N1-N5).
+only on its code (one exception, marked where it is). Each regression test names the review
+finding it reproduces (PR 40: B1-B4, S1-S4, N1-N5 of round 1; S1-S5, N1-N6 of round 2).
 """
 
 from __future__ import annotations
@@ -15,7 +15,9 @@ import errno
 import fcntl
 import hashlib
 import json
+import os
 import re
+import socket
 import subprocess
 import sys
 import textwrap
@@ -32,9 +34,10 @@ from ironbird import seqstate
 from ironbird.ccdd.loader import load_ccdd
 from ironbird.ccdd.model import MessageKind
 from ironbird.codec import Codec
+from ironbird.config import load_config
 from ironbird.errors import Code, IronbirdError
 from ironbird.header import load_profile
-from ironbird.ledger import RECORD_TIERS
+from ironbird.ledger import RECORD_TIERS, Ledger
 from ironbird.seqstate import (
     BLOCK,
     INVALID_NAME,
@@ -54,6 +57,8 @@ from ironbird.seqstate import (
     read_boot_id,
     render_state,
 )
+from ironbird.session import Session
+from ironbird.transport import LinkEnd, TransportClosed
 from support.faultfs import FaultFs
 
 KEY = "fc/command/0x1890"
@@ -386,8 +391,8 @@ def test_a_lease_released_without_commit_spends_nothing(tmp_path: Path) -> None:
 def test_span_send_holds_the_lock_until_release_and_serial_releases_at_commit(
     tmp_path: Path,
 ) -> None:
-    """UDP holds the take's lock to the hand-off, so the wire order is the take order; serial
-    (span_send off) lets other processes take once the count is committed."""
+    """UDP holds the take's lock to the hand-off, so datagrams reach the kernel in take order;
+    serial (span_send off) lets other processes take once the count is committed."""
 
     async def scenario() -> None:
         held, other = _store(tmp_path), _store(tmp_path, wait=0.2)
@@ -688,8 +693,8 @@ def test_a_live_slot_of_any_bytes_is_a_slot_or_refused(raw: bytes) -> None:
 @settings(max_examples=200, deadline=1000)
 @given(
     st.sampled_from([KEY, "fc/telemetry/0x0b00", "ground/command/0x1891"]),
-    st.integers(0, 2**63 - 1),
-    st.integers(0, 2**63 - 1),
+    st.integers(0, 2**64 - 1),
+    st.integers(0, 2**64 - 1),
     st.integers(0, 88 * 8 - 1),
 )
 def test_the_loop_reads_its_own_slot_as_the_full_check_does(
@@ -717,7 +722,7 @@ def test_the_loop_reads_its_own_slot_as_the_full_check_does(
 
 def test_a_full_durable_file_of_the_longest_keys_fits_the_cap() -> None:
     marks = {
-        key_of(f"{'n' * 28}{i:04d}", "telemetry", (1 << 64) - 1 - i): (1 << 63) - 1
+        key_of(f"{'n' * 28}{i:04d}", "telemetry", (1 << 64) - 1 - i): seqstate.MAX_COUNT - 1
         for i in range(MAX_STREAMS)
     }
     assert all(len(k) <= MAX_KEY_LEN for k in marks)
@@ -1079,13 +1084,14 @@ def test_an_unusable_state_directory_warns_once_and_counts_in_memory(
 ) -> None:
     state = tmp_path / "state"
     state.mkdir(mode=0o700, exist_ok=True)
+    (state / LOCK_NAME).unlink(missing_ok=True)  # the responder made it when it started
     (state / LOCK_NAME).mkdir()  # the lock cannot be opened, as in a read-only directory
     first = _ib(mock_config_path, "send", "fc", "MOCK_NOOP")
     assert _seq(first) == 0 and f"warning {Code.SEQ_UNSAVED.value}" in first.stderr
     assert first.stderr.count(Code.SEQ_UNSAVED.value) == 1
     second = _ib(mock_config_path, "send", "fc", "MOCK_NOOP")
     assert _seq(second) == 0  # restarts at 0 in every process, as warned
-    assert not (state / STATE_NAME).exists()
+    assert KEY not in _marks(state)  # nothing of the sends is kept (the responder's replies are)
     assert _events(state, "sequence.memory_only")
 
 
@@ -1188,3 +1194,495 @@ def test_ledger_records_from_the_store_have_tiers() -> None:
     source = (Path(__file__).parents[1] / "src" / "ironbird" / "seqstate.py").read_text()
     named = set(re.findall(r'"(sequence\.[a-z_]+)"', source))
     assert named and named <= set(RECORD_TIERS)
+
+
+# -- round 2 of the review (PR 40: S1-S5, N1-N6) -------------------------------------------
+
+Y_KEY = "fc/command/0x1891"
+
+
+def os_open_live(directory: Path) -> int:
+    """A descriptor on the live table of its own, as another process has."""
+    return os.open(directory / LIVE_NAME, os.O_RDWR)
+
+
+def render_bytes(marks: dict[str, int]) -> bytes:
+    """A state file's bytes without the store's own checks on the keys."""
+    return json.dumps({"v": 1, "next": marks}).encode()
+
+
+def test_s1_a_full_disk_at_the_rebuild_after_a_reboot_does_not_restart_at_zero(
+    tmp_path: Path,
+) -> None:
+    """S1 (e6): ENOSPC while the table is rebuilt after a reboot counted in memory from 0, so a
+    receiver that rejects non-advancing counts dropped the commands. The durable file is still
+    readable: memory counting starts above it."""
+    fs = FaultFs()
+    reports = _Reports()
+
+    async def scenario() -> tuple[list[int], list[int]]:
+        first = _store(tmp_path)
+        sent = await _takes(first, 20)
+        await first.aclose()
+        fs.fail("pwrite", errno.ENOSPC)
+        second = _store(tmp_path, reports, boot=OTHER_BOOT, fs=fs)
+        after = await _takes(second, 3)
+        assert not second.persistent
+        await second.aclose()
+        return sent, after
+
+    sent, after = _run(scenario())
+    assert min(after) > max(sent)
+    assert after == list(range(after[0], after[0] + 3))
+    assert reports.codes == [Code.SEQ_UNSAVED]
+
+
+def test_s1_a_hard_linked_live_table_does_not_restart_at_zero(tmp_path: Path) -> None:
+    """S1 (e7): a `cp -al` backup of the state directory made the table "not ours" and every
+    process counted in memory from 0 while the files said 64."""
+
+    async def scenario() -> tuple[list[int], list[int]]:
+        first = _store(tmp_path)
+        sent = await _takes(first, 20)
+        await first.aclose()
+        (tmp_path / "backup-live").hardlink_to(tmp_path / LIVE_NAME)
+        second = _store(tmp_path)
+        after = await _takes(second, 3)
+        assert not second.persistent
+        await second.aclose()
+        return sent, after
+
+    sent, after = _run(scenario())
+    assert min(after) > max(sent)
+
+
+def test_s1_the_live_table_alone_is_a_floor_when_the_durable_file_is_gone(
+    tmp_path: Path,
+) -> None:
+    """The memory fallback reads every ceiling it can: with the durable file deleted and the
+    directory unusable for writing, the table's slots still say what was handed out."""
+    fs = FaultFs()
+
+    async def scenario() -> tuple[list[int], list[int]]:
+        first = _store(tmp_path)
+        sent = await _takes(first, 20)
+        await first.aclose()
+        (tmp_path / STATE_NAME).unlink()
+        fs.fail("flock", errno.ENOLCK, when=lambda fd, op: bool(op & fcntl.LOCK_EX))
+        second = _store(tmp_path, fs=fs)
+        after = await _takes(second, 2)
+        assert not second.persistent
+        await second.aclose()
+        return sent, after
+
+    sent, after = _run(scenario())
+    assert min(after) > max(sent)
+
+
+def test_s1_a_hard_linked_durable_file_is_a_floor_not_a_zero(tmp_path: Path) -> None:
+    """S1 (e8): refused as "not a plain file" after a reboot, the stale table was wiped before
+    the file was read, so every stream restarted at 0. A refused file that still parses is a
+    floor: a forger can make counts skip, never repeat."""
+    reports = _Reports()
+
+    async def scenario() -> tuple[list[int], list[int]]:
+        first = _store(tmp_path)
+        sent = await _takes(first, 20)
+        await first.aclose()
+        (tmp_path / "backup-state.json").hardlink_to(tmp_path / STATE_NAME)
+        second = _store(tmp_path, reports, boot=OTHER_BOOT)
+        after = await _takes(second, 3)
+        assert second.persistent
+        await second.aclose()
+        return sent, after
+
+    sent, after = _run(scenario())
+    assert after == [BLOCK, BLOCK + 1, BLOCK + 2] and max(sent) < BLOCK
+    assert Code.SEQ_RESET in reports.codes
+    assert (tmp_path / "backup-state.json").exists()  # the other link is untouched evidence
+
+
+def test_s2_a_deleted_durable_file_is_recovered_from_the_live_table(tmp_path: Path) -> None:
+    """S2 (e1): with the file gone, the next rewrite held only the stream that forced it; after
+    the next reboot the others sent 0, 1, 2 again."""
+
+    async def scenario() -> tuple[list[int], list[int]]:
+        first = _store(tmp_path)
+        sent = await _takes(first, 10, KEY)
+        await _takes(first, 1, Y_KEY)
+        (tmp_path / STATE_NAME).unlink()
+        await _takes(first, BLOCK + 1, Y_KEY)  # raises Y: rewrites the file
+        assert KEY in _marks(tmp_path)  # X came back from the table
+        await first.aclose()
+        second = _store(tmp_path, boot=OTHER_BOOT)
+        after = await _takes(second, 3, KEY)
+        await second.aclose()
+        return sent, after
+
+    sent, after = _run(scenario())
+    assert min(after) > max(sent)
+
+
+def test_s2_a_process_that_opens_after_the_file_was_deleted_restores_it(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        first = _store(tmp_path)
+        await _takes(first, 10, KEY)
+        (tmp_path / STATE_NAME).unlink()
+        second = _store(tmp_path)  # same boot: the table is good
+        await _takes(second, 1, Y_KEY)
+        assert _marks(tmp_path)[KEY] == BLOCK  # settled when it opened, before any reboot
+        await first.aclose()
+        await second.aclose()
+
+    _run(scenario())
+
+
+def test_s2_a_file_older_than_the_table_is_brought_up_to_it(tmp_path: Path) -> None:
+    """S2 (e1b, same boot): a durable file restored from a backup is below the table's
+    ceilings. The first stream to raise its ceiling sees it and merges every stream's."""
+
+    async def scenario() -> list[int]:
+        store = _store(tmp_path)
+        sent = await _takes(store, 1, KEY)
+        old = (tmp_path / STATE_NAME).read_bytes()  # {KEY: 64}
+        await _takes(store, 1, Y_KEY)
+        sent += await _takes(store, 2 * BLOCK, KEY)  # the table: 192
+        restore = tmp_path / "restore.tmp"
+        restore.write_bytes(old)
+        restore.replace(tmp_path / STATE_NAME)
+        sent += await _takes(store, BLOCK + 1, KEY)  # crosses 192: raises, sees the file is old
+        marks = _marks(tmp_path)
+        assert marks[Y_KEY] == BLOCK  # not lost with the old file
+        assert marks[KEY] > sent[-1]
+        await store.aclose()
+        return sent
+
+    sent = _run(scenario())
+    assert sent == list(range(len(sent)))
+
+
+def test_s3_a_stored_count_near_the_bound_never_makes_the_store_write_what_it_refuses(
+    tmp_path: Path,
+) -> None:
+    """S3 (e2): 2^63-1 passed the parser and the store then wrote ceilings its own parser
+    refused (IB-SEQ-001 on every read, then a rebuild that dropped to 129). One bound for both."""
+    top = seqstate.MAX_COUNT - 1
+    (tmp_path / STATE_NAME).write_bytes(render_state({KEY: top - 2}))
+    reports = _Reports()
+
+    async def scenario() -> list[int]:
+        store = _store(tmp_path, reports)
+        taken = await _takes(store, 2)
+        for _ in range(3):  # no count left below the bound: a coded refusal, every time
+            with pytest.raises(IronbirdError) as info:
+                await store.lease(KEY)
+            assert info.value.code is Code.SEQ_TAKE
+        await store.aclose()
+        return taken
+
+    assert _run(scenario()) == [top - 2, top - 1]
+    assert max(_marks(tmp_path).values()) <= top  # what it wrote, it can read back
+    assert reports.codes == [] and reports.named("sequence.exhausted")
+
+
+def test_s3_a_seat_beyond_the_bound_is_a_coded_refusal_not_an_assert(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        for seat in (seqstate.MAX_COUNT - 1, seqstate.MAX_COUNT, 1 << 70):
+            with pytest.raises(IronbirdError) as info:
+                await store.lease(KEY, seat=seat)
+            assert info.value.code is Code.SEQ_TAKE
+        lease = await store.lease(KEY, seat=seqstate.MAX_COUNT - 2)  # the highest that fits
+        lease.commit()
+        lease.release()
+        await store.aclose()
+
+    _run(scenario())
+    assert max(_marks(tmp_path).values()) < seqstate.MAX_COUNT
+
+
+def test_s4_a_take_whose_worker_hangs_fails_at_the_bound_and_does_not_blame_another_process(
+    tmp_path: Path,
+) -> None:
+    """S4 (e5): the sync of a raised ceiling never returned and the take waited for ever; the
+    next take of the process failed with "stayed locked by another process", though the holder
+    was its own abandoned worker. Also N3: the abandoned worker's records are still delivered."""
+    fs = FaultFs()
+    reports = _Reports()
+
+    async def scenario() -> None:
+        store = _store(tmp_path, reports, fs=fs, wait=0.5)
+        await _takes(store, BLOCK)
+        rule = fs.block("fdatasync", times=1)
+        started = time.monotonic()
+        with pytest.raises(IronbirdError) as first:
+            await asyncio.wait_for(store.lease(KEY), timeout=10)
+        assert first.value.code is Code.SEQ_TAKE and time.monotonic() - started < 5
+        with pytest.raises(IronbirdError) as second:
+            await asyncio.wait_for(store.lease(KEY), timeout=10)
+        assert second.value.code is Code.SEQ_TAKE
+        # the one assertion on wording in this file: the holder is this process's own worker
+        assert "another process" not in second.value.summary
+        assert rule.gate is not None
+        rule.gate.set()  # the disk comes back
+        for _ in range(100):
+            if len(reports.named("sequence.extend")) > 1:  # the first was the initial step
+                break
+            await asyncio.sleep(0.02)
+        assert [s["to"] for s in reports.named("sequence.extend")[-1]["streams"]] == [2 * BLOCK]
+        assert await _takes(store, 1) == [BLOCK]  # nothing was spent by the refused takes
+        await store.aclose()
+
+    _run(scenario())
+
+
+def test_n3_the_records_of_a_cancelled_take_still_reach_the_ledger(tmp_path: Path) -> None:
+    """N3: a Ctrl-C during an extend left the durable file changed and no `sequence.extend`."""
+    fs = FaultFs()
+    reports = _Reports()
+
+    async def scenario() -> None:
+        store = _store(tmp_path, reports, fs=fs)
+        await _takes(store, BLOCK)
+        rule = fs.block("fdatasync", times=1)
+        take = asyncio.create_task(store.lease(KEY))
+        await asyncio.sleep(0.2)
+        take.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await take
+        assert rule.gate is not None
+        rule.gate.set()
+        for _ in range(100):
+            if len(reports.named("sequence.extend")) > 1:  # the first was the initial step
+                break
+            await asyncio.sleep(0.02)
+        assert len(reports.named("sequence.extend")) == 2
+        await store.aclose()
+
+    _run(scenario())
+
+
+def test_s5_a_wait_for_the_live_lock_that_is_given_up_leaves_the_lock_alone(
+    tmp_path: Path,
+) -> None:
+    """S5: a contended take is polled by a helper thread. When the take is cancelled the helper
+    must neither keep the lock it may win later nor release one a later take of the same
+    process holds (flock on a descriptor that holds the lock succeeds)."""
+
+    async def scenario() -> None:
+        store, other = _store(tmp_path), _store(tmp_path, wait=0.3)
+        await _takes(store, 1)
+        holder = os_open_live(tmp_path)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        take = asyncio.create_task(store.lease(KEY))
+        await asyncio.sleep(0.1)  # the helper is polling
+        take.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await take
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        lease = await store.lease(KEY)  # the same store takes the lock itself, on the loop
+        await asyncio.sleep(0.1)  # the abandoned helper would have polled by now
+        with pytest.raises(IronbirdError) as info:
+            await other.lease(KEY)  # still held by `lease`
+        assert info.value.code is Code.SEQ_TAKE
+        lease.commit()
+        lease.release()
+        assert await _takes(other, 1) == [2]
+        os.close(holder)
+        await store.aclose()
+        await other.aclose()
+
+    _run(scenario())
+
+
+def test_s5_a_contended_take_is_granted_after_the_holder_releases(tmp_path: Path) -> None:
+    async def scenario() -> list[int]:
+        store = _store(tmp_path)
+        await _takes(store, 1)
+        holder = os_open_live(tmp_path)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.05, fcntl.flock, holder, fcntl.LOCK_UN)
+        taken = await _takes(store, 2)
+        os.close(holder)
+        await store.aclose()
+        return taken
+
+    assert _run(scenario()) == [1, 2]
+
+
+def test_n2_a_send_that_must_not_reopen_does_not_open_the_transport(
+    tmp_path: Path, mock_config_path: Path
+) -> None:
+    """N2: Engine.send's retry after a close under the send reopened the transport (a name
+    resolution, a bind) while the caller held the cross-process lock of the sequence table."""
+    config = load_config(mock_config_path)
+    ledger = Ledger(tmp_path / "ledger", session_id="n2")
+    session = Session(config, role="ground", ledger=ledger, notify=lambda _n: None)
+    engine = session._engine
+    link = config.links[0]
+    opened: list[int] = []
+
+    class Closing:
+        description = "stub"
+
+        async def send(self, data: bytes, **_kw: Any) -> None:
+            engine._io(link, LinkEnd.SOURCE).transport = None  # a capture closed it
+            raise TransportClosed
+
+    async def open_stub(io: Any, transport: Any, receiver: Any) -> None:
+        opened.append(1)
+
+    Closing.prepare_send = lambda self: asyncio.sleep(0)  # type: ignore[attr-defined]
+
+    async def scenario() -> None:
+        engine._new_transport = lambda io: Closing()  # type: ignore[method-assign,assignment,misc]
+        engine._open_transport = open_stub  # type: ignore[method-assign]
+        await engine.prepare_send(link, LinkEnd.SOURCE)  # the caller opens before it locks
+        with pytest.raises(IronbirdError) as info:
+            await engine.send(link, LinkEnd.SOURCE, b"x", reopen=False)
+        assert info.value.code is Code.TX_SEND
+        assert opened == [1]  # the first open only; the retry did not reopen
+        opened.clear()
+        with pytest.raises(IronbirdError):  # the default opens again for the retry
+            await engine.send(link, LinkEnd.SOURCE, b"x")
+        assert len(opened) == 2
+
+    _run(scenario())
+
+
+def test_n2_a_session_sends_again_on_a_transport_opened_outside_the_sequence_lock(
+    tmp_path: Path, mock_config_path: Path
+) -> None:
+    """N2, end to end: the transport closed under a UDP send (the lease holds the lock) is
+    reopened only after the lock is let go of, and the packet goes out with the next count."""
+    config = load_config(mock_config_path)
+    ledger = Ledger(tmp_path / "ledger", session_id="n2b")
+    session = Session(config, role="ground", ledger=ledger, notify=lambda _n: None)
+    engine = session._engine
+    command = config.links[0].command_endpoint
+    fc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    fc.bind((command.host, command.port))
+    live = tmp_path / "ledger" / LIVE_NAME
+    lock_free_at_open: list[bool] = []
+    real_open, real_new = engine._open_transport, engine._new_transport
+    sends: list[int] = []
+
+    async def spy(io: Any, transport: Any, receiver: Any) -> None:
+        if live.exists():
+            probe = os_open_live(live.parent)
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_free_at_open.append(True)
+            except BlockingIOError:
+                lock_free_at_open.append(False)
+            finally:
+                os.close(probe)
+        await real_open(io, transport, receiver)
+
+    def new(io: Any) -> Any:
+        transport = real_new(io)
+        real_send = transport.send
+
+        async def send(data: bytes, **kw: Any) -> None:
+            sends.append(len(data))
+            if len(sends) == 1:
+                io.transport = None  # a capture closed it under the send
+                raise TransportClosed
+            await real_send(data, **kw)
+
+        transport.send = send
+        return transport
+
+    engine._open_transport = spy  # type: ignore[method-assign]
+    engine._new_transport = new  # type: ignore[method-assign]
+
+    async def scenario() -> list[int | None]:
+        async with session:
+            first = await session.send_command("fc", "MOCK_NOOP")
+            second = await session.send_command("fc", "MOCK_NOOP")
+            return [first.sequence, second.sequence]
+
+    try:
+        counts = _run(scenario())
+    finally:
+        fc.close()
+    assert len(sends) == 3 and lock_free_at_open == [True]  # reopened without the lock
+    assert counts == [1, 2]  # the first count was spent by the send that found no transport
+
+
+def test_n4_keys_that_are_not_streams_are_refused_not_counted(tmp_path: Path) -> None:
+    """N4: keys matching the alphabet but spelled no way key_of writes (`x`, `a/b/command/...`)
+    were counted toward the 4096 and skipped by `ib seq show`, so IB-SEQ-005's advice could not
+    be followed from it. Both files now refuse them; the corpus has the cases."""
+    for key in ("x", "a/b/command/0x1890", "fc/command/0x00AB", "fc/other/0x1890", "/command/0x1"):
+        assert parse_state(render_bytes({key: 5})) is None
+    raw = bytearray(seqstate._pack_slot("x", 5, 10))
+    with pytest.raises(seqstate._Garbage):
+        seqstate._unpack_slot(bytes(raw))
+    assert seqstate._unpack_slot(seqstate._pack_slot(KEY, 5, 10)).key == KEY
+
+
+def test_n5_a_ledger_that_stops_mid_session_does_not_move_the_counts_to_memory(
+    tmp_path: Path, mock_config_path: Path
+) -> None:
+    """N5: the directory was decided from `ledger.enabled` at the first use, so a ledger
+    disabled before the first send counted from 0 in memory."""
+    config = load_config(mock_config_path)
+    ledger = Ledger(tmp_path / "ledger", session_id="n5")
+    session = Session(config, role="ground", ledger=ledger, notify=lambda _n: None)
+    ledger.disable()
+
+    async def scenario() -> list[int]:
+        sequences = session.sequences("fc")
+        taken: list[int] = []
+        for _ in range(2):
+            lease = await sequences.lease("command", 0x1890)
+            taken.append(lease.count)
+            lease.commit()
+            lease.release()
+        assert sequences.store.persistent
+        await sequences.store.aclose()
+        return taken
+
+    assert _run(scenario()) == [0, 1]
+    assert (tmp_path / "ledger" / STATE_NAME).exists()
+
+
+def test_n6_one_sync_raises_every_stream_of_a_responder_before_its_first_reply(
+    tmp_path: Path,
+) -> None:
+    """N6: a responder's first reply of each message waited for a sync of its own (and a full
+    rewrite of the file each)."""
+    keys = [f"fc/telemetry/0x{mid:04x}" for mid in (0x890, 0x891, 0x892, 0x893)]
+    fs_one, fs_all = FaultFs(), FaultFs()
+
+    async def raise_(directory: Path, fs: FaultFs, which: list[str]) -> None:
+        store = _store(directory, fs=fs)
+        store.keep_ahead()
+        await store.preraise(which)
+        await store.aclose()
+
+    one, all_ = tmp_path / "one", tmp_path / "all"
+    _run(raise_(one, fs_one, keys[:1]))
+    _run(raise_(all_, fs_all, keys))
+    assert dict.fromkeys(keys, BLOCK) == _marks(all_)
+    assert fs_all.count("fdatasync") == fs_one.count("fdatasync")  # one sync, however many
+    # and the first takes after it wait for none
+    fs_take = FaultFs()
+
+    async def takes() -> None:
+        store = _store(all_, fs=fs_take)
+        for key in keys:
+            assert await _takes(store, 1, key) == [0]
+        await store.aclose()
+
+    _run(takes())
+    assert fs_take.count("fdatasync") == 0
+
+
+def test_n6_a_responder_start_leaves_its_reply_ceilings_stored(
+    mock_config_path: Path, responder: Any, tmp_path: Path
+) -> None:
+    marks = _marks(tmp_path / "state")
+    assert marks and all("/telemetry/" in key for key in marks)

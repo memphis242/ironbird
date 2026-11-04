@@ -167,6 +167,7 @@ RECORD_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "sequence.compacted": Tier.ESSENTIAL,
         "sequence.reopened": Tier.ESSENTIAL,
         "sequence.full": Tier.ESSENTIAL,
+        "sequence.exhausted": Tier.ESSENTIAL,
         "sequence.ahead_failed": Tier.ESSENTIAL,
         "sequence.memory_only": Tier.ESSENTIAL,
         "sink.detached": Tier.ESSENTIAL,
@@ -627,6 +628,12 @@ class Ledger:
     @property
     def enabled(self) -> bool:
         return not self._dead
+
+    @property
+    def configured(self) -> bool:
+        """Whether this ledger was given a state directory to use (:attr:`directory` is a real
+        one), whether or not it has since stopped writing."""
+        return self._enabled
 
     @property
     def counted(self) -> Mapping[Tier, tuple[int, int]]:

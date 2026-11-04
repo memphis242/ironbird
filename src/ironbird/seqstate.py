@@ -33,26 +33,36 @@ Off the event loop: a take on the loop is a non-blocking ``flock``, one ``fstata
 file must still be the one this process opened), and a ``pread`` and ``pwrite`` of one slot.
 Everything that can block (raising a ceiling, which syncs; inserting a stream; rebuilding;
 opening the files) runs in a worker thread (:class:`~ironbird.offloop.OffLoop`) whose lock waits
-are bounded by :data:`LOCK_WAIT_S`; a contended live lock is waited for on the loop with
-``asyncio.sleep``. A long-lived sender (:meth:`SequenceStore.keep_ahead`, ``ib respond``) raises a
-ceiling in the background once half a step is left, so its takes do not wait for a sync.
+are bounded by :data:`LOCK_WAIT_S`, and the loop stops waiting for it at that bound (an abandoned
+worker ends on its own, and its records still reach the ledger). A contended live lock is polled
+every :data:`POLL_FAST_S` by a helper thread (a sleep on the loop is at least a millisecond), so
+the loop is never blocked and the wait ends within a poll of the holder's release. A long-lived
+sender (:meth:`SequenceStore.keep_ahead`, ``ib respond``) raises a ceiling in the background once
+half a step is left, so its takes do not wait for a sync.
 
-Failure paths. A lock that cannot be had within the bound, or a state file that cannot be read
-or replaced once the store is open, fails the take (``IB-SEQ-006``, nothing is sent): a count is
-never handed out unrecorded. Only a state directory that cannot be used *from the start*
-(read-only, full, no file locks, a planted file in the way, no boot id) makes the process count
-in memory (``IB-SEQ-002``, once), restarting at 0 as the message says. :data:`MAX_STREAMS`
-streams fill the durable file; another one is refused (``IB-SEQ-005``, ledgered), never evicted.
+Failure paths. A lock that cannot be had within the bound, a worker that does not answer within
+it, or a state file that cannot be read or replaced once the store is open, fails the take
+(``IB-SEQ-006``, nothing is sent): a count is never handed out unrecorded. Only a state directory
+that cannot be used *from the start* (read-only, full, no file locks, a planted file in the way,
+no boot id) makes the process count in memory (``IB-SEQ-002``, once), and then from every ceiling
+that can still be read in the directory (the durable file, a refused one that still parses
+included, and the live table), so it starts above every count handed out before; only a
+directory with nothing readable starts at 0. :data:`MAX_STREAMS` streams fill the durable file;
+another one is refused (``IB-SEQ-005``, ledgered), never evicted.
 
 Both files are *untrusted* on read. :data:`STATE_NAME` is opened ``O_NOFOLLOW | O_NONBLOCK`` and
 checked with ``fstat`` (regular, ours, one link), at most :data:`MAX_BYTES`, strict schema, at
-most :data:`MAX_STREAMS` keys in the key alphabet of at most :data:`MAX_KEY_LEN` characters,
-ceilings in ``[0, MAX_COUNT)``. An invalid one is ``IB-SEQ-001``: a send or reset moves it aside
-to :data:`INVALID_NAME` (one slot, the newest kept) and rebuilds it from the live table; ``ib
+most :data:`MAX_STREAMS` keys, each spelled as :func:`key_of` writes it, ceilings in
+``[0, MAX_COUNT)`` - the one bound for every stored count, on read and on write (a ceiling is
+never raised past it). An invalid one is ``IB-SEQ-001``: a send or reset moves it aside to
+:data:`INVALID_NAME` (one slot, the newest kept) and rebuilds it from the live table, and from
+the file itself when only its ``fstat`` checks failed and it still parses (a hard link, a file of
+another user): its values are a floor, so a forger can make counts skip but never repeat. ``ib
 seq show`` leaves it untouched. :data:`LIVE_NAME` must be a regular file of ours with one link;
-a wrong size, magic, version, header checksum or boot, or a damaged slot (checksum, alphabet,
+a wrong size, magic, version, header checksum or boot, or a damaged slot (checksum, key,
 ``next > ceiling``), rebuilds the table (``IB-SEQ-004``), so every stream carries on from its
-durable ceiling.
+durable ceiling, or from a valid slot's ceiling when that is higher (a durable file that is gone
+or older than the table it sat beside).
 """
 
 from __future__ import annotations
@@ -68,10 +78,11 @@ import os
 import re
 import stat
 import struct
+import threading
 import time
 import uuid
 import zlib
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
@@ -91,11 +102,17 @@ SCHEMA: Final = 1
 MAX_STREAMS: Final = 4096  # streams with a stored count, all nodes together
 MAX_KEY_LEN: Final = 64
 MAX_BYTES: Final = 384 * 1024
-MAX_COUNT: Final = 1 << 63  # stored counts and ceilings stay below this; any field is narrower
+MAX_COUNT: Final = 1 << 62  # every stored count and ceiling, read or written, stays below this
 SPAN: Final = 1 << 64  # what one slot field holds
 BLOCK: Final = 64  # the step: a durable ceiling is at most this far above the next count
 AHEAD_AT: Final = BLOCK // 2  # a long-lived sender raises a ceiling when this many are left
 LOCK_WAIT_S: Final = 10.0  # the bound on every wait for a lock of the state files
+CALL_GRACE_S: Final = 0.25  # how long past its own bound the loop waits for a worker's answer
+POLL_FAST_S: Final = 50e-6  # the helper thread's poll of a contended live lock, at first
+POLL_FAST_FOR_S: Final = 5e-3  # ...for this long, then slower
+POLL_MID_S: Final = 200e-6
+POLL_MID_FOR_S: Final = 0.1
+POLL_SLOW_S: Final = 1e-3
 LIVE_SLOTS: Final = 2 * MAX_STREAMS  # load at most one half: short probes
 LIVE_MAGIC: Final = b"IBSQLIV1"
 LIVE_VERSION: Final = 1
@@ -117,7 +134,7 @@ _PAD: Final = b"\0\0\0\0"
 assert HEAD_BYTES == 128 and SLOT_BYTES == 88, "the live layout is fixed"
 assert MAX_STREAMS * (MAX_KEY_LEN + 24) + 32 <= MAX_BYTES, "a full durable file fits its cap"
 assert LIVE_SLOTS >= 2 * MAX_STREAMS and LIVE_SLOTS & (LIVE_SLOTS - 1) == 0
-assert BLOCK >= 2 and 0 < AHEAD_AT < BLOCK and MAX_COUNT + 4 * BLOCK < SPAN
+assert BLOCK >= 2 and 0 < AHEAD_AT < BLOCK and MAX_COUNT + BLOCK < SPAN
 
 _OPEN_FLAGS: Final = (
     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
@@ -149,6 +166,7 @@ _KINDS: Final = ("command", "telemetry")
 _KEY_RE: Final = re.compile(rf"[A-Za-z0-9_~/\-]{{1,{MAX_KEY_LEN}}}")
 _STEM_RE: Final = re.compile(r"[A-Za-z0-9_\-]{1,32}")  # what a configured node name can be
 _STEM_LIMIT: Final = MAX_KEY_LEN - len("/telemetry/0x") - 16  # room for a 64-bit MID
+_STEM_KEY_RE: Final = re.compile(rf"[A-Za-z0-9_~\-]{{1,{_STEM_LIMIT}}}")  # what node_stem makes
 assert _STEM_LIMIT >= 32
 
 
@@ -173,7 +191,7 @@ def parse_key(key: str) -> tuple[str, str, int] | None:
     """``(node stem, kind, MID)`` of a key spelled exactly as :func:`key_of` writes it."""
     stem, _, rest = key.rpartition("/")
     stem, _, kind = stem.rpartition("/")
-    if not stem or kind not in _KINDS or not rest.startswith("0x"):
+    if not _STEM_KEY_RE.fullmatch(stem) or kind not in _KINDS or not rest.startswith("0x"):
         return None
     try:
         mid = int(rest, 16)
@@ -196,7 +214,8 @@ def _refuse(token: str) -> object:
 
 def parse_state(raw: bytes) -> dict[str, int] | None:
     """The durable ceilings a file holds, or ``None`` for anything that is not exactly
-    ``{"v": 1, "next": {"<key>": <int in [0, MAX_COUNT)>, ...}}`` within the limits."""
+    ``{"v": 1, "next": {"<key>": <int in [0, MAX_COUNT)>, ...}}`` within the limits, every key
+    spelled as :func:`key_of` writes it (a key no stream has is not a stream to count)."""
     if not raw or len(raw) > MAX_BYTES:
         return None
     try:
@@ -210,7 +229,7 @@ def parse_state(raw: bytes) -> dict[str, int] | None:
         return None
     out: dict[str, int] = {}
     for key, value in marks.items():
-        if not isinstance(key, str) or not _KEY_RE.fullmatch(key):
+        if not isinstance(key, str) or parse_key(key) is None:
             return None
         if type(value) is not int or not 0 <= value < MAX_COUNT:
             return None
@@ -221,7 +240,7 @@ def parse_state(raw: bytes) -> dict[str, int] | None:
 def render_state(marks: Mapping[str, int]) -> bytes:
     """The durable file's content. Never drops a key: the caller keeps to :data:`MAX_STREAMS`."""
     assert len(marks) <= MAX_STREAMS
-    assert all(_KEY_RE.fullmatch(k) and 0 <= v < SPAN for k, v in marks.items())
+    assert all(parse_key(k) is not None and 0 <= v < MAX_COUNT for k, v in marks.items())
     data = json.dumps({"v": SCHEMA, "next": dict(sorted(marks.items()))}, separators=(",", ":"))
     out = data.encode("ascii") + b"\n"
     assert len(out) <= MAX_BYTES  # the key alphabet needs no escapes
@@ -277,7 +296,7 @@ def _unpack_slot(raw: bytes) -> _Slot:
         key = padded.rstrip(b"\0").decode("ascii")
     except UnicodeDecodeError:
         raise _Garbage from None
-    if not _KEY_RE.fullmatch(key) or not next_ <= ceiling < MAX_COUNT + 4 * BLOCK:
+    if parse_key(key) is None or not next_ <= ceiling < MAX_COUNT:
         raise _Garbage
     return _Slot(key, next_, ceiling)
 
@@ -297,7 +316,7 @@ def _own_slot(raw: bytes, padded: bytes) -> tuple[int, int] | None:
     if _CRC.unpack_from(raw, _SLOT_BODY.size)[0] != zlib.crc32(raw[: _SLOT_BODY.size]):
         return None
     next_, ceiling = _COUNTS.unpack_from(raw, MAX_KEY_LEN)
-    if not next_ <= ceiling < MAX_COUNT + 4 * BLOCK:
+    if not next_ <= ceiling < MAX_COUNT:
         return None
     return next_, ceiling
 
@@ -330,6 +349,43 @@ def _backoff(step: float, waited: float) -> float:
     if waited < 0.1:
         return min(max(step * 2, 50e-6), 1e-3)
     return 0.01
+
+
+def _poll_step(waited: float) -> float:
+    """The pause of the helper thread's poll of the live lock after ``waited`` seconds: short
+    while the holder is a take (tens of microseconds), longer once it has held on for a while."""
+    if waited < POLL_FAST_FOR_S:
+        return POLL_FAST_S
+    return POLL_MID_S if waited < POLL_MID_FOR_S else POLL_SLOW_S
+
+
+def _scan_slots(raw: bytes) -> dict[str, int]:
+    """The ceiling of each stream in the slots of ``raw`` (a table without its header) that are
+    valid, whatever else is damaged; a stream in two slots keeps the higher. Never raises."""
+    out: dict[str, int] = {}
+    for start in range(0, len(raw) - SLOT_BYTES + 1, SLOT_BYTES):
+        try:
+            slot = _unpack_slot(raw[start : start + SLOT_BYTES])
+        except _Garbage:
+            continue
+        if slot.ceiling > out.get(slot.key, 0):
+            out[slot.key] = slot.ceiling
+    return out
+
+
+def _merged(into: dict[str, int], more: Mapping[str, int]) -> None:
+    """Raise each count of ``into`` to the one in ``more``."""
+    for key, value in more.items():
+        if value > into.get(key, 0):
+            into[key] = value
+
+
+def _capped(marks: dict[str, int]) -> dict[str, int]:
+    """``marks`` kept to :data:`MAX_STREAMS` entries: the streams with the highest ceilings."""
+    if len(marks) <= MAX_STREAMS:
+        return marks
+    top = sorted(((v, k) for k, v in marks.items()), reverse=True)[:MAX_STREAMS]
+    return {key: value for value, key in top}
 
 
 def _pwrite_all(fs: FileSystem, fd: int, data: bytes, offset: int) -> None:
@@ -378,6 +434,7 @@ class _Table:
         return _unpack_slot(self._fs.pread(self._fd, SLOT_BYTES, _offset(index)))
 
     def write(self, index: int, key: str, next_: int, ceiling: int) -> None:
+        assert ceiling < MAX_COUNT, "no slot is written above the bound the reader accepts"
         _pwrite_all(self._fs, self._fd, _pack_slot(key, next_, ceiling), _offset(index))
 
     def find(self, key: str) -> tuple[int, _Slot]:
@@ -406,6 +463,11 @@ class _Table:
                 out[slot.key] = (index, slot)
         return out
 
+    def ceilings(self) -> dict[str, int]:
+        """The ceiling of every stream with a valid slot, damaged slots skipped."""
+        raw = self._fs.pread(self._fd, LIVE_BYTES - HEAD_BYTES, HEAD_BYTES)
+        return _scan_slots(raw)
+
     def wipe(self, boot: bytes) -> None:
         """Every slot empty, the header this boot's."""
         self._fs.ftruncate(self._fd, 0)
@@ -418,20 +480,36 @@ class _Table:
 
 class _LockTimeout(Exception):
     def __init__(self, name: str) -> None:
-        super().__init__(f"{name} stayed locked by another process")
+        super().__init__(f"{name} stayed locked")
         self.name = name
 
 
-class _Unusable(Exception):
-    """The state directory cannot hold the counts at all (decided when the store opens)."""
+class _CallTimeout(Exception):
+    """A worker did not answer within the bound (a hung disk)."""
 
-    def __init__(self, why: str, cause: BaseException) -> None:
+
+class _Unusable(Exception):
+    """The state directory cannot hold the counts at all (decided when the store opens).
+    ``salvaged`` is what the live table held before a rebuild that then failed."""
+
+    def __init__(
+        self, why: str, cause: BaseException, salvaged: Mapping[str, int] | None = None
+    ) -> None:
         super().__init__(why)
         self.why = why
         self.cause = cause
+        self.salvaged: Mapping[str, int] = salvaged or {}
 
 
 class _Full(Exception):
+    def __init__(self, key: str) -> None:
+        super().__init__(key)
+        self.key = key
+
+
+class _Exhausted(Exception):
+    """A stream's count has reached :data:`MAX_COUNT`."""
+
     def __init__(self, key: str) -> None:
         super().__init__(key)
         self.key = key
@@ -450,6 +528,8 @@ class _Durable:
     marks: dict[str, int]
     invalid: str | None = None  # why the file on disk was refused
     details: str = ""
+    missing: bool = False  # there is no file
+    floor: dict[str, int] = field(default_factory=dict)  # what a refused file still said
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,6 +556,7 @@ class _Outcome:
     failure: BaseException | None = None
     events: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     warnings: list[IronbirdError] = field(default_factory=list)
+    delivered: bool = False  # events and warnings have reached the ledger and the user
 
 
 def _check_ours(fs: FileSystem, fd: int, name: str) -> os.stat_result:
@@ -496,6 +577,8 @@ class _Files:
         self._out: Final = out
         self._durable_held = False
         self._boot: bytes | None = None
+        self._salvaged: dict[str, int] = {}  # what the tables this transaction rebuilt held
+        self._fresh = False  # the table in hand was just emptied: nothing in it to read
 
     @property
     def boot(self) -> bytes:
@@ -569,6 +652,7 @@ class _Files:
         try:
             self._flock(fd, fcntl.LOCK_EX, LIVE_NAME)
             table = _Table(fs, fd)
+            self._fresh = False
             why = table.problem(self.boot)
             if why is not None:
                 self._rebuild(table, why)
@@ -577,7 +661,11 @@ class _Files:
             close_quietly(fs, fd)
 
     def _rebuild(self, table: _Table, why: str) -> None:
+        if why:  # whatever slots are valid still say what was handed out: a floor for the rebuild
+            with contextlib.suppress(OSError):
+                _merged(self._salvaged, table.ceilings())
         table.wipe(self.boot)
+        self._fresh = True
         path = self._cfg.directory / LIVE_NAME
         if not why:
             self._event("sequence.live_created", path=str(path))
@@ -596,14 +684,14 @@ class _Files:
         try:
             fd = fs.open_at(dir_fd, STATE_NAME, INSPECT_FLAGS)
         except FileNotFoundError:
-            return _Durable({})
+            return _Durable({}, missing=True)
         except OSError as exc:
             if exc.errno == errno.ELOOP:
                 return self._invalid("is a symbolic link", "", inspect)
             raise
         try:
             st = fs.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
+            if not stat.S_ISREG(st.st_mode):
                 return self._invalid("is not a plain file of this user", "", inspect)
             if st.st_size > MAX_BYTES:
                 return self._invalid(f"is over {MAX_BYTES} bytes", f"{st.st_size} bytes", inspect)
@@ -611,6 +699,10 @@ class _Files:
         finally:
             close_quietly(fs, fd)
         marks = parse_state(raw)
+        if st.st_uid != os.getuid() or st.st_nlink != 1:
+            refused = self._invalid("is not a plain file of this user", "", inspect)
+            refused.floor = marks or {}  # a hard link or a file of another user can only add
+            return refused
         if marks is None:
             digest = hashlib.sha256(raw).hexdigest()[:16]
             return self._invalid(
@@ -659,17 +751,16 @@ class _Files:
             out.write(render_state(marks))
             out.commit()
 
-    @staticmethod
-    def _recover(durable: _Durable, table: _Table) -> dict[str, int]:
-        """The durable ceilings, rebuilt from the live table when the file was refused."""
-        if durable.invalid is None:
-            return dict(durable.marks)
-        try:
-            entries = table.entries()
-        except _Garbage:
-            return {}
-        live = sorted(((s.ceiling, k) for k, (_, s) in entries.items() if s.ceiling), reverse=True)
-        return {key: ceiling for ceiling, key in live[:MAX_STREAMS]}
+    def _recover(self, durable: _Durable, table: _Table) -> dict[str, int]:
+        """The durable ceilings, with what else is known to have been handed out merged in: the
+        values of a refused file, the slots of a table this transaction rebuilt, and, when the
+        file was refused or is gone, the slots of the live table in hand."""
+        marks = dict(durable.marks)
+        _merged(marks, durable.floor)
+        _merged(marks, self._salvaged)
+        if (durable.invalid is not None or durable.missing) and not self._fresh:
+            _merged(marks, table.ceilings())
+        return _capped(marks)
 
     def _locate(self, table: _Table, key: str, marks: Mapping[str, int]) -> tuple[int, _Slot]:
         """The slot of ``key``, inserted at its durable ceiling when new (next equal to the
@@ -707,15 +798,16 @@ class _Files:
 
     def open_main(self) -> _Main:
         """The descriptors for takes on the loop, with the live table checked (rebuilt under
-        the durable lock when needed). Raises :class:`_Unusable` for a directory that cannot
-        hold the counts at all."""
+        the durable lock when needed, and the durable file brought up to what the table and the
+        file's own leftovers show). Raises :class:`_Unusable` for a directory that cannot hold
+        the counts at all."""
         fs = self._cfg.fs
         try:
             _ = self.boot  # no boot id, no way to tell a stale table from a live one
             fs.mkdir_p(self._cfg.directory)
             dir_fd = fs.open_dir(self._cfg.directory)
         except OSError as exc:
-            raise _unusable(exc) from exc
+            raise _unusable(exc, self._salvaged) from exc
         try:
             fd, st = self._open_live(dir_fd)
             try:
@@ -729,19 +821,64 @@ class _Files:
                     why = _Table(fs, fd).problem(self.boot)
                 finally:
                     fs.flock(fd, fcntl.LOCK_UN)
-                if why is not None:
-                    with self._durable_lock() as locked, self._table(locked):
-                        pass  # rebuilt by _table, under both locks
+                if why is not None or not self._has_durable(dir_fd):
+                    self.extend([])  # rebuilds the table and settles the file, under both locks
                 return _Main(dir_fd, fd, (st.st_dev, st.st_ino))
             except BaseException:
                 close_quietly(fs, fd)
                 raise
         except OSError as exc:
             close_quietly(fs, dir_fd)
-            raise _unusable(exc) from exc
+            raise _unusable(exc, self._salvaged) from exc
         except BaseException:
             close_quietly(fs, dir_fd)
             raise
+
+    def _has_durable(self, dir_fd: int) -> bool:
+        try:
+            self._cfg.fs.stat_at(dir_fd, STATE_NAME)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True  # something is there; the reader says what
+        return True
+
+    def floors(self) -> tuple[dict[str, int], str]:
+        """Every ceiling the state directory shows, read only and whatever else is wrong with
+        it: the durable file (a refused one that parses too) and the slots of the live table (of
+        any boot, damaged ones skipped). For a process that must count in memory: it starts above
+        all of them. The second value says what could not be read."""
+        fs = self._cfg.fs
+        out: dict[str, int] = {}
+        problems: list[str] = []
+        try:
+            dir_fd = fs.open_dir(self._cfg.directory)
+        except OSError as exc:
+            return out, f"{self._cfg.directory}: {exc.strerror or exc}"
+        try:
+            try:
+                durable = self._read_durable(dir_fd)
+                _merged(out, durable.marks)
+                _merged(out, durable.floor)
+            except OSError as exc:
+                problems.append(f"{STATE_NAME}: {exc.strerror or exc}")
+            try:
+                fd = fs.open_at(dir_fd, LIVE_NAME, INSPECT_FLAGS)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                problems.append(f"{LIVE_NAME}: {exc.strerror or exc}")
+            else:
+                try:
+                    if stat.S_ISREG(fs.fstat(fd).st_mode):
+                        _merged(out, _scan_slots(fs.pread(fd, LIVE_BYTES - HEAD_BYTES, HEAD_BYTES)))
+                except OSError as exc:
+                    problems.append(f"{LIVE_NAME}: {exc.strerror or exc}")
+                finally:
+                    close_quietly(fs, fd)
+        finally:
+            close_quietly(fs, dir_fd)
+        return _capped(out), "; ".join(problems)
 
     def extend(
         self,
@@ -756,28 +893,42 @@ class _Files:
         hand out ``n + 1`` next. The durable file is replaced (synced) before any slot holds a
         new ceiling. Returns the slot index of every key."""
         block = self._cfg.block
+        top = MAX_COUNT - 1  # the highest ceiling that is stored
         indices: dict[str, int] = {}
         with self._durable_lock() as dir_fd:
             durable = self._read_durable(dir_fd)
             plans: dict[str, _Plan] = {}
             with self._table(dir_fd) as table:
                 marks = self._recover(durable, table)
+                scanned = durable.invalid is not None or durable.missing or self._fresh
                 for key in keys:
                     if key not in marks and len(marks) >= MAX_STREAMS:
                         raise _Full(key)
                     index, slot = self._locate(table, key, marks)
                     indices[key] = index
+                    seated = seat is not None and seat[0] == key
+                    if not scanned and not seated and slot.ceiling > marks.get(key, 0):
+                        # a slot above its durable ceiling: the file is older than the table
+                        # (restored, replaced), so every stream may be short in it
+                        _merged(marks, table.ceilings())
+                        scanned = True
                     old = marks.get(key, 0)
-                    if seat is not None and seat[0] == key:
+                    if seat is not None and seated:
                         first = seat[1] + 1
-                        plans[key] = _Plan(index, slot, old, first + block, first)
+                        plans[key] = _Plan(index, slot, old, min(first + block, top), first)
                         continue
                     left = slot.ceiling - slot.next
                     if (key == need and left > 0) or (ahead and left > AHEAD_AT):
                         continue  # raised by another process meanwhile
                     start = slot.next if slot.ceiling == old else max(slot.next, old)
-                    plans[key] = _Plan(index, slot, old, max(old, start + block))
-            if not plans and durable.invalid is None:
+                    new = min(max(old, start + block), top)
+                    if new <= start:  # no count left below the bound
+                        if key == need:
+                            raise _Exhausted(key)
+                        continue
+                    plans[key] = _Plan(index, slot, old, new)
+                repaired = marks != durable.marks
+            if not plans and durable.invalid is None and not repaired:
                 return indices
             for key, plan in plans.items():
                 marks[key] = plan.ceiling
@@ -823,18 +974,12 @@ class _Files:
             chosen: list[str] = []
             for key in sorted(set(marks) | {k for k, (_, s) in live.items() if s.ceiling}):
                 parsed = parse_key(key)
-                if parsed is None:
-                    picked = everything
-                else:
-                    picked = (stem is None or parsed[0] == stem) and (
-                        mid is None or parsed[2] == mid
-                    )
-                if not picked:
+                assert parsed is not None  # both files hold only keys of that spelling
+                if not (stem is None or parsed[0] == stem) or not (mid is None or parsed[2] == mid):
                     continue
                 chosen.append(key)
-                if parsed is not None:
-                    nxt = live[key][1].next if key in live else marks.get(key, 0)
-                    gone.append((*parsed, nxt))
+                nxt = live[key][1].next if key in live else marks.get(key, 0)
+                gone.append((*parsed, nxt))
             for key in chosen:
                 marks.pop(key, None)
             if chosen or durable.invalid is not None:
@@ -885,17 +1030,16 @@ class _Files:
         rows: list[Stored] = []
         for key in sorted(set(durable.marks) | {k for k, (_, s) in live.items() if s.ceiling}):
             parsed = parse_key(key)
-            if parsed is None:
-                continue
+            assert parsed is not None  # both files hold only keys of that spelling
             ceiling = durable.marks.get(key, 0)
             nxt = live[key][1].next if key in live else ceiling
             rows.append((*parsed, nxt, ceiling))
         return rows
 
 
-def _unusable(exc: OSError) -> BaseException:
+def _unusable(exc: OSError, salvaged: Mapping[str, int]) -> BaseException:
     if exc.errno in _UNUSABLE:
-        return _Unusable(exc.strerror or type(exc).__name__, exc)
+        return _Unusable(exc.strerror or type(exc).__name__, exc, salvaged)
     return exc
 
 
@@ -903,16 +1047,81 @@ def _extend_ahead(keys: Sequence[str], files: _Files) -> dict[str, int]:
     return files.extend(keys, ahead=True)
 
 
-def _run(cfg: _Config, deadline: float, work: Callable[[_Files], Any]) -> _Outcome:
-    out = _Outcome()
+def _run(
+    cfg: _Config,
+    deadline: float,
+    work: Callable[[_Files], Any],
+    out: _Outcome,
+    loop: asyncio.AbstractEventLoop,
+    deliver: Callable[[_Outcome], None],
+) -> _Outcome:
     try:
         out.result = work(_Files(cfg, deadline, out))
     except BaseException as exc:  # handed to the loop, with the records made on the way
         out.failure = exc
+    with contextlib.suppress(RuntimeError):  # the loop may be closed: nobody left to tell
+        loop.call_soon_threadsafe(deliver, out)  # also when the caller has stopped waiting
     return out
 
 
 # -- the store -----------------------------------------------------------------------------
+
+
+class _Waiter:
+    """What a helper thread polling for the live lock and the task that started it agree on. The
+    thread tries the lock only while the wait is on, and the task, once it gives the wait up,
+    knows whether the lock came in before that. A ``flock`` on a descriptor that already holds
+    the lock succeeds, so a thread that tried again after the task had gone on (and taken the
+    lock itself for the next take) would think it had the lock, and release it."""
+
+    def __init__(self) -> None:
+        self._mutex = threading.Lock()
+        self._state: Literal["waiting", "granted", "abandoned"] = "waiting"
+
+    @property
+    def abandoned(self) -> bool:
+        return self._state == "abandoned"
+
+    def attempt(self, fs: FileSystem, fd: int) -> Literal["granted", "busy", "abandoned"]:
+        """One non-blocking try of the exclusive lock of ``fd``, while the wait is on."""
+        with self._mutex:
+            if self._state == "abandoned":
+                return "abandoned"
+            try:
+                fs.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno not in _BUSY:
+                    raise
+                return "busy"
+            self._state = "granted"
+            return "granted"
+
+    def abandon(self) -> bool:
+        """Give the wait up. ``False`` when the lock had been granted already (the caller then
+        holds it and must release it)."""
+        with self._mutex:
+            if self._state == "granted":
+                return False
+            self._state = "abandoned"
+            return True
+
+
+def _poll_lock(fs: FileSystem, fd: int, deadline: float, waiter: _Waiter) -> bool:
+    """Take the exclusive lock of ``fd`` by polling, in a helper thread, until ``deadline`` or
+    until ``waiter`` is abandoned. ``True`` once the lock is granted."""
+    started = time.monotonic()
+    while True:
+        match waiter.attempt(fs, fd):
+            case "granted":
+                return True
+            case "abandoned":
+                return False
+            case _:
+                pass
+        now = time.monotonic()
+        if now >= deadline:
+            return False
+        time.sleep(min(_poll_step(now - started), deadline - now))
 
 
 class Lease:
@@ -920,8 +1129,9 @@ class Lease:
 
     :attr:`count` is the count to put in the packet (not reduced to a field width). The take's
     lock is held until :meth:`release`, or with ``span_send`` off until :meth:`commit`, so a
-    sender that hands its packet to the kernel before releasing puts packets on the wire in take
-    order. :meth:`commit` spends the count; a lease released without it hands out nothing."""
+    sender that hands its packet to the kernel before releasing hands packets to the kernel in
+    take order (what a network does to them after that is not ours). :meth:`commit` spends the
+    count; a lease released without it hands out nothing."""
 
     __slots__ = (
         "_ceiling",
@@ -962,6 +1172,13 @@ class Lease:
         if not self._span:
             self._store._unlock_main()
 
+    @property
+    def holds_lock(self) -> bool:
+        """Whether this lease holds the cross-process lock right now (UDP: from the take to the
+        hand-off; serial: not after the commit). Nothing that can wait on the network, a name
+        resolution included, belongs under it."""
+        return not self._released and self._store._main_locked
+
     def release(self) -> None:
         """Let the next take go ahead. Safe to call more than once."""
         if not self._released:
@@ -970,10 +1187,11 @@ class Lease:
 
 
 class _UnusableError(Exception):
-    def __init__(self, why: str, cause: BaseException) -> None:
+    def __init__(self, why: str, cause: BaseException, salvaged: Mapping[str, int]) -> None:
         super().__init__(why)
         self.why = why
         self.cause = cause
+        self.salvaged = salvaged
 
 
 class SequenceStore:
@@ -1000,6 +1218,7 @@ class SequenceStore:
         self._wait: Final = lock_wait_s
         self._cfg: Final = _Config(directory, fs, block, boot_id) if directory is not None else None
         self._offloop: Final[OffLoop[_Outcome]] = OffLoop("sequence-state", 4)
+        self._lockers: Final[OffLoop[bool]] = OffLoop("sequence-lock", 2)
         self._turn: Final = asyncio.Lock()
         self._main: _Main | None = None
         self._main_locked = False
@@ -1030,8 +1249,22 @@ class SequenceStore:
         """The next count of ``key``, or ``seat`` when given (the stream then goes on from
         ``seat + 1`` in every process). Raises ``IB-SEQ-005`` or ``IB-SEQ-006``, handing out
         nothing. Release the lease once the packet is handed off or given up."""
-        assert seat is None or 0 <= seat < MAX_COUNT
+        if seat is not None and not 0 <= seat < MAX_COUNT - 1:
+            raise IronbirdError(
+                Code.SEQ_TAKE,
+                f"no sequence count for {stream_text(key)}: {seat} is beyond the highest stored "
+                f"count ({MAX_COUNT - 2}); nothing sent",
+            )
         deadline = time.monotonic() + self._wait
+        await self._enter(key)
+        try:
+            return await self._take(key, seat, span_send, deadline)
+        except BaseException:
+            self._end_lease()
+            raise
+
+    async def _enter(self, key: str) -> None:
+        """This process's turn to take (one send at a time holds the lock of the live table)."""
         if self._turn.locked():  # another send of this process holds it: wait, bounded
             try:
                 async with asyncio.timeout(self._wait):
@@ -1040,11 +1273,23 @@ class SequenceStore:
                 raise self._busy(key, "the previous send of this process did not finish") from None
         else:
             await self._turn.acquire()  # free: taken without suspending
+
+    async def preraise(self, keys: Sequence[str]) -> None:
+        """Open the files and raise the ceiling of every stream of ``keys`` that has no count to
+        spare, all in one sync, so that the first take of each does not wait for one (a
+        responder's first reply of each message). Raises ``IB-SEQ-005`` or ``IB-SEQ-006``."""
+        ordered = sorted(set(keys))
+        if not ordered or self._cfg is None:
+            return
+        await self._enter(ordered[0])
         try:
-            return await self._take(key, seat, span_send, deadline)
-        except BaseException:
+            deadline = time.monotonic() + self._wait
+            if await self._ready(ordered[0], deadline):
+                self._remember(
+                    await self._work(ordered[0], deadline, partial(_extend_ahead, ordered))
+                )
+        finally:
             self._end_lease()
-            raise
 
     async def _take(self, key: str, seat: int | None, span_send: bool, deadline: float) -> Lease:
         if not await self._ready(key, deadline):
@@ -1129,7 +1374,7 @@ class SequenceStore:
         if index is None:
             return  # seated: the worker wrote the slot
         main = self._main
-        assert main is not None and self._main_locked and count < ceiling
+        assert main is not None and self._main_locked and count < ceiling < MAX_COUNT
         try:
             data = _pack_own_slot(_padded(key), count + 1, ceiling)
             _pwrite_all(self._fs, main.fd, data, _offset(index))
@@ -1151,23 +1396,31 @@ class SequenceStore:
             self._turn.release()
 
     async def _lock_main(self, key: str, deadline: float) -> None:
+        """The live lock for a take. A free lock is taken on the loop; a contended one is polled
+        by a helper thread (a sleep on the loop lasts a millisecond at least, and a process
+        that takes in a tight loop gets the lock back before such a sleep ends)."""
         main = self._main
         assert main is not None and not self._main_locked
-        started = time.monotonic()
-        step = 0.0
-        while True:
-            try:
-                self._fs.flock(main.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._main_locked = True
-                return
-            except OSError as exc:
-                if exc.errno not in _BUSY:
-                    raise self._failed(key, exc) from exc
-            now = time.monotonic()
-            if now >= deadline:
-                raise self._busy(key, f"{LIVE_NAME} stayed locked by another process")
-            step = _backoff(step, now - started)
-            await asyncio.sleep(min(step, deadline - now))
+        try:
+            self._fs.flock(main.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._main_locked = True
+            return
+        except OSError as exc:
+            if exc.errno not in _BUSY:
+                raise self._failed(key, exc) from exc
+        waiter = _Waiter()
+        try:
+            got = await self._lockers.call(partial(_poll_lock, self._fs, main.fd, deadline, waiter))
+        except BaseException as exc:  # cancelled, or the helper failed
+            if not waiter.abandon():  # the lock came in as the wait ended: give it back
+                with contextlib.suppress(OSError):
+                    self._fs.flock(main.fd, fcntl.LOCK_UN)
+            if isinstance(exc, OSError | OffLoopBusy | RuntimeError):
+                raise self._failed(key, exc) from exc
+            raise
+        if not got:
+            raise self._busy(key, f"{LIVE_NAME} stayed locked {self._holder()}")
+        self._main_locked = True
 
     # -- opening, workers ------------------------------------------------------------------
 
@@ -1178,14 +1431,14 @@ class SequenceStore:
         if self._main is not None:
             return True
         if self._cfg is None:
-            self._to_memory(self._memory_why, None)
+            self._record_memory(self._memory_why, None, {}, "")
             return False
         try:
             self._main = await self._work(key, deadline, lambda f: f.open_main())
         except _UnusableError as exc:
             if self._opened:  # counts were handed out from the files: memory could repeat them
                 raise self._failed(key, exc.cause) from exc.cause
-            self._to_memory(exc.why, exc.cause)
+            await self._to_memory(exc.why, exc.cause, exc.salvaged)
             return False
         self._opened = True
         return True
@@ -1208,35 +1461,80 @@ class SequenceStore:
         if not await self._ready(key, deadline):
             raise AssertionError("open once, never memory")  # pragma: no cover
 
-    def _to_memory(self, why: str, cause: BaseException | None) -> None:
-        self._memory = {}
+    async def _to_memory(self, why: str, cause: BaseException, salvaged: Mapping[str, int]) -> None:
+        """Count in memory, starting every stream above the stored count that can still be read
+        in the directory (it may be unusable for writing and still be readable)."""
+        floors: dict[str, int] = dict(salvaged)
+        unread = ""
+        try:
+            read, unread = await self._call(time.monotonic() + self._wait, lambda f: f.floors())
+            _merged(floors, read)
+        except Exception as exc:  # nothing readable: the message says so
+            unread = f"{type(exc).__name__}: {exc}"
+        self._record_memory(why, cause, floors, unread)
+
+    def _record_memory(
+        self, why: str, cause: BaseException | None, floors: dict[str, int], unread: str
+    ) -> None:
+        self._memory = dict(floors)
         where = self._directory if self._directory is not None else "the state directory"
-        self._record("sequence.memory_only", {"directory": str(where), "reason": why})
+        self._record(
+            "sequence.memory_only",
+            {"directory": str(where), "reason": why, "from_stored": len(floors), "unread": unread},
+        )
+        start = (
+            f"above the {len(floors)} stream(s) with a stored count it can read (its own counts "
+            "are not kept, so every ib process that does this repeats them)"
+            if floors
+            else "so every ib process starts at 0"
+        )
+        details = f"{type(cause).__name__}: {cause}" if cause is not None else ""
+        if unread:
+            details += ("\n" if details else "") + f"could not read the stored counts: {unread}"
         self._report(
             IronbirdError(
                 Code.SEQ_UNSAVED,
-                f"cannot keep sequence counts in {where} ({why}); counting in memory, so every "
-                "ib process starts at 0 (set IRONBIRD_STATE_DIR to a writable directory)",
-                details=f"{type(cause).__name__}: {cause}" if cause is not None else "",
+                f"cannot keep sequence counts in {where} ({why}); counting in memory, {start} "
+                "(set IRONBIRD_STATE_DIR to a writable directory)",
+                details=details,
                 cause=cause,
             )
         )
 
     async def _call(self, deadline: float, work: Callable[[_Files], _T]) -> _T:
-        """``work`` in a worker thread. Its records and warnings are delivered here, then its
-        result is returned or its failure raised (:class:`_Unusable` as ``_UnusableError``)."""
+        """``work`` in a worker thread, waited for until ``deadline`` (and a moment more, so
+        that a lock wait the worker gives up at the same time is reported as that). Its records
+        and warnings are delivered, then its result is returned or its failure raised
+        (:class:`_Unusable` as ``_UnusableError``). A worker still running when the wait ends is
+        abandoned: it ends on its own, and its records are delivered when it does."""
         cfg = self._cfg
         assert cfg is not None
-        out = await self._offloop.call(lambda: _run(cfg, deadline, work))
+        out = _Outcome()
+        loop = asyncio.get_running_loop()
+        try:
+            async with asyncio.timeout(max(deadline - time.monotonic(), 0.0) + CALL_GRACE_S):
+                await self._offloop.call(
+                    lambda: _run(cfg, deadline, work, out, loop, self._deliver)
+                )
+        except TimeoutError as exc:
+            raise _CallTimeout from exc
+        self._deliver(out)
+        if out.failure is not None:
+            if isinstance(out.failure, _Unusable):
+                raise _UnusableError(out.failure.why, out.failure.cause, out.failure.salvaged)
+            raise out.failure
+        return out.result  # type: ignore[no-any-return]
+
+    def _deliver(self, out: _Outcome) -> None:
+        """Hand a worker's records to the ledger and its warnings to the user, once, whether or
+        not the task that started it is still waiting."""
+        if out.delivered:
+            return
+        out.delivered = True
         for event, fields in out.events:
             self._record(event, fields)
         for warning in out.warnings:
             self._report(warning)
-        if out.failure is not None:
-            if isinstance(out.failure, _Unusable):
-                raise _UnusableError(out.failure.why, out.failure.cause)
-            raise out.failure
-        return out.result  # type: ignore[no-any-return]
 
     async def _work(self, key: str, deadline: float, work: Callable[[_Files], _T]) -> _T:
         """:meth:`_call` for a take: every failure becomes the take's coded error."""
@@ -1245,22 +1543,43 @@ class SequenceStore:
         except _UnusableError:
             raise
         except _LockTimeout as exc:
-            raise self._busy(key, str(exc)) from exc
+            raise self._busy(key, f"{exc.name} stayed locked {self._holder()}") from exc
+        except _CallTimeout as exc:
+            raise self._busy(key, "the sequence state files did not answer") from exc
         except _Full as exc:
             self._record("sequence.full", {"key": exc.key, "streams": MAX_STREAMS})
             raise IronbirdError(
                 Code.SEQ_FULL,
-                f"no sequence count for {stream_text(key)}: {MAX_STREAMS} streams already have "
+                f"no sequence count for {stream_text(exc.key)}: {MAX_STREAMS} streams already have "
                 "stored counts; nothing sent (ib seq reset the streams no longer used)",
+            ) from exc
+        except _Exhausted as exc:
+            self._record("sequence.exhausted", {"key": exc.key, "limit": MAX_COUNT})
+            raise IronbirdError(
+                Code.SEQ_TAKE,
+                f"no sequence count for {stream_text(exc.key)}: the stored count is at its limit "
+                f"({MAX_COUNT - 1}); nothing sent (ib seq reset this stream)",
             ) from exc
         except (OSError, OffLoopBusy, RuntimeError) as exc:
             raise self._failed(key, exc) from exc
 
+    def _holder(self) -> str:
+        """Who a lock that stayed locked was held by, as far as this process can tell: a worker
+        of its own that has not returned (a hung disk) rather than another process."""
+        if self._offloop.running:
+            return "by a worker of this process that has not returned"
+        return "by another process"
+
     def _busy(self, key: str, what: str) -> IronbirdError:
+        hint = (
+            "is the disk hung?"
+            if self._offloop.running
+            else "is another ib process stopped, or the disk hung?"
+        )
         return IronbirdError(
             Code.SEQ_TAKE,
             f"no sequence count for {stream_text(key)}: {what} within {self._wait:g} s; nothing "
-            "sent (is another ib process stopped, or the disk hung?)",
+            f"sent ({hint})",
         )
 
     def _failed(self, key: str, exc: BaseException) -> IronbirdError:
@@ -1320,9 +1639,21 @@ class SequenceStore:
             )
         try:
             return await self._call(time.monotonic() + self._wait, work)
-        except (OSError, OffLoopBusy, RuntimeError, _LockTimeout, _UnusableError, _Full) as exc:
+        except (
+            OSError,
+            OffLoopBusy,
+            RuntimeError,
+            _LockTimeout,
+            _CallTimeout,
+            _UnusableError,
+            _Full,
+        ) as exc:
             cause: BaseException = exc.cause if isinstance(exc, _UnusableError) else exc
             why = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+            if isinstance(exc, _LockTimeout):
+                why = f"{exc.name} stayed locked {self._holder()}"
+            elif isinstance(exc, _CallTimeout):
+                why = "the sequence state files did not answer"
             raise IronbirdError(
                 Code.SEQ_STATE,
                 f"cannot use the sequence counts in {self._directory} ({why}); check the "
@@ -1362,3 +1693,7 @@ class NodeSequences:
     ) -> Lease:
         key = key_of(self._node, kind, mid)
         return await self._store.lease(key, seat=seat, span_send=span_send)
+
+    async def preraise(self, kind: str, mids: Iterable[int]) -> None:
+        """:meth:`SequenceStore.preraise` for the streams of ``kind`` and ``mids``."""
+        await self._store.preraise([key_of(self._node, kind, mid) for mid in mids])

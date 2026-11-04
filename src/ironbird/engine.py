@@ -1005,15 +1005,20 @@ class Engine:
         send socket), so a send that follows hands its bytes to the kernel without waiting on
         name resolution or a bind. Raises the coded error such a send would."""
         transport = await self._sending_transport(self._io(link, end))
+        assert transport is not None
         await transport.prepare_send()
 
-    async def _sending_transport(self, io: _LinkIO) -> Transport:
+    async def _sending_transport(self, io: _LinkIO, *, may_open: bool = True) -> Transport | None:
+        """The open transport of ``io``, opened first when it is not (name resolution and a bind
+        can take seconds); ``None`` when it is not open and ``may_open`` is off."""
         async with io.lock:
             if self._closed:
                 raise IronbirdError(
                     Code.TX_SEND, "not sent: the session is closing (not a link failure)"
                 )
             if io.transport is None:
+                if not may_open:
+                    return None
                 transport = self._new_transport(io)
                 try:
                     await self._open_transport(io, transport, None)
@@ -1032,13 +1037,18 @@ class Engine:
         *,
         confirm: bool = False,
         handed_off: Callable[[], None] | None = None,
+        reopen: bool = True,
     ) -> None:
         """Send ``data`` out of ``end`` of ``link``. The TX frame enters ingest the moment the
         bytes leave the process (``handed_off`` runs right after), so sinks see what was sent.
 
         The transport is shared with the end's captures, so closing the last one can close it
         under a send that has not yet left the process. That send is made again on the transport
-        that replaces it; a send is never reported as a link failure for that.
+        that replaces it; a send is never reported as a link failure for that. With ``reopen``
+        off nothing is opened here (the caller holds a lock that other processes wait for, and a
+        name resolution must not run under it): a transport that is no longer open, or closed
+        under the send, raises :class:`~ironbird.transport.TransportClosed` with nothing sent,
+        and the caller sends again once it has let go of its lock.
         """
         io = self._io(link, end)
         went_out = False
@@ -1052,11 +1062,13 @@ class Engine:
 
         closed: TransportClosed | None = None
         for _ in range(2):
-            transport = await self._sending_transport(io)
+            transport = await self._sending_transport(io, may_open=reopen)
+            if transport is None:
+                raise TransportClosed
             try:
                 await transport.send(data, confirm=confirm, handed_off=out)
             except TransportClosed as exc:
-                if went_out:
+                if went_out or not reopen:
                     raise
                 closed = exc
                 continue

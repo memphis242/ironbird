@@ -65,7 +65,7 @@ from ironbird.ledgertiers import Tier
 from ironbird.notice import Level, Notice, level_of
 from ironbird.sanitize import HEX_PREVIEW_BYTES, clean, hex_preview
 from ironbird.seqstate import Lease, NodeSequences, SequenceStore
-from ironbird.transport import LinkEnd
+from ironbird.transport import LinkEnd, TransportClosed
 
 TICK_S: Final = 1.0
 EVENT_QUEUE_SIZE: Final = 1024
@@ -457,12 +457,14 @@ class Session:
 
     def sequences(self, node_name: str) -> NodeSequences:
         """The sequence counts of the packets sent to (or as) ``node_name``, shared with every
-        other ironbird process through the state directory. With the ledger off there is no
-        state directory: the counts are kept in memory, as ``IB-SEQ-002`` says at the first."""
+        other ironbird process through the state directory. Without a state directory (a ledger
+        that was never given one) the counts are kept in memory, as ``IB-SEQ-002`` says at the
+        first. A ledger that stops mid-session leaves the state directory as it was: the counts
+        go on from it."""
         if self._sequences is None:
             ledger = self.ledger
             self._sequences = SequenceStore(
-                ledger.directory if ledger.enabled else None,
+                ledger.directory if ledger.configured else None,
                 report=self.report,
                 record=lambda event, fields: ledger.record("state", event, **fields),
                 unusable="the ledger is off, so there is no state directory",
@@ -653,27 +655,45 @@ class Session:
                 lease.release()  # on the wire: the next take, in any process, may go ahead
 
         try:
-            await self._engine.prepare_send(route.link, end)
-            if sequence is not None:  # the count is known: a refused frame seats nothing
-                framing = True
-                encoded = codec.frame(prepared, sequence)
-                framing = False
-            if prepared.sequenced:
-                lease = await self.sequences(route.server.name).lease(
-                    "command",
-                    prepared.mid,
-                    seat=sequence,
-                    span_send=route.link.transport == UDP_TRANSPORT,
-                )
-            if encoded is None:
-                framing = True
-                encoded = codec.frame(prepared, None if lease is None else lease.count)
-                framing = False
-            if lease is not None:
-                lease.commit()
-            await self._engine.send(
-                route.link, end, encoded.data, confirm=True, handed_off=handed_off
-            )
+            for tries in range(2):
+                encoded = None
+                try:
+                    await self._engine.prepare_send(route.link, end)
+                    if sequence is not None:  # the count is known: a refused frame seats nothing
+                        framing = True
+                        encoded = codec.frame(prepared, sequence)
+                        framing = False
+                    if prepared.sequenced:
+                        lease = await self.sequences(route.server.name).lease(
+                            "command",
+                            prepared.mid,
+                            seat=sequence,
+                            span_send=route.link.transport == UDP_TRANSPORT,
+                        )
+                    if encoded is None:
+                        framing = True
+                        encoded = codec.frame(prepared, None if lease is None else lease.count)
+                        framing = False
+                    if lease is not None:
+                        lease.commit()
+                    await self._engine.send(
+                        route.link,
+                        end,
+                        encoded.data,
+                        confirm=True,
+                        handed_off=handed_off,
+                        reopen=lease is None or not lease.holds_lock,  # no lookup under the lock
+                    )
+                    break
+                except TransportClosed as exc:
+                    # closed under the send while the lock was held: nothing left the process.
+                    # Let go of the lock (the count is spent, a gap) and send again on a
+                    # transport opened without it.
+                    if attempt.went_out or tries:
+                        raise _closed_under_send(endpoint, exc) from exc
+                    if lease is not None:
+                        lease.release()
+                        lease = None
         except IronbirdError as exc:
             result = exc.code.value
             if encoded is not None:
@@ -1082,6 +1102,13 @@ class Session:
         rules = _validate_rules(self.node, codec, self.config)
         sequences = self.sequences(self.node.name)
         sequences.store.keep_ahead()  # a long-lived sender: no reply waits for a sync
+        if codec.profile(MessageKind.TELEMETRY).sequence_field is not None:
+            try:  # one sync now, so no reply waits for its message's first count
+                await sequences.preraise(
+                    "telemetry", {codec.model.by_name[rule.reply].mid for rule in rules.values()}
+                )
+            except IronbirdError as exc:  # the replies that need a count report their own
+                self.report(exc)
         capture = await self.capture([route], consumer=RESPONDER)
         self.ledger.record(
             "action",
@@ -1092,6 +1119,16 @@ class Session:
             rules=len(rules),
         )
         return Responder(self, route, codec, capture, rules, sequences)
+
+
+def _closed_under_send(where: str, cause: TransportClosed) -> IronbirdError:
+    """The error of a send whose transport was closed under it twice, nothing sent either time."""
+    return IronbirdError(
+        Code.TX_SEND,
+        f"not sent: {where} was closed while sending (another consumer of this link end closed it "
+        "twice under the send; send again; not a link failure)",
+        cause=cause,
+    )
 
 
 def _mids_text(mids: frozenset[int]) -> str:
@@ -1569,30 +1606,44 @@ class Responder:
             return None
         link = self._route.link
         lease: Lease | None = None
+        encoded: EncodedPacket | None = None
         try:
-            if prepared.sequenced:
-                lease = await self._sequences.lease(
-                    "telemetry", prepared.mid, span_send=link.transport == UDP_TRANSPORT
-                )
-            try:
-                encoded = self._codec.frame(prepared, None if lease is None else lease.count)
-            except IronbirdError as exc:
-                session.report(_rule_failure(self._codec, rule, values, exc))
-                return None
-            if lease is not None:
-                lease.commit()
-            await session._engine.send(
-                link,
-                link_end(self._route.side),
-                encoded.data,
-                handed_off=None if lease is None else lease.release,
-            )
+            for tries in range(2):
+                if prepared.sequenced:
+                    lease = await self._sequences.lease(
+                        "telemetry", prepared.mid, span_send=link.transport == UDP_TRANSPORT
+                    )
+                try:
+                    encoded = self._codec.frame(prepared, None if lease is None else lease.count)
+                except IronbirdError as exc:
+                    session.report(_rule_failure(self._codec, rule, values, exc))
+                    return None
+                if lease is not None:
+                    lease.commit()
+                try:
+                    await session._engine.send(
+                        link,
+                        link_end(self._route.side),
+                        encoded.data,
+                        handed_off=None if lease is None else lease.release,
+                        reopen=lease is None or not lease.holds_lock,  # no lookup under the lock
+                    )
+                    break
+                except TransportClosed as exc:
+                    # closed under the send while the lock was held (nothing left the process):
+                    # let go of it and send again on a transport opened without it
+                    if tries:
+                        raise _closed_under_send(link.telemetry_target, exc) from exc
+                    if lease is not None:
+                        lease.release()
+                        lease = None
         except IronbirdError as exc:
             session.report(exc)
             return None
         finally:
             if lease is not None:
                 lease.release()
+        assert encoded is not None  # the loop ends by a break (sent) or a return or a raise
         session.ledger.record_reply(
             encoded.message.name,
             size=len(encoded.data),
