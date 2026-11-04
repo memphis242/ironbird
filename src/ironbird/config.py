@@ -267,6 +267,13 @@ DEFAULT_POOL_MIN_BYTES: Final = 8 * MIB
 DEFAULT_RANGE_BYTES: Final = 4 * MIB
 MIN_RANGE_BYTES: Final = 4096
 MAX_RANGE_BYTES: Final = 256 * MIB
+#: How long an export worker that holds work may move no byte of its pipe and use no CPU time
+#: before it has stalled (the export then ends with IB-EXP-003). A worker decoding a range moves
+#: no byte until it replies but uses CPU time, which counts as progress; ``"unlimited"`` never
+#: ends the export for a silent worker.
+DEFAULT_WORKER_STALL_S: Final = 300
+MIN_WORKER_STALL_S: Final = 10
+MAX_WORKER_STALL_S: Final = 86400
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,11 +282,14 @@ class ExportConfig:
     of worker processes (``None``: one per core; 1: never use workers); ``pool_min_bytes``, the
     size of the recording (all its parts) from which workers are used; ``range_bytes``, how much
     of the file a worker takes at a time (smaller ranges balance better and use less memory,
-    larger ones hand off less often)."""
+    larger ones hand off less often); ``worker_stall_s``, how long a worker that holds work may
+    move no byte of its pipe and use no CPU time before the export ends instead of waiting for it
+    (``None``: never)."""
 
     jobs: int | None = None
     pool_min_bytes: int = DEFAULT_POOL_MIN_BYTES
     range_bytes: int = DEFAULT_RANGE_BYTES
+    worker_stall_s: int | None = DEFAULT_WORKER_STALL_S
 
 
 DEFAULT_SPIN_BELOW_US: Final = 0  # spin-free: measured to keep 1 ms without it
@@ -751,13 +761,23 @@ def _parse_retention(ctx: _Ctx, raw: object) -> RetentionConfig:
 def _parse_export(ctx: _Ctx, raw: object) -> ExportConfig:
     if not isinstance(raw, dict):
         raise ctx.fail("export", "must be a table")
-    ctx.keys(raw, "export", {"jobs", "pool_min_bytes", "range_bytes"}, set())
+    ctx.keys(raw, "export", {"jobs", "pool_min_bytes", "range_bytes", "worker_stall"}, set())
     defaults = ExportConfig()
     pool_min = _config_size(
         ctx, raw, "pool_min_bytes", "export", 0, 1024 * TIB, defaults.pool_min_bytes
     )
     span = _config_size(
         ctx, raw, "range_bytes", "export", MIN_RANGE_BYTES, MAX_RANGE_BYTES, defaults.range_bytes
+    )
+    stall = _config_duration(
+        ctx,
+        raw,
+        "worker_stall",
+        "export",
+        MIN_WORKER_STALL_S,
+        MAX_WORKER_STALL_S,
+        defaults.worker_stall_s,
+        unlimited=True,
     )
     assert pool_min is not None and span is not None
     if span % 8:
@@ -766,6 +786,7 @@ def _parse_export(ctx: _Ctx, raw: object) -> ExportConfig:
         jobs=_config_int(ctx, raw, "jobs", "export", 1, MAX_EXPORT_JOBS) if "jobs" in raw else None,
         pool_min_bytes=pool_min,
         range_bytes=span,
+        worker_stall_s=stall,
     )
 
 

@@ -606,8 +606,13 @@ ib export run1.ibrec --format text --from +90s --to +2m -o minute.txt
   or replaced while it is exported is read to the end from the file the export opened, in the calling
   process, as with `--jobs 1`. A recording read through the index because `--from`/`--to` or
   `--where` rule chunks out, one still being written, and a followed one are exported in the calling
-  process. A worker that dies (killed, out of memory) or cannot start is `IB-EXP-003` (the message
-  says to run again or with `--jobs 1`; the cause is in the ledger), and Ctrl-C, SIGTERM or SIGHUP
+  process. The workers and the export talk in a fixed binary format, never serialized objects, and
+  the export trusts nothing a worker sends until it has checked it (a worker decodes untrusted
+  recordings). A worker that dies (killed, out of memory), cannot start, makes no progress for
+  `[export] worker_stall` (5 minutes: a worker that moves no byte and uses no CPU time, stopped
+  or hung; time the export itself was suspended, as by Ctrl-Z, does not count), or sends anything but a well-formed answer
+  to the range it was given is `IB-EXP-003` (the message says to run again or
+  with `--jobs 1`; the cause is in the ledger), and Ctrl-C, SIGTERM or SIGHUP
   (also one sent to the whole process group) ends the export (130/143/129), terminates the workers
   and leaves nothing: they ignore SIGINT and SIGHUP, which only the export acts on, and exit by
   themselves if the export is killed. `[export] pool_min_bytes` (8MiB; `0` for always) moves the
@@ -922,6 +927,7 @@ Sizes are bytes or `"64MiB"`, durations `"10min"`. Defaults are in the second co
 | | `keep_recent`, `warn_interval`, `scan_interval` | 10, 24h, 10min |
 | `[export]` | `jobs` | one per core, 1 to 64 (1: never use workers) |
 | | `pool_min_bytes`, `range_bytes` | 8MiB (0: always use workers), 4MiB (a multiple of 8, 4KiB to 256MiB) |
+| | `worker_stall` | 5min (10s to 24h, or `"unlimited"`): a worker holding work that moves no byte and uses no CPU time for this long ends the export with `IB-EXP-003` |
 | `[send]` | `spin_below_us` | 0, off (0 to 1000000): a `--every` period below this (microseconds) ends each wait with a 75 us spin |
 
 Environment: `IRONBIRD_CONFIG`, `IRONBIRD_STATE_DIR` (ledger; absolute), `IRONBIRD_RECORD_DIR`
@@ -942,7 +948,7 @@ pytest -n auto
 ruff check . && ruff format --check .
 pyright                                # strict on src/, strict minus style rules on tests/ ([tool.pyright])
 mypy                                   # strict, src/ only (config: [tool.mypy])
-bandit -c pyproject.toml -r src        # security lint; a skip is `# nosec B301  # reason`
+bandit -c pyproject.toml -r src        # security lint; a skip is `# nosec B104  # reason`
 tools/coverage.sh -n auto              # branch coverage of src/ironbird; fails under fail_under
 ```
 
