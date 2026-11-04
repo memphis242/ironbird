@@ -615,7 +615,8 @@ from ironbird.recording import pexport
 signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT, signal.SIGHUP, signal.SIGTERM])
 os.kill(os.getpid(), signal.SIGINT)
 os.kill(os.getpid(), signal.SIGHUP)
-pexport._init_worker(pexport.EmbeddedDefinitions(Path("x"), {}, "", (), {}, 2048, ""), os.getppid())
+pexport._settle(os.getppid())
+pexport._build(pexport.EmbeddedDefinitions(Path("x"), {}, "", (), {}, 2048, ""))
 print(*(signal.getsignal(s) == signal.SIG_IGN for s in (signal.SIGINT, signal.SIGHUP)))
 """
 

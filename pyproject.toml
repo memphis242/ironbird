@@ -115,7 +115,7 @@ pretty = false
 # temp paths by design (ruff's "S" rules cover them with per-file ignores).
 targets = ["src"]
 # Every skip is justified inline next to the code it covers; nothing is disabled globally.
-# A skip is written `# nosec B301  # reason` (text after a second `#`; bandit
+# A skip is written `# nosec B104  # reason` (text after a second `#`; bandit
 # reads any words after the id as more test ids). B101 (assert) is the one exception: asserts are the project's
 # assertive-programming tool (see CLAUDE.md), so the test is excluded for the whole tree.
 skips = ["B101"]

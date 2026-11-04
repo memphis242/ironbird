@@ -418,8 +418,11 @@ ib export run1.ibrec --format text --from +90s --to +2m -o minute.txt
   or replaced while it is exported is read to the end from the file the export opened, in the calling
   process, as with `--jobs 1`. A recording read through the index because `--from`/`--to` or
   `--where` rule chunks out, one still being written, and a followed one are exported in the calling
-  process. A worker that dies (killed, out of memory) or cannot start is `IB-EXP-003` (the message
-  says to run again or with `--jobs 1`; the cause is in the ledger), and Ctrl-C, SIGTERM or SIGHUP
+  process. The workers and the export talk in a fixed binary format, never serialized objects, and
+  the export trusts nothing a worker sends until it has checked it (a worker decodes untrusted
+  recordings). A worker that dies (killed, out of memory), cannot start, or sends anything but a
+  well-formed answer to the range it was given is `IB-EXP-003` (the message says to run again or
+  with `--jobs 1`; the cause is in the ledger), and Ctrl-C, SIGTERM or SIGHUP
   (also one sent to the whole process group) ends the export (130/143/129), terminates the workers
   and leaves nothing: they ignore SIGINT and SIGHUP, which only the export acts on, and exit by
   themselves if the export is killed. `[export] pool_min_bytes` (8MiB; `0` for always) moves the
@@ -752,7 +755,7 @@ pytest -n auto
 ruff check . && ruff format --check .
 pyright
 mypy                                   # strict, src/ only (config: [tool.mypy])
-bandit -c pyproject.toml -r src        # security lint; a skip is `# nosec B301  # reason`
+bandit -c pyproject.toml -r src        # security lint; a skip is `# nosec B104  # reason`
 ```
 
 Packaging and dependency checks (the CI `package` job and the weekly `audit` / `el8-audit` jobs):

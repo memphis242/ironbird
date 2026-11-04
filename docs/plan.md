@@ -261,13 +261,13 @@ Practices (enforced in review and by tests):
   flagged in views, and reported as one coalesced line.
 - **Preserve the evidence.** Malformed packets are recorded raw and shown as hex with
   the failing offset highlighted; they are never silently dropped or "repaired".
-- **No code from data.** No `pickle`, `eval`, `exec`, or YAML object loading on
-  anything read from files, the wire, or shared memory. The ring moves raw bytes and
-  offsets only. The export worker pool (2m) pickles jobs and results between the parent and
-  its own spawned workers over a private socketpair; the types are fixed by ironbird's code,
-  recording bytes only ever become string or number contents inside them, and nothing read
-  from a file is unpickled. The header-profile `python:` escape hatch is trusted
-  local configuration and is documented as such.
+- **No code from data.** No `pickle`, `marshal`, `eval`, `exec`, or YAML object loading on
+  anything read from files, the wire, shared memory or another process. The ring moves raw bytes
+  and offsets only. The export worker pool (2m) talks to its own spawned workers in a fixed,
+  versioned binary framing (`recording/poolframe.py`), in both directions; a worker's replies are
+  untrusted (it decodes untrusted recordings) and are read through one decode function and checked
+  against the job before use. The header-profile `python:` escape hatch is trusted local
+  configuration and is documented as such.
 - **Bounded resources.** Caps on per-MID caches, scroll-back, unknown-MID tables, and
   ledger queue; a flood of unique garbage MIDs cannot exhaust memory.
 - **Output injection.** Strings from packets are sanitized before display: control
@@ -4059,9 +4059,9 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
 - **Processes.** `spawn`, never `fork`. The pool is owned (`WorkerPool`, which a caller may keep for many
   exports; started lazily by the export that needs it, a worker at a time as jobs are submitted): one
   `multiprocessing.Process` and one duplex `multiprocessing.Pipe` per worker, the parent's copy of the
-  worker's end closed after the start so that a worker that dies is an end of file on its pipe; jobs and
-  results are pickled messages over that pipe (the tool's own typed data between a process and its own
-  child on a private socket pair; nothing read from a recording is ever unpickled as code), each worker
+  worker's end closed after the start so that a worker that dies is an end of file on its pipe; the
+  definitions, jobs and results are frames of the pool's wire format over that pipe (see Wire format,
+  below), each worker
   has up to two jobs sent (one running, one ready; a job message over 16 KiB goes only to an idle worker so a
   send never waits on a busy one), and the parent reads on the calling thread with
   `multiprocessing.connection.wait` in 50 ms slices. There is no manager thread and no queue shared
@@ -4083,13 +4083,63 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
   in one process; the temporary output is removed by the same cleanup, and the workers are terminated
   (killed after 5 s) on any abnormal end; a finished export tells idle workers to go by closing their
   pipes and terminates one still holding a job nobody wants. A worker that dies, a result that cannot
-  be pickled or read back, a pool that cannot start (a process or file limit) and a worker fault are `IB-EXP-003` (one line: what failed and to run again or with
+  be framed or read back, a pool that cannot start (a process or file limit) and a worker fault are `IB-EXP-003` (one line: what failed and to run again or with
   `--jobs 1`; the traceback or the cause is in the ledger record). Definitions are rebuilt in each
   worker from the bytes the parent built from (`--defs recording`: the embedded blobs) or, for
   `--defs config`, from the configuration with a digest of the definition files that a worker checks
   before it decodes (a file edited during the export is `IB-EXP-003`, not a different decode). The
   parent reads a range itself (the file moved from under its name) with the codecs it decodes with,
   not codecs rebuilt from the configuration.
+- **Wire format** (user decision, replacing pickle: a worker that a decoder bug compromised could
+  otherwise run code in the parent by what it unpickles). `recording/poolframe.py`; the message
+  types are plain data in `recording/poolmsg.py`. A frame is a 12-byte header (magic `IBPF`, version
+  1, type: definitions, job, outcome, fault; a reserved zero field; the body length, which must be
+  the rest of the message) and a body of the type's fields in a fixed order, little endian:
+  fixed-width integers packed per group, flag bytes whose undefined bits must be zero, enums by
+  explicit code tables (an error code by its stable text), and `u32`-length-prefixed blocks for
+  text (UTF-8, validated), raw bytes and lists. Paths and command-line text (the filter, aliases,
+  message names) travel as the operating system's bytes, as Python carries them. META travels as
+  its one ASCII JSON form (it is JSON data; the canonical-form check refuses any other spelling).
+  The encoding is canonical: what `decode` accepts is exactly what `encode` writes for the value
+  it returns. Unknown types, versions, codes and flags, a length past the end or over its cap,
+  bytes after the last field, bad UTF-8 and duplicate keys are a `FrameError` (`IB-EXP-003`).
+  Bounds: a frame of each type has a cap (definitions 128 MiB, a job 64 MiB, a reply 128 MiB),
+  which the receiver also passes to the pipe so a longer message is refused from its length,
+  before it is read; every list has a cap; one frame makes at most 2^22 strings and list elements.
+  The encoder applies the same caps, so a value that cannot be sent is an error at the sender. A
+  worker is spawned with only its pipe and the parent's pid; the definitions are the pipe's first
+  frame (encoded once per pool). The parent reads a reply only through `read_reply`, which decodes
+  it, refuses a fault or any other type, and checks it against the job (`check_reply`): the range
+  asked for, a start where the job reads from and an end not before it, a cut that moves on,
+  damage and gaps only with the kinds of the rows, every row kind defined, the tables the format
+  has (one stream for text and JSON Lines, a malformed table only in a directory export, one block
+  per table), and the lines of the blocks, the rows that made a line and the order of the lines in
+  agreement; then the walk checks it as before. A worker answers a message it cannot read with a
+  fault and ends; a result it cannot frame becomes a crash outcome. Error text sent back is made
+  sendable (`diagnostic`: lone surrogates as their `\udcXX` escape, what the display shows anyway;
+  at most 1 MiB, keeping the end). The definitions a range applied count against the event cap
+  like its damage and gap notes, so a worker cuts a range rich in STREAM/SOURCE records at a record
+  boundary instead of sending an unbounded list. The only pickle left is multiprocessing's own
+  spawn bootstrap (the target function, the pipe and an int), parent to child. Tests:
+  `tests/test_poolframe.py` (every sample of every type read back exactly and canonically; every
+  truncation, with the header made to agree as well; every byte changed and every four bytes made a
+  lying length, refused or read back exactly; unknown types and versions; six kinds of bad UTF-8; a
+  frame over its cap refused unread; counts over their caps and the item budget; values the
+  encoder must refuse; Hypothesis properties of the round trip and of `read_reply` on mutated
+  replies; the parent's pool on a fake worker: garbage, a fault, a job, the wrong range and a
+  length over the cap are `IB-EXP-003` and a truthful reply reaches its ticket; a worker answers an
+  unreadable message with a fault), the corpus `tests/corpus/malformed/poolframe-*.bin` (40 replies,
+  built by `tests/poolframe_corpus.py`, each refused), and the nightly atheris harness
+  `tools/fuzz/fuzz_poolframe.py`. Found while replacing it, each a test that fails on the code
+  before: (1) a worker's crash outcome (a job that raised, or definitions a worker cannot build,
+  such as a `--defs config` file edited during the export) has no start, and the walk took it for
+  a range holding no record: every such range was skipped and the export succeeded without its
+  rows. A crash now ends the export with `IB-EXP-003` before the start is looked at, and
+  `check_reply` refuses an exact range without a start unless it crashed or its file moved
+  (`test_a_worker_that_crashes_ends_the_export_instead_of_skipping_its_range`, real workers).
+  (2) A reply refused after its ticket was taken off the worker's queue left that ticket without
+  an answer (the parent asserted, or under `-O` polled forever); the ticket now stays queued until
+  the reply is accepted.
 - **When the pool is used.** `--jobs N` (1..64) beats `[export] jobs`, which beats the default of one
   worker per core the process may run on (its CPU affinity and the `cpu.max` quota of its cgroup v2
   group and the groups above it, rounded up; a group that cannot be examined, such as `EACCES`, is no
@@ -4571,7 +4621,7 @@ its options:
 CI gates beyond ruff, pyright and the tests (`.github/workflows/ci.yml`):
 
 - **mypy** (strict, `src/` only; `[tool.mypy]`) and **bandit** (`src/`; `[tool.bandit]`) run in the
-  `checks` job. Every bandit skip is inline with a reason (`# nosec B301  # reason`; the only global
+  `checks` job. Every bandit skip is inline with a reason (`# nosec B104  # reason`; the only global
   skip is B101, because asserts are the assertive-programming tool).
 - **packaging** (`package` job, `tools/ci/check-package.sh`): sdist and wheel build from a copy of the
   tree, `twine check --strict`, wheel contents match `src/ironbird` (plus `py.typed` and the entry
@@ -4590,9 +4640,12 @@ Deferred (decisions open):
   `tools/ci/audit-ignore.txt`). Verify pytest-benchmark and xdist on pytest 9, bump, drop the entry.
 - mypy does not yet cover `tests/` (pyright strict does): about 85 findings, mostly monkeypatching of
   module attributes and re-exported names, to be cleaned up in a dedicated pass.
-- `recording/pexport.py` unpickles the export worker's replies in the parent. The pipe is private and
-  the worker is the tool's own process, but a worker that a decoder bug compromised could then run
-  code in the parent. Replacing pickle with a fixed binary framing removes that class (design change).
+- Authenticating the export pool's frames (an HMAC under a per-pool random key) is not done: the
+  pipe is a private socketpair between the parent and its own children, so only a process of the
+  same user could write to it, and such a process can already do anything the user can (ptrace,
+  the files); the framing already makes every reply untrusted data. Revisit if a worker ever runs
+  with less privilege than the parent (a sandbox), where a key would keep an escaped decoder from
+  forging another worker's replies.
 - The audit jobs do not run (even non-gating) on PRs that touch `tools/ci/audit-*`; a manual
   `workflow_dispatch` run covers them instead, and one must be triggered on this branch before merge.
 

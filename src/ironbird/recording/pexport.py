@@ -37,18 +37,18 @@ its identity (device and inode). A worker whose name leads somewhere else (the f
 replaced) or nowhere reads nothing; the parent then reads that range and every later one itself,
 from the file it holds, exactly as the single process would.
 
-**Bounded memory.** A result carries at most :data:`RESULT_TEXT_CAP` characters of rows (and at
-most :data:`MAX_RANGE_EVENTS` damage and gap notes): a worker that reaches either stops at a
-record boundary, and the parent asks for the rest of the range with an exact job from there. At
-most :data:`WINDOW_PER_WORKER` ranges per worker are submitted and not yet written, so the rows
-held, in the parent and in the workers, never pass ``WINDOW_PER_WORKER x workers x
-RESULT_TEXT_CAP`` characters. A range is submitted beyond the first one per worker only while the
-bytes of rows waiting plus the largest result seen for each range still running fit in
-:data:`PENDING_TEXT_BUDGET`; that estimate follows what came back, so after a stretch of narrow
-rows the ranges already submitted may all turn out wide, and the held rows then come to the
-first figure. Results are written in order and dropped. Ranges are planned one after another and
-are shorter when the rows are wide (:meth:`_Runner._length`), so that a result is rarely cut.
-Nothing buffers the recording.
+**Bounded memory.** A result carries at most :data:`RESULT_TEXT_CAP` characters of rows (and at most
+:data:`MAX_RANGE_EVENTS` damage and gap notes, and as many stream and source definitions): a worker
+that reaches a cap stops at a record boundary, and the parent asks for the rest of the range with an
+exact job from there. At most :data:`WINDOW_PER_WORKER` ranges per worker are submitted and not yet
+written, so the rows held, in the parent and in the workers, never pass ``WINDOW_PER_WORKER x
+workers x RESULT_TEXT_CAP`` characters. A range is submitted beyond the first one per worker only
+while the bytes of rows waiting plus the largest result seen for each range still running fit in
+:data:`PENDING_TEXT_BUDGET`; that estimate follows what came back, so after a stretch of narrow rows
+the ranges already submitted may all turn out wide, and the held rows then come to the first figure.
+Results are written in order and dropped. Ranges are planned one after another and are shorter when
+the rows are wide (:meth:`_Runner._length`), so that a result is rarely cut. Nothing buffers the
+recording.
 
 **When the output closes** (standard output into ``head``) the single process stops at the row
 the output refused, and when a write fails (a full disk) it stops at the row that made the file
@@ -67,13 +67,18 @@ is terminated or dies part way through a message is an end of file on its pipe a
 for bytes that will not come. The parent waits in :func:`multiprocessing.connection.wait` in short
 slices. The processes, and the resource tracker the first of them starts, are created with the
 shutdown signals blocked, so a hangup sent to the process group reaches the parent alone. A worker
-that dies, or whose result cannot be read, is ``IB-EXP-003``.
+that dies, or whose result cannot be read, is ``IB-EXP-003``. A worker is started with nothing but
+its pipe and the parent's process id; the definitions it decodes with are the first message on the
+pipe.
 
-Untrusted input: everything a worker reads is validated by the reader before it is decoded, and
-what comes back is plain data that the parent checks against the walk before it is used. Jobs and
-results are pickled over the private pipe between the parent and its own worker; nothing read from
-a recording or the wire is ever unpickled, and a message that is not the result asked for is
-``IB-EXP-003``.
+Untrusted input: everything a worker reads is validated by the reader before it is decoded, and a
+worker that decodes untrusted recordings is not trusted either. Every message on the pipe, both
+ways, is a frame of the fixed binary format of :mod:`~ironbird.recording.poolframe`: no object is
+ever serialized, so no message can run code or name a type to build. The parent reads a reply
+only through :func:`~ironbird.recording.poolframe.decode` (caps on every length, the pipe refusing
+a message longer than any reply before reading it), checks it against the job it answers
+(:func:`~ironbird.recording.poolframe.check_reply`) and then against the walk; a reply that fails
+any of these is ``IB-EXP-003``, as a worker that died is.
 """
 
 from __future__ import annotations
@@ -81,10 +86,8 @@ from __future__ import annotations
 import array
 import contextlib
 import dataclasses
-import hashlib
 import multiprocessing
 import os
-import pickle  # nosec B403  # only the parent's private pipe to its own worker is unpickled
 import signal
 import threading
 import time
@@ -102,33 +105,36 @@ from ironbird.config import (
     DEFAULT_RANGE_BYTES,
     MAX_EXPORT_JOBS,
     MIN_RANGE_BYTES,
-    load_config,
 )
 from ironbird.errors import Code, IronbirdError
 from ironbird.filter import Filter, compile_filter
 from ironbird.frame import Frame, GapReason, Stream
-from ironbird.fsops import read_capped
-from ironbird.header import MAX_PROFILE_FILE_BYTES
 from ironbird.recording import format as fmt
-from ironbird.recording.defs import (
-    Blobs,
-    Head,
-    config_codecs,
-    embedded_codecs,
-)
+from ironbird.recording import poolframe
 from ironbird.recording.export import (
     NO_LINE,
     Destination,
     ExportFormat,
-    ExportResult,
     Pipeline,
     Selection,
     Table,
-    TableKey,
     make_pipeline,
 )
 from ironbird.recording.format import RecordType
 from ironbird.recording.player import Ending
+from ironbird.recording.poolframe import FrameError, Kind
+from ironbird.recording.poolmsg import (
+    Block,
+    ConfigDefinitions,
+    Definitions,
+    EmbeddedDefinitions,
+    Fault,
+    Job,
+    Outcome,
+    Seed,
+    Shape,
+)
+from ironbird.recording.poolmsg import DefinitionsChanged as _Changed
 from ironbird.recording.reader import Damage, RecordingReader
 from ironbird.recording.replay import JumpTable, Replay, gap_in_range
 from ironbird.sigmask import HANDLED_SIGNALS, WAIT_SLICE_S, checkpoint, masked
@@ -147,6 +153,7 @@ PARENT_WATCH_S: Final = 1.0  # how often a worker looks for its parent
 STOP_WAIT_S: Final = 5.0  # how long terminated workers are waited for before they are killed
 ALIGN: Final = fmt.ALIGN
 assert RANGE_BYTES % ALIGN == 0 and MIN_RANGE_BYTES % ALIGN == 0
+assert RESULT_TEXT_CAP <= poolframe.MAX_TEXT_CAP and MAX_RANGE_EVENTS <= poolframe.MAX_EVENT_CAP
 
 
 CGROUP_ROOT: Final = Path("/sys/fs/cgroup")
@@ -206,236 +213,6 @@ def default_jobs() -> int:
     if quota is not None:
         cores = min(cores, quota)
     return max(1, min(cores, MAX_JOBS))
-
-
-# -- definitions, rebuilt in each worker ------------------------------------------------------
-
-
-def _plain(value: object) -> object:
-    """``value`` (read-only mappings and sequences from JSON) as plain dicts and lists, which
-    pickle."""
-    if isinstance(value, Mapping):
-        return {k: _plain(v) for k, v in value.items()}
-    if isinstance(value, list | tuple):
-        return [_plain(v) for v in value]
-    return value
-
-
-@dataclass(frozen=True, slots=True)
-class EmbeddedDefinitions:
-    """The codecs of ``--defs recording``: built again from the definitions the recording embeds
-    (their bytes travel, so every worker builds from what the parent built from). Two recordings
-    that embed the same definitions have equal recipes."""
-
-    path: Path = field(compare=False)  # names the recording in an error
-    blobs: Blobs
-    problem: str
-    nodes: tuple[str, ...]
-    meta: dict[str, Any]
-    max_packet_bytes: int
-    hint: str
-
-    @staticmethod
-    def of(replay: Replay, hint: str) -> EmbeddedDefinitions:
-        meta = _plain(replay.meta.data)
-        assert isinstance(meta, dict)
-        head = replay.head
-        return EmbeddedDefinitions(
-            replay.parts[0],
-            dict(head.blobs),
-            head.problem,
-            tuple(replay.nodes),
-            meta,
-            replay.max_packet_bytes,
-            hint,
-        )
-
-    def build(self) -> dict[str, Codec]:
-        head = Head({}, self.blobs, self.problem)
-        return embedded_codecs(
-            self.path, head, self.nodes, self.meta, self.max_packet_bytes, self.hint
-        )
-
-
-def config_fingerprint(config_nodes: Mapping[str, Any], nodes: tuple[str, ...]) -> str:
-    """A digest of the definition files the configuration names for ``nodes``, to tell a worker
-    that the files are not what the parent decoded with."""
-    digest = hashlib.sha256()
-    for name in sorted(set(nodes)):
-        digest.update(name.encode("utf-8", "surrogateescape") + b"\0")
-        node = config_nodes.get(name)
-        if node is None:
-            continue
-        for path, limit in (
-            (node.ccdd, fmt.MAX_BLOB_CONTENT),
-            (node.command_header, MAX_PROFILE_FILE_BYTES),
-            (node.telemetry_header, MAX_PROFILE_FILE_BYTES),
-        ):
-            if path is None:
-                digest.update(b"-\0")
-                continue
-            try:
-                content = read_capped(path, limit)
-            except OSError as exc:
-                digest.update(f"unreadable:{exc.errno}\0".encode())
-                continue
-            digest.update(len(content).to_bytes(8, "little") + hashlib.sha256(content).digest())
-    return digest.hexdigest()
-
-
-@dataclass(frozen=True, slots=True)
-class ConfigDefinitions:
-    """The codecs of ``--defs config``: built again from the configuration's files. A worker
-    refuses to decode if those files are not what the parent saw (``fingerprint``)."""
-
-    config_path: Path
-    config_sha256: str | None
-    nodes: tuple[str, ...]
-    max_packet_bytes: int
-    command: str
-    fingerprint: str
-
-    @staticmethod
-    def of(
-        config_path: Path,
-        config_sha256: str | None,
-        config_nodes: Mapping[str, Any],
-        nodes: tuple[str, ...],
-        max_packet_bytes: int,
-        command: str,
-    ) -> ConfigDefinitions:
-        return ConfigDefinitions(
-            config_path,
-            config_sha256,
-            nodes,
-            max_packet_bytes,
-            command,
-            config_fingerprint(config_nodes, nodes),
-        )
-
-    def build(self) -> dict[str, Codec]:
-        config = load_config(self.config_path)
-        if self.config_sha256 is not None and config.sha256 != self.config_sha256:
-            raise _Changed(f"{self.config_path} changed while the export ran")
-        before = config_fingerprint(config.nodes, self.nodes)
-        codecs = config_codecs(config, self.nodes, self.max_packet_bytes, self.command)
-        if before != self.fingerprint or config_fingerprint(config.nodes, self.nodes) != before:
-            raise _Changed("a definition file named by the configuration changed during the export")
-        return codecs
-
-
-class _Changed(Exception):
-    """The definitions on disk are not the ones the parent decoded with."""
-
-
-Definitions = EmbeddedDefinitions | ConfigDefinitions
-
-
-# -- what the parent sends and gets back ------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class Shape:
-    """What an export writes: the format and options, the filter as text (a compiled filter does
-    not travel) and the messages asked for. It travels with each range, so a pool built for some
-    definitions serves any export that decodes with them."""
-
-    fmt: ExportFormat
-    where: str | None
-    links: frozenset[str]
-    aliases: tuple[tuple[str, str], ...] | None
-    messages: tuple[str, ...]
-    header_fields: bool
-    raw_enums: bool
-    directory: bool
-    skip_damage: bool
-    categories: bool = False  # the output takes rows one at a time and may refuse one
-
-
-@dataclass(frozen=True, slots=True)
-class Seed:
-    """The state a range begins with: the streams and sources defined before it, the last
-    sequence number, the work charged to the resync budget."""
-
-    streams: dict[int, Stream]
-    sources: dict[int, str]
-    last_seq: int
-    work: int
-
-
-@dataclass(frozen=True, slots=True)
-class Job:
-    """A range: records from the first at or after ``guess`` (``exact``: the record at ``guess``)
-    until the first at or after ``stop`` (``None``: the end of the file)."""
-
-    index: int
-    path: Path
-    guess: int
-    stop: int | None
-    exact: bool
-    seed: Seed
-    start_ns: int | None
-    end_ns: int | None
-    shape: Shape
-    identity: tuple[int, int]  # (device, inode) of the file the parent has open
-    text_cap: int  # characters of rows after which the range is cut short
-    event_cap: int  # damage and gap notes after which the range is cut short
-
-
-@dataclass(frozen=True, slots=True)
-class Block:
-    """The rows of one table from one range: ``key`` identifies the table (``None``: the malformed
-    table, or the only stream of text and JSON Lines), ``text`` has no header row."""
-
-    key: TableKey | None
-    malformed: bool
-    rows: int
-    text: str
-    handle: int = 0  # the table in the worker that made it (what ``Outcome.order`` names)
-
-
-@dataclass(slots=True)
-class Outcome:
-    """What a worker made of a :class:`Job`. Plain data; the parent trusts none of it until it has
-    been checked against the walk."""
-
-    index: int
-    start: int | None = None  # where the first record was read (None: no record boundary found)
-    end: int = 0  # where reading ended
-    reached_stop: bool = False
-    first_seq: int | None = None
-    last_seq: int = 0
-    definitions: list[tuple[Any, ...]] = field(default_factory=list)
-    used_streams: list[int] = field(default_factory=list)  # ids the range found in its seed
-    used_sources: list[int] = field(default_factory=list)
-    work: int = 0  # bytes charged to the resync budget by the range
-    # bytes the range's resync scans read, the search for its first record included
-    scanned: int = 0
-    trailer: bool = False
-    seen: bool = False  # the parent has learned from its size
-    partial: bool = False  # cut short at a cap: the range goes on from ``end``
-    moved: bool = False  # the name does not lead to the file the parent has open: nothing was read
-    damage: list[Damage] = field(default_factory=list)
-    damage_rows: list[int] = field(default_factory=list)  # rows made before each damage
-    failure: tuple[str, str, str] | None = None  # (code, summary, details) the reader raised
-    crash: str | None = None  # a worker fault, as text
-    frames_read: int = 0
-    frames_in_range: int = 0
-    gap_marks: list[tuple[int, int, int]] = field(default_factory=list)
-    """``(rows made before, gaps, frames lost)``: the gap records in range, run together when no
-    row came between them."""
-    counts: ExportResult = field(default_factory=ExportResult)
-    blocks: list[Block] = field(default_factory=list)
-    categories: bytes | None = None
-    """The kind of each row, in the order they were made (``NO_LINE`` set: no line); ``None``
-    unless the parent writes row by row or the range holds damage or gaps."""
-    order: array.array[int] | None = None
-    """With ``categories`` and more than one block: the :attr:`Block.handle` each line belongs to,
-    line by line in the order they were made."""
-
-    @property
-    def clean(self) -> bool:
-        return self.crash is None and self.failure is None and not self.damage and not self.moved
 
 
 # -- the worker -------------------------------------------------------------------------------
@@ -535,7 +312,7 @@ class _Worker:
             if begin is None:
                 out.end = job.guess
                 return out
-            definitions = reader.log_definitions()
+            out.definitions = reader.log_definitions()  # it grows as the range is read
             lookups = reader.track_lookups()
             dest = _BlockDestination(single_stream=shape.fmt is not ExportFormat.CSV)
             pipe = make_pipeline(
@@ -563,7 +340,6 @@ class _Worker:
             else:
                 out.end, out.partial = cut, True
             out.last_seq = reader.last_seq
-            out.definitions = definitions
             out.used_streams = sorted(lookups.streams)
             out.used_sources = sorted(lookups.sources)
             out.work = reader.work - seed.work
@@ -633,6 +409,9 @@ class _Worker:
                             marks.append((rows, 1, lost))
                         if self._full(job, out, dest):
                             return item.end
+                case RecordType.STREAM | RecordType.SOURCE:
+                    if self._full(job, out, dest):  # a definition was noted
+                        return item.end
                 case _:
                     pass
         return None
@@ -640,7 +419,11 @@ class _Worker:
     @staticmethod
     def _full(job: Job, out: Outcome, dest: _BlockDestination) -> bool:
         """Whether the range has made all a result may carry."""
-        return dest.chars >= job.text_cap or len(out.damage) + len(out.gap_marks) >= job.event_cap
+        return (
+            dest.chars >= job.text_cap
+            or len(out.damage) + len(out.gap_marks) >= job.event_cap
+            or len(out.definitions) >= job.event_cap
+        )
 
     @staticmethod
     def _collect(shape: Shape, pipe: Pipeline, dest: _BlockDestination, out: Outcome) -> None:
@@ -671,7 +454,7 @@ class _Worker:
 
 
 class _Process:
-    """The state of this worker process: set by :func:`_init_worker`, used by :func:`run_job`."""
+    """The state of this worker process: set by :func:`_build`, used by :func:`run_job`."""
 
     worker: _Worker | None = None
     fault: str | None = None
@@ -684,17 +467,23 @@ def _watch_parent(parent: int) -> None:
             os._exit(1)
 
 
-def _init_worker(definitions: Definitions, parent: int) -> None:
-    """Run once in each worker process: the parent coordinates shutdown, so Ctrl-C and a hangup
+def _settle(parent: int) -> None:
+    """Run first in each worker process: the parent coordinates shutdown, so Ctrl-C and a hangup
     reach the parent only. The worker starts with the shutdown signals blocked (the pool is made
     with them blocked), so one that arrived while it started is pending: SIGINT and SIGHUP are
     set to be ignored before the mask is lifted, so such a signal is dropped, not raised in the
-    middle of this function; SIGTERM keeps its default so the parent can terminate the worker."""
+    middle of the worker's setup; SIGTERM keeps its default so the parent can terminate the
+    worker."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.pthread_sigmask(signal.SIG_UNBLOCK, HANDLED_SIGNALS)
     threading.Thread(target=_watch_parent, args=(parent,), daemon=True).start()
+
+
+def _build(definitions: Definitions) -> None:
+    """Build the worker's state from ``definitions``; a fault is kept, and every job is answered
+    with it."""
     try:
         _Process.worker = _Worker(definitions)
     except _Changed as exc:
@@ -716,25 +505,59 @@ def run_job(job: Job) -> Outcome:
         return Outcome(job.index, crash=traceback.format_exc())
 
 
-def serve(conn: connection.Connection, definitions: Definitions, parent: int) -> None:
-    """The main function of a worker process: build the state, then answer the jobs that come
-    over ``conn`` one at a time until the parent closes its end (or is gone). A result that cannot
-    be pickled is answered with a crash outcome naming why."""
-    _init_worker(definitions, parent)
+def _reply(outcome: Outcome) -> bytes:
+    """The frame of ``outcome``, its error text made fit to send (see
+    :func:`poolframe.diagnostic`); a result that cannot be framed is a crash outcome naming why."""
+    if outcome.failure is not None:
+        code, summary, details = outcome.failure
+        outcome.failure = (code, poolframe.diagnostic(summary), poolframe.diagnostic(details))
+    if outcome.crash is not None:
+        outcome.crash = poolframe.diagnostic(outcome.crash)
+    try:
+        return poolframe.encode(outcome)
+    except FrameError:
+        crash = poolframe.diagnostic(traceback.format_exc())
+        return poolframe.encode(Outcome(outcome.index, crash=crash))
+
+
+_FROM_PARENT: Final[dict[Kind, tuple[type, ...]]] = {
+    Kind.DEFINITIONS: (EmbeddedDefinitions, ConfigDefinitions),
+    Kind.JOB: (Job,),
+}
+
+
+def _from_parent(conn: connection.Connection, kind: Kind) -> poolframe.Message | None:
+    """The next message from the parent, which must be of type ``kind``; ``None`` when the parent
+    has gone. A message that is not one is answered with a :class:`Fault`, and is ``None``."""
+    try:
+        data = conn.recv_bytes(poolframe.receive_cap(kind))
+    except (EOFError, OSError):
+        return None
+    try:
+        message = poolframe.decode(data)
+        if not isinstance(message, _FROM_PARENT[kind]):
+            raise FrameError(f"a {type(message).__name__} came where a {kind.name} must")
+    except FrameError as exc:
+        with contextlib.suppress(OSError):
+            conn.send_bytes(poolframe.encode(Fault(poolframe.diagnostic(str(exc)))))
+        return None
+    return message
+
+
+def serve(conn: connection.Connection, parent: int) -> None:
+    """The main function of a worker process: read the definitions the parent sends first and
+    build the state, then answer the jobs that come over ``conn`` one at a time until the parent
+    closes its end (or is gone). Every message is a frame of :mod:`~ironbird.recording.poolframe`;
+    one that is not what the parent sends is answered with a fault, and the worker ends."""
+    _settle(parent)
     with contextlib.closing(conn):
-        while True:
+        definitions = _from_parent(conn, Kind.DEFINITIONS)
+        if not isinstance(definitions, EmbeddedDefinitions | ConfigDefinitions):
+            return
+        _build(definitions)
+        while isinstance(job := _from_parent(conn, Kind.JOB), Job):
             try:
-                job = pickle.loads(conn.recv_bytes())  # noqa: S301  # nosec B301  # the parent's own message
-            except (EOFError, OSError):
-                return
-            outcome = run_job(job)
-            try:
-                reply = pickle.dumps(outcome, pickle.HIGHEST_PROTOCOL)
-            except Exception:
-                crash = Outcome(job.index, crash=traceback.format_exc())
-                reply = pickle.dumps(crash, pickle.HIGHEST_PROTOCOL)
-            try:
-                conn.send_bytes(reply)
+                conn.send_bytes(_reply(run_job(job)))
             except OSError:
                 return
 
@@ -872,6 +695,7 @@ class WorkerPool:
         self._slots: list[_Slot] = []
         self._queued: deque[Ticket] = deque()  # submitted, not yet sent to a worker
         self._error: IronbirdError | None = None
+        self._greeting: bytes | None = None  # the definitions, framed once for every worker
         self.broken = False
 
     # -- the tickets --
@@ -882,8 +706,8 @@ class WorkerPool:
         if self._error is not None:
             raise self._error
         try:
-            data = pickle.dumps(job, pickle.HIGHEST_PROTOCOL)
-        except Exception as exc:
+            data = poolframe.encode(job)
+        except FrameError as exc:
             raise self._undeliverable("a job could not be sent to a worker", exc) from exc
         ticket = Ticket(job, data)
         self._queued.append(ticket)
@@ -910,27 +734,29 @@ class WorkerPool:
         self._dispatch()
 
     def _receive(self, slot: _Slot) -> None:
+        """Take the next answer of ``slot``'s worker. It is untrusted: read only by
+        :func:`poolframe.read_reply`, and anything it refuses ends the pool as a worker that
+        died does."""
+        conn = slot.conn
         try:
-            reply = pickle.loads(slot.conn.recv_bytes())  # noqa: S301  # nosec B301  # our own worker's message
+            data = conn.recv_bytes(poolframe.MAX_REPLY_BYTES)
         except (EOFError, OSError) as exc:
-            self._fail(self.died(exc))
+            if conn.readable:
+                self._fail(self.died(exc))
+            else:  # the pipe refused a message longer than any reply, before reading it
+                self._fail(
+                    self._undeliverable("an export worker sent a result too long to be one", exc)
+                )
             return
-        except Exception as exc:  # bytes that are not an outcome
+        ticket = slot.sent[0]  # a worker answers in the order it was asked
+        try:
+            reply = poolframe.read_reply(ticket.job, data)
+        except FrameError as exc:  # the ticket is still sent: the failure answers it
             self._fail(
                 self._undeliverable("an export worker returned a result that cannot be read", exc)
             )
             return
-        ticket = slot.sent.popleft()
-        if not isinstance(reply, Outcome) or reply.index != ticket.job.index:
-            self._fail(
-                self._undeliverable(
-                    "an export worker returned the wrong result",
-                    AssertionError(
-                        f"asked for range {ticket.job.index}, got {type(reply).__name__}"
-                    ),
-                )
-            )
-            return
+        slot.sent.popleft()
         if not ticket.cancelled:
             ticket.outcome = reply
 
@@ -1007,7 +833,15 @@ class WorkerPool:
         starts, are made with the shutdown signals blocked, so a hangup or an interrupt sent to
         the process group reaches the parent alone. Two scopes: starting the resource tracker
         leaves SIGINT and SIGTERM unblocked in the thread that did it (multiprocessing unblocks
-        them after the spawn), and a worker must not inherit that."""
+        them after the spawn), and a worker must not inherit that.
+
+        The worker is given only its pipe and the parent's process id; the first message on the
+        pipe is the definitions it decodes with, framed like every other."""
+        if self._greeting is None:
+            try:
+                self._greeting = poolframe.encode(self.definitions)
+            except FrameError as exc:
+                raise self._cannot_start(exc) from exc
         context = multiprocessing.get_context("spawn")
         ours = theirs = None
         try:
@@ -1016,7 +850,7 @@ class WorkerPool:
                 resource_tracker.ensure_running()
             process = context.Process(
                 target=serve,
-                args=(theirs, self.definitions, os.getpid()),
+                args=(theirs, os.getpid()),
                 name="ironbird-export-worker",
                 daemon=True,
             )
@@ -1025,22 +859,34 @@ class WorkerPool:
         except (OSError, RuntimeError) as exc:  # a process or file limit, memory
             if ours is not None:
                 ours.close()
-            self.broken = True
-            reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
-            self._error = IronbirdError(
-                Code.EXP_WORKER,
-                f"cannot start export workers ({reason[:200]}); run the export with --jobs 1 to "
-                "decode in one process",
-                details=f"{type(exc).__name__}: {exc}",
-                cause=exc,
-            )
-            raise self._error from exc
+            raise self._cannot_start(exc) from exc
         finally:
             if theirs is not None:
                 theirs.close()  # the worker holds the only other copy: its death is our end of file
         slot = _Slot(process, ours)
-        self._slots.append(slot)
+        self._slots.append(slot)  # ended by close() whatever happens next
+        try:
+            ours.send_bytes(self._greeting)
+        except OSError as exc:  # the worker is gone already
+            raise self._cannot_start(exc) from exc
         return slot
+
+    def _cannot_start(self, exc: BaseException) -> IronbirdError:
+        """The error that ends the pool when a worker cannot be started or given its
+        definitions."""
+        self.broken = True
+        if isinstance(exc, FrameError):
+            reason = exc.reason
+        else:
+            reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+        self._error = IronbirdError(
+            Code.EXP_WORKER,
+            f"cannot start export workers ({reason[:200]}); run the export with --jobs 1 to "
+            "decode in one process",
+            details=f"{type(exc).__name__}: {exc}",
+            cause=exc,
+        )
+        return self._error
 
     def close(self, *, abnormal: bool = False) -> None:
         """End the workers: idle ones are told to go (their pipe closes) and exit; after an error
@@ -1098,6 +944,7 @@ class ParallelOptions:
         assert 1 <= self.jobs <= MAX_JOBS
         assert self.range_bytes >= MIN_RANGE_BYTES and self.range_bytes % ALIGN == 0
         assert self.text_cap >= 1 and self.text_budget >= 1 and self.event_cap >= 1
+        assert self.text_cap <= poolframe.MAX_TEXT_CAP and self.event_cap <= poolframe.MAX_EVENT_CAP
         assert self.pool is None or self.pool.definitions == self.definitions
 
     def wanted(self, replay: Replay) -> bool:
@@ -1437,6 +1284,8 @@ class _Runner:
                 report.max_text_bytes = max(report.max_text_bytes, self._waiting_text())
                 tickets.pop(index, None)
                 jobs.pop(index, None)
+                if outcome.crash is not None:  # a crash has no start either: never a skip
+                    raise self._crashed(outcome.crash)
                 if outcome.start is None:
                     break  # no record begins in the range and the walk is past it
                 refused = not self._write(outcome, reader, path)
@@ -1447,8 +1296,6 @@ class _Runner:
                 if outcome.failure is not None:
                     code, summary, details = outcome.failure
                     raise IronbirdError(Code(code), summary, details=details)
-                if outcome.crash is not None:
-                    raise self._crashed(outcome.crash)
                 walk.apply(outcome.definitions)
                 if outcome.first_seq is not None:  # a range without frames leaves the sequence
                     walk.last_seq = outcome.last_seq
