@@ -4551,6 +4551,77 @@ its options:
    mockups are the reference until the TUI exists.
 4. TUI command composer with tiered search and argument entry.
 5. Send modes: scheduled at T, repeat N, every M ms/s until T or for duration.
+   **Done for `ib send` (`send/modes`)**: `--at`, `--repeat`, `--every` with `--for`/`--until`, and
+   `--raw-enum`; the flags, timing model and decisions are in the README's "Send modes" section, in
+   `src/ironbird/sendmodes.py` (plan, slots) and `src/ironbird/pacer.py` (the pacer thread). Decisions:
+   - Absolute monotonic deadlines (no drift); a wall-clock `--at` re-read until the last second, `--until`
+     fixed on the monotonic clock at the start; zone-less times are UTC; offsets, `--for` and ends are
+     bounded to a year at parse time.
+   - The link is opened before the start. With `--at` the start and window are fixed before the open (an
+     open that overruns T skips the slots on T's grid, counted; a non-periodic `--at` goes late and says
+     so); with no `--at` the series starts when the link is open, and a `--until` window left no longer
+     than the period is refused (`IB-CLI-001`, nothing sent).
+   - Pacing is spin-free: a dedicated pacer thread sleeps to each deadline (`Event.wait`, then
+     `time.sleep` for the last 2 ms, timer slack lowered to 1 us with `prctl(PR_SET_TIMERSLACK)`, ledgered
+     when unavailable) and sends from the thread (UDP: a duplicate of the connected socket; serial:
+     through the loop). Nothing spins by default (measured on a busy 4-core host: `--every 1ms` on the
+     wire with a median jitter of 23 us, p99 170 us, at 26% of a core, against 185 us, 360 us and 100%
+     for the spinning version; README "Send modes"); a period under `[send] spin_below_us` (0, off)
+     ends each wait with a 75 us spin (median 7 us at 1 ms, for about spin / period more CPU).
+     The loop builds the packets ahead (bounded queue, no earlier than 20 ms before the slot, so the
+     ledger's transmit gate and a header time field are current, and only for slots the thread can still
+     serve: it publishes the slot it takes before the packet leaves the queue, a timed series starts from
+     the slot nearest now, and a packet not tied to a slot is built only while slots remain in the window,
+     so a complete series leaves no count built and unsent, except through a skip in the last 20 ms of
+     the window, which can leave up to a build-ahead's worth of packets built and unsent, each ledgered
+     `unsent`; the loop reads the queue depth before the slot the thread publishes, so an interleaving
+     can only defer a build, never add one) and handles the thread's reports. The loop's
+     work never delays a wait or a send, but the thread shares the GIL: the switch interval is lowered
+     (0.2 ms) for the life of a series and restored by the last series running in the process (a
+     refcount under a lock; the interval is process-wide) (measured: 61-68 of 300 slots skipped at 10 ms under 8
+     ms Python bursts, 1-5 after; 808 of 2000 at 1 ms under 3 ms bursts, about 100 after). The thread is
+     started with `sigmask.start_thread`; a start that fails is `IB-SYS-001`.
+   - Accounting: the thread publishes the packet in flight; a send through the loop (serial) is cancelled
+     by the stop and answers whether the head of the packet is on the line; a send that ignores the stop
+     for 5 s is abandoned: a coded `IB-TX-002` is ledgered and shown, its packet is ledgered `unconfirmed`,
+     and a failure the abandoned thread reports later is ledgered (`late: true`), not dropped. A send
+     the stop cut with only the head of its packet on the line is sent, marked `cut: true` in its
+     `tx.command`, and the torn-packet error (`IB-TX-002`) names it by command and sequence count; the
+     signal notice shows the series' end only when it was not the interruption itself; a UDP send buffer
+     still full after the 2 s wait says so and what to do. Consecutive starved slots are one
+     report; a handler error during the wind-down does not skip the rest of it. A burst on a full UDP send
+     buffer waits up to 2 s for room. `send.fault` is ledgered once per series; `-v` samples a fast
+     series' packets (2 a second) instead of printing each; a signal after the series ended still names
+     its count (`cli.signal` `series_*`).
+   - An overrunning slot is skipped (not caught up) when its send cannot start within half a period of
+     its deadline; a slot with no packet built is skipped as `starved`. Lateness is measured in the
+     thread when the send returns. A header that carries the send time makes each packet valid for its
+     own slot only (discarded with it, its count unused and ledgered); any other packet moves to the
+     next slot, so the counts on the wire stay consecutive.
+   - A failed send stops the series (exit 1). UDP refusals of a series are never cleared by the next
+     send: the next send fails with them, the loop checks within 50 ms of every send, and once after
+     the last.
+   - Ledger: the arguments once in `send.plan`; the first 600 packets each in a `tx.command`, then one
+     `tx.command.window` per 10 s (as `respond.replies`), every failure in full; exact totals and the
+     first and last count in `send.outcome`.
+   - Every packet takes its own count from the codec. Seam for the persistent counter (`send/sequence`,
+     PR #40): a seated first count (`--sequence N`) applies to packet 0 only (each later packet takes
+     the next count), is recorded in `send.plan.request`, and a reservation of counts must be prefetched
+     off the loop and outside the pacer thread (the builder runs up to 20 ms ahead of each slot, so a
+     reservation there does not delay a packet; one that blocks longer starves slots, which is
+     reported). Counts of packets built and never sent (the end of a series, a skipped timed slot) are
+     ledgered as `unsent`/`skipped`.
+
+   Remaining in Stage 5: replay to the wire (`ib replay --send`, D5), the TUI commanding page and its
+   scheduling UI, send modes for `ib respond`. **Deferred (PR #41 review, N7):** a distinct exit status
+   or a `--max-skipped` threshold for a series whose cadence degraded (today it exits 0 and
+   `send.outcome` says how many slots were skipped; the threshold wants a user decision on its form),
+   and an up-front check that a serial link's baud rate carries one packet per period (framing and
+   escaping make the wire size data-dependent; the lateness and skips report it today). The persistent
+   sequence counter is a separate piece of work (`send/sequence`). **Deferred (PR #41 round 3, outside
+   this PR, both predate it):** a SIGINT that arrives before the interpreter installs its signal
+   handlers ends the process with the default action (exit -2, nothing sent); and a stdout whose read end is closed gives no `IB-OUT` output-lost notice for a single
+   send or a series, which exit 0.
 6. xlsx export, optional semantic search (local sentence-transformer as an extra),
    1553 transport when hardware is available.
 
