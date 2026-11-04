@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Final, NoReturn, cast, final
+from typing import Final, NoReturn, Protocol, cast, final
 
 from ironbird import header as hdr
 from ironbird.ccdd.model import (
@@ -502,6 +502,19 @@ def _element_packer(field: FieldDef) -> struct.Struct:
 CAP_ADVICE: Final = " (ironbird.max_packet_bytes); raise it or shrink the message"
 
 
+class SequenceSource(Protocol):
+    """Where a codec gets the sequence counts of the packets it builds when they must outlive
+    it (:class:`ironbird.seqstate.NodeSequences`). A count is not reduced to a field width."""
+
+    def take(self, kind: str, mid: int) -> int:
+        """The next count of the ``kind`` ("command" or "telemetry") message with this MID."""
+        ...
+
+    def seat(self, kind: str, mid: int, value: int) -> None:
+        """Make ``value`` the last count handed out: the next one is ``value + 1``."""
+        ...
+
+
 class Codec:
     """Encode/decode for one target: its CCDD model plus its two header profiles."""
 
@@ -534,7 +547,8 @@ class Codec:
                 MessageKind.TELEMETRY: telemetry_profile,
             }
         )
-        self._sequence: dict[int, int] = {}
+        self._sequence: dict[tuple[str, int], int] = {}
+        self._source: SequenceSource | None = None
         self._command_mids: frozenset[int] = frozenset(m for m, _ in model.commands_by_key)
         self._payload_bounds: Mapping[MessageKind, Mapping[int, tuple[int, int]]] = (
             MappingProxyType(
@@ -685,13 +699,26 @@ class Codec:
                 )
 
     def reset_sequences(self) -> None:
-        """Restart every per-MID sequence counter at zero."""
+        """Restart every in-memory per-MID sequence counter at zero."""
         self._sequence.clear()
 
-    def _next_sequence(self, mid: int) -> int:
-        value = self._sequence.get(mid, 0)
-        self._sequence[mid] = value + 1
+    def use_sequence_source(self, source: SequenceSource) -> None:
+        """Take sequence counts from ``source`` (kept across processes) from now on, instead of
+        counting in memory from zero."""
+        self._source = source
+
+    def _next_sequence(self, kind: MessageKind, mid: int) -> int:
+        if self._source is not None:
+            return self._source.take(kind.value, mid)
+        value = self._sequence.get((kind.value, mid), 0)
+        self._sequence[(kind.value, mid)] = value + 1
         return value
+
+    def _seat_sequence(self, kind: MessageKind, mid: int, value: int) -> None:
+        if self._source is not None:
+            self._source.seat(kind.value, mid, value)
+        else:
+            self._sequence[(kind.value, mid)] = value + 1
 
     # -- encode ----------------------------------------------------------------------
 
@@ -816,6 +843,7 @@ class Codec:
         tamper: Mapping[str, int] | None,
         header: Mapping[str, int] | None,
         faults: tuple[CountFault, ...] = (),
+        sequence: int | None = None,
     ) -> EncodedPacket:
         profile = self._profiles[msg.kind]
         values: dict[str, int] = {**msg.header}
@@ -823,7 +851,21 @@ class Codec:
             self._check_header_values(profile, header, "header")
             values.update(header)
         values.update(inputs)
-        counter = self._next_sequence(msg.mid)
+        field = profile.sequence_field
+        if sequence is not None:
+            if field is None:
+                raise IronbirdError(
+                    Code.ENC_ARG, f"profile {profile.name} has no sequence field to set"
+                )
+            if not 0 <= sequence <= field.mask:
+                raise IronbirdError(
+                    Code.ENC_ARG,
+                    f"sequence {sequence} does not fit the {field.bits}-bit sequence field "
+                    f"(0..{field.mask})",
+                )
+            counter = sequence
+        else:
+            counter = self._next_sequence(msg.kind, msg.mid) if field is not None else 0
         data = hdr.pack(
             profile,
             payload,
@@ -836,9 +878,11 @@ class Codec:
         assert (
             len(data) <= self.max_packet_bytes
         )  # guaranteed by _validate_fit (+ tamper keeps size)
-        field = profile.sequence_field
-        sequence = counter & field.mask if field is not None else None
-        return EncodedPacket(data, msg, msg.mid, sequence, msg.function_code, faults)
+        if field is None:
+            return EncodedPacket(data, msg, msg.mid, None, msg.function_code, faults)
+        if sequence is not None:  # the counter goes on from the value set
+            self._seat_sequence(msg.kind, msg.mid, sequence)
+        return EncodedPacket(data, msg, msg.mid, counter & field.mask, msg.function_code, faults)
 
     def encode_command(
         self,
@@ -848,11 +892,16 @@ class Codec:
         tamper: Mapping[str, int] | None = None,
         header: Mapping[str, int] | None = None,
         allow_count_mismatch: bool = False,
+        sequence: int | None = None,
     ) -> EncodedPacket:
         """Encode a command. ``header`` sets input fields of the command header profile for this
         packet; it wins over the message's own ``header`` values, which win over the profile's
         defaults. A count or length field is filled from the data it sizes; a value given for it
-        that disagrees is refused unless ``allow_count_mismatch`` (fault injection)."""
+        that disagrees is refused unless ``allow_count_mismatch`` (fault injection).
+
+        ``sequence`` sets the packet's sequence field (``IB-ENC-002`` when it does not fit or the
+        profile has none) and re-seats the MID's counter there: the next packet gets
+        ``sequence + 1``."""
         msg = self._lookup(name, MessageKind.COMMAND)
         payload, faults = self._encode_payload(
             msg,
@@ -864,7 +913,13 @@ class Codec:
         profile = self._profiles[MessageKind.COMMAND]
         assert profile.function_code_field is not None and msg.function_code is not None
         return self._frame(
-            msg, payload, {profile.function_code_field: msg.function_code}, tamper, header, faults
+            msg,
+            payload,
+            {profile.function_code_field: msg.function_code},
+            tamper,
+            header,
+            faults,
+            sequence,
         )
 
     def encode_telemetry(

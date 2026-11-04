@@ -112,6 +112,7 @@ from ironbird.retention import LONG_COMMANDS
 from ironbird.retnotices import Notices
 from ironbird.retservice import Retention
 from ironbird.sanitize import hex_preview
+from ironbird.seqstate import SequenceStore, node_stem
 from ironbird.session import Route, Session, Side
 from ironbird.sigmask import (
     HANDLED_SIGNALS,
@@ -164,6 +165,15 @@ ledger_app = typer.Typer(
     rich_markup_mode="markdown",
 )
 app.add_typer(ledger_app, name="ledger")
+seq_app = typer.Typer(
+    name="seq",
+    help="Show or reset the CCSDS sequence counts kept between sends.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+    rich_markup_mode="markdown",
+)
+app.add_typer(seq_app, name="seq")
 
 
 class Format(StrEnum):
@@ -1088,6 +1098,18 @@ def _parse_header_values(items: list[str] | None) -> dict[str, int]:
     return values
 
 
+def _parse_sequence(text: str | None) -> int | None:
+    """``--sequence N`` as an integer (the codec checks it against the sequence field)."""
+    if text is None:
+        return None
+    try:
+        return parse_ascii_int(text)
+    except ValueError:
+        raise IronbirdError(
+            Code.CLI_USAGE, f"--sequence {text[:40]!r}: the value must be an integer"
+        ) from None
+
+
 class _RecordingScope:
     """``--record`` for one command: a recording that lives for the ``async with`` block.
 
@@ -1288,6 +1310,16 @@ def send(
             "data of the variable-length field it sizes.",
         ),
     ] = False,
+    sequence: Annotated[
+        str | None,
+        typer.Option(
+            "--sequence",
+            metavar="N",
+            help="Send with sequence count N (within the header's sequence field) and count on "
+            "from it: the next send gets N+1. Without it the count continues from the last "
+            "send to this node and MID, kept in the state directory across invocations.",
+        ),
+    ] = None,
     as_node: AsOption = None,
     verbose: VerboseOption = False,
 ) -> None:
@@ -1299,6 +1331,7 @@ def send(
     async def body(session: Session, config: SystemConfig, run: _Run) -> int:
         parsed = _parse_args(args)
         header_values = _parse_header_values(header)
+        sequence_value = _parse_sequence(sequence)
         tamper: dict[str, int] = {}
         codec = session.codec_for(session.route(node, link_name=link).server.name)
         profile = codec.profile(MessageKind.COMMAND)
@@ -1325,6 +1358,7 @@ def send(
             link=link,
             header=header_values,
             allow_count_mismatch=allow_count_mismatch,
+            sequence=sequence_value,
         )
         faults = [
             text
@@ -1347,6 +1381,120 @@ def send(
         return 0
 
     _run(ctx, as_node, verbose, body, "send", transmits=True)
+
+
+def _sequence_store(session: Session) -> SequenceStore:
+    """The state directory's sequence counts, for ``ib seq``."""
+    ledger = session.ledger
+    if not ledger.enabled:
+        raise IronbirdError(
+            Code.LED_DIR,
+            "no usable state directory to keep sequence counts in; "
+            "set IRONBIRD_STATE_DIR to a writable directory",
+        )
+    return SequenceStore(
+        ledger.directory,
+        report=session.report,
+        record=lambda event, fields: ledger.record("state", event, **fields),
+    )
+
+
+def _seq_mid(session: Session, node: str, text: str) -> int:
+    """A MID given as a number or as the name of a message of ``node``."""
+    try:
+        value = parse_ascii_int(text)
+    except ValueError:
+        msg = session.codec_for(node).model.by_name.get(text)
+        if msg is None:
+            raise IronbirdError(
+                Code.CLI_USAGE,
+                f"MID {text[:40]!r} is neither a number nor a message name of {node}",
+            ) from None
+        return msg.mid
+    if not 0 <= value < (1 << 32):
+        raise IronbirdError(Code.CLI_USAGE, f"MID {text[:40]!r} is out of range")
+    return value
+
+
+def _seq_row(row: tuple[str, str, int, int]) -> str:
+    stem, kind, mid, _next = row
+    return f"{term(stem)} {kind} 0x{mid:04X}"
+
+
+@seq_app.command("show")
+def seq_show(
+    ctx: typer.Context,
+    node: Annotated[str | None, typer.Argument(help="Only this node (name or alias).")] = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """List the stored sequence counts: per node, kind and MID, the next count to be handed out
+    (counts wrap at the header's sequence field width; a count a crashed process had reserved
+    but not used shows as a higher one)."""
+
+    async def body(session: Session, config: SystemConfig, run: _Run) -> int:
+        wanted = config.resolve(node).name if node is not None else None
+        rows = _sequence_store(session).stored()
+        if wanted is not None:
+            rows = [r for r in rows if r[0] == node_stem(wanted)]
+        if not rows:
+            run.console.out(
+                "no stored sequence counts" + (f" for {term(wanted)}" if wanted else "")
+            )
+            return 0
+        run.console.out("NODE KIND MID NEXT")
+        for row in rows:
+            run.console.out(f"{_seq_row(row)} {row[3]}")
+        return 0
+
+    _run(ctx, None, verbose, body, "seq.show")
+
+
+@seq_app.command("reset")
+def seq_reset(
+    ctx: typer.Context,
+    node: Annotated[str | None, typer.Argument(help="Node (name or alias) to reset.")] = None,
+    mid: Annotated[
+        str | None,
+        typer.Argument(help="Only this MID (number or message name); default: all of the node."),
+    ] = None,
+    all_nodes: Annotated[
+        bool, typer.Option("--all", help="Reset the counts of every node and MID.")
+    ] = False,
+    verbose: VerboseOption = False,
+) -> None:
+    """Forget stored sequence counts without sending anything: the next send of each starts at 0.
+
+    Give NODE and MID, NODE alone, or --all; with none of them nothing is reset."""
+    if all_nodes and node is not None:
+        raise typer.BadParameter("--all takes no NODE or MID")
+    if not all_nodes and node is None:
+        raise typer.BadParameter("say what to reset: NODE MID, NODE, or --all")
+
+    async def body(session: Session, config: SystemConfig, run: _Run) -> int:
+        target = config.resolve(node).name if node is not None else None
+        wanted = _seq_mid(session, target, mid) if target is not None and mid is not None else None
+        gone = _sequence_store(session).forget(target, wanted)
+        session.ledger.record(
+            "action",
+            "seq.reset",
+            node=target,
+            mid=wanted,
+            removed=[
+                {"node": stem, "kind": kind, "mid": m, "next": mark} for stem, kind, m, mark in gone
+            ],
+        )
+        for row in gone:
+            run.console.out(f"reset {_seq_row(row)} (was next {row[3]})")
+        what = (
+            "everything"
+            if target is None
+            else f"{term(target)}" + (f" 0x{wanted:04X}" if wanted is not None else "")
+        )
+        if not gone:
+            run.console.out(f"no stored sequence count for {what}; nothing reset")
+        return 0
+
+    _run(ctx, None, verbose, body, "seq.reset")
 
 
 def session_verbose(ctx: typer.Context, local: bool) -> bool:

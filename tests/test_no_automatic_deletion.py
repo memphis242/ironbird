@@ -75,6 +75,9 @@ ALLOWED: dict[tuple[str, str], set[str]] = {
     ("ledgerstore.py", "overwrite"): {"LedgerStore._pwrite_all"},
     ("retnotices.py", "overwrite"): {"Notices._transaction"},
     ("ledger.py", "overwrite"): {"Ledger._append_final"},
+    # the sequence state's lock file, opened read-write for flock and never written to (the
+    # state itself is replaced whole through TempOutput)
+    ("seqstate.py", "overwrite"): {""},
     # a salvage's own leftover temporary file, picked up again and appended to (checked first);
     # a directory export's member whose descriptor was given up, appended to again (the inode is
     # checked against the one created)

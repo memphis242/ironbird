@@ -64,6 +64,7 @@ from ironbird.ledger import Ledger
 from ironbird.ledgertiers import Tier
 from ironbird.notice import Level, Notice, level_of
 from ironbird.sanitize import HEX_PREVIEW_BYTES, clean, hex_preview
+from ironbird.seqstate import SequenceStore
 from ironbird.transport import LinkEnd
 
 TICK_S: Final = 1.0
@@ -164,6 +165,8 @@ class Session:
         self._coalescer: Coalescer = Coalescer(notify)
         ledger.set_notifier(notify)
         self._codecs: dict[str, Codec] = {}
+        self._sequences: SequenceStore | None = None
+        self._counted: set[str] = set()  # nodes whose codec takes persistent sequence counts
         self._definitions: dict[str, DefinitionBytes] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._last_tx: TxAttempt | None = None
@@ -241,6 +244,8 @@ class Session:
             await self._engine.close()
         finally:
             try:
+                if self._sequences is not None:
+                    self._sequences.close()
                 self.flush_notices()
             finally:
                 self.ledger.settle()
@@ -449,6 +454,21 @@ class Session:
         self._definitions[node_name] = definitions
         return codec
 
+    def _count_persistently(self, node_name: str, codec: Codec) -> None:
+        """Make ``codec`` take its sequence counts from the state directory (shared with every
+        other ironbird process), unless the ledger, and so the state directory, is off."""
+        if node_name in self._counted or not self.ledger.enabled:
+            return
+        self._counted.add(node_name)
+        if self._sequences is None:
+            ledger = self.ledger
+            self._sequences = SequenceStore(
+                ledger.directory,
+                report=self.report,
+                record=lambda event, fields: ledger.record("state", event, **fields),
+            )
+        codec.use_sequence_source(self._sequences.for_node(node_name))
+
     def _profile_of_kind(
         self, node_name: str, key: str, path: Path, data: bytes, kind: ProfileKind
     ) -> HeaderProfile:
@@ -572,13 +592,17 @@ class Session:
         link: str | None = None,
         header: Mapping[str, int] | None = None,
         allow_count_mismatch: bool = False,
+        sequence: int | None = None,
     ) -> SentCommand:
         route = self.route(peer, require=Side.COMMANDER, link_name=link)
         codec = self.codec_for(route.server.name)
+        self._count_persistently(route.server.name, codec)
         endpoint = route.link.command_target
         extra: dict[str, Any] = {"header": dict(header)} if header else {}
         if allow_count_mismatch:
             extra["allow_count_mismatch"] = True  # asked for; ``send.fault`` records what it did
+        if sequence is not None:
+            extra["sequence_set"] = sequence  # asked for; ``tx.command`` has the count sent
         self.ledger.record(
             "action",
             "send.request",
@@ -590,7 +614,12 @@ class Session:
             **extra,
         )
         encoded = codec.encode_command(
-            command, args, tamper=tamper, header=header, allow_count_mismatch=allow_count_mismatch
+            command,
+            args,
+            tamper=tamper,
+            header=header,
+            allow_count_mismatch=allow_count_mismatch,
+            sequence=sequence,
         )
         if encoded.count_faults:  # the values that went out and the ones the data implied
             self.ledger.record(
@@ -1022,6 +1051,7 @@ class Session:
         chosen = route.link
         codec = self.codec_for(self.node.name)
         rules = _validate_rules(self.node, codec, self.config)
+        self._count_persistently(self.node.name, codec)  # after the rules' trial encodes
         capture = await self.capture([route], consumer=RESPONDER)
         self.ledger.record(
             "action",

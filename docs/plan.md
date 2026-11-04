@@ -4240,6 +4240,9 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
 | `IB-REC-014` | `REC_OPEN` | the recording file cannot be opened or read (missing, permission, not a regular file); `IB-REC-004` is only "opens, but is not a recording" | error-messages |
 | `IB-TX-009` | `TX_UP` | info: a serial link is back after `IB-TX-008` | error-messages |
 | `IB-EXP-004` | `EXP_OMITTED` | **warning**: frames left out of an export because the format has no place for them (a single-file CSV) | error-messages |
+| `IB-SEQ-001` | `SEQ_RESET` | **warning**: `sequence-state.json` is invalid (unreadable as a plain file of ours, over 32 KiB, schema, bounds): counts restart at 0 and the file is recreated | send/sequence |
+| `IB-SEQ-002` | `SEQ_UNSAVED` | **warning**: the sequence counts cannot be kept in the state directory (read-only, full, no file locks, lock held over 1 s, name not replaceable): counted in memory, restarting at 0 in every process; once per process | send/sequence |
+| `IB-SEQ-003` | `SEQ_STATE` | `ib seq show\|reset` cannot read or replace the stored counts (exit 1) | send/sequence |
 | `IB-FLT-001` | `FLT_SYNTAX` | filter syntax error (column, excerpt) | 2f |
 | `IB-FLT-002` | `FLT_NAME` | unknown name in a filter, or a reserved name misused | 2f |
 | `IB-FLT-003` | `FLT_TYPE` | literal does not fit the name's type, or the filter can never match | 2f |
@@ -4304,14 +4307,60 @@ listed as deferred.
 - **Integers outside an enum in a command** are refused (`IB-ENC-002`, with the names) unless the CCDD field sets
   `"allow_raw": true` (valid only next to an `enum`; `IB-CCD-002` otherwise). Telemetry encoding (`ib respond`, tests) is not
   restricted, since a vehicle can report any value, and out-of-enum values are decoded and shown as numbers. Fault injection of an unlisted value therefore needs the flag in the CCDD.
-- **Deferred, needs the user's decision: the CCSDS sequence count restarts at 0 in every `ib send`.**
-  Stock cFE ignores command sequence counts, but flight software that rejects duplicate or
-  non-advancing counts would drop every scripted command after the first, and a "sent seq 0" ledger
-  line on each command traces poorly. Options: (A) persist a per-(node, MID) command counter under
-  `$XDG_STATE_HOME/ironbird/` with a file lock, so counts advance across invocations (state to
-  manage, a lock to hold on every send, and a reset policy when the target reboots); (B) add
-  `ib send --sequence N` and state the per-process reset in `ib send --help` (stateless, the script
-  owns the count, nothing on disk). Not implemented until chosen.
+- **Resolved (user decision, `send/sequence`): the CCSDS sequence count persists across processes.**
+  Both options were taken: a persistent counter and `--sequence`. `src/ironbird/seqstate.py`.
+    - *Key.* `<node>/<command|telemetry>/<MID in hex>` in `sequence-state.json` in the state
+      directory (`IRONBIRD_STATE_DIR`, else `$XDG_STATE_HOME/ironbird`); `node` is the flight node the
+      packets are for (the target of `ib send`, the node `ib respond` acts as). MID, not the profile's
+      APID: a header layout is user-definable and no profile field is "the APID" (`mid_fields` lists
+      whichever fields make up the MID), cFE's software bus counts per message ID, and a per-MID series
+      is unbroken for a receiver that checks per MID. Two MIDs that share an APID count independently.
+      The counter is not tied to the sender: every `--as` ground node sending to one flight node shares
+      the stream, as the flight node sees one. The width comes from the profile at encode time (counts
+      are stored unreduced, modulo 2^64, and masked into the field), so a profile change needs no
+      migration and counts wrap at the field's mask.
+    - *Concurrency and cost.* A process reserves a block of 64 counts under `flock` on
+      `sequence-state.lock` (a separate file, because the state file is replaced and its inode changes),
+      records the new reservation mark in the state file, and hands the block out of memory. A burst of
+      sends costs one lock, one temporary file, `fdatasync` plus directory `fsync` per 64 packets,
+      never per packet. The alternative, holding the lock for the session, would stall every other
+      `ib send` for the life of `ib respond`.
+    - *Crash safety.* The file holds the reservation mark: the lowest count nobody has handed out or
+      reserved. The mark is replaced atomically (`TempOutput`: temporary file, sync, rename, directory
+      sync) before the first count of a block is used, so after any crash (process, power) the mark is
+      at or above every count ever used and a count is never reused; the unused rest of a block is
+      skipped (up to 63 counts, allowed). A clean exit gives the unused counts back when its block is
+      still the newest reservation, so `ib send` twice gives 0 then 1; if another process reserved
+      meanwhile the gap stays. Counts from concurrent processes are unique but interleave by block, not
+      by time (a receiver that rejects any non-advancing count sees that only with truly concurrent
+      senders on one MID). A count taken by a send that then failed (no listener, encode error after
+      the count was taken) is spent.
+    - *Untrusted state file.* Opened `O_NOFOLLOW|O_NONBLOCK`, `fstat` (regular, ours, one link), at most
+      32 KiB, strict schema, at most 128 keys of at most 120 characters, marks integers in
+      [0, 2^64), strict JSON (no `NaN`). Any violation is `IB-SEQ-001` (warning): the file is treated as
+      empty, counts restart at 0, the file is replaced at the next reservation, and `sequence.reset`
+      goes to the ledger with the size and a digest. When over 128 keys the least recently reserved
+      go first (their next send restarts at 0). Corpus: `tests/corpus/malformed/seqstate-*.json`.
+    - *No usable state.* A read-only or full directory, no file locks, a lock held over 1 s, or a name
+      that cannot be replaced is `IB-SEQ-002` (warning, once per process, `sequence.memory_only` in the
+      ledger): counts continue in memory and restart at 0 in every process, as the message says. A
+      disabled ledger (no usable state directory) also counts in memory; its own warning stands.
+      Locks are never skipped: handing out counts unlocked could repeat them.
+    - *`ib send --sequence N`.* Sets the sequence field of that one packet (decimal or `0x`; refused with
+      `IB-ENC-002`, exit 2, nothing sent and no count taken, when it does not fit the field or the
+      profile has no sequence field) and **re-seats** the counter: the next send is N+1, so a script
+      that replays an exact series (`--sequence 100`, then plain sends) works and a test of wrap-around
+      is two commands. The `send.request` record has `sequence_set`; `tx.command` has the count sent.
+    - *`ib seq show [NODE]`, `ib seq reset NODE [MID]|--all`.* `show` lists the stored marks (the next
+      count to hand out; a running `ib respond` shows its reserved block's end). `reset` forgets the
+      counts so the next send of each starts at 0, under the same lock, sends nothing, and ledgers
+      `seq.reset` with what it removed. Bare `ib seq reset` is a usage error (exit 2); an unknown node
+      is `IB-CFG-004`; a MID is a number or a message name of the node; nothing stored is not an error.
+      A failure to read or replace the file is `IB-SEQ-003`.
+    - *Respond.* The responder's telemetry replies count the same way, keyed by the node it acts as;
+      the trial encodes made while validating the rules use the in-memory counter, so they take no count.
+    - Not done: the recorded `sequence` of old ledgers is not rewritten; a reset policy when the target
+      reboots is the user's `ib seq reset`, not automatic.
 - **Deferred, needs the user's decision: no `ib send --allow-raw`.** Off-nominal enum values need
   `allow_raw` in the CCDD; a per-invocation CLI override would bypass the CCDD as source of truth.
 - **Deferred: an integer echoed into a float field is refused.** Conservative; allowing it needs a
@@ -4449,11 +4498,10 @@ its options:
   floats as numbers and non-finite as `null`, losing which one it was; (d) per-message type
   metadata line at the top of the output; (e) 64-bit integers as strings behind a flag.
 - **`seq` means two things.** In `listen`/`replay` lines `seq=` is the CCSDS sequence count (and
-  every `ib send` process starts it at 0); in CSV and `rec info` it is the recording's frame number.
+  every `ib send` process continued it from the state directory since `send/sequence`); in CSV and `rec info` it is the recording's frame number.
   Options: (a) rename the frame number to `frame` everywhere it is printed; (b) rename the CCSDS one
-  to `ccsds_seq`; (c) both; (d) a persistent per-MID sequence counter in the state directory so
-  successive `ib send` runs count on (a separate behaviour change for the receiving side's
-  sequence-gap checks).
+  to `ccsds_seq`; (c) both. (The persistent per-MID counter, former option (d), is done: see the
+  encode and load boundary review.)
 - **Ambiguous line output.** `s=` (empty) and `s==1+1` in `listen`/text export, and a string value
   containing ` x=y`, cannot be told from a field. Options: (a) quote strings that are empty or hold
   a space, `=` or a quote; (b) always quote strings; (c) leave and point to `--format json`.
