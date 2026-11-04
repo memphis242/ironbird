@@ -9,7 +9,28 @@
       "Bash(git log *)",
       "Bash(git worktree list *)",
       "Bash(git reset --hard origin/main)",
-      "Bash(gh api *)"
+      "Bash(gh api *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git fetch *)",
+      "Bash(git pull *)",
+      "Bash(git merge *)",
+      "Bash(git rebase *)",
+      "Bash(git switch *)",
+      "Bash(git branch *)",
+      "Bash(git worktree *)",
+      "Bash(git restore *)",
+      "Bash(git show *)",
+      "Bash(git rev-parse *)",
+      "Bash(git -c *)",
+      "Bash(git -C *)",
+      "Bash(gh *)",
+    ],
+    "deny": [
+       "Bash(git push --force*)",
+       "Bash(git push -f*)",
+       "Bash(git push origin main*)"
     ]
   },
   "effortLevel": "low"
