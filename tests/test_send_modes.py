@@ -22,7 +22,6 @@ import time
 from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -35,6 +34,7 @@ from ironbird.config import Endpoint
 from ironbird.errors import Code, IronbirdError
 from ironbird.filter.lexer import parse_time
 from ironbird.ledger import TxSeries
+from ironbird.seqstate import PRIME_TAKE_WITHIN_S
 from ironbird.transport.udp import SEND_WAIT_S, UdpThreadSender, UdpTransport
 from recutil import CLI_MAIN, EXAMPLES, Proc, run_ib
 from replayutil import child_env, write_config_58k
@@ -1920,44 +1920,83 @@ def test_a_length_delta_the_header_cannot_hold_is_refused_at_once_and_spends_no_
         assert sink.sequences() == [0]  # the refused request took no count
 
 
+# The near and the far start of a series' prime (PRIME_TAKE_WITHIN_S): which one ib takes is
+# decided by how far its start is once ib is up, so an attempt whose start ib's startup moved
+# into the other case, or too near to see when the counts were made, says nothing about it.
+PRIME_WITHIN_NS = round(PRIME_TAKE_WITHIN_S * SEC)
+NEAR_WAIT_NS = 1500 * MS  # the wait a near-start attempt aims ib at: inside the near case
+RAISED_BEFORE_NS = 500 * MS  # a near start's ceiling is raised this long before it, or more
+
+
+def at_ms(wall_ns: int) -> int:
+    """``wall_ns`` to the millisecond, as an ``--at`` time written by :func:`sm.iso_utc` is."""
+    return wall_ns // MS * MS
+
+
+def plan_of(events: list[dict[str, Any]], start: int) -> dict[str, Any]:
+    """The ``send.plan`` record of the series that started at ``start``."""
+    return next(
+        e for e in events if e["event"] == "send.plan" and e["start_utc"] == sm.iso_utc(start)
+    )
+
+
 def test_a_series_prepares_its_counts_before_it_waits_for_its_start(
     tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
 ) -> None:
     """S2 (PR 40 round 3): the store was opened, `--sequence` seated and the first count taken
     20 ms before the first slot, so another process's sync at that moment made the first packet
-    late. The ceiling is raised while the series still waits for its start."""
+    late. The ceiling is raised while the series still waits for its start: a start within
+    PRIME_TAKE_WITHIN_S has it done at launch. An attempt counts when ib began its wait inside
+    that case and long enough before the start to tell launch from start."""
     config, port, env = setup
-    with sink_for(port) as sink:
-        start = time.time() + 1.5
-        done = run_ib(
-            tmp_path,
-            [
-                "-c",
-                str(config),
-                "send",
-                "fc",
-                "MOCK_NOOP",
-                "--at",
-                sm.iso_utc(int(start * SEC)),
-                "--every",
-                "5ms",
-                "--repeat",
-                "6",
-                "--sequence",
-                "50",
-            ],
-            env,
+    lead = NEAR_WAIT_NS
+    for _ in range(AT_ATTEMPTS):
+        launched = time.time_ns()
+        start = at_ms(launched + lead)
+        with sink_for(port) as sink:
+            done = run_ib(
+                tmp_path,
+                [
+                    "-c",
+                    str(config),
+                    "send",
+                    "fc",
+                    "MOCK_NOOP",
+                    "--at",
+                    sm.iso_utc(start),
+                    "--every",
+                    "5ms",
+                    "--repeat",
+                    "6",
+                    "--sequence",
+                    "50",
+                ],
+                env,
+            )
+            ended = time.time_ns()
+            if refused_as_usage(done):  # the start passed before ib checked it
+                time.sleep(0.2)
+                assert sink.count == 0
+                lead = ended - launched + NEAR_WAIT_NS
+                continue
+            assert done.returncode == 0, done.stderr
+            wait_for_packets(sink, 6)
+            assert sink.sequences() == list(range(50, 56))
+        events = ledger_events(tmp_path)
+        plan = plan_of(events, start)
+        waiting = parse_time(plan["ts"])  # ledgered with the link open, before the prime
+        if not RAISED_BEFORE_NS + WAITING_HEADROOM_NS <= start - waiting <= PRIME_WITHIN_NS:
+            lead = waiting - launched + NEAR_WAIT_NS  # aimed at the near case again
+            continue
+        raised = [
+            e for e in events if e["event"] == "sequence.extend" and e["session"] == plan["session"]
+        ]
+        assert raised, "the ceiling was never raised"
+        assert parse_time(raised[0]["ts"]) < start - RAISED_BEFORE_NS, (
+            "the ceiling was raised at the start itself"
         )
-        assert done.returncode == 0, done.stderr
-        wait_for_packets(sink, 6)
-        assert sink.sequences() == list(range(50, 56))
-    events = ledger_events(tmp_path)
-
-    def at(event: dict[str, Any]) -> float:
-        return datetime.fromisoformat(event["ts"]).timestamp()
-
-    raised = [e for e in events if e["event"] == "sequence.extend"]
-    assert raised and at(raised[0]) < start - 0.5, "the ceiling was raised at the start itself"
+        return
+    pytest.fail(f"ib did not begin a near start's wait in time in {AT_ATTEMPTS} attempts")
 
 
 def test_an_until_window_the_link_open_closed_is_a_usage_error_not_an_internal_one(
@@ -2000,44 +2039,67 @@ def test_a_far_start_takes_its_seat_before_the_start_not_at_it(
 ) -> None:
     """S2 (PR 40 round 4): beyond 2 s the seat of `--sequence` (a durable write and sync) and the
     first reservation ran 20 ms before the first slot, so another process holding the durable
-    lock then held the first packet back. They are done 2 s before the start."""
+    lock then held the first packet back. They are done 2 s before the start. An attempt counts
+    when ib began its wait in the far case, with headroom: one whose startup used up the lead
+    took the near case (or was refused), which this does not test."""
     import fcntl
 
     config, port, env = setup
     hold_s = 0.4
-    with sink_for(port) as sink:
-        start = time.time() + 4.0
-        proc, _ = ib_send(
-            tmp_path,
-            config,
-            env,
-            "MOCK_NOOP",
-            "--at",
-            sm.iso_utc(int(start * SEC)),
-            "--every",
-            "5ms",
-            "--repeat",
-            "10",
-            "--sequence",
-            "100",
+    lead = 4 * SEC
+    state = tmp_path / "state"
+    for _ in range(AT_ATTEMPTS):
+        launched = time.time_ns()
+        start = at_ms(launched + lead)
+        with sink_for(port) as sink:
+            proc, _ = ib_send(
+                tmp_path,
+                config,
+                env,
+                "MOCK_NOOP",
+                "--at",
+                sm.iso_utc(start),
+                "--every",
+                "5ms",
+                "--repeat",
+                "10",
+                "--sequence",
+                "100",
+            )
+            try:
+                while not (state / "sequence-state.lock").exists() and proc.popen.poll() is None:
+                    time.sleep(0.01)  # the series created it when it opened the state
+                if proc.popen.poll() is None:
+                    fd = os.open(state / "sequence-state.lock", os.O_RDWR)
+                    try:
+                        while time.time_ns() < start - 25 * MS:
+                            time.sleep(0.001)
+                        fcntl.flock(fd, fcntl.LOCK_EX)  # another process syncing around the start
+                        time.sleep(hold_s)
+                    finally:
+                        os.close(fd)
+                done = proc.finish()
+            finally:
+                proc.kill()
+            ended = time.time_ns()
+            if done == 2 and Code.CLI_USAGE.value in proc.stderr:  # the start passed first
+                time.sleep(0.2)
+                assert sink.count == 0
+                lead = longer_lead(lead, ended - launched)
+                continue
+            assert done == 0, proc.stderr
+            wait_for_packets(sink, 10)
+            assert sink.sequences() == list(range(100, 110))
+            first = sink.walls[0] - start
+        waiting = parse_time(plan_of(ledger_events(tmp_path), start)["ts"])
+        if start - waiting < PRIME_WITHIN_NS + WAITING_HEADROOM_NS:  # not the far case
+            lead = longer_lead(lead, waiting - launched)
+            continue
+        assert first < hold_s * SEC / 2, (
+            f"the first packet came {first / MS:.0f} ms after its start"
         )
-        state = tmp_path / "state"
-        while not (state / "sequence-state.lock").exists() and proc.popen.poll() is None:
-            time.sleep(0.01)  # the series created it when it opened the state
-        fd = os.open(state / "sequence-state.lock", os.O_RDWR)
-        try:
-            while time.time() < start - 0.025:
-                time.sleep(0.001)
-            fcntl.flock(fd, fcntl.LOCK_EX)  # another process syncing around the start
-            time.sleep(hold_s)
-        finally:
-            os.close(fd)
-        done = proc.finish()
-        assert done == 0, proc.stderr
-        wait_for_packets(sink, 10)
-        assert sink.sequences() == list(range(100, 110))
-        first = sink.walls[0] / SEC - start
-    assert first < hold_s / 2, f"the first packet came {first * 1000:.0f} ms after its start"
+        return
+    pytest.fail(f"ib did not begin a far start's wait in time in {AT_ATTEMPTS} attempts")
 
 
 def test_two_series_at_once_to_one_node_and_mid_take_unique_counts_with_no_restart(
