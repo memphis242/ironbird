@@ -34,6 +34,8 @@ import pytest
 
 from hosttiming import needs_a_quiet_host, wake_reference
 from ironbird import pacer, sendmodes
+from ironbird.fsops import REAL_FS, FileSystem
+from ironbird.seqstate import SequenceStore
 from recutil import CLI_MAIN
 from replayutil import child_env, write_config_58k
 from serialutil import serial_config
@@ -53,6 +55,7 @@ BURST_RAISES_MAX = 12  # ceiling raises of a 20000-packet burst (about 10; 600 a
 SERIAL_SKIPPED_SHARE_MAX = 0.06  # of the slots of a 1 ms series on a serial line
 CONTENDED_SKIPPED_SHARE_MAX = 0.08  # of the slots of a 1 ms series beside a same-stream burst
 SERIES_RAISES_MAX = 16  # ceiling raises of a 1 ms series of 3 s (about 13; 94 at a step of 64)
+SYNC_DELAY_S = 0.25  # added to each of the two syncs of a raise: 500 ms in all
 
 
 class _Sink:
@@ -361,3 +364,86 @@ def test_a_one_millisecond_series_beside_a_burst_on_its_stream_keeps_its_slots(
     outcome = outcomes[0]
     print(f"\n1 ms beside a burst: skipped {outcome['skipped']} of 4000")
     assert outcome["skipped"] <= CONTENDED_SKIPPED_SHARE_MAX * 4000, outcome
+
+
+class _SlowSyncFs(FileSystem):
+    """The real file system whose syncs take ``delay_s`` longer, as on a loaded CI disk."""
+
+    def __init__(self, delay_s: float) -> None:
+        super().__init__()
+        self.delay_s = delay_s
+        self.syncs = 0
+
+    def fsync(self, fd: int) -> None:
+        self.syncs += 1
+        time.sleep(self.delay_s)
+        REAL_FS.fsync(fd)
+
+    def fdatasync(self, fd: int) -> None:
+        self.syncs += 1
+        time.sleep(self.delay_s)
+        REAL_FS.fdatasync(fd)
+
+
+@needs_a_quiet_host
+def test_a_one_millisecond_series_starves_no_slot_while_a_raise_takes_half_a_second(
+    tmp_path: Path,
+) -> None:
+    """A durable raise of a ceiling is two syncs: with the series' lead at 250 ms (a step of half
+    a second of its rate, raised when half of it was left) one slow sync starved a 1 ms series
+    (153 of 3000 slots on a CI disk; 1415 with the syncs delayed by 300 ms). The step is 4 s of the
+    rate now, raised with 2 s of it left, so a raise that takes 500 ms ends in time."""
+    fs = _SlowSyncFs(SYNC_DELAY_S)
+    slots = 3000
+    starved = skipped = 0
+    built = 0
+
+    def handle(report: pacer.Report[int]) -> BaseException | None:
+        nonlocal starved, skipped
+        if report.kind is pacer.Kind.SKIPPED:
+            skipped += report.slots
+            starved += report.slots if report.starved else 0
+        return report.error
+
+    async def main() -> int:
+        store = SequenceStore(tmp_path / "state", report=lambda e: None, fs=fs)
+        wake_pacer: list[Any] = []
+        counts = store.for_node("fc").series(
+            "command",
+            0x1890,
+            seat=None,
+            wake=lambda: wake_pacer[0].wake(),  # noqa: PLW0108 (the pacer is made after)
+            per_second=1000.0,
+            planned=slots,
+        )
+        await counts.prime_take()  # at launch, as `ib send` does: not a slot's wait
+        fs.syncs = 0
+        start = time.monotonic_ns() + 20 * MS
+        grid = sendmodes.Grid(start, time.time_ns(), MS, start + slots * MS, None, False)
+        series: pacer.SeriesPacer[int] = pacer.SeriesPacer(
+            grid, lambda data, stop: True, pacer.ThreadWaiter(0), timed=False
+        )
+        wake_pacer.append(series)
+
+        def build(number: int, slot: int) -> pacer.Built[int] | None:
+            nonlocal built
+            count = counts.next()
+            if count is None:
+                return None
+            built += 1
+            return pacer.Built(number, slot, b"x", count)
+
+        try:
+            await series.run(build, handle)
+        finally:
+            await counts.aclose()
+            await store.aclose()
+        return fs.syncs
+
+    syncs = asyncio.run(main())
+    print(
+        f"\n1 ms, syncs +{SYNC_DELAY_S * 1000:.0f} ms each: {syncs} syncs, built {built}, "
+        f"skipped {skipped} (starved {starved}) of {slots}"
+    )
+    assert syncs >= 2, "no raise happened: the series did not need one"
+    assert starved == 0, (starved, skipped)

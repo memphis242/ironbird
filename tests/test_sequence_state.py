@@ -50,10 +50,12 @@ from ironbird.seqstate import (
     MAX_KEY_LEN,
     MAX_STEP,
     MAX_STREAMS,
+    MIN_LEAD_S,
     PRIME_TAKE_WITHIN_S,
     SLOT_BYTES,
     STATE_NAME,
     SequenceStore,
+    ahead_at,
     batch_for,
     key_of,
     node_stem,
@@ -1952,10 +1954,55 @@ def test_the_step_and_the_batch_of_a_series_follow_its_rate() -> None:
     packets of a burst."""
     assert step_for(None) == MAX_STEP and batch_for(None) == MAX_BATCH
     assert step_for(1) == BLOCK and batch_for(1) == 1  # a slow series: the least step
-    assert step_for(1000) == 500 and batch_for(1000) == 20  # 1 ms: half a second, 20 ms
+    assert step_for(1000) == 4000 and batch_for(1000) == 20  # 1 ms: 4 s, 20 ms
+    assert step_for(100) == 400 and step_for(20) == 80 and step_for(10) == BLOCK
     assert step_for(1e9) == MAX_STEP and batch_for(1e9) == MAX_BATCH  # capped
     steps = [step_for(rate) for rate in (1, 10, 100, 1000, 5000, 1e4, 1e6)]
     assert steps == sorted(steps) and all(BLOCK <= step <= MAX_STEP for step in steps)
+
+
+def test_a_raise_starts_with_seconds_of_the_rate_in_hand_and_gaps_by_one_step_at_most() -> None:
+    """A 1 ms series starved whenever one raise (two fsyncs) outlasted its lead, 250 ms: the
+    step is 4 s of the rate and the raise starts at half of it, or at 1 s of the rate if more."""
+    for rate in (1, 5, 10, 50, 100, 500, 999, 1000, 1023, 1500, 3000, 3072, 4000, 1e4, 1e6):
+        step = step_for(rate)
+        at = ahead_at(step, rate)
+        assert BLOCK <= step <= MAX_STEP and step // 2 <= at <= step - step // 4
+        assert step - at >= step // 4  # each raise adds a quarter of a step at least
+        if step < MAX_STEP:  # 4 s of the rate: half of it, 2 s, is left at the trigger
+            assert at / rate >= 2.0 - 1 / rate, (rate, step, at)
+        elif rate <= 3 * MAX_STEP // 4:  # capped: at least a second of lead
+            assert at / rate >= MIN_LEAD_S, (rate, step, at)
+    assert (step_for(1000), ahead_at(step_for(1000), 1000)) == (4000, 2000)  # 2 s at 1 ms
+    assert ahead_at(MAX_STEP, 2500) == 2500 and ahead_at(MAX_STEP, 100) == MAX_STEP // 2
+    assert ahead_at(MAX_STEP, 1e6) == MAX_STEP - MAX_STEP // 4  # never nearly every take
+    assert ahead_at(MAX_STEP) == MAX_STEP // 2 and ahead_at(BLOCK, None) == BLOCK // 2
+    assert ahead_at(1) == 0 and ahead_at(BLOCK, 10) == BLOCK // 2  # slow: 3.2 s of lead
+
+
+def test_a_series_raises_its_ceiling_at_the_lead_of_its_rate(tmp_path: Path) -> None:
+    """The store raises a series' stream when ``ahead_at`` counts are left, not half a step."""
+
+    async def scenario() -> tuple[int, int, int]:
+        store = _store(tmp_path)
+        wake = asyncio.Event()
+        counts = _series(store, wake, per_second=3000.0)
+        assert store._steps[KEY] == MAX_STEP and store._ats[KEY] == 3000
+        assert store._ahead_left(KEY) == 3000
+        await counts.prime_take()
+        first = _marks(tmp_path)[KEY]
+        await _series_counts(counts, MAX_STEP - 3000 - 100, wake)  # more than 3000 are left
+        await asyncio.sleep(0.2)
+        before = _marks(tmp_path)[KEY]
+        await _series_counts(counts, 200, wake)  # 3000 or fewer are left
+        await asyncio.sleep(0.5)
+        raised = _marks(tmp_path)[KEY]
+        await counts.aclose()
+        await store.aclose()
+        return first, before, raised
+
+    first, before, raised = _run(scenario())
+    assert before == first and raised > first
 
 
 def test_a_burst_syncs_a_few_times_not_every_32_counts_and_gaps_by_one_step_at_most(
@@ -2011,14 +2058,14 @@ def test_the_ceiling_of_a_series_never_exceeds_its_step_so_a_power_loss_gaps_by_
     async def scenario() -> None:
         store = _store(tmp_path)
         wake = asyncio.Event()
-        counts = _series(store, wake, per_second=1000)  # a step of 500
+        counts = _series(store, wake, per_second=1000)  # a step of 4000
         got = await _series_counts(counts, 1, wake)
-        assert _marks(tmp_path)[KEY] - got[-1] <= 500 + 1
-        for _ in range(3):
-            await _series_counts(counts, 400, wake)
+        assert _marks(tmp_path)[KEY] - got[-1] <= 4000 + 1
+        for _ in range(4):  # past a raise, which starts with 2000 left
+            await _series_counts(counts, 1500, wake)
             await asyncio.sleep(0.05)
             last = _stored_next(tmp_path)
-            assert _marks(tmp_path)[KEY] - last <= 500
+            assert _marks(tmp_path)[KEY] - last <= 4000
         await counts.aclose()
         await store.aclose()
 
@@ -2209,7 +2256,7 @@ def test_the_step_of_a_short_burst_is_the_packets_it_plans_not_the_most(tmp_path
     assert step_for(None, 2) == BLOCK
     assert step_for(None, 1000) == 1000
     assert step_for(None, 10**6) == MAX_STEP == step_for(None)
-    assert step_for(1000.0, 100) == 100 and step_for(1000.0) == 500
+    assert step_for(1000.0, 100) == 100 and step_for(1000.0) == 4000
 
     async def scenario() -> None:
         store = _store(tmp_path)

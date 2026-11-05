@@ -241,10 +241,12 @@ and the counts wrap at the width of the header profile's sequence field.
   is not ours); a series reserves its counts ahead of its packets (below), so its packets are in count order
   only within their own process. Over serial the lock is released once the count is taken (a serial device is
   one process's), so the order is exact per process. `sequence-state.json` holds a synced ceiling one *step*
-  ahead of the next count: 64 counts for a single send or a responder, and for a series about half a second
-  of its rate (up to 4096, which a burst uses, and no more than the packets it plans, never under 64), so that
-  a series syncs a few times a second, not every few dozen packets. A crashed process loses nothing, and a power loss skips at most one step of a stream (a
-  gap of up to 64 counts, or 4096 for a fast series or a long burst), never repeating a count.
+  ahead of the next count: 64 counts for a single send or a responder, and for a series about four seconds
+  of its rate (up to 4096, which a burst uses, and no more than the packets it plans, never under 64), raised in
+  the background once half of it is left (or a second of its rate, if more), so that a series syncs every few
+  seconds, not every few dozen packets, and has about two seconds in hand when a raise starts (a slow disk
+  does not starve it). A crashed process loses nothing, and a power loss skips at most one step of a stream (a
+  gap of up to 64 counts, or 4096 for a series of 1000 packets a second or more or a long burst), never repeating a count.
 - `ib send NODE CMD --sequence N` sends that one packet with count `N` (decimal or `0x`; it must fit
   the sequence field, and the profile must have one, else `IB-ENC-002`, exit 2, nothing sent) and
   continues from it: the next send, from any process, is `N+1`. In a series (`--repeat`, `--every`,

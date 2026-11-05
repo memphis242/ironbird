@@ -24,7 +24,7 @@ Two files in the state directory hold the counts.
   is at most one *step* above the next count, so a power loss skips at most one step of counts of
   a stream and never reuses one. The step is :data:`BLOCK` for a single send and for a responder;
   a series sizes it to its own demand (:func:`step_for`: about :data:`STEP_WINDOW_S` of its rate,
-  at most :data:`MAX_STEP`), so that it syncs a few times a second, not every few dozen counts.
+  at most :data:`MAX_STEP`), so that it syncs every few seconds, not every few dozen counts.
 
 Invariant, per stream: ``next <= ceiling <= durable`` (a missing durable entry counts as 0).
 Only a holder of the durable lock changes a slot's ceiling or the table's layout (insert,
@@ -41,7 +41,11 @@ every :data:`POLL_FAST_S` by a helper thread (a sleep on the loop is at least a 
 no syscall on the loop waits for a lock or a sync and the wait ends within a poll of the holder's
 release (the worker threads share the interpreter, though: see :meth:`SequenceStore.keep_ahead`).
 A long-lived sender (``ib respond``, a series) raises a ceiling in the background once half a step
-is left, so its takes do not wait for a sync.
+is left (:func:`ahead_at`: a series also once :data:`MIN_LEAD_S` of its rate is left, when that is
+more), so its takes do not wait for a sync. A series therefore has about two seconds of its rate in
+hand when a raise starts (at least one second at the :data:`MAX_STEP` cap), where a raise of two
+fsyncs takes milliseconds on a healthy disk and hundreds on a loaded one. A power loss still skips
+at most one step.
 
 A series of sends (``ib send --repeat/--every/--at``) builds its packets ahead of their slots on
 the loop and sends them from the pacer thread, so it cannot hold a lease from take to hand-off.
@@ -125,7 +129,8 @@ MAX_COUNT: Final = 1 << 62  # every stored count and ceiling, read or written, s
 SPAN: Final = 1 << 64  # what one slot field holds
 BLOCK: Final = 64  # the least step: a durable ceiling is at most one step above the next count
 MAX_STEP: Final = 4096  # the most a series raises a ceiling by in one sync
-STEP_WINDOW_S: Final = 0.5  # a series raises a ceiling by this much of its own rate, in counts
+STEP_WINDOW_S: Final = 4.0  # a series raises a ceiling by this much of its own rate, in counts
+MIN_LEAD_S: Final = 1.0  # a raise ahead starts with at least this much of the rate left
 AHEAD_AT: Final = BLOCK // 2  # a long-lived sender raises a ceiling when this many are left
 BATCH_WINDOW_S: Final = 0.02  # a series reserves this much of its rate in counts at a time
 MAX_BATCH: Final = 32  # ...and at most this many (a burst reserves this many)
@@ -160,6 +165,7 @@ assert HEAD_BYTES == 128 and SLOT_BYTES == 88, "the live layout is fixed"
 assert MAX_STREAMS * (MAX_KEY_LEN + 24) + 32 <= MAX_BYTES, "a full durable file fits its cap"
 assert LIVE_SLOTS >= 2 * MAX_STREAMS and LIVE_SLOTS & (LIVE_SLOTS - 1) == 0
 assert BLOCK >= 2 and 0 < AHEAD_AT < BLOCK <= MAX_STEP and MAX_COUNT + MAX_STEP < SPAN
+assert 0 < MIN_LEAD_S <= STEP_WINDOW_S / 2
 
 _OPEN_FLAGS: Final = (
     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
@@ -238,13 +244,30 @@ def step_for(per_second: float | None, planned: int | None = None) -> int:
     they go), ``planned`` of them when that is known: how far a durable ceiling is above the
     counts handed out when it is raised. That is :data:`STEP_WINDOW_S` of the rate, at least
     :data:`BLOCK` and at most :data:`MAX_STEP`, and no more than the packets still planned
-    (but never below :data:`BLOCK`). A raise starts when half a step is left, so a series syncs
-    a few times a second, and a power loss skips no more than this many counts of its stream."""
+    (but never below :data:`BLOCK`). A raise starts when :func:`ahead_at` counts are left, so a
+    series syncs every few seconds, and a power loss skips no more than this many counts of its
+    stream."""
     cap = MAX_STEP if planned is None else min(MAX_STEP, max(BLOCK, planned))
     if per_second is None:
         return cap
     assert per_second > 0
     return min(cap, max(BLOCK, math.ceil(per_second * STEP_WINDOW_S)))
+
+
+def ahead_at(step: int, per_second: float | None = None) -> int:
+    """The counts left under a ceiling at which a sender kept ahead starts raising it: half the
+    ``step``, or :data:`MIN_LEAD_S` of ``per_second`` when that is more (a step at the
+    :data:`MAX_STEP` cap is less than :data:`STEP_WINDOW_S` of a fast rate), but at most three
+    quarters of the step, so that each raise adds at least a quarter of it. The lead the series
+    has when the raise starts is this many counts over its rate: about :data:`STEP_WINDOW_S` / 2
+    seconds while the step is not capped, and at least :data:`MIN_LEAD_S` up to a rate of
+    three quarters of :data:`MAX_STEP` a second."""
+    assert step >= 1
+    half = step // 2
+    if per_second is None:
+        return half
+    assert per_second > 0
+    return min(max(half, math.ceil(per_second * MIN_LEAD_S)), step - step // 4)
 
 
 def batch_for(per_second: float | None) -> int:
@@ -939,14 +962,17 @@ class _Files:
         seat: tuple[str, int] | None = None,
         ahead: bool = False,
         steps: Mapping[str, int] | None = None,
+        ats: Mapping[str, int] | None = None,
     ) -> dict[str, int]:
         """Raise the ceilings of ``keys``: of ``need`` when it has no count left, of the others
-        when ``ahead`` and half a step or less is left; ``seat`` ``(key, n)`` makes the stream
-        hand out ``n + 1`` next. A stream's step is its entry in ``steps`` when that is more than
-        the store's own. The durable file is replaced (synced) before any slot holds a new
-        ceiling. Returns the slot index of every key."""
+        when ``ahead`` and the count left is at most the stream's entry in ``ats`` (half its step
+        when it has none); ``seat`` ``(key, n)`` makes the stream hand out ``n + 1`` next. A
+        stream's step is its entry in ``steps`` when that is more than the store's own. The
+        durable file is replaced (synced) before any slot holds a new ceiling. Returns the slot
+        index of every key."""
         block = self._cfg.block
         wide = steps or {}
+        trigger = ats or {}
         top = MAX_COUNT - 1  # the highest ceiling that is stored
         indices: dict[str, int] = {}
         with self._durable_lock() as dir_fd:
@@ -973,7 +999,7 @@ class _Files:
                         plans[key] = _Plan(index, slot, old, min(first + step, top), first)
                         continue
                     left = slot.ceiling - slot.next
-                    if (key == need and left > 0) or (ahead and left > step // 2):
+                    if (key == need and left > 0) or (ahead and left > trigger.get(key, step // 2)):
                         continue  # raised by another process meanwhile
                     start = slot.next if slot.ceiling == old else max(slot.next, old)
                     new = min(max(old, start + step), top)
@@ -1107,8 +1133,10 @@ def _extend_one(
     return files.extend([key], need=key, steps=steps)
 
 
-def _extend_ahead(keys: Sequence[str], steps: Mapping[str, int], files: _Files) -> dict[str, int]:
-    return files.extend(keys, ahead=True, steps=steps)
+def _extend_ahead(
+    keys: Sequence[str], steps: Mapping[str, int], ats: Mapping[str, int], files: _Files
+) -> dict[str, int]:
+    return files.extend(keys, ahead=True, steps=steps, ats=ats)
 
 
 def _run(
@@ -1295,6 +1323,7 @@ class SequenceStore:
         self._opened = False  # open once: from then on no falling back to memory
         self._ahead = False
         self._steps: dict[str, int] = {}  # the step of each stream kept ahead (bounded by them)
+        self._ats: dict[str, int] = {}  # ...and the counts left at which it is raised
         self._pending: set[str] = set()  # streams to raise ahead (bounded by the streams used)
         self._raising: frozenset[str] = frozenset()  # what the running raise ahead covers
         self._prefetch: asyncio.Task[None] | None = None
@@ -1307,15 +1336,17 @@ class SequenceStore:
     def for_node(self, node: str) -> NodeSequences:
         return NodeSequences(self, node)
 
-    def keep_ahead(self, key: str | None = None, step: int = 0) -> None:
+    def keep_ahead(self, key: str | None = None, step: int = 0, at: int = 0) -> None:
         """Raise ceilings in the background before they are reached (a long-lived sender). The
         raise is a worker thread's, so the loop never waits for a sync; the worker does share the
         interpreter with the loop, which is why a series asks for few, large steps: ``key``, when
-        given, is raised by ``step`` counts (:func:`step_for`) instead of the store's own step."""
+        given, is raised by ``step`` counts (:func:`step_for`) instead of the store's own step,
+        once ``at`` counts or fewer are left (:func:`ahead_at`; half the step when 0)."""
         self._ahead = True
         if key is not None and step > self._steps.get(key, 0):
-            assert step <= MAX_STEP
+            assert step <= MAX_STEP and 0 <= at < step
             self._steps[key] = step
+            self._ats[key] = at or step // 2
 
     # -- taking a count ------------------------------------------------------------------
 
@@ -1417,7 +1448,9 @@ class SequenceStore:
             if await self._ready(ordered[0], deadline):
                 self._remember(
                     await self._work(
-                        ordered[0], deadline, partial(_extend_ahead, ordered, dict(self._steps))
+                        ordered[0],
+                        deadline,
+                        partial(_extend_ahead, ordered, dict(self._steps), dict(self._ats)),
                     )
                 )
         finally:
@@ -1520,15 +1553,15 @@ class SequenceStore:
             raise self._failed(key, exc) from exc
         left = ceiling - (count + used)
         # a raise in progress covers the key: its takes need not queue another
-        if self._ahead and key not in self._raising and left <= self._half_step(key):
+        if self._ahead and key not in self._raising and left <= self._ahead_left(key):
             self._queue_ahead(key)
         return used
 
-    def _half_step(self, key: str) -> int:
-        """The counts left under a ceiling at which a sender kept ahead raises it."""
+    def _ahead_left(self, key: str) -> int:
+        """The counts left under a ceiling at which a sender kept ahead starts raising it."""
         cfg = self._cfg
         assert cfg is not None
-        return max(cfg.block, self._steps.get(key, 0)) // 2
+        return self._ats.get(key) or max(cfg.block, self._steps.get(key, 0)) // 2
 
     def _unlock_main(self) -> None:
         main = self._main
@@ -1756,7 +1789,9 @@ class SequenceStore:
             deadline = time.monotonic() + self._wait
             try:
                 self._remember(
-                    await self._call(deadline, partial(_extend_ahead, keys, dict(self._steps)))
+                    await self._call(
+                        deadline, partial(_extend_ahead, keys, dict(self._steps), dict(self._ats))
+                    )
                 )
             except Exception as exc:  # a take that then finds no count left reports it, coded
                 self._record(
@@ -1867,7 +1902,8 @@ class NodeSequences:
         them when that is known. A series is long-lived, so ceilings are raised in the
         background, by a step that fits its rate and its length (:func:`step_for`)."""
         key = key_of(self._node, kind, mid)
-        self._store.keep_ahead(key, step_for(per_second, planned))
+        step = step_for(per_second, planned)
+        self._store.keep_ahead(key, step, ahead_at(step, per_second))
         return SeriesCounts(
             self._store, key, seat=seat, wake=wake, batch=batch_for(per_second), planned=planned
         )

@@ -4484,11 +4484,12 @@ listed as deferred.
     - *Durable ceiling* (`sequence-state.json`, unchanged v1 format, "next" now meaning the ceiling):
       every count handed out is below it, and it is at most one step above the stream's next count. The
       step is 64 (`BLOCK`) for a single send and a responder; a series sizes it to its demand
-      (`step_for`): half a second of its rate, at least 64 and at most 4096 (`MAX_STEP`), a burst the
+      (`step_for`): 4 s of its rate (`STEP_WINDOW_S`), at least 64 and at most 4096 (`MAX_STEP`), a burst the
       most. Raised under `sequence-state.lock` and replaced through `TempOutput` (synced) *before* a slot
       holds the new ceiling; the live lock is never held across that sync (lock order: durable, then
       live). A table from another boot is rebuilt and each stream resumes from its ceiling: a power loss
-      skips at most one step (a gap of up to 64 counts, 4096 for a fast series) and never reuses a count.
+      skips at most one step (a gap of up to 64 counts, 4096 for a series of 1000 packets a second or more
+      or a long burst) and never reuses a count.
       A seat (`--sequence N`) sets the ceiling to `N + 1 + step`, lowering it too, so the bound holds
       after a backward seat. No give-back exists, so there is no reuse window at exit.
     - *Off the loop and bounded.* The take on the loop never syncs and never blocks it. A free live lock
@@ -4504,8 +4505,9 @@ listed as deferred.
       own and its ledger records and warnings are delivered when it does, also when the awaiting task was
       cancelled). A lock held by this process's own abandoned worker is reported as that, not as another
       process. `ib respond` and a series (`keep_ahead`) raise a ceiling in the background with half a step
-      left, so a take waits for a sync only when takes outrun it (a reply: one sync per 32 counts at most; a
-      series: per 2048 counts at the most, a few a second), and a raise in progress is not queued again
+      left (a series: `ahead_at`, or `MIN_LEAD_S`, 1 s, of its rate if that is more, at most three quarters
+      of the step), so a take waits for a sync only when takes outrun it (a reply: one sync per 32 counts at
+      most; a series: per 2000 counts at the most at 1 ms, one every 2 s), and a raise in progress is not queued again
       by the takes it covers (no second, empty raise). `ib respond` raises
       every reply message's ceiling in one sync at start (`NodeSequences.preraise`), so the first reply
       of each message waits for none. A count that cannot be taken within the bound, or a state file that
@@ -4612,9 +4614,15 @@ listed as deferred.
       deadline is skipped as starved. (The worker threads that raise a ceiling do share the interpreter
       and the CPU with the loop; see "Measured" for what that costs.)
       A series asks for background ceiling raises (`keep_ahead`) by a step sized to its rate
-      (`step_for`: half a second of it, 64 to 4096, a burst 4096, and no more than the packets it plans, so a
-      `--repeat 2` raises by 64), so a series syncs a few times a second and not every 32 packets, which
-      cost a burst two thirds of its rate. A series gets ready in two phases (`SeriesCounts.prime_open`,
+      (`step_for`: 4 s of it, 64 to 4096, a burst 4096, and no more than the packets it plans, so a
+      `--repeat 2` raises by 64), so a series syncs every few seconds and not every 32 packets, which
+      cost a burst two thirds of its rate. It starts the raise (`ahead_at`) when half the step is left, or
+      1 s of its rate if that is more (never over three quarters of the step), so a series has about 2 s
+      of lead (at least 1 s up to a rate of 3 k a second) before a raise must be done: a raise is two
+      fsyncs, which on a loaded CI disk took over 250 ms, the lead of a step of half a second of the rate
+      (a 1 ms series skipped 153 of 3000 slots; with the sync delayed by 150, 300 and 600 ms, 319, 1415
+      and 1956 starved). A series of 4096 packets a second or more has under a second of lead per step
+      (a power loss may skip at most 4096 counts, which a longer step would raise). A series gets ready in two phases (`SeriesCounts.prime_open`,
       `prime_take`): right after the link opens it opens the store and raises the ceiling (for a start
       more than 2 s away; a failure or a lock held past the time left is a ledgered warning, since it is
       only an optimization, and the second phase retries), and `PRIME_TAKE_WITHIN_S` (2 s) before the start
