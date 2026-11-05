@@ -36,6 +36,7 @@ from ironbird.filter.lexer import parse_time
 from ironbird.ledger import TxSeries
 from ironbird.seqstate import PRIME_TAKE_WITHIN_S
 from ironbird.transport.udp import SEND_WAIT_S, UdpThreadSender, UdpTransport
+from ledgerutil import records_in_order
 from recutil import CLI_MAIN, EXAMPLES, Proc, run_ib
 from replayutil import child_env, write_config_58k
 
@@ -1247,10 +1248,8 @@ def setup(tmp_path: Path) -> tuple[Path, int, dict[str, str]]:
 
 
 def ledger_events(tmp_path: Path) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for path in sorted((tmp_path / "state").glob("*.jsonl")):
-        out += [json.loads(line) for line in path.read_text().splitlines()]
-    return out
+    """Every ledger record, the invocations in the order they ran."""
+    return records_in_order(tmp_path / "state")
 
 
 def ib_send(
