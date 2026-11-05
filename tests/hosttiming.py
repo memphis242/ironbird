@@ -1,9 +1,11 @@
-"""Marker shared by the host-timing guards (tests/test_benchmarks.py, tests/bench/), and the
-host's own wake-up reference that a pacing guard is measured against."""
+"""Marker shared by the host-timing guards (tests/test_benchmarks.py, tests/bench/), the host's
+own wake-up reference that a pacing guard is measured against, and the wall-time deadline of the
+property tests, which only an untraced run enforces."""
 
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -26,6 +28,24 @@ needs_a_quiet_host = pytest.mark.skipif(
 )
 
 _NS: Final = 1_000_000_000
+
+
+def traced() -> bool:
+    """Whether coverage measures this process (tools/coverage.sh, ``coverage run``). Its tracer
+    slows Python code by a factor that depends on the code (branch-dense loops the most) and on
+    how many traced processes share the host, so no wall-time bound holds under it."""
+    coverage = sys.modules.get("coverage")
+    return coverage is not None and coverage.Coverage.current() is not None
+
+
+def hang_deadline(ms: int) -> int | None:
+    """A property test's Hypothesis ``deadline``: ``ms``, the wall time past which one example is
+    a hang rather than slow code, or none at all under coverage (:func:`traced`), where it would
+    measure the tracer. The untraced runs of CI (the lint, types, tests jobs) run the same tests
+    and enforce it; what a test asserts about the work done (a framer's own work count, a cap)
+    holds traced or not."""
+    assert ms > 0
+    return None if traced() else ms
 
 
 @dataclass(frozen=True)

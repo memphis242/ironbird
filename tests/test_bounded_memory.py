@@ -27,6 +27,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from conftest import CORPUS
+from hosttiming import hang_deadline
 from ironbird.ccdd.model import MessageKind
 from ironbird.config import Endpoint, load_config
 from ironbird.engine import (
@@ -47,7 +48,9 @@ from ledgerutil import records
 
 T = TypeVar("T")
 TRUNCATED_BIT = int(FrameFlag.TRUNCATED)
-FUZZ = settings(max_examples=200, deadline=2000, suppress_health_check=[HealthCheck.too_slow])
+FUZZ = settings(
+    max_examples=200, deadline=hang_deadline(2000), suppress_health_check=[HealthCheck.too_slow]
+)
 
 
 def _run(coro: Coroutine[Any, Any, T], timeout: float = 60) -> T:

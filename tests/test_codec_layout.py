@@ -6,6 +6,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from conftest import EXAMPLES
+from hosttiming import hang_deadline
 from ironbird import header
 from ironbird.ccdd.model import (
     CcddModel,
@@ -76,7 +77,9 @@ def _layouts(draw: st.DrawFn) -> tuple[Message, dict[str, object]]:
     return message, values
 
 
-@settings(max_examples=400, deadline=1000, suppress_health_check=[HealthCheck.too_slow])
+@settings(
+    max_examples=400, deadline=hang_deadline(1000), suppress_health_check=[HealthCheck.too_slow]
+)
 @given(_layouts())
 def test_generated_layout_round_trips(case: tuple[Message, dict[str, object]]) -> None:
     message, values = case

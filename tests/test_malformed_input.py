@@ -18,6 +18,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from conftest import CORPUS, EXAMPLES
+from hosttiming import hang_deadline
 from ironbird import header
 from ironbird.ccdd.json_adapter import JsonAdapter, parse_model
 from ironbird.ccdd.loader import load_ccdd
@@ -44,7 +45,8 @@ CMD_TOML: dict[str, Any] = tomllib.loads(
 
 FUZZ = settings(
     max_examples=300,
-    deadline=1000,  # a parser that takes a second on a few KB is a hang for our purposes
+    # a parser that takes a second on a few KB is a hang for our purposes
+    deadline=hang_deadline(1000),
     suppress_health_check=[HealthCheck.too_slow],
 )
 

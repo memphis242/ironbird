@@ -23,6 +23,7 @@ from hypothesis import strategies as st
 import ser_corpus
 import serialutil
 from conftest import CORPUS, EXAMPLES
+from hosttiming import hang_deadline
 from ironbird import header as hdr
 from ironbird.ccdd.model import MessageKind
 from ironbird.errors import Code, DecodeError, IronbirdError
@@ -50,7 +51,7 @@ UNLIMITED = WorkBudget(per_byte=1 << 30, base=1 << 40, cap=1 << 41)
 
 FUZZ = settings(
     max_examples=200,
-    deadline=2000,
+    deadline=hang_deadline(2000),
     suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
 )
 

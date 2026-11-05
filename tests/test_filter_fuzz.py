@@ -22,14 +22,19 @@ from filter_defs import (
     count_decodes,
     make_frame,
 )
+from hosttiming import hang_deadline
 from ironbird.ccdd.model import MessageKind, TypeClass
 from ironbird.codec import Codec
 from ironbird.errors import Code
 from ironbird.filter import MAX_FILTER_CHARS, FilterError, compile_filter, parse
 from ironbird.frame import Frame
 
-FUZZ = settings(max_examples=400, deadline=1000, suppress_health_check=[HealthCheck.too_slow])
-PROPERTY = settings(max_examples=600, deadline=2000, suppress_health_check=[HealthCheck.too_slow])
+FUZZ = settings(
+    max_examples=400, deadline=hang_deadline(1000), suppress_health_check=[HealthCheck.too_slow]
+)
+PROPERTY = settings(
+    max_examples=600, deadline=hang_deadline(2000), suppress_health_check=[HealthCheck.too_slow]
+)
 
 
 @pytest.fixture(scope="module")

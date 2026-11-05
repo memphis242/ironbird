@@ -30,6 +30,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from conftest import CORPUS, EXAMPLES
+from hosttiming import hang_deadline
 from ironbird import seqstate
 from ironbird.ccdd.loader import load_ccdd
 from ironbird.ccdd.model import MessageKind
@@ -675,7 +676,9 @@ def test_a_forged_durable_symlink_is_not_followed_or_written_through(tmp_path: P
     assert (tmp_path / INVALID_NAME).is_symlink()  # moved aside, as it was
 
 
-@settings(max_examples=200, deadline=1000, suppress_health_check=[HealthCheck.too_slow])
+@settings(
+    max_examples=200, deadline=hang_deadline(1000), suppress_health_check=[HealthCheck.too_slow]
+)
 @given(st.binary(max_size=2000))
 def test_parse_state_never_raises_and_what_it_accepts_round_trips(data: bytes) -> None:
     marks = parse_state(data)
@@ -683,7 +686,7 @@ def test_parse_state_never_raises_and_what_it_accepts_round_trips(data: bytes) -
         assert parse_state(render_state(marks)) == marks
 
 
-@settings(max_examples=300, deadline=1000)
+@settings(max_examples=300, deadline=hang_deadline(1000))
 @given(st.binary(min_size=SLOT_BYTES, max_size=SLOT_BYTES))
 def test_a_live_slot_of_any_bytes_is_a_slot_or_refused(raw: bytes) -> None:
     try:
@@ -695,7 +698,7 @@ def test_a_live_slot_of_any_bytes_is_a_slot_or_refused(raw: bytes) -> None:
         assert seqstate._pack_slot(slot.key, slot.next, slot.ceiling) == raw
 
 
-@settings(max_examples=200, deadline=1000)
+@settings(max_examples=200, deadline=hang_deadline(1000))
 @given(
     st.sampled_from([KEY, "fc/telemetry/0x0b00", "ground/command/0x1891"]),
     st.integers(0, 2**64 - 1),
