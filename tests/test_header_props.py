@@ -25,6 +25,7 @@ from headergen import (
     span_of,
     specs,
 )
+from hosttiming import hang_deadline
 from ironbird import header
 from ironbird.ccdd.json_adapter import parse_model
 from ironbird.ccdd.model import MessageKind
@@ -34,7 +35,7 @@ from ironbird.header import Header, HeaderProfile
 
 FUZZ = settings(
     max_examples=300,
-    deadline=2000,
+    deadline=hang_deadline(2000),
     suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
 )
 

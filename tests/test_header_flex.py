@@ -21,6 +21,7 @@ from typer.testing import CliRunner
 import golden_2i
 from conftest import CORPUS, EXAMPLES
 from filter_defs import CCDD_N1, STREAMS, count_decodes, make_frame
+from hosttiming import hang_deadline
 from ironbird import checksum, header
 from ironbird.ccdd.json_adapter import parse_model
 from ironbird.ccdd.loader import load_ccdd
@@ -510,7 +511,7 @@ def test_the_mid_must_agree_with_the_fixed_fields_wherever_they_sit() -> None:
     assert info.value.code is Code.ENC_FIT and "packet_type" in info.value.summary
 
 
-@settings(max_examples=200, deadline=1000)
+@settings(max_examples=200, deadline=hang_deadline(1000))
 @given(st.integers(0, 255), st.integers(0, 127), st.integers(0, 127))
 def test_msgid_v2_round_trips_every_mid_and_the_unused_apid_bits_do_not_matter(
     subsystem: int, apid: int, spare: int

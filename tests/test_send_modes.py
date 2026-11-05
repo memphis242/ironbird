@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import os
 import signal
 import socket
 import subprocess
@@ -33,7 +34,9 @@ from ironbird.config import Endpoint
 from ironbird.errors import Code, IronbirdError
 from ironbird.filter.lexer import parse_time
 from ironbird.ledger import TxSeries
+from ironbird.seqstate import PRIME_TAKE_WITHIN_S
 from ironbird.transport.udp import SEND_WAIT_S, UdpThreadSender, UdpTransport
+from ledgerutil import records_in_order
 from recutil import CLI_MAIN, EXAMPLES, Proc, run_ib
 from replayutil import child_env, write_config_58k
 
@@ -554,6 +557,44 @@ def test_the_pacer_thread_runs_a_series_and_accounts_for_every_packet() -> None:
     assert sent + count(reports, pm.Kind.UNSENT) == built  # nothing built is unaccounted for
     # (that nothing is built that cannot be sent is a property of the slot logic, tested on
     # simulated time: an overloaded host skips slots, and a skip can leave a packet unsent)
+
+
+def test_a_packet_whose_count_is_awaited_is_built_again_once_the_builder_wakes_the_pacer() -> None:
+    """A build that returns nothing builds and counts no packet; the pacer builds the same slot
+    when woken, and every packet it then sent has a number (no gap, none twice)."""
+    refused: list[int] = []
+    numbers: list[int] = []
+    reports: list[Report] = []
+    wire: list[bytes] = []
+
+    def send(data: bytes, stop: threading.Event) -> bool:
+        wire.append(data)
+        return True
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        pacer: pm.SeriesPacer[int] = pm.SeriesPacer(
+            burst_grid(6), send, pm.ThreadWaiter(pm.SPIN_NS), timed=False
+        )
+
+        def build(number: int, slot: int) -> pm.Built[int] | None:
+            if number in (0, 3) and refused.count(number) == 0:  # its count is being taken
+                refused.append(number)
+                loop.call_later(0.02, pacer.wake)
+                return None
+            numbers.append(number)
+            return pm.Built(number, slot, bytes([number]), number)
+
+        def handle(report: Report) -> BaseException | None:
+            reports.append(report)
+            return report.error
+
+        await pacer.run(build, handle)
+
+    asyncio.run(main())
+    assert refused == [0, 3] and numbers == [0, 1, 2, 3, 4, 5]
+    assert wire == [bytes([n]) for n in range(6)]
+    assert count(reports, pm.Kind.SENT) == 6
 
 
 def test_a_cancelled_pacer_stops_its_thread_and_reports_what_it_sent() -> None:
@@ -1207,10 +1248,8 @@ def setup(tmp_path: Path) -> tuple[Path, int, dict[str, str]]:
 
 
 def ledger_events(tmp_path: Path) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for path in sorted((tmp_path / "state").glob("*.jsonl")):
-        out += [json.loads(line) for line in path.read_text().splitlines()]
-    return out
+    """Every ledger record, the invocations in the order they ran."""
+    return records_in_order(tmp_path / "state")
 
 
 def ib_send(
@@ -1780,3 +1819,369 @@ def test_raw_enum_with_nothing_to_allow_is_a_usage_error(
         env,
     )
     assert done.returncode == 2 and Code.CLI_USAGE.value in done.stderr
+
+
+# -- sequence counts of a series: the state directory's, as for a single send (PR 40 with 41) --
+
+
+def wait_for_packets(sink: Sink, wanted: int, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while sink.count < wanted and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert sink.count == wanted
+
+
+def send_ok(tmp_path: Path, config: Path, env: dict[str, str], *args: str) -> None:
+    done = run_ib(tmp_path, ["-c", str(config), "send", "fc", *args], env)
+    assert done.returncode == 0, done.stderr
+
+
+def test_a_series_continues_the_count_of_the_sends_before_it_and_the_next_send_goes_on(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
+) -> None:
+    """B1 (PR 40 round 2): a series counted 0.. from the codec's memory whatever was sent before,
+    and the single send after it reused its counts."""
+    config, port, env = setup
+    with sink_for(port) as sink:
+        for _ in range(3):
+            send_ok(tmp_path, config, env, "MOCK_NOOP")
+        send_ok(tmp_path, config, env, "MOCK_NOOP", "--repeat", "5")
+        send_ok(tmp_path, config, env, "MOCK_NOOP", "--every", "10ms", "--repeat", "4")
+        send_ok(tmp_path, config, env, "MOCK_NOOP")
+        wait_for_packets(sink, 13)
+        assert sink.sequences() == list(range(13))
+    spent = [e["sequence"] for e in ledger_events(tmp_path) if e["event"] == "tx.command"]
+    assert sorted(spent) == list(range(13))
+
+
+@pytest.mark.parametrize("mode", [["--repeat", "6"], ["--every", "10ms", "--repeat", "6"]])
+def test_sequence_seats_the_first_packet_of_a_series_and_counts_on_from_it(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]], mode: list[str]
+) -> None:
+    config, port, env = setup
+    with sink_for(port) as sink:
+        send_ok(tmp_path, config, env, "MOCK_NOOP", "--sequence", "100", *mode)
+        send_ok(tmp_path, config, env, "MOCK_NOOP")  # goes on above the series
+        send_ok(tmp_path, config, env, "MOCK_NOOP", "--sequence", "16382", *mode)  # wraps
+        send_ok(tmp_path, config, env, "MOCK_NOOP")
+        wait_for_packets(sink, 6 + 1 + 6 + 1)
+        assert sink.sequences() == [
+            *range(100, 106),
+            106,
+            16382,
+            16383,
+            0,
+            1,
+            2,
+            3,
+            4,
+        ]
+    plan = next(e for e in ledger_events(tmp_path) if e["event"] == "send.plan")
+    assert plan["request"]["sequence_set"] == 100
+
+
+def test_a_sequence_that_does_not_fit_is_refused_before_a_series_starts(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
+) -> None:
+    config, port, env = setup
+    with sink_for(port) as sink:
+        done = run_ib(
+            tmp_path,
+            ["-c", str(config), "send", "fc", "MOCK_NOOP", "--repeat", "3", "--sequence", "16384"],
+            env,
+        )
+        assert done.returncode == 2 and "IB-" in done.stderr
+        send_ok(tmp_path, config, env, "MOCK_NOOP")
+        wait_for_packets(sink, 1)
+        assert sink.sequences() == [0]  # the refused series took no count
+
+
+@pytest.mark.parametrize(
+    "mode", [["--every", "10ms", "--repeat", "3"], ["--at", "+30s"], ["--repeat", "3"]]
+)
+def test_a_length_delta_the_header_cannot_hold_is_refused_at_once_and_spends_no_count(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]], mode: list[str]
+) -> None:
+    """S4 (PR 40 round 3): the range of a tampered field was checked while framing, after the
+    `--at` wait and with a count spent, so every refused series left a gap."""
+    config, port, env = setup
+    with sink_for(port) as sink:
+        started = time.monotonic()
+        done = run_ib(
+            tmp_path,
+            ["-c", str(config), "send", "fc", "MOCK_NOOP", "--length-delta", "-100", *mode],
+            env,
+        )
+        assert done.returncode == 2 and "IB-HDR-003" in done.stderr, done.stderr
+        assert time.monotonic() - started < 20  # not after a 30 s wait
+        send_ok(tmp_path, config, env, "MOCK_NOOP")
+        wait_for_packets(sink, 1)
+        assert sink.sequences() == [0]  # the refused request took no count
+
+
+# The near and the far start of a series' prime (PRIME_TAKE_WITHIN_S): which one ib takes is
+# decided by how far its start is once ib is up, so an attempt whose start ib's startup moved
+# into the other case, or too near to see when the counts were made, says nothing about it.
+PRIME_WITHIN_NS = round(PRIME_TAKE_WITHIN_S * SEC)
+NEAR_WAIT_NS = 1500 * MS  # the wait a near-start attempt aims ib at: inside the near case
+RAISED_BEFORE_NS = 500 * MS  # a near start's ceiling is raised this long before it, or more
+
+
+def at_ms(wall_ns: int) -> int:
+    """``wall_ns`` to the millisecond, as an ``--at`` time written by :func:`sm.iso_utc` is."""
+    return wall_ns // MS * MS
+
+
+def plan_of(events: list[dict[str, Any]], start: int) -> dict[str, Any]:
+    """The ``send.plan`` record of the series that started at ``start``."""
+    return next(
+        e for e in events if e["event"] == "send.plan" and e["start_utc"] == sm.iso_utc(start)
+    )
+
+
+def test_a_series_prepares_its_counts_before_it_waits_for_its_start(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
+) -> None:
+    """S2 (PR 40 round 3): the store was opened, `--sequence` seated and the first count taken
+    20 ms before the first slot, so another process's sync at that moment made the first packet
+    late. The ceiling is raised while the series still waits for its start: a start within
+    PRIME_TAKE_WITHIN_S has it done at launch. An attempt counts when ib began its wait inside
+    that case and long enough before the start to tell launch from start."""
+    config, port, env = setup
+    lead = NEAR_WAIT_NS
+    for _ in range(AT_ATTEMPTS):
+        launched = time.time_ns()
+        start = at_ms(launched + lead)
+        with sink_for(port) as sink:
+            done = run_ib(
+                tmp_path,
+                [
+                    "-c",
+                    str(config),
+                    "send",
+                    "fc",
+                    "MOCK_NOOP",
+                    "--at",
+                    sm.iso_utc(start),
+                    "--every",
+                    "5ms",
+                    "--repeat",
+                    "6",
+                    "--sequence",
+                    "50",
+                ],
+                env,
+            )
+            ended = time.time_ns()
+            if refused_as_usage(done):  # the start passed before ib checked it
+                time.sleep(0.2)
+                assert sink.count == 0
+                lead = ended - launched + NEAR_WAIT_NS
+                continue
+            assert done.returncode == 0, done.stderr
+            wait_for_packets(sink, 6)
+            assert sink.sequences() == list(range(50, 56))
+        events = ledger_events(tmp_path)
+        plan = plan_of(events, start)
+        waiting = parse_time(plan["ts"])  # ledgered with the link open, before the prime
+        if not RAISED_BEFORE_NS + WAITING_HEADROOM_NS <= start - waiting <= PRIME_WITHIN_NS:
+            lead = waiting - launched + NEAR_WAIT_NS  # aimed at the near case again
+            continue
+        raised = [
+            e for e in events if e["event"] == "sequence.extend" and e["session"] == plan["session"]
+        ]
+        assert raised, "the ceiling was never raised"
+        assert parse_time(raised[0]["ts"]) < start - RAISED_BEFORE_NS, (
+            "the ceiling was raised at the start itself"
+        )
+        return
+    pytest.fail(f"ib did not begin a near start's wait in time in {AT_ATTEMPTS} attempts")
+
+
+def test_an_until_window_the_link_open_closed_is_a_usage_error_not_an_internal_one(
+    tmp_path: Path,
+    setup: tuple[Path, int, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S1 (PR 40 round 4): `--every X --until T` accepted at parse time, whose window the link
+    open then closed, planned no packets and tripped an assertion (IB-INT-001). The open is
+    delayed here by a fixed time instead of raced."""
+    from typer.testing import CliRunner
+
+    from ironbird.cli.main import app
+    from ironbird.session import Session
+
+    config, port, env = setup
+    for name in ("IRONBIRD_STATE_DIR", "IRONBIRD_RECORD_DIR"):
+        monkeypatch.setenv(name, env[name])
+    monkeypatch.delenv("IRONBIRD_CONFIG", raising=False)
+    real = Session.series_link
+
+    async def slow_open(self: Session, target: Any) -> Any:
+        await asyncio.sleep(0.5)  # longer than the window left at parse time
+        return await real(self, target)
+
+    monkeypatch.setattr(Session, "series_link", slow_open)
+    until = sm.iso_utc(time.time_ns() + 300 * MS)
+    with sink_for(port) as sink:
+        result = CliRunner().invoke(
+            app, ["-c", str(config), "send", "fc", "MOCK_NOOP", "--every", "1ms", "--until", until]
+        )
+        time.sleep(0.1)
+        assert sink.count == 0
+    assert result.exit_code == 2, result.output
+    assert Code.CLI_USAGE.value in result.output and Code.INTERNAL.value not in result.output
+
+
+def test_a_far_start_takes_its_seat_before_the_start_not_at_it(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
+) -> None:
+    """S2 (PR 40 round 4): beyond 2 s the seat of `--sequence` (a durable write and sync) and the
+    first reservation ran 20 ms before the first slot, so another process holding the durable
+    lock then held the first packet back. They are done 2 s before the start. An attempt counts
+    when ib began its wait in the far case, with headroom: one whose startup used up the lead
+    took the near case (or was refused), which this does not test."""
+    import fcntl
+
+    config, port, env = setup
+    hold_s = 0.4
+    lead = 4 * SEC
+    state = tmp_path / "state"
+    for _ in range(AT_ATTEMPTS):
+        launched = time.time_ns()
+        start = at_ms(launched + lead)
+        with sink_for(port) as sink:
+            proc, _ = ib_send(
+                tmp_path,
+                config,
+                env,
+                "MOCK_NOOP",
+                "--at",
+                sm.iso_utc(start),
+                "--every",
+                "5ms",
+                "--repeat",
+                "10",
+                "--sequence",
+                "100",
+            )
+            try:
+                while not (state / "sequence-state.lock").exists() and proc.popen.poll() is None:
+                    time.sleep(0.01)  # the series created it when it opened the state
+                if proc.popen.poll() is None:
+                    fd = os.open(state / "sequence-state.lock", os.O_RDWR)
+                    try:
+                        while time.time_ns() < start - 25 * MS:
+                            time.sleep(0.001)
+                        fcntl.flock(fd, fcntl.LOCK_EX)  # another process syncing around the start
+                        time.sleep(hold_s)
+                    finally:
+                        os.close(fd)
+                done = proc.finish()
+            finally:
+                proc.kill()
+            ended = time.time_ns()
+            if done == 2 and Code.CLI_USAGE.value in proc.stderr:  # the start passed first
+                time.sleep(0.2)
+                assert sink.count == 0
+                lead = longer_lead(lead, ended - launched)
+                continue
+            assert done == 0, proc.stderr
+            wait_for_packets(sink, 10)
+            assert sink.sequences() == list(range(100, 110))
+            first = sink.walls[0] - start
+        waiting = parse_time(plan_of(ledger_events(tmp_path), start)["ts"])
+        if start - waiting < PRIME_WITHIN_NS + WAITING_HEADROOM_NS:  # not the far case
+            lead = longer_lead(lead, waiting - launched)
+            continue
+        assert first < hold_s * SEC / 2, (
+            f"the first packet came {first / MS:.0f} ms after its start"
+        )
+        return
+    pytest.fail(f"ib did not begin a far start's wait in time in {AT_ATTEMPTS} attempts")
+
+
+def test_two_series_at_once_to_one_node_and_mid_take_unique_counts_with_no_restart(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
+) -> None:
+    """B1: two `ib send --repeat` processes counted from 0 each, in step, so every count was on
+    the wire twice. Each process's packets now carry its own take order, and together they are
+    one unbroken series."""
+    config, port, env = setup
+    each = 300
+    with sink_for(port) as sink:
+        procs = [
+            ib_send(tmp_path, config, env, "MOCK_NOOP", "--repeat", str(each))[0] for _ in range(2)
+        ]
+        try:
+            for proc in procs:
+                assert proc.finish(timeout=60) == 0, proc.stderr
+        finally:
+            for proc in procs:
+                proc.kill()
+        wait_for_packets(sink, 2 * each)
+        sequences = sink.sequences()
+    assert sorted(sequences) == list(range(2 * each))  # unique; no restart at 0; no gap
+    outcomes = [e for e in ledger_events(tmp_path) if e["event"] == "send.outcome"]
+    assert [o["sent"] for o in outcomes] == [each, each]
+    # a third invocation goes on above both
+    with sink_for(port) as sink:
+        send_ok(tmp_path, config, env, "MOCK_NOOP")
+        wait_for_packets(sink, 1)
+        assert sink.sequences() == [(2 * each) % 16384]
+
+
+def test_two_periodic_series_at_once_interleave_without_a_repeated_count(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
+) -> None:
+    config, port, env = setup
+    with sink_for(port) as sink:
+        procs = [
+            ib_send(tmp_path, config, env, "MOCK_NOOP", "--every", "5ms", "--repeat", "60")[0]
+            for _ in range(2)
+        ]
+        try:
+            for proc in procs:
+                assert proc.finish(timeout=60) == 0, proc.stderr
+        finally:
+            for proc in procs:
+                proc.kill()
+        deadline = time.monotonic() + 5
+        while sink.count < 120 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        sequences = sink.sequences()
+    assert len(sequences) == len(set(sequences)) and min(sequences) == 0
+    assert all(0 <= s < 130 for s in sequences)  # a skipped slot may leave a gap, never a repeat
+
+
+def test_a_reset_during_a_series_restarts_its_counts_at_zero(
+    tmp_path: Path, setup: tuple[Path, int, dict[str, str]]
+) -> None:
+    config, port, env = setup
+    with sink_for(port) as sink:
+        proc, _ = ib_send(tmp_path, config, env, "MOCK_NOOP", "--every", "10ms", "--for", "2s")
+        try:
+            deadline = time.monotonic() + 20
+            while sink.count < 30:
+                assert proc.popen.poll() is None, proc.stderr
+                assert time.monotonic() < deadline
+                time.sleep(0.02)
+            done = run_ib(tmp_path, ["-c", str(config), "seq", "reset", "fc"], env)
+            assert done.returncode == 0, done.stderr
+            assert proc.finish(timeout=30) == 0, proc.stderr
+        finally:
+            proc.kill()
+        time.sleep(0.2)
+        sequences = sink.sequences()
+    drops = [i for i, (a, b) in enumerate(itertools.pairwise(sequences)) if b != (a + 1) % 16384]
+    assert len(drops) == 1, sequences
+    before, after = sequences[: drops[0] + 1], sequences[drops[0] + 1 :]
+    assert before == list(range(len(before)))  # from 0 until the reset
+    assert after[0] == 0 and consecutive(after)  # then from 0 again
+    # and the series left the stream where it ended: above its last packet, by the counts it had
+    # reserved and not used (fewer than a batch)
+    with sink_for(port) as sink:
+        send_ok(tmp_path, config, env, "MOCK_NOOP")
+        wait_for_packets(sink, 1)
+        (next_count,) = sink.sequences()
+        assert 0 <= (next_count - after[-1] - 1) % 16384 < 32

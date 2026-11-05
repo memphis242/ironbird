@@ -43,7 +43,7 @@ from ironbird.cli.output import (
     line_codec,
     write_within,
 )
-from ironbird.codec import Codec, EncodedPacket, parse_ascii_int
+from ironbird.codec import Codec, EncodedPacket, PreparedPacket, parse_ascii_int
 from ironbird.config import (
     MAX_EXPORT_JOBS,
     ExportConfig,
@@ -115,10 +115,12 @@ from ironbird.retnotices import Notices
 from ironbird.retservice import Retention
 from ironbird.sanitize import hex_preview
 from ironbird.sendmodes import (
+    START_LEAD_NS,
     Grid,
     SendPlan,
     SystemClock,
     Tally,
+    check_open_window,
     fmt_ns,
     iso_utc,
     outcome_fields,
@@ -127,7 +129,9 @@ from ironbird.sendmodes import (
     resolve,
     start_grid,
     timing_text,
+    wait_for_wall,
 )
+from ironbird.seqstate import PRIME_TAKE_WITHIN_S, SequenceStore, SeriesCounts, node_stem
 from ironbird.session import Route, SentCommand, Session, Side
 from ironbird.sigmask import (
     HANDLED_SIGNALS,
@@ -145,6 +149,7 @@ EXIT_DAMAGED_INPUT: Final = 5  # output produced, but the input recording was da
 EXIT_UNLOGGED: Final = 6  # a command or reply went out but its ledger record was never written
 STATUS_INTERVAL_S: Final = 5.0  # ``ib record`` status line on stderr
 NS_PER_S: Final = 1_000_000_000
+PRIME_FINE_NS: Final = 5_000_000  # how closely the second phase of a series' prime is timed
 RAW_ENUM_HINT: Final = "use --raw-enum"
 RAW_ENUM_SHOWN: Final = 3  # raw enum values named in a confirmation line
 SEND_LINE_MAX_RATE: Final = 2.0  # a series up to this many packets/s prints a line for each
@@ -185,6 +190,15 @@ ledger_app = typer.Typer(
     rich_markup_mode="markdown",
 )
 app.add_typer(ledger_app, name="ledger")
+seq_app = typer.Typer(
+    name="seq",
+    help="Show or reset the CCSDS sequence counts kept between sends.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+    rich_markup_mode="markdown",
+)
+app.add_typer(seq_app, name="seq")
 
 
 class Format(StrEnum):
@@ -1131,6 +1145,18 @@ def _parse_header_values(items: list[str] | None) -> dict[str, int]:
     return values
 
 
+def _parse_sequence(text: str | None) -> int | None:
+    """``--sequence N`` as an integer (the codec checks it against the sequence field)."""
+    if text is None:
+        return None
+    try:
+        return parse_ascii_int(text)
+    except ValueError:
+        raise IronbirdError(
+            Code.CLI_USAGE, f"--sequence {text[:40]!r}: the value must be an integer"
+        ) from None
+
+
 class _RecordingScope:
     """``--record`` for one command: a recording that lives for the ``async with`` block.
 
@@ -1382,6 +1408,17 @@ def send(
             help="With --every: stop sending this long after the first packet.",
         ),
     ] = None,
+    sequence: Annotated[
+        str | None,
+        typer.Option(
+            "--sequence",
+            metavar="N",
+            help="Send with sequence count N (within the header's sequence field) and count on "
+            "from it: the next send gets N+1. In a series it is the first packet's count. "
+            "Without it the count continues from the last send to this node and MID, kept in "
+            "the state directory across invocations.",
+        ),
+    ] = None,
     as_node: AsOption = None,
     verbose: VerboseOption = False,
 ) -> None:
@@ -1402,6 +1439,7 @@ def send(
         spec = parse_spec(at, repeat, every, until, for_)
         parsed = _parse_args(args)
         header_values = _parse_header_values(header)
+        sequence_value = _parse_sequence(sequence)
         tamper: dict[str, int] = {}
         codec = session.codec_for(session.route(node, link_name=link).server.name)
         profile = codec.profile(MessageKind.COMMAND)
@@ -1421,15 +1459,20 @@ def send(
                 f"{term(command[:64])} has none",
             )
         raw_values: tuple[tuple[str, int], ...] = ()
+        prepared: PreparedPacket | None = None
         if raw_enum or spec.is_series:  # refused now, not at the start time of a series
-            raw_values = codec.check_command(
+            prepared = codec.prepare_command(
                 command,
                 parsed,
+                tamper=tamper,
                 header=header_values,
                 allow_count_mismatch=allow_count_mismatch,
                 raw_enum=raw_enum,
                 enum_hint=RAW_ENUM_HINT,
             )
+            raw_values = prepared.raw_enums
+            if sequence_value is not None:
+                codec.check_sequence(MessageKind.COMMAND, sequence_value)
         if raw_enum and not raw_values:
             raise IronbirdError(
                 Code.CLI_USAGE,
@@ -1447,6 +1490,7 @@ def send(
             if text
         ]
         if spec.is_series:
+            assert prepared is not None
             plan = resolve(spec, invoked_wall_ns, time.time_ns())
             return await _send_series(
                 session,
@@ -1463,6 +1507,8 @@ def send(
                     allow_count_mismatch=allow_count_mismatch,
                     raw_enum=raw_enum,
                     raw_values=raw_values,
+                    prepared=prepared,
+                    sequence=sequence_value,
                 ),
                 faults=faults,
                 show_hex=session_verbose(ctx, verbose),
@@ -1477,6 +1523,7 @@ def send(
             allow_count_mismatch=allow_count_mismatch,
             raw_enum=raw_enum,
             enum_hint=RAW_ENUM_HINT,
+            sequence=sequence_value,
         )
         run.console.out(_sent_line(sent, faults))
         if session_verbose(ctx, verbose):
@@ -1543,9 +1590,11 @@ class _SeriesRequest:
     allow_count_mismatch: bool
     raw_enum: bool
     raw_values: tuple[tuple[str, int], ...]
+    prepared: PreparedPacket  # encoded and checked once; each packet adds its count and time
+    sequence: int | None  # ``--sequence``: the count of the first packet
 
     def ledger_fields(self) -> dict[str, object]:
-        return {
+        fields: dict[str, object] = {
             "args": dict(self.args),
             "tamper": dict(self.tamper),
             "header": dict(self.header),
@@ -1553,6 +1602,9 @@ class _SeriesRequest:
             "allow_count_mismatch": self.allow_count_mismatch,
             "raw_enums": [{"field": n, "value": v} for n, v in self.raw_values],
         }
+        if self.sequence is not None:
+            fields["sequence_set"] = self.sequence  # asked for; each packet's record has its count
+        return fields
 
 
 async def _send_series(
@@ -1575,9 +1627,12 @@ async def _send_series(
     with its coded error (exit 1, after the summary); a signal ends it with the summary and exit
     128+n. The pacer thread is stopped before either is reported, so the count sent is exact.
 
-    The count of each packet is its own: every packet is encoded with the next count of its
-    codec. (A seated first count, ``--sequence`` of the persistent counter, applies to packet 0
-    only; the counts used are in each packet's record and in ``send.outcome``.)
+    The count of each packet is its own: the stream's next count in the state directory
+    (:mod:`ironbird.seqstate`), taken as the packet is built, so the counts are unique and
+    persistent across processes and invocations. Packets of two processes sending on one stream
+    interleave on the wire, each process's in count order. A packet built and not sent (skipped,
+    unsent, unconfirmed) has spent its count. ``--sequence`` seats the first packet's count; the
+    counts used are in each packet's record and in ``send.outcome``.
     """
     command, node = req.command, req.node
     target = session.series_target(node, link=req.link)
@@ -1585,6 +1640,8 @@ async def _send_series(
     link = await session.series_link(target)  # the link opens here, before any packet is built
     open_ns = time.monotonic_ns() - opening
     now_wall = time.time_ns()
+    # the same refusal as start_grid's, before anything is planned from a window the open closed
+    check_open_window(plan, now_wall + START_LEAD_NS)
     tally = Tally(planned=plan.planned(plan.start_wall_ns or now_wall))
     run.series, run.series_command = tally, command  # a signal from here on reports the count
     rate = None if plan.every_ns is None else NS_PER_S / plan.every_ns
@@ -1624,23 +1681,26 @@ async def _send_series(
     check: asyncio.TimerHandle | None = None
     refused: list[IronbirdError] = []  # a refusal found on the loop, the first only
 
-    def build(number: int, slot: int) -> Built[EncodedPacket]:
+    def wake() -> None:
+        if pacer is not None:
+            pacer.wake()
+
+    counts = session.series_counts(
+        target, req.prepared, seat=req.sequence, wake=wake, per_second=rate, planned=tally.planned
+    )
+    faults_recorded = False
+
+    def build(number: int, slot: int) -> Built[EncodedPacket] | None:
+        nonlocal faults_recorded
         assert grid is not None
         # A packet carries its slot's time (or, built late, the time it was built).
         stamp_ns = max(grid.slot_wall_ns(slot), time.time_ns())
-        encoded = session.build_command(
-            target,
-            command,
-            req.args,
-            tamper=req.tamper,
-            header=req.header,
-            allow_count_mismatch=req.allow_count_mismatch,
-            raw_enum=req.raw_enum,
-            enum_hint=RAW_ENUM_HINT,
-            at_time=stamp_ns / NS_PER_S,
-        )
-        if number == 0:  # the faults injected are those of the request: ledgered once
-            session.record_send_faults(target.route.server.name, encoded)
+        encoded = session.build_command(target, req.prepared, counts, at_time=stamp_ns / NS_PER_S)
+        if encoded is None:  # its count is being taken; the pacer builds again when it is there
+            return None
+        if not faults_recorded:  # the faults injected are those of the request: ledgered once
+            faults_recorded = True
+            session.record_send_faults(target.route.server.name, req.prepared)
         return Built(number, slot, encoded.data, encoded)
 
     def check_refusal() -> None:
@@ -1811,6 +1871,8 @@ async def _send_series(
 
     try:
         try:
+            if counts is not None:
+                await _prime_counts(session, counts, plan.start_wall_ns)
             grid = await start_grid(plan, SystemClock())
             tally.planned = grid.planned
             tally.first_mono_ns = tally.last_mono_ns = grid.start_mono
@@ -1825,6 +1887,8 @@ async def _send_series(
             await link.settle()
         finally:
             link.close()
+            if counts is not None:
+                await counts.aclose()
     except asyncio.CancelledError:
         finish("interrupted")
         raise
@@ -1836,6 +1900,158 @@ async def _send_series(
         raise
     finish("complete")
     return 0
+
+
+async def _prime_counts(session: Session, counts: SeriesCounts, start_wall_ns: int | None) -> None:
+    """Get the series' first counts ready before its start, in two phases: at launch the files
+    are opened and the ceiling raised (a failure there is a warning when the start is far
+    enough to try again), and :data:`~ironbird.seqstate.PRIME_TAKE_WITHIN_S` before the start
+    ``--sequence`` is seated and the first counts reserved, where a failure is the coded error,
+    before anything is sent."""
+    lead_s = 0.0 if start_wall_ns is None else (start_wall_ns - time.time_ns()) / NS_PER_S
+    problem = await counts.prime_open(lead_s)
+    if problem is not None:
+        session.report(problem, context="series prime", level=Level.WARNING)
+    if lead_s > PRIME_TAKE_WITHIN_S:
+        assert start_wall_ns is not None
+        await wait_for_wall(
+            SystemClock(), start_wall_ns - round(PRIME_TAKE_WITHIN_S * NS_PER_S), PRIME_FINE_NS
+        )
+    await counts.prime_take()
+
+
+def _sequence_store(session: Session) -> SequenceStore:
+    """The state directory's sequence counts, for ``ib seq``."""
+    ledger = session.ledger
+    if not ledger.enabled:
+        raise IronbirdError(
+            Code.LED_DIR,
+            "no usable state directory to keep sequence counts in; "
+            "set IRONBIRD_STATE_DIR to a writable directory",
+        )
+    return SequenceStore(
+        ledger.directory,
+        report=session.report,
+        record=lambda event, fields: ledger.record("state", event, **fields),
+    )
+
+
+def _sequence_masks(session: Session, config: SystemConfig) -> dict[tuple[str, str], int]:
+    """The sequence field mask of each configured node's command and telemetry profile, by
+    ``(node stem, kind)``; a node whose definitions do not load is left out (shown unmasked)."""
+    masks: dict[tuple[str, str], int] = {}
+    for name in config.nodes:
+        try:
+            codec = session.codec_for(name)
+        except IronbirdError:
+            continue
+        for kind in (MessageKind.COMMAND, MessageKind.TELEMETRY):
+            field = codec.profile(kind).sequence_field
+            if field is not None:
+                masks[(node_stem(name), kind.value)] = field.mask
+    return masks
+
+
+def _seq_mid(session: Session, node: str, text: str) -> int:
+    """A MID given as a number or as the name of a message of ``node``."""
+    try:
+        value = parse_ascii_int(text)
+    except ValueError:
+        msg = session.codec_for(node).model.by_name.get(text)
+        if msg is None:
+            raise IronbirdError(
+                Code.CLI_USAGE,
+                f"MID {text[:40]!r} is neither a number nor a message name of {node}",
+            ) from None
+        return msg.mid
+    if not 0 <= value < (1 << 32):
+        raise IronbirdError(Code.CLI_USAGE, f"MID {text[:40]!r} is out of range")
+    return value
+
+
+def _seq_row(row: tuple[str, str, int, int] | tuple[str, str, int, int, int]) -> str:
+    stem, kind, mid = row[:3]
+    return f"{term(stem)} {kind} 0x{mid:04X}"
+
+
+@seq_app.command("show")
+def seq_show(
+    ctx: typer.Context,
+    node: Annotated[str | None, typer.Argument(help="Only this node (name or alias).")] = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """List the stored sequence counts: per node, kind and MID, the sequence field value the
+    next packet gets (with --verbose also the unreduced count and the stored ceiling). Reads
+    only: no file is created or changed, an invalid one included."""
+
+    async def body(session: Session, config: SystemConfig, run: _Run) -> int:
+        wanted = config.resolve(node).name if node is not None else None
+        rows = await _sequence_store(session).stored()
+        if wanted is not None:
+            rows = [r for r in rows if r[0] == node_stem(wanted)]
+        if not rows:
+            run.console.out(
+                "no stored sequence counts" + (f" for {term(wanted)}" if wanted else "")
+            )
+            return 0
+        masks = _sequence_masks(session, config)
+        run.console.out("NODE KIND MID NEXT" + (" COUNT CEILING" if run.verbose else ""))
+        for row in rows:
+            mask = masks.get((row[0], row[1]))
+            shown = str(row[3] & mask) if mask is not None else f"{row[3]} (no profile)"
+            extra = f" {row[3]} {row[4]}" if run.verbose else ""
+            run.console.out(f"{_seq_row(row)} {shown}{extra}")
+        return 0
+
+    _run(ctx, None, verbose, body, "seq.show")
+
+
+@seq_app.command("reset")
+def seq_reset(
+    ctx: typer.Context,
+    node: Annotated[str | None, typer.Argument(help="Node (name or alias) to reset.")] = None,
+    mid: Annotated[
+        str | None,
+        typer.Argument(help="Only this MID (number or message name); default: all of the node."),
+    ] = None,
+    all_nodes: Annotated[
+        bool, typer.Option("--all", help="Reset the counts of every node and MID.")
+    ] = False,
+    verbose: VerboseOption = False,
+) -> None:
+    """Forget stored sequence counts without sending anything: the next send of each starts at 0.
+
+    Give NODE and MID, NODE alone, or --all; with none of them nothing is reset."""
+    if all_nodes and node is not None:
+        raise typer.BadParameter("--all takes no NODE or MID")
+    if not all_nodes and node is None:
+        raise typer.BadParameter("say what to reset: NODE MID, NODE, or --all")
+
+    async def body(session: Session, config: SystemConfig, run: _Run) -> int:
+        target = config.resolve(node).name if node is not None else None
+        wanted = _seq_mid(session, target, mid) if target is not None and mid is not None else None
+        gone = await _sequence_store(session).forget(target, wanted)
+        session.ledger.record(
+            "action",
+            "seq.reset",
+            node=target,
+            mid=wanted,
+            removed=[
+                {"node": stem, "kind": kind, "mid": m, "next": mark} for stem, kind, m, mark in gone
+            ],
+        )
+        for row in gone:
+            run.console.out(f"reset {_seq_row(row)} (was next {row[3]})")
+        what = (
+            "everything"
+            if target is None
+            else f"{term(target)}" + (f" 0x{wanted:04X}" if wanted is not None else "")
+        )
+        if not gone:
+            run.console.out(f"no stored sequence count for {what}; nothing reset")
+        return 0
+
+    _run(ctx, None, verbose, body, "seq.reset")
 
 
 def session_verbose(ctx: typer.Context, local: bool) -> bool:

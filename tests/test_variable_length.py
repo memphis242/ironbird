@@ -25,6 +25,7 @@ from typer.testing import CliRunner
 import var_corpus
 from conftest import CORPUS, EXAMPLES
 from filter_defs import LINKS, STREAMS, count_decodes, make_frame
+from hosttiming import hang_deadline
 from ironbird import header, render
 from ironbird.ccdd.json_adapter import JsonAdapter, parse_model
 from ironbird.ccdd.loader import load_ccdd
@@ -672,7 +673,9 @@ PAYLOADS = st.one_of(
 )
 
 
-@settings(max_examples=600, deadline=1000, suppress_health_check=[HealthCheck.too_slow])
+@settings(
+    max_examples=600, deadline=hang_deadline(1000), suppress_health_check=[HealthCheck.too_slow]
+)
 @given(name=st.sampled_from(["ALL", "LEN", "TRAIL", "GAP", "CMD", "EVT"]), payload=PAYLOADS)
 def test_arbitrary_payloads_never_raise_and_check_equals_decode(name: str, payload: bytes) -> None:
     c = _CODEC
@@ -692,7 +695,9 @@ def test_arbitrary_payloads_never_raise_and_check_equals_decode(name: str, paylo
         assert 0 <= error.offset <= len(data)
 
 
-@settings(max_examples=300, deadline=1000, suppress_health_check=[HealthCheck.too_slow])
+@settings(
+    max_examples=300, deadline=hang_deadline(1000), suppress_health_check=[HealthCheck.too_slow]
+)
 @given(
     count=st.integers(0, 0xFFFF),
     entries=st.integers(0, 70),
@@ -748,7 +753,9 @@ def _reencode(c: Codec, packet: DecodedPacket) -> bytes:
     return c.encode_telemetry(msg.name, args).data
 
 
-@settings(max_examples=200, deadline=1000, suppress_health_check=[HealthCheck.too_slow])
+@settings(
+    max_examples=200, deadline=hang_deadline(1000), suppress_health_check=[HealthCheck.too_slow]
+)
 @given(
     floats=st.lists(st.floats(width=32, allow_nan=False), min_size=1, max_size=5),
     ints=st.lists(st.integers(-(2**15), 2**15 - 1), max_size=10),

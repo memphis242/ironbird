@@ -26,6 +26,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from conftest import EXAMPLES
+from hosttiming import hang_deadline
 from ironbird import header, render
 from ironbird.ccdd.loader import load_ccdd_bytes
 from ironbird.ccdd.model import FieldDef, MessageKind, TypeClass
@@ -47,12 +48,13 @@ from ironbird.units import compact_duration, parse_count, parse_duration, parse_
 
 FUZZ = settings(
     max_examples=200,
-    deadline=2000,  # a parser that takes two seconds on a few KB is a hang for our purposes
+    # a parser that takes two seconds on a few KB is a hang for our purposes
+    deadline=hang_deadline(2000),
     suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
 )
 SLOW = settings(
     max_examples=60,
-    deadline=5000,
+    deadline=hang_deadline(5000),
     suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
 )
 CMD_PROFILE = header.load_profile(EXAMPLES / "headers" / "ccsds_v1_cfs_cmd.toml")

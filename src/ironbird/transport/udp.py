@@ -692,6 +692,13 @@ class UdpTransport:
         await asyncio.sleep(CONFIRM_WAIT_S)
         self._raise_pending()
 
+    async def prepare_send(self) -> None:
+        """Open the connected send socket that a listener's first send would open."""
+        if self._tx is None and self._remote is not None and not self._closed:
+            async with self._tx_lock:
+                if self._tx is None:
+                    await self._open_tx()
+
     def raise_earlier(self) -> None:
         """Raise, coded, a refusal still pending for a datagram sent earlier (a series of
         sends, whose refusals arrive after the sends returned and must be reported, not
@@ -713,10 +720,7 @@ class UdpTransport:
         in flight). None for a transport with no connected send socket."""
         if self._closed or self._remote is None:
             return None
-        if self._tx is None:
-            async with self._tx_lock:
-                if self._tx is None:
-                    await self._open_tx()
+        await self.prepare_send()
         assert self._tx is not None
         try:
             dup = self._tx.dup()
@@ -755,10 +759,7 @@ class UdpTransport:
     ) -> None:
         """Send one datagram; with ``confirm`` also wait for a refusal. Fire-and-forget else.
         (``label`` is for transports that report on a packet after its send: UDP does not.)"""
-        if self._tx is None and self._remote is not None and not self._closed:
-            async with self._tx_lock:
-                if self._tx is None:
-                    await self._open_tx()
+        await self.prepare_send()
         self.send_nowait(data)
         if handed_off is not None:
             handed_off()

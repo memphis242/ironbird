@@ -32,7 +32,11 @@ thread that holds the lock through a long C call still delays the pacer, and the
 series reports includes any such wait.
 
 A packet is built no earlier than :data:`AHEAD_NS` before its slot, so the ledger's transmit
-gate and the time a packet carries are current. The pacer never blocks on the queue: a slot
+gate and the time a packet carries are current. Building takes the packet's sequence count
+(:class:`~ironbird.seqstate.SeriesCounts`), on the loop and without waiting; when a count has to
+be waited for the builder returns nothing, the slot is built for again once the count is there,
+and a slot whose packet is still missing at its deadline is skipped like any other. The thread
+never takes a count. The pacer never blocks on the queue: a slot
 whose packet is not there at its deadline is skipped (``starved``) and reported, consecutive
 starved slots as one report.
 
@@ -170,8 +174,10 @@ class LeftThenFailed(Exception):
 #: A send made in the pacer thread: True once the packet left, False when ``stop`` was set
 #: before it did; it raises when the send failed (:class:`LeftThenFailed` once it had left).
 ThreadSend = Callable[[bytes, threading.Event], bool]
-#: Builds packet ``number`` for ``slot`` on the loop (``IronbirdError`` ends the series).
-Build = Callable[[int, int], Built[T]]
+#: Builds packet ``number`` for ``slot`` on the loop (``IronbirdError`` ends the series). ``None``:
+#: the packet cannot be built yet (its sequence count is being taken); nothing is built or
+#: counted, and the builder calls :meth:`SeriesPacer.wake` when it can be asked again.
+Build = Callable[[int, int], Built[T] | None]
 #: Handles a report on the loop; for a FAILED one returns the error the series ends with.
 Handle = Callable[[Report[T]], BaseException | None]
 #: Called in the abandoned pacer thread with the FAILED report it can no longer deliver. It must
@@ -287,6 +293,10 @@ class SeriesPacer(Generic[T]):
         """The packet the thread is sending, if any (read in the thread that sends it, this is
         the packet of the send that is running)."""
         return self._inflight
+
+    def wake(self) -> None:
+        """On the loop: build again (the builder that returned ``None`` can now build)."""
+        self._wake.set()
 
     def abort(self, error: BaseException) -> None:
         """On the loop: end the series with ``error`` (a refusal the link reported for one of
@@ -472,7 +482,10 @@ class SeriesPacer(Generic[T]):
                 due = grid.start_mono - AHEAD_NS if not self._built else now
             if due > now:
                 return (due - now) / NS
-            self._queue.append(build(self._built, slot))
+            built = build(self._built, slot)
+            if built is None:
+                return None  # the builder wakes the loop once it can build
+            self._queue.append(built)
             self._ready.set()
             self._built += 1
             self._next_slot = slot + 1

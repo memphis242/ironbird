@@ -21,6 +21,7 @@ from typing import IO, Any
 import pytest
 
 from ironbird.errors import Code
+from ironbird.filter.lexer import parse_time
 from ironbird.recording.format import RecordType
 from ironbird.recording.reader import RecordingReader
 from ironbird.recording.writer import RecorderOptions, part_path
@@ -489,16 +490,42 @@ def test_sigterm_ends_a_paced_replay_at_once_with_143_and_a_ledger_record(
     assert 2 <= len(proc.stdout.splitlines()) < 20
 
 
-def test_speed_one_takes_about_the_recorded_time(tmp_path: Path, env: dict[str, str]) -> None:
-    write_recording(tmp_path / "r.ibrec", hk_frames(11, step_ns=100_000_000))
-    started = time.monotonic()
+def paced_span_ns(tmp_path: Path) -> int:
+    """How long the last replay took from its ``replay.start`` to its ``replay.stop`` record:
+    the pacing, with the interpreter's start-up and exit (the slowest and noisiest part of a
+    run under coverage or on a loaded host) left out."""
+    events = ledger_events(tmp_path)
+    start = [e for e in events if e["event"] == "replay.start"][-1]
+    stop = [e for e in events if e["event"] == "replay.stop"][-1]
+    return parse_time(stop["ts"]) - parse_time(start["ts"])
+
+
+# The pacing's arithmetic (speed 1 waits the recorded time, speed 2 half of it) is proved with a
+# fake clock in tests/test_replay.py, and how close to the recorded time a paced replay keeps on
+# a quiet host in tests/bench/test_replay_pacing.py. What a run here can prove whatever the load
+# is one-sided: a paced replay never ends before its schedule, and a speed over 1 divides the
+# recorded time by far more than any stall could hide.
+SECOND = 1_000_000_000
+
+
+def test_speed_one_never_plays_faster_than_the_recorded_time(
+    tmp_path: Path, env: dict[str, str]
+) -> None:
+    write_recording(tmp_path / "r.ibrec", hk_frames(11, step_ns=100_000_000))  # 1 s
     done = run_ib(tmp_path, ["replay", str(tmp_path / "r.ibrec"), "--speed", "1"], env)
-    took = time.monotonic() - started
-    assert done.returncode == 0 and len(done.stdout.splitlines()) == 11
-    assert 1.0 <= took < 10.0  # the recording spans 1 s; the rest is process start-up
-    fast = time.monotonic()
-    run_ib(tmp_path, ["replay", str(tmp_path / "r.ibrec"), "--speed", "100"], env)
-    assert time.monotonic() - fast < took
+    assert done.returncode == 0 and len(done.stdout.splitlines()) == 11, done.stderr
+    assert paced_span_ns(tmp_path) >= SECOND
+
+
+def test_a_speed_over_one_divides_the_recorded_time_by_it(
+    tmp_path: Path, env: dict[str, str]
+) -> None:
+    write_recording(tmp_path / "r.ibrec", hk_frames(11, step_ns=10 * SECOND))  # 100 s
+    done = run_ib(tmp_path, ["replay", str(tmp_path / "r.ibrec"), "--speed", "100"], env)
+    assert done.returncode == 0 and len(done.stdout.splitlines()) == 11, done.stderr
+    span = paced_span_ns(tmp_path)
+    assert span >= SECOND  # paced, at 100 times: not as fast as possible
+    assert span < 50 * SECOND  # not at 1 (100 s), nor at any speed under 2
 
 
 def test_a_closed_pipe_ends_the_replay_quietly(tmp_path: Path, env: dict[str, str]) -> None:

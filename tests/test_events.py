@@ -18,6 +18,7 @@ from hypothesis import strategies as st
 from typer.testing import CliRunner
 
 from conftest import EXAMPLES, free_udp_ports
+from hosttiming import hang_deadline
 from ironbird.ccdd.json_adapter import parse_model
 from ironbird.ccdd.loader import load_ccdd
 from ironbird.ccdd.model import Category, EventSeverity, MessageKind
@@ -251,7 +252,9 @@ def test_event_text_is_inert_when_displayed() -> None:
 EVENT_PAYLOAD_SIZE = 44  # MOCK_EVENT: char[8] + u16 + u16 + char[32]
 
 
-@settings(max_examples=300, deadline=1000, suppress_health_check=[HealthCheck.too_slow])
+@settings(
+    max_examples=300, deadline=hang_deadline(1000), suppress_health_check=[HealthCheck.too_slow]
+)
 @given(st.binary(min_size=EVENT_PAYLOAD_SIZE, max_size=EVENT_PAYLOAD_SIZE))
 def test_any_event_payload_extracts_without_raising_and_renders_inert(payload: bytes) -> None:
     codec = _codec("mock.json")

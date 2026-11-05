@@ -4389,6 +4389,12 @@ row, used by the single process and by every worker), `[export]` in `config.py`,
 | `IB-REC-014` | `REC_OPEN` | the recording file cannot be opened or read (missing, permission, not a regular file); `IB-REC-004` is only "opens, but is not a recording" | error-messages |
 | `IB-TX-009` | `TX_UP` | info: a serial link is back after `IB-TX-008` | error-messages |
 | `IB-EXP-004` | `EXP_OMITTED` | **warning**: frames left out of an export because the format has no place for them (a single-file CSV) | error-messages |
+| `IB-SEQ-001` | `SEQ_RESET` | **warning**: `sequence-state.json` is invalid (not a plain file of ours, over 384 KiB, schema, a key no stream has, bounds): a send or reset moves it aside to `sequence-state.json.invalid` and rebuilds it from the live table; `ib seq show` leaves it untouched | send/sequence |
+| `IB-SEQ-002` | `SEQ_UNSAVED` | **warning**: the state directory cannot hold the counts from the start (read-only, full, no file locks, a planted file, no boot id, the ledger off): counted in memory, above every stored count still readable there (from 0 only when none is); once per process | send/sequence |
+| `IB-SEQ-003` | `SEQ_STATE` | `ib seq show\|reset` cannot read or replace the stored counts (exit 1) | send/sequence |
+| `IB-SEQ-004` | `SEQ_LIVE` | **warning**: `sequence-live` was rebuilt (another boot or host, wrong size or version, a damaged slot, removed while in use): every stream carries on from its durable ceiling | send/sequence |
+| `IB-SEQ-005` | `SEQ_FULL` | 4096 streams already have stored counts: a new stream's packet is not sent (`sequence.full`) | send/sequence |
+| `IB-SEQ-006` | `SEQ_TAKE` | no count could be taken (a lock not had within 10 s, a worker that does not answer in that time, a write error, a stored count at its limit): nothing sent; never a fallback that could repeat a count | send/sequence |
 | `IB-FLT-001` | `FLT_SYNTAX` | filter syntax error (column, excerpt) | 2f |
 | `IB-FLT-002` | `FLT_NAME` | unknown name in a filter, or a reserved name misused | 2f |
 | `IB-FLT-003` | `FLT_TYPE` | literal does not fit the name's type, or the filter can never match | 2f |
@@ -4453,14 +4459,211 @@ listed as deferred.
 - **Integers outside an enum in a command** are refused (`IB-ENC-002`, with the names) unless the CCDD field sets
   `"allow_raw": true` (valid only next to an `enum`; `IB-CCD-002` otherwise). Telemetry encoding (`ib respond`, tests) is not
   restricted, since a vehicle can report any value, and out-of-enum values are decoded and shown as numbers. Fault injection of an unlisted value therefore needs the flag in the CCDD.
-- **Deferred, needs the user's decision: the CCSDS sequence count restarts at 0 in every `ib send`.**
-  Stock cFE ignores command sequence counts, but flight software that rejects duplicate or
-  non-advancing counts would drop every scripted command after the first, and a "sent seq 0" ledger
-  line on each command traces poorly. Options: (A) persist a per-(node, MID) command counter under
-  `$XDG_STATE_HOME/ironbird/` with a file lock, so counts advance across invocations (state to
-  manage, a lock to hold on every send, and a reset policy when the target reboots); (B) add
-  `ib send --sequence N` and state the per-process reset in `ib send --help` (stateless, the script
-  owns the count, nothing on disk). Not implemented until chosen.
+- **Resolved (user decision, `send/sequence`): the CCSDS sequence count is shared by every process.**
+  Both options were taken: a persistent counter and `--sequence`. `src/ironbird/seqstate.py`. The first
+  design (64-count blocks per process, given back at exit) failed review: counts reset silently past 128
+  streams, a lock timeout fell back to repeating counts, concurrent senders interleaved by block (gaps of
+  63, backward steps, a 14-bit field wrapping 64 times early), and a give-back after a reset rewound a
+  mark another process was using. It was replaced by a shared live counter and a durable ceiling.
+    - *Key.* `<node>/<command|telemetry>/<MID in hex>`; `node` is the flight node the packets are for (the
+      target of `ib send`, the node `ib respond` acts as). MID, not the profile's APID: a header layout is
+      user-definable and no profile field is "the APID" (`mid_fields` lists whichever fields make up the
+      MID), cFE's software bus counts per message ID, and a per-MID series is unbroken for a receiver that
+      checks per MID. Two MIDs that share an APID count independently. The counter is not tied to the
+      sender: every `--as` ground node sending to one flight node shares the stream, as the flight node
+      sees one. Counts are stored unreduced and masked into the profile's sequence field at framing, so a
+      profile change needs no migration. Keys use `[A-Za-z0-9_~/-]`, at most 64 characters (a configured
+      node name is at most 32), one spelling per stream (`0x01890` is not `0x1890`).
+    - *Live table* (`sequence-live`): 128-byte header (magic, version, slot count and size, boot id from
+      `/proc/sys/kernel/random/boot_id`, host name, CRC-32) and 8192 slots of 88 bytes (key, next,
+      ceiling, CRC-32), open addressing; about 704 KiB, page cache only, never synced. A take is `flock`
+      (non-blocking) on the table, `fstatat` (still the file this process opened, else reopen), and a
+      `pread`/`pwrite` of one slot: exact counts in take order across processes, and a reset or seat by
+      any process is seen by every process's next take. A process crash loses nothing (the page cache
+      outlives it).
+    - *Durable ceiling* (`sequence-state.json`, unchanged v1 format, "next" now meaning the ceiling):
+      every count handed out is below it, and it is at most one step above the stream's next count. The
+      step is 64 (`BLOCK`) for a single send and a responder; a series sizes it to its demand
+      (`step_for`): 4 s of its rate (`STEP_WINDOW_S`), at least 64 and at most 4096 (`MAX_STEP`), a burst the
+      most. Raised under `sequence-state.lock` and replaced through `TempOutput` (synced) *before* a slot
+      holds the new ceiling; the live lock is never held across that sync (lock order: durable, then
+      live). A table from another boot is rebuilt and each stream resumes from its ceiling: a power loss
+      skips at most one step (a gap of up to 64 counts, 4096 for a series of 1000 packets a second or more
+      or a long burst) and never reuses a count.
+      A seat (`--sequence N`) sets the ceiling to `N + 1 + step`, lowering it too, so the bound holds
+      after a backward seat. No give-back exists, so there is no reuse window at exit.
+    - *Off the loop and bounded.* The take on the loop never syncs and never blocks it. A free live lock
+      is taken there (non-blocking `flock`); a contended one is polled by a helper thread (50 us steps for
+      5 ms, 200 us to 100 ms, then 1 ms), because a sleep on the loop lasts a millisecond at least
+      (epoll's resolution) and a process taking in a tight loop re-took the lock before it ended: a paced
+      take beside one waited 8-14 ms at p99, now about 1.1 ms (gated, below). A cancelled wait is
+      abandoned under a mutex shared with the helper, which never touches the lock afterwards (a `flock`
+      on a descriptor that already holds the lock succeeds, so a late helper would have released the next
+      take's lock). Raising a ceiling, inserting a stream, rebuilding and opening run in an `OffLoop`
+      worker with lock waits bounded by 10 s, and the loop stops waiting for the worker 0.25 s past that
+      bound (a sync that never returns fails the take with `IB-SEQ-006`; the abandoned worker ends on its
+      own and its ledger records and warnings are delivered when it does, also when the awaiting task was
+      cancelled). A lock held by this process's own abandoned worker is reported as that, not as another
+      process. `ib respond` and a series (`keep_ahead`) raise a ceiling in the background with half a step
+      left (a series: `ahead_at`, or `MIN_LEAD_S`, 1 s, of its rate if that is more, at most three quarters
+      of the step), so a take waits for a sync only when takes outrun it (a reply: one sync per 32 counts at
+      most; a series: per 2000 counts at the most at 1 ms, one every 2 s), and a raise in progress is not queued again
+      by the takes it covers (no second, empty raise). `ib respond` raises
+      every reply message's ceiling in one sync at start (`NodeSequences.preraise`), so the first reply
+      of each message waits for none. A count that cannot be taken within the bound, or a state file that
+      cannot be written once the store is open, is `IB-SEQ-006`: nothing is sent. Memory counting
+      (`IB-SEQ-002`) is only for a directory unusable from the start, and then starts every stream above
+      the ceilings still readable there: the durable file (a refused one that parses too), the live table
+      (any boot, damaged slots skipped), and what an interrupted rebuild had read; from 0 only when
+      nothing is readable. Two processes in memory mode still repeat each other, as the warning says.
+    - *Wire order.* A count is taken after the packet is checked (`Codec.prepare_*`) and the transport is
+      open (`Engine.prepare_send`), then framed (`Codec.frame`) and committed. Over UDP the lease's lock
+      spans framing and the hand-off to the kernel (released in `handed_off`), so datagrams are handed to
+      the kernel in count order across processes; what a multi-queue NIC does to datagrams of different
+      sockets after that is not ours. Over serial it is released at commit, since a write can wait on the
+      UART; the in-process lease is held to the hand-off, so the order is exact per process (a serial
+      device belongs to one process). A refused frame (a tamper value out of range) spends no count.
+      Nothing that can wait on a name resolution runs under the lock: `Engine.send(reopen=False)` does
+      not reopen a transport a capture closed under the send, it fails the send as "send again" (`IB-TX-002`;
+      nothing left the process and the count is a gap).
+    - *Measured* (ext4 on a virtio disk, 4 cores, Python 3.11): a take, commit and release costs 11 us
+      median back to back (10 us with asserts off, `python -O`), 27 us with framing a telemetry
+      reply; paced at 1 kHz, as a responder runs, 51 us median and 160 us p99, where the five system
+      calls alone cost 19 us after each idle millisecond on this VM. Back-to-back bursts that outrun the
+      background raise wait for its sync about once per 32 counts (p99 1.6 ms idle). One `ib send`'s
+      store (open, one take, close) is 0.4-0.6 ms, against 3.0 ms for the block design's reservation
+      and give-back. Gated by `tests/test_sequence_state.py`: one sync per 64 counts, none per take, and
+      a hung sync never stops the loop; and by `tests/test_benchmarks.py` (serial CI step): a take costs
+      under 100 us at the median, and a take paced at 1 kHz beside a process taking in a tight loop
+      (50 us held, 30 us between) stays under 4 ms at p99 (measured 1.1 ms; 8-10 ms with the poll on the
+      loop).
+    - *Measured, series (round 3 of PR 40; 4 cores, ext4 on virtio, back to back with main in the same
+      minutes, the host shared with other work).* With a ceiling step of 64 and a take per packet a
+      series paid for the store: a UDP burst of 20000 packets ran at 2.5-3.8 k packets a second against
+      8.6 k on main (480-500 raises), a serial 1 ms series skipped 12% of its slots against 2%, and a 1 ms
+      UDP series beside a burst on its stream 7-11% against 1-3%. With a step sized to the rate and
+      counts reserved a batch at a time: the burst 8.8 k a second against main's 8.4 k (10 raises), the
+      serial 1 ms series skips 1.4% of its slots (main 1.7%), the contended UDP one 0.8% (main 1.0%), and alone 0.8% (main 1.0%). The raise itself
+      was examined for a stall of the loop: its worker spends about 0.1 ms in Python and the rest in
+      `fsync`, `fdatasync` and `rename` (3 to 4 ms each when the host is busy), the `pwrite` of the loop
+      is not delayed by a concurrent `fsync` (0.3 ms at most), and a real raise every 20 ms delays a 1 ms
+      timer of the main thread no more as a thread than as a separate process (so no more with the
+      interpreter lock than without it), at the default 5 ms switch interval and at 0.2 ms alike.
+      The loss measured came from the number of raises and of takes, so both are cut: a raise every
+      2048 counts at the most, a take every 20 packets at 1 ms. Gated by `tests/bench/test_send_timing.py`
+      (serial CI step, `needs_a_quiet_host`): a burst of 20000 at 4 k a second or more with at most 12
+      raises, a serial 1 ms series skipping at most 6% of 3000 slots, and a 1 ms series beside a
+      same-stream burst skipping at most 8% of 4000; each fails on a step of 64 and a take per packet
+      (3.6 k a second and 472 raises; 6.8%; 8.2%).
+    - *Limits.* 4096 streams in the durable file; another is refused (`IB-SEQ-005`, `sequence.full`),
+      never evicted. The live table has twice the slots; reset streams are dropped from it when it fills.
+    - *Untrusted state.* `sequence-state.json`: `O_NOFOLLOW|O_NONBLOCK`, `fstat` (regular, ours, one link),
+      at most 384 KiB, strict schema and JSON (no `NaN`), at most 4096 keys, each spelled exactly as
+      `key_of` writes it (a key matching only the alphabet, such as `x` or `a/b/command/0x1890`, is no
+      stream and refuses the file, so nothing unlisted counts toward the 4096), values in [0, 2^62). That
+      bound is the one for every stored count, read or written: a ceiling is never raised past 2^62 - 1
+      (a stream there refuses the take with `IB-SEQ-006` and `sequence.exhausted`), so the store cannot
+      write what its parser refuses. An invalid file is `IB-SEQ-001`: a send or reset moves it aside to
+      `sequence-state.json.invalid` (one slot, the newest kept, named in `sequence.reset`) and rebuilds it
+      from the live table, and from the file's own values when only its `fstat` checks failed (a hard
+      link, another user's file) and it still parses: those are a floor, so a forger can make counts skip
+      but never repeat; `ib seq show` reads only and never writes. A missing file, or one with a stream
+      below its slot in the table (restored from a backup), is brought up to the table's ceilings at the
+      next open or raise (one table scan, 9.5 ms, only on that evidence). `sequence-live`: regular, ours,
+      one link, exact size, header CRC, magic, version and boot; a slot with a bad CRC, a key that is no
+      stream, nonzero padding, a ceiling at or above the bound or `next > ceiling` rebuilds the table
+      (`IB-SEQ-004`, `sequence.rebuilt`), after its valid slots were read as a floor for the new file.
+      A planted symbolic link or directory makes the directory unusable (`IB-SEQ-002`), never followed.
+      A same-user forger can still write plausible slots; the state directory is the user's own.
+      Corpus: `tests/corpus/malformed/seqstate-*.json`, `seqlive-*.bin`.
+    - *Several hosts.* A table written on another host (an NFS-shared state directory) is rebuilt at every
+      such switch: counts stay unique through the durable ceiling, with gaps of up to 64 and a warning each
+      time. One state directory per host is the supported setup.
+    - *`ib send --sequence N`.* Sets the sequence field of that one packet (decimal or `0x`; refused with
+      `IB-ENC-002`, exit 2, nothing sent and no count taken, when it does not fit the field or the
+      profile has no sequence field) and re-seats the stream for every process: the next send is N+1, so a
+      script that replays an exact series works and a test of wrap-around is two commands. A concurrent
+      sender's next count may precede the seated packet on the wire. `send.request` has `sequence_set`;
+      `tx.command` has the count sent.
+    - *`ib seq show [NODE]`, `ib seq reset NODE [MID]|--all`.* `show` prints, per stream, the value the next
+      packet carries (masked by the node's profile; `-v` adds the unreduced count and the ceiling) and
+      creates or changes no file. `reset` drops the chosen streams from the durable file and the live
+      table at once (a running `ib respond` sees it on its next reply), sends nothing, and ledgers
+      `seq.reset` with what it removed and the next count each had. Bare `ib seq reset` is a usage error
+      (exit 2); an unknown node is `IB-CFG-004`; a MID is a number below 2^32 or a message name of the node;
+      nothing stored is not an error. A failure to read or replace the files is `IB-SEQ-003`.
+    - *Ledger.* `sequence.extend` (per raised ceiling: stream, from, to, next; why: need, ahead or seat),
+      `sequence.forget`, `sequence.reset` (invalid durable file), `sequence.rebuilt`,
+      `sequence.live_created`, `sequence.compacted`, `sequence.reopened`, `sequence.full`,
+      `sequence.exhausted`, `sequence.ahead_failed`, `sequence.memory_only`; all essential.
+    - *Respond.* The responder's telemetry replies count the same way, keyed by the node it acts as; the
+      trial encodes made while validating the rules count in the codec's memory, so they take no count.
+    - *A series of sends (`--repeat/--every/--at`, merged with PR #41).* Each packet's count comes from
+      the store when the pacer's `build()` frames the packet ahead (on the loop, never in the pacer
+      thread; the series' arguments are encoded and checked once by `Codec.prepare_command`, which also
+      refuses a `--length-delta` the header cannot hold, so a refused series takes no count and fails
+      before its `--at` wait). Counts are reserved a few at a time (`SeriesCounts`, `batch_for`: 20 ms of
+      the series' rate, 1 to 32, a burst 32, never more than the packets still planned):
+      `SequenceStore.reserve_now` is the existing non-blocking take (a `LOCK_NB` flock, one `fstatat`, one
+      slot `pread`/`pwrite`) for `n` counts, committed and released at once, so the flock and slot traffic
+      and the contention with a process taking in a tight loop are divided by `n`. When the take would wait
+      (files not open yet, a ceiling to raise, a slot to insert, the lock held by another process, a send
+      of this process holding its turn) `build()` returns nothing, a task takes the counts with the
+      ordinary bounded `lease`, and its completion wakes the pacer (`SeriesPacer.wake`), which builds that
+      slot again; the loop makes no blocking syscall for it and a slot still without a packet at its
+      deadline is skipped as starved. (The worker threads that raise a ceiling do share the interpreter
+      and the CPU with the loop; see "Measured" for what that costs.)
+      A series asks for background ceiling raises (`keep_ahead`) by a step sized to its rate
+      (`step_for`: 4 s of it, 64 to 4096, a burst 4096, and no more than the packets it plans, so a
+      `--repeat 2` raises by 64), so a series syncs every few seconds and not every 32 packets, which
+      cost a burst two thirds of its rate. It starts the raise (`ahead_at`) when half the step is left, or
+      1 s of its rate if that is more (never over three quarters of the step), so a series has about 2 s
+      of lead (at least 1 s up to a rate of 3 k a second) before a raise must be done: a raise is two
+      fsyncs, which on a loaded CI disk took over 250 ms, the lead of a step of half a second of the rate
+      (a 1 ms series skipped 153 of 3000 slots; with the sync delayed by 150, 300 and 600 ms, 319, 1415
+      and 1956 starved). A series of 4096 packets a second or more has under a second of lead per step
+      (a power loss may skip at most 4096 counts, which a longer step would raise). A series gets ready in two phases (`SeriesCounts.prime_open`,
+      `prime_take`): right after the link opens it opens the store and raises the ceiling (for a start
+      more than 2 s away; a failure or a lock held past the time left is a ledgered warning, since it is
+      only an optimization, and the second phase retries), and `PRIME_TAKE_WITHIN_S` (2 s) before the start
+      it seats `--sequence` and reserves the first counts (a count taken hours ahead would be passed by
+      every send meanwhile); a failure then is the take's coded error, before anything is sent. So the
+      durable sync of a seat is never in the last 20 ms before the first slot. `--sequence N` is the first packet's
+      count; an unusable value is refused before the series starts. Counts are unique and persistent;
+      cross-process wire order is guaranteed only within one process (as for serial): two processes' series
+      interleave, each in its own count order, and a single send's count can reach the kernel before a
+      series' lower one: by up to the batch plus the 20 ms build-ahead (about 40 ms at 1 ms, 30 ms at
+      10 ms), and by up to 2 s for the counts taken ahead of the start. A reserved or built-but-unsent count (discarded, unsent, unconfirmed,
+      left over at the end or at an interrupt) is spent (a gap), and a built packet is ledgered as such
+      with its sequence. An interrupted series leaves about 40 counts of gap at a 1 ms period (reserved
+      plus built ahead; at most `MAX_BATCH` + 8 for a burst), so every Ctrl-C advances the stream by about
+      that, besides the power-loss bound. A reset (`ib seq reset`) is seen at the series' next
+      reservation, not at once: the packets already built and the counts already reserved (about 40 at
+      1 ms, 20 ms to 40 ms of the series) go out with the old counts. Seeing it at once would take a table
+      read per packet on the loop, which the reservation exists to avoid; a single send sees a reset at
+      once. Closing the session cancels a ceiling raise in the background at once on a signal (and waits
+      0.25 s at most otherwise): the worker ends on its own and at most a step is skipped, so Ctrl-C exits
+      in 0.1 s even when a raise is waiting for a lock another process holds (it waited the 10 s bound
+      before). Tests: `tests/test_sequence_state.py` (`SeriesCounts`, batches, steps, prime, close,
+      spent counts) and `tests/test_send_modes.py` (continuing, `--sequence` with `--every`, two
+      concurrent series, a reset during a series).
+    - *Known limits (documented, not fixed).*
+        - *Network file systems.* `$XDG_STATE_HOME` defaults under `$HOME`, which is often NFS on lab
+          servers. Each take's `flock`, `fstatat`, `pread` and `pwrite` are then RPCs on the event loop (a
+          hard mount that hangs freezes the capture), and `flock` emulation over NFS is untested. Set
+          `IRONBIRD_STATE_DIR` to a local disk. A `fstatfs` check at open that warns (or takes counts off the
+          loop) is a possible follow-up.
+        - *Serial.* The in-process lease is held until the bytes reach the device, so a slow UART
+          serializes a responder's replies, and a backlog of more than 10 s of line time turns replies
+          into `IB-SEQ-006` where the main branch queued them.
+        - *`--sequence N` races a live sender.* The seat is written by the worker before the loop takes
+          the lock, so another process can send N+1 before this process sends N. The next count after
+          the seat is right in every process; only the wire order of that one packet is unspecified.
+        - A durable file restored from a backup while the table is gone (reboot, or after the table was
+          wiped) cannot be recovered: its counts can repeat those sent since the backup, up to the
+          backup's age. Nothing on disk records more.
+    - Not done: the recorded `sequence` of old ledgers is not rewritten; a reset policy when the target
+      reboots is the user's `ib seq reset`, not automatic.
 - **Deferred, needs the user's decision: no `ib send --allow-raw`.** Off-nominal enum values need
   `allow_raw` in the CCDD; a per-invocation CLI override would bypass the CCDD as source of truth.
 - **Deferred: an integer echoed into a float field is refused.** Conservative; allowing it needs a
@@ -4598,11 +4801,10 @@ its options:
   floats as numbers and non-finite as `null`, losing which one it was; (d) per-message type
   metadata line at the top of the output; (e) 64-bit integers as strings behind a flag.
 - **`seq` means two things.** In `listen`/`replay` lines `seq=` is the CCSDS sequence count (and
-  every `ib send` process starts it at 0); in CSV and `rec info` it is the recording's frame number.
+  every `ib send` process continued it from the state directory since `send/sequence`); in CSV and `rec info` it is the recording's frame number.
   Options: (a) rename the frame number to `frame` everywhere it is printed; (b) rename the CCSDS one
-  to `ccsds_seq`; (c) both; (d) a persistent per-MID sequence counter in the state directory so
-  successive `ib send` runs count on (a separate behaviour change for the receiving side's
-  sequence-gap checks).
+  to `ccsds_seq`; (c) both. (The persistent per-MID counter, former option (d), is done: see the
+  encode and load boundary review.)
 - **Ambiguous line output.** `s=` (empty) and `s==1+1` in `listen`/text export, and a string value
   containing ` x=y`, cannot be told from a field. Options: (a) quote strings that are empty or hold
   a space, `=` or a quote; (b) always quote strings; (c) leave and point to `--format json`.
@@ -4749,20 +4951,18 @@ its options:
      its deadline; a slot with no packet built is skipped as `starved`. Lateness is measured in the
      thread when the send returns. A header that carries the send time makes each packet valid for its
      own slot only (discarded with it, its count unused and ledgered); any other packet moves to the
-     next slot, so the counts on the wire stay consecutive.
+     next slot, so one process's counts on the wire stay consecutive.
    - A failed send stops the series (exit 1). UDP refusals of a series are never cleared by the next
      send: the next send fails with them, the loop checks within 50 ms of every send, and once after
      the last.
    - Ledger: the arguments once in `send.plan`; the first 600 packets each in a `tx.command`, then one
      `tx.command.window` per 10 s (as `respond.replies`), every failure in full; exact totals and the
      first and last count in `send.outcome`.
-   - Every packet takes its own count from the codec. Seam for the persistent counter (`send/sequence`,
-     PR #40): a seated first count (`--sequence N`) applies to packet 0 only (each later packet takes
-     the next count), is recorded in `send.plan.request`, and a reservation of counts must be prefetched
-     off the loop and outside the pacer thread (the builder runs up to 20 ms ahead of each slot, so a
-     reservation there does not delay a packet; one that blocks longer starves slots, which is
-     reported). Counts of packets built and never sent (the end of a series, a skipped timed slot) are
-     ledgered as `unsent`/`skipped`.
+   - Every packet takes its own count from the persistent counter (`send/sequence`, PR #40), when the
+     builder encodes it (see "A series of sends" under the sequence counts): a seated first count
+     (`--sequence N`) applies to packet 0 only (each later packet takes the next count) and is recorded in
+     `send.plan.request` as `sequence_set`. Counts of packets built and never sent (the end of a series, a
+     skipped timed slot) are ledgered as `unsent`/`skipped` with their sequence.
 
    Remaining in Stage 5: replay to the wire (`ib replay --send`, D5), the TUI commanding page and its
    scheduling UI, send modes for `ib respond`. **Deferred (PR #41 review, N7):** a distinct exit status
@@ -4770,7 +4970,7 @@ its options:
    `send.outcome` says how many slots were skipped; the threshold wants a user decision on its form),
    and an up-front check that a serial link's baud rate carries one packet per period (framing and
    escaping make the wire size data-dependent; the lateness and skips report it today). The persistent
-   sequence counter is a separate piece of work (`send/sequence`). **Deferred (PR #41 round 3, outside
+   sequence counter is `send/sequence` (PR #40), merged with this stage. **Deferred (PR #41 round 3, outside
    this PR, both predate it):** a SIGINT that arrives before the interpreter installs its signal
    handlers ends the process with the default action (exit -2, nothing sent); and a stdout whose read end is closed gives no `IB-OUT` output-lost notice for a single
    send or a series, which exit 0.

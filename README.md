@@ -91,7 +91,8 @@ pointer names the part too: `[ledger n=1234 file=<stamp>-<session>.p0003]`.
 |---------|--------------|---------|
 | `ib nodes` | List nodes, aliases and links, and check every definition file | below |
 | `ib find TEXT` | Search commands and telemetry by name, MID or description | below |
-| `ib send NODE CMD [name=value ...] [--at T] [--repeat N] [--every D (--for D\|--until T)]` | Encode and send a command: once, at a time, N times or periodically | below |
+| `ib send NODE CMD [name=value ...] [--sequence N] [--at T] [--repeat N] [--every D (--for D\|--until T)]` | Encode and send a command: once, at a time, N times or periodically | below |
+| `ib seq show [NODE]`, `ib seq reset NODE [MID]\|--all` | Show or reset the shared sequence counts | below |
 | `ib listen NODE [--where EXPR] [--record PATH]` | Decode and print incoming packets | Filtering |
 | `ib events [--min-type T] [--where EXPR]` | Print only cFS events from every telemetry link | below |
 | `ib respond --as NODE` | Act as a flight node: answer commands with configured telemetry | below |
@@ -182,7 +183,7 @@ ib send fc MOCK_NOOP --at +30s --every 1ms --for 10s  # a timed burst
   least half a period apart. A skipped slot does not count toward `--repeat` (N packets are sent) but is
   lost from a `--for`/`--until` window. A packet whose header carries its slot's time is discarded with
   its slot (its count goes unused, which its ledger record says); any other is sent in the next slot,
-  so the counts on the wire stay consecutive. The summary says how many slots were skipped.
+  so this process's counts on the wire stay consecutive. The summary says how many slots were skipped.
 - **Lateness** is the time from a slot's deadline to the return of the send call that handed its
   packet to the kernel, measured in the pacer thread; the summary gives the maximum and mean (and, for
   `--at`, how late the first packet left), the ledger the same.
@@ -226,6 +227,75 @@ ib send fc MOCK_NOOP --at +30s --every 1ms --for 10s  # a timed burst
   the longest send, elapsed time, the first and last sequence count sent, exact totals by result, and
   how the pacer ran: `timer_slack_ns`, or `timer_slack_error` when the slack could not be lowered),
   however the series ends.
+
+**Sequence counts** (`ib send`, `ib respond`): the CCSDS sequence count of the packets ironbird
+builds is shared by every ironbird process and kept between runs, per target node and message ID, in
+the state directory (`IRONBIRD_STATE_DIR`, else `$XDG_STATE_HOME/ironbird`). Two `ib send` runs send
+`seq 0` and `seq 1`, two concurrent `ib send` loops on one MID together send 0, 1, 2, ... with no gaps,
+and the counts wrap at the width of the header profile's sequence field.
+
+- How: a small table, `sequence-live`, holds the next count of each stream; every count is taken under a
+  file lock in microseconds, so counts are exact and in take order across processes. Over UDP a single send
+  (and a responder's reply) holds the lock until the packet is handed to the kernel, so those packets are
+  handed to the kernel in count order (what a network does to them after that, on a multi-queue NIC for one,
+  is not ours); a series reserves its counts ahead of its packets (below), so its packets are in count order
+  only within their own process. Over serial the lock is released once the count is taken (a serial device is
+  one process's), so the order is exact per process. `sequence-state.json` holds a synced ceiling one *step*
+  ahead of the next count: 64 counts for a single send or a responder, and for a series about four seconds
+  of its rate (up to 4096, which a burst uses, and no more than the packets it plans, never under 64), raised in
+  the background once half of it is left (or a second of its rate, if more), so that a series syncs every few
+  seconds, not every few dozen packets, and has about two seconds in hand when a raise starts (a slow disk
+  does not starve it). A crashed process loses nothing, and a power loss skips at most one step of a stream (a
+  gap of up to 64 counts, or 4096 for a series of 1000 packets a second or more or a long burst), never repeating a count.
+- `ib send NODE CMD --sequence N` sends that one packet with count `N` (decimal or `0x`; it must fit
+  the sequence field, and the profile must have one, else `IB-ENC-002`, exit 2, nothing sent) and
+  continues from it: the next send, from any process, is `N+1`. In a series (`--repeat`, `--every`,
+  `--at`) it is the first packet's count and the rest go on from it.
+- A series reserves the counts of its packets a few at a time (about 20 ms of its rate, 20 at a 1 ms
+  period, at most 32, which a burst uses) when it builds them (up to 20 ms before their slots), on the
+  event loop and without waiting when it can: the same file lock and slot as a single send, held for
+  microseconds and released at once. When a take would wait (a ceiling to raise, another process holding
+  the lock) a task takes it and the slot is built when it is there; a slot whose packet is still missing
+  at its deadline is skipped like any other. The pacer thread never takes a count. A series gets
+  ready in two phases so that its first packet is not held up by a sync: at launch it opens the state and
+  raises the ceiling, and 2 s before a start that is further away (at once for a nearer one) it seats
+  `--sequence` and takes its first counts. A busy or failing state at launch is not fatal for a start more
+  than 2 s away, since that phase is an optimization: it is ledgered as a warning (and shown) and the
+  second phase tries again; a failure then is the coded error (`IB-SEQ-005`, `IB-SEQ-006`), exit 1, before
+  anything is sent. The counts are never taken hours ahead, which every send meanwhile would pass. So a series continues the count of the sends
+  before it and the next send continues the series. Two processes sending on one stream, series or not,
+  get unique counts, but only within one process do the packets reach the kernel in count order (as with
+  two processes on one serial line): their packets interleave on the wire, each process's in its own count
+  order, and a single send's count can reach the kernel before a series' lower one: by up to the batch plus the
+  20 ms build-ahead (about 40 ms at a 1 ms period, 30 ms at 10 ms), and by up to 2 s for the counts the
+  series took ahead of its start. A count
+  reserved or built and not sent (skipped, unsent, unconfirmed, a timed packet whose slot was skipped, or
+  left over when the series ends or is interrupted) is spent, so the stream shows a gap there; the ledger
+  record of a built packet says so. An interrupted series at 1 ms leaves a gap of up to about 40 counts
+  (what it had reserved and built ahead), on top of the power-loss bound above; each Ctrl-C costs that.
+  `ib seq reset` is seen by a series at its next reservation, so up to those same 40 or so of its packets
+  (the first ones, up to 2 s old, for a series that has not started) can still go out with the old counts
+  before it restarts at 0; a single send sees a reset at once.
+- `ib seq show [NODE]` lists the value the next packet of each stream carries (`-v` adds the unreduced count
+  and the stored ceiling); it only reads, so an invalid file is left as it is for you to inspect.
+  `ib seq reset NODE MID` forgets one stream, `ib seq reset NODE` all streams of a node, `ib seq reset --all`
+  everything, so the next send starts at 0 again (for example after the flight computer reboots), in a running
+  `ib respond` too. `MID` is a number or a message name. Nothing is sent, the reset is ledgered, and bare
+  `ib seq reset` is a usage error (exit 2) so nothing is wiped by accident.
+- The files are treated like any input from outside. An invalid `sequence-state.json` is `warning
+  IB-SEQ-001`: the next send moves it aside to `sequence-state.json.invalid` and rebuilds it from the live
+  table. A damaged or foreign `sequence-live`, or one from before a reboot, is `warning IB-SEQ-004` and is
+  rebuilt from the stored ceilings. Keep one state directory per host: a table written by another host is
+  rebuilt each time (counts stay unique, with gaps of up to a step: 64, or 4096 for a fast series). A `sequence-state.json` that is gone, or older
+  than the table beside it, is brought up to the table; one that is refused only because it is a hard link or
+  another user's file still counts as a floor, so a stray copy can make counts skip but never repeat.
+- A state directory that cannot hold the counts at all (read-only, full, no file locks) is one `warning
+  IB-SEQ-002` per process. The process then counts in memory, above every stored count it can still read in the
+  directory (it starts at 0 only when nothing is readable), and its own counts are not kept, so two processes
+  in that state repeat each other. Once counting from the files, a count that cannot be taken (a lock held for
+  over 10 s by a stopped process or a hung disk, a worker that does not answer in that time, a write error)
+  fails the send with `IB-SEQ-006` and nothing is sent: a count is never repeated to keep going.
+  Up to 4096 streams keep counts; another one is refused with `IB-SEQ-005` (reset the ones no longer used).
 
 ## The ledger under load, a full disk, and retention
 
@@ -741,7 +811,7 @@ Argument text is checked, never repaired, and every refusal is `IB-ENC-002` nami
   `"allow_raw": true` next to its `enum`; `ib send --raw-enum` sends one deliberately, once (fault injection).
 - `seq N` in the `send` line, the ledger's `sequence` and `SentCommand.sequence` are the value in the
   packet's sequence field (wrapped at the field width); a profile with no sequence field reports none.
-  The sequence count starts at 0 in every process (see the plan's deferral on a persistent count).
+  The count is the stream's next one in the state directory (see "Sequence counts"), a series' packets included.
 
 ## Filtering with --where
 

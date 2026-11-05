@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ironbird.filter.lexer import parse_time
 from ironbird.ledger import Ledger
 
 
@@ -34,3 +35,16 @@ def session_records(directory: Path, *, bookkeeping: bool = False) -> list[dict[
                 if isinstance(row, dict) and "event" in row:
                     rows.append(row)
     return rows if bookkeeping else [r for r in rows if not r["event"].startswith("ledger.")]
+
+
+def records_in_order(directory: Path) -> list[dict[str, Any]]:
+    """Every record of the ``*.jsonl`` ledger files in ``directory``, the files in the order their
+    first records were written, each file's records in place. A file's name is its session's
+    start to the second, then its random session id, so sessions begun within one second sort
+    by chance in name order: two invocations in a row often do."""
+    files: list[tuple[int, str, list[dict[str, Any]]]] = []
+    for path in directory.glob("*.jsonl"):
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        if rows:
+            files.append((parse_time(rows[0]["ts"]), path.name, rows))
+    return [row for _, _, rows in sorted(files, key=lambda f: (f[0], f[1])) for row in rows]

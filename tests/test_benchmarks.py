@@ -39,6 +39,7 @@ from ironbird.frame import Decoded, Direction, Frame, FrameFlag, Stream
 from ironbird.header import load_profile
 from ironbird.ledger import Ledger
 from ironbird.notice import Level
+from ironbird.seqstate import SequenceStore
 from ironbird.session import Session
 from ironbird.transport import LinkEnd
 from test_engine import _Probe
@@ -1213,3 +1214,117 @@ def test_the_enforcement_check_catches_a_lost_serial_run(old: str, new: str) -> 
     text = WORKFLOW.read_text()
     assert old in text, f"mutation anchor not found: {old!r}"
     assert _unenforced_jobs(text.replace(old, new))
+
+
+# -- sequence counts (ironbird.seqstate) ---------------------------------------------------
+
+SEQ_TAKE_MEDIAN_S = 100e-6  # a take, commit and release (measured ~11 us); not per packet sent
+SEQ_CONTENDED_P99_S = 4e-3  # a paced take beside a process taking in a tight loop (~1 ms; a
+# poll that sleeps on the loop gave 8-14 ms: a sleep there lasts a millisecond at least)
+
+SEQ_BURST_SENDER = """
+import asyncio, sys, time
+from pathlib import Path
+from ironbird.seqstate import SequenceStore
+
+def spin(seconds):
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        pass
+
+async def main(directory, run_s):
+    store = SequenceStore(Path(directory), report=lambda e: None, block=1 << 30)
+    key, taken = "fc/command/0x1891", 0
+    end = time.monotonic() + run_s
+    while time.monotonic() < end:
+        lease = await store.lease(key)
+        lease.commit()
+        spin(50e-6)  # the hand-off to the kernel, with the lock held
+        lease.release()
+        spin(30e-6)  # building the next packet
+        taken += 1
+    print(taken, flush=True)
+
+asyncio.run(main(sys.argv[1], float(sys.argv[2])))
+"""
+
+
+def _percentile(sorted_values: list[float], fraction: float) -> float:
+    return sorted_values[min(len(sorted_values) - 1, int(len(sorted_values) * fraction))]
+
+
+@needs_a_quiet_host
+def test_sequence_take_median_cost(tmp_path: Path) -> None:
+    async def run() -> float:
+        store = SequenceStore(tmp_path, report=lambda e: None)
+        store.keep_ahead()
+        key = "fc/command/0x1890"
+        for _ in range(200):  # open the files, insert the stream
+            lease = await store.lease(key)
+            lease.commit()
+            lease.release()
+        times: list[float] = []
+        for i in range(5000):
+            started = time.perf_counter()
+            lease = await store.lease(key)
+            lease.commit()
+            lease.release()
+            times.append(time.perf_counter() - started)
+            if i % 16 == 0:
+                await asyncio.sleep(0)  # the background raise
+        await store.aclose()
+        times.sort()
+        return times[len(times) // 2]
+
+    median = asyncio.run(run())
+    print(f"sequence take median {median * 1e6:.1f} us")
+    assert median < SEQ_TAKE_MEDIAN_S, f"median {median * 1e6:.1f} us"
+
+
+@needs_a_quiet_host
+def test_a_paced_sequence_take_beside_a_burst_sender_stays_prompt(tmp_path: Path) -> None:
+    """S5 (PR 40, round 2): a responder replying at 1 kHz next to a process that takes counts in
+    a tight loop waited 10-35 ms for the live lock, because the poll that waited for it slept on
+    the event loop (a millisecond at least) and the other process re-took the lock first."""
+    sender = subprocess.Popen(
+        [sys.executable, "-c", SEQ_BURST_SENDER, str(tmp_path), "5"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+    async def paced() -> list[float]:
+        store = SequenceStore(tmp_path, report=lambda e: None, block=1 << 30)
+        key = "fc/telemetry/0x0891"
+        for _ in range(50):
+            lease = await store.lease(key)
+            lease.commit()
+            lease.release()
+        p99s: list[float] = []
+        for _ in range(3):  # three windows; the host's own hiccups hit one of them at most
+            times: list[float] = []
+            next_at = time.monotonic()
+            for _ in range(1000):
+                next_at += 0.001
+                await asyncio.sleep(max(0.0, next_at - time.monotonic()))
+                started = time.perf_counter()
+                lease = await store.lease(key)
+                lease.commit()
+                lease.release()
+                times.append(time.perf_counter() - started)
+            times.sort()
+            p99s.append(_percentile(times, 0.99))
+        await store.aclose()
+        return p99s
+
+    try:
+        time.sleep(0.3)  # the sender is taking
+        p99s = asyncio.run(paced())
+        out, _ = sender.communicate(timeout=30)
+    finally:
+        if sender.poll() is None:
+            sender.kill()
+            sender.communicate()
+    takes = int(out.strip())
+    print(f"paced p99 per window {[round(p * 1e6) for p in p99s]} us; sender took {takes}")
+    assert takes > 5_000, "the other process did not contend"
+    assert min(p99s) < SEQ_CONTENDED_P99_S, f"p99 {[round(p * 1e6) for p in p99s]} us"

@@ -29,7 +29,18 @@ from ironbird.recording.export import ExportFormat, ExportResult
 from ironbird.recording.player import Ending
 from ironbird.recording.poolmsg import Block, EmbeddedDefinitions, Fault, Job, Outcome, Seed, Shape
 from ironbird.recording.reader import Damage
-from poolframe_corpus import CORPUS, JOB, LAYOUTS, PREFIX, ROWS, SHAPE, cases, outcome, samples
+from poolframe_corpus import (
+    CORPUS,
+    JOB,
+    LAYOUTS,
+    PREFIX,
+    REJECTIONS_OVER_CAP,
+    ROWS,
+    SHAPE,
+    cases,
+    outcome,
+    samples,
+)
 
 SAMPLES = samples()
 
@@ -300,6 +311,23 @@ def test_every_corpus_reply_is_refused(name: str) -> None:
     with pytest.raises(pf.FrameError) as caught:
         pf.read_reply(JOB, data, LAYOUTS)
     assert caught.value.code is Code.EXP_WORKER
+
+
+@pytest.mark.parametrize("over", [len(pf._CODES) + 1, REJECTIONS_OVER_CAP])
+def test_a_rejection_count_over_the_code_table_is_refused_at_its_count(over: int) -> None:
+    """The cap of the rejections is the live error-code table, which every new code grows: one
+    past it is refused, as the checked-in case's count (past every table) is, at the count
+    itself rather than at whatever its bytes would be misread as."""
+    good = pf.encode(outcome())
+    one = struct.pack("<I", 1) + struct.pack("<I", len(b"IB-DEC-001")) + b"IB-DEC-001"
+    assert good.count(one) == 1
+    data = good.replace(one, struct.pack("<I", over) + one[4:])
+    with pytest.raises(pf.FrameError) as caught:
+        pf.read_reply(JOB, data, LAYOUTS)
+    assert caught.value.offset == good.index(one)
+    assert caught.value.reason == f"rejections: {over} is more than {len(pf._CODES)}"
+    if over == REJECTIONS_OVER_CAP:
+        assert data == (CORPUS / f"{PREFIX}rejections-over-cap.bin").read_bytes()
 
 
 # -- properties ------------------------------------------------------------------------------

@@ -1153,14 +1153,27 @@ class Engine:
         if failure is not None:
             raise failure
 
-    async def _ensure_transport(self, io: _LinkIO) -> Transport:
-        """The open transport of ``io``, opening one when there is none. Called with
-        ``io.lock`` held. A session that is closing refuses with ``IB-TX-002``."""
+    async def prepare_send(self, link: Link, end: LinkEnd) -> None:
+        """Open what :meth:`send` on ``end`` of ``link`` would open (the transport, a connected
+        send socket), so a send that follows hands its bytes to the kernel without waiting on
+        name resolution or a bind. Raises the coded error such a send would."""
+        io = self._io(link, end)
+        async with io.lock:
+            transport = await self._ensure_transport(io)
+        await transport.prepare_send()
+
+    async def _ensure_transport(self, io: _LinkIO, *, may_open: bool = True) -> Transport:
+        """The open transport of ``io``, opening one when there is none (name resolution and a
+        bind can take seconds). Called with ``io.lock`` held. A session that is closing refuses
+        with ``IB-TX-002``; with ``may_open`` off a transport that is not open raises
+        :class:`~ironbird.transport.TransportClosed` and nothing is opened."""
         if self._closed:
             raise IronbirdError(
                 Code.TX_SEND, "not sent: the session is closing (not a link failure)"
             )
         if io.transport is None:
+            if not may_open:
+                raise TransportClosed
             transport = self._new_transport(io)
             try:
                 await self._open_transport(io, transport, None)
@@ -1191,6 +1204,7 @@ class Engine:
         *,
         confirm: bool = False,
         handed_off: Callable[[], None] | None = None,
+        reopen: bool = True,
         label: str = "",
     ) -> None:
         """Send ``data`` out of ``end`` of ``link``. The TX frame enters ingest the moment the
@@ -1199,7 +1213,11 @@ class Engine:
 
         The transport is shared with the end's captures, so closing the last one can close it
         under a send that has not yet left the process. That send is made again on the transport
-        that replaces it; a send is never reported as a link failure for that.
+        that replaces it; a send is never reported as a link failure for that. With ``reopen``
+        off nothing is opened here (the caller holds a lock that other processes wait for, and a
+        name resolution must not run under it): a transport that is no longer open, or closed
+        under the send, raises :class:`~ironbird.transport.TransportClosed` with nothing sent,
+        and the caller sends again once it has let go of its lock.
         """
         io = self._io(link, end)
         went_out = False
@@ -1214,11 +1232,11 @@ class Engine:
         closed: TransportClosed | None = None
         for _ in range(2):
             async with io.lock:
-                transport = await self._ensure_transport(io)
+                transport = await self._ensure_transport(io, may_open=reopen)
             try:
                 await transport.send(data, confirm=confirm, handed_off=out, label=label)
             except TransportClosed as exc:
-                if went_out:
+                if went_out or not reopen:
                     raise
                 closed = exc
                 continue

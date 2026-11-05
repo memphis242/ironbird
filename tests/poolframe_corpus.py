@@ -71,6 +71,8 @@ JOB = Job(
 #: The tables the definitions of :data:`JOB` make: what a reply's tables are checked against.
 LAYOUTS = pf.Layouts([("HK_TLM", ("seq", "CmdCounter"))])
 REASON = "FRAME record fails its CRC"
+#: The rejection count of ``poolframe-rejections-over-cap``: more than any error-code table.
+REJECTIONS_OVER_CAP = 0xFFFF
 ROWS = "1,2\n3,4\n"
 
 
@@ -201,10 +203,14 @@ def cases() -> dict[str, bytes]:
         "definitions-over-cap",
         _frame(pf.Kind.OUTCOME, zeros + struct.pack("<I", pf.MAX_NOTES + 1)),
     )
+    # The cap of the rejections is the size of the error-code table, which grows with every new
+    # code, so the case's count is one no table reaches: the checked-in bytes stay over the cap of
+    # every build. The exact boundary (one past the table) is tested against the live table.
     rejections = struct.pack("<I", 1) + _length_prefixed("IB-DEC-001")
+    assert len(pf._CODES) < REJECTIONS_OVER_CAP
     case(
         "rejections-over-cap",
-        _replace_once(good, rejections, struct.pack("<I", len(pf._CODES) + 1) + rejections[4:]),
+        _replace_once(good, rejections, struct.pack("<I", REJECTIONS_OVER_CAP) + rejections[4:]),
     )
     case("fault-length-over-cap", _frame(pf.Kind.FAULT, struct.pack("<I", pf.MAX_DIAG_BYTES + 1)))
     # text

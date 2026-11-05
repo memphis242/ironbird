@@ -96,6 +96,11 @@ class Transport(Protocol):
         """Open the link end. ``None`` makes it send-only. Raises a coded ``IB-TX-001``."""
         ...
 
+    async def prepare_send(self) -> None:
+        """Open what the first :meth:`send` would (a connected send socket), so that send
+        hands its bytes over without waiting. Raises a coded ``IB-TX-001``."""
+        ...
+
     async def send(
         self,
         data: bytes,

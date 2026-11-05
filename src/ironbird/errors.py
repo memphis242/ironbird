@@ -81,6 +81,13 @@ class Code(StrEnum):
     RET_SCAN = "IB-RET-004"  # retention scan partial, or a reserve that could not be recovered
     RET_TARGET = "IB-RET-005"  # --until-under cannot be reached: the rest is protected
     RET_UNSAFE = "IB-RET-006"  # directory writable by others without the sticky bit
+    # Sequence counts
+    SEQ_RESET = "IB-SEQ-001"  # the durable sequence file is invalid: moved aside and rebuilt
+    SEQ_UNSAVED = "IB-SEQ-002"  # the sequence counts cannot be kept on disk: counted in memory
+    SEQ_STATE = "IB-SEQ-003"  # ib seq cannot read or change the stored sequence counts
+    SEQ_LIVE = "IB-SEQ-004"  # the live sequence table was rebuilt (other boot, damaged, replaced)
+    SEQ_FULL = "IB-SEQ-005"  # no room for another stream's sequence count: nothing sent
+    SEQ_TAKE = "IB-SEQ-006"  # no sequence count could be taken (lock wait, I/O): nothing sent
     # Output
     OUT_DROPPED = "IB-OUT-001"  # output lines dropped because stdout/stderr is not draining
     OUT_LOST = "IB-OUT-002"  # final tally: output lines dropped, abandoned or never deliverable
@@ -131,7 +138,16 @@ class Code(StrEnum):
 #: outside this set can be reported as a warning and a member can be reported as an error. A
 #: warning code is never raised, so it never decides an exit code.
 WARNING_CODES: Final[frozenset[Code]] = frozenset(
-    {Code.TX_RCVBUF, Code.REC_DIRSYNC, Code.REC_LEFTOVER, Code.REC_UNCOPIED, Code.EXP_OMITTED}
+    {
+        Code.TX_RCVBUF,
+        Code.REC_DIRSYNC,
+        Code.REC_LEFTOVER,
+        Code.REC_UNCOPIED,
+        Code.EXP_OMITTED,
+        Code.SEQ_RESET,
+        Code.SEQ_UNSAVED,
+        Code.SEQ_LIVE,
+    }
 )
 
 

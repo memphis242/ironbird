@@ -19,6 +19,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from conftest import EXAMPLES
+from hosttiming import hang_deadline
 from ironbird.ccdd.loader import load_ccdd
 from ironbird.ccdd.model import MessageKind
 from ironbird.codec import Codec
@@ -514,7 +515,9 @@ def test_frame_rejects_meaningless_serial_flag_combinations(flags: FrameFlag) ->
         make_frame(stream=SERIAL_STREAM, flags=flags, mid=mid, orig_len=orig)
 
 
-FUZZ = settings(max_examples=300, deadline=1000, suppress_health_check=[HealthCheck.too_slow])
+FUZZ = settings(
+    max_examples=300, deadline=hang_deadline(1000), suppress_health_check=[HealthCheck.too_slow]
+)
 
 
 @FUZZ
