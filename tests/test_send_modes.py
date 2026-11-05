@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
-import math
 import os
 import signal
 import socket
@@ -34,6 +33,7 @@ from ironbird import pacer as pm
 from ironbird import sendmodes as sm
 from ironbird.config import Endpoint
 from ironbird.errors import Code, IronbirdError
+from ironbird.filter.lexer import parse_time
 from ironbird.ledger import TxSeries
 from ironbird.transport.udp import SEND_WAIT_S, UdpThreadSender, UdpTransport
 from recutil import CLI_MAIN, EXAMPLES, Proc, run_ib
@@ -1260,6 +1260,24 @@ def ib_send(
     return Proc(tmp_path, f"send{time.monotonic_ns()}", argv, env), argv
 
 
+# An --at start is one ib can keep only if it is ready before it. A start that ib's own startup
+# passes (slow under coverage tracing or a loaded host) is refused with IB-CLI-001 and nothing
+# sent, or, passed after that check, met late; neither says anything about how ib keeps a
+# start. Such an attempt is repeated with a lead measured from it, never with a looser check.
+AT_ATTEMPTS = 5
+WAITING_HEADROOM_NS = 500 * MS  # an attempt counts when ib was waiting this long before its start
+
+
+def longer_lead(lead_ns: int, took_ns: int) -> int:
+    """The lead for the next attempt, after one with ``lead_ns`` whose ib took ``took_ns`` to
+    get ready (or to refuse the start): at least twice either."""
+    return max(2 * lead_ns, 2 * took_ns + SEC)
+
+
+def refused_as_usage(done: subprocess.CompletedProcess[str]) -> bool:
+    return done.returncode == 2 and Code.CLI_USAGE.value in done.stderr
+
+
 def consecutive(sequences: list[int]) -> bool:
     return all((b - a) % 16384 == 1 for a, b in itertools.pairwise(sequences))
 
@@ -1314,23 +1332,45 @@ def test_every_for_keeps_the_period_and_reports_lateness(
 def test_at_sends_at_the_start_never_before_it(
     tmp_path: Path, setup: tuple[Path, int, dict[str, str]], extra: list[str]
 ) -> None:
+    """The first packet leaves at or after an absolute --at, and promptly after it. An attempt
+    whose start ib's own startup passed proves only the first half, so it is repeated."""
     config, port, env = setup
-    start = (math.ceil(time.time()) + 3) * SEC  # a whole second, absolute
-    with sink_for(port) as sink:
-        done = run_ib(
-            tmp_path,
-            ["-c", str(config), "send", "fc", "MOCK_NOOP", "--at", sm.iso_utc(start), *extra],
-            env,
-        )
+    lead = 3 * SEC
+    for _ in range(AT_ATTEMPTS):
+        launched = time.time_ns()
+        start = -(-(launched + lead) // SEC) * SEC  # a whole second, absolute
+        with sink_for(port) as sink:
+            done = run_ib(
+                tmp_path,
+                ["-c", str(config), "send", "fc", "MOCK_NOOP", "--at", sm.iso_utc(start), *extra],
+                env,
+            )
+            ended = time.time_ns()
+            time.sleep(0.2)
+            walls = list(sink.walls)
+        assert all(wall >= start for wall in walls)  # not a moment early, on any attempt
+        if refused_as_usage(done):  # the start passed before ib checked it
+            assert not walls
+            lead = longer_lead(lead, ended - launched)
+            continue
         assert done.returncode == 0, done.stderr
-        time.sleep(0.2)
-        assert sink.count == (3 if extra else 1)
-        assert sink.walls[0] >= start  # not a moment early
-    events = ledger_events(tmp_path)
-    plan = next(e for e in events if e["event"] == "send.plan")
-    outcome = next(e for e in events if e["event"] == "send.outcome")
-    assert plan["start_utc"].endswith("Z")
-    assert 0 <= outcome["start_late_ns"] < 500 * MS
+        assert len(walls) == (3 if extra else 1)
+        events = ledger_events(tmp_path)
+        plan = next(
+            e for e in events if e["event"] == "send.plan" and e["start_utc"] == sm.iso_utc(start)
+        )
+        outcome = next(
+            e for e in events if e["event"] == "send.outcome" and e["session"] == plan["session"]
+        )
+        assert plan["start_utc"].endswith("Z")
+        waiting = parse_time(plan["ts"])  # ledgered with the link open, as the wait begins
+        assert launched <= waiting
+        if start - waiting < WAITING_HEADROOM_NS:  # ib was still starting up at its start
+            lead = longer_lead(lead, waiting - launched)
+            continue
+        assert 0 <= outcome["start_late_ns"] < 500 * MS
+        return
+    pytest.fail(f"ib was not ready before its --at in {AT_ATTEMPTS} attempts")
 
 
 def test_usage_errors_exit_2_and_send_nothing(
@@ -1454,13 +1494,26 @@ def test_a_dead_receiver_is_found_on_the_first_packet_of_a_fast_series(
 
 
 @pytest.mark.parametrize(
-    "flags", [["--repeat", "2"], ["--at", "+0.5s"], ["--every", "1s", "--for", "3s"]]
+    "flags", [["--repeat", "2"], ["--at", "+{lead_ms}ms"], ["--every", "1s", "--for", "3s"]]
 )
 def test_a_dead_receiver_is_found_for_any_series(
     tmp_path: Path, setup: tuple[Path, int, dict[str, str]], flags: list[str]
 ) -> None:
     config, _, env = setup  # nothing listens
-    done = run_ib(tmp_path, ["-c", str(config), "send", "fc", "MOCK_NOOP", *flags], env)
+
+    def send(lead_ns: int) -> subprocess.CompletedProcess[str]:
+        typed = [flag.format(lead_ms=lead_ns // MS) for flag in flags]
+        return run_ib(tmp_path, ["-c", str(config), "send", "fc", "MOCK_NOOP", *typed], env)
+
+    lead = 500 * MS  # an --at offset counts from ib's start; its startup can use it up
+    launched = time.monotonic_ns()
+    done = send(lead)
+    for _ in range(AT_ATTEMPTS - 1):
+        if "--at" not in flags or not refused_as_usage(done):
+            break
+        lead = longer_lead(lead, time.monotonic_ns() - launched)
+        launched = time.monotonic_ns()
+        done = send(lead)
     assert done.returncode == 1 and Code.TX_SEND.value in done.stderr
     outcome = next(e for e in ledger_events(tmp_path) if e["event"] == "send.outcome")
     assert outcome["outcome"] == "failed" and outcome["error"] == Code.TX_SEND.value
