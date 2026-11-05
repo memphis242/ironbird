@@ -4,12 +4,14 @@ temporary output when a signal comes, a worker dies, or the parent is killed."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -231,6 +233,40 @@ def alive(pid: int) -> bool:
     return text.rsplit(")", 1)[1].split()[0] != "Z"
 
 
+def stopped(pid: int) -> bool:
+    """Every thread of ``pid`` is stopped by a job-control signal (a signal sent now waits)."""
+    states = []
+    assert Path(f"/proc/{pid}/task").is_dir(), f"process {pid} is gone (no /proc/{pid}/task)"
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        try:
+            states.append((task / "stat").read_text().rsplit(")", 1)[1].split()[0])
+        except OSError:
+            continue  # a thread that ended
+    return bool(states) and all(state == "T" for state in states)
+
+
+def signal_set(pid: int, *fields: str) -> set[int]:
+    """The signals in the ``fields`` masks of ``/proc/PID/status`` (none once it is gone)."""
+    try:
+        lines = Path(f"/proc/{pid}/status").read_text().splitlines()
+    except OSError:
+        return set()
+    mask = 0
+    for line in lines:
+        name, _, value = line.partition(":")
+        if name in fields:
+            mask |= int(value, 16)
+    return {n for n in range(1, mask.bit_length() + 1) if mask >> (n - 1) & 1}
+
+
+def pending(pid: int) -> set[int]:
+    return signal_set(pid, "SigPnd", "ShdPnd")
+
+
+def ignored(pid: int) -> set[int]:
+    return signal_set(pid, "SigIgn")
+
+
 def wait_until(predicate: Any, timeout: float = 20.0, what: str = "") -> None:
     deadline = time.monotonic() + timeout
     while not predicate():
@@ -241,6 +277,22 @@ def wait_until(predicate: Any, timeout: float = 20.0, what: str = "") -> None:
 def semaphores() -> set[str]:
     shm = Path("/dev/shm")
     return {p.name for p in shm.glob("sem.mp-*")} if shm.is_dir() else set()
+
+
+JOBS = 3
+_LIVE: list[Stalled] = []
+
+
+@pytest.fixture(autouse=True)
+def _reap_stalled() -> Iterator[None]:
+    """Whatever a test leaves of its stalled exports (it failed before ``finish``) is let go and
+    killed, so no parent or worker outlives the test."""
+    _LIVE.clear()
+    yield
+    runs = list(_LIVE)
+    _LIVE.clear()
+    for run in runs:
+        run.reap()
 
 
 class Stalled:
@@ -273,7 +325,7 @@ class Stalled:
                 "-o",
                 str(self.out),
                 "--jobs",
-                "3",
+                str(JOBS),
             ],
             env={**env, "IB_TEST_MARK": str(self.mark), "IB_TEST_GO": str(self.go)},
             stdout=subprocess.DEVNULL,
@@ -282,11 +334,35 @@ class Stalled:
             start_new_session=new_session,
             cwd=tmp_path,
         )
+        self.new_session = new_session
+        self.workers: list[int] = []
+        self.tmp_path = tmp_path
+        _LIVE.append(self)
         wait_until(lambda: self.mark.exists() or self.proc.poll() is not None, what="the stall")
         assert self.proc.poll() is None, "the export ended before the stall"
-        wait_until(lambda: len(workers_of(self.proc.pid)) >= 2, what="the workers")
+        wait_until(lambda: len(workers_of(self.proc.pid)) >= JOBS, what="the workers")
         self.workers = workers_of(self.proc.pid)
-        self.tmp_path = tmp_path
+
+    def reap(self) -> None:
+        """Let the parent go, then kill the run's process group (a run in its own session) or the
+        parent and its workers (a run in the test's own group, which is not to be signalled)."""
+        with contextlib.suppress(OSError):
+            self.go.write_text("go")
+        running = self.proc.poll() is None
+        victims = workers_of(self.proc.pid) if running else []
+        if self.new_session:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.proc.pid, signal.SIGKILL)
+        elif running:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(self.proc.pid, signal.SIGKILL)
+            for pid in victims:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            self.proc.wait(timeout=10)
+        if self.proc.stderr is not None:
+            self.proc.stderr.close()
 
     def temporaries(self) -> list[str]:
         return sorted(p.name for p in self.tmp_path.iterdir() if p.name.endswith(".tmp"))
@@ -333,11 +409,30 @@ def test_ctrl_c_at_a_terminal_reaches_every_process_and_only_the_parent_acts(
     tmp_path: Path, env: dict[str, str], config: Path, big: Path
 ) -> None:
     """SIGINT goes to the whole foreground process group: the workers ignore it, the parent ends
-    the export (130), terminates them and leaves nothing."""
+    the export (130), terminates them and leaves nothing.
+
+    The parent is held stopped while the group is interrupted, so nothing but a worker itself
+    can end a worker in that window: the interrupt waits, pending, in the parent, and each worker
+    is seen to ignore it (one still starting has it blocked, and drops it as it sets it ignored).
+    Only then is the parent let go to act on it."""
     run = Stalled(tmp_path, env, config, big, "text", new_session=True)
-    os.killpg(os.getpgid(run.proc.pid), signal.SIGINT)
-    time.sleep(0.3)
-    assert all(alive(p) for p in run.workers) or run.proc.poll() is not None
+    group = os.getpgid(run.proc.pid)
+    assert all(os.getpgid(p) == group for p in run.workers), "the workers share the group"
+    os.kill(run.proc.pid, signal.SIGSTOP)
+    try:
+        wait_until(lambda: stopped(run.proc.pid), what="the parent to stop")
+        os.killpg(group, signal.SIGINT)
+        assert signal.SIGINT in pending(run.proc.pid), "the interrupt waits in the parent"
+        for pid in run.workers:
+            wait_until(
+                lambda pid=pid: not alive(pid) or signal.SIGINT in ignored(pid),
+                what=f"worker {pid} to ignore SIGINT",
+            )
+        assert all(alive(p) for p in run.workers), "a worker acted on the interrupt"
+        assert not any(signal.SIGINT in pending(p) for p in run.workers), "nothing left to act"
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(run.proc.pid, signal.SIGCONT)
     err = run.finish()
     assert run.proc.returncode == 130, err
     assert "Traceback" not in err

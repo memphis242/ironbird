@@ -1,11 +1,20 @@
-"""Host-timing guard for ``ib send --every``: the pacer thread keeps a 1 ms period on a quiet
-host, a 10 ms period costs little CPU, a 50 ms period stays within half a period, and a helper
-thread busy in Python costs the pacer few slots.
+"""Host-timing guard for ``ib send --every``: the pacer thread keeps a 1 ms period within a small
+margin of what the host itself allows, a 10 ms period costs little CPU, a 50 ms period stays within
+half a period, and a helper thread busy in Python costs the pacer few slots.
 
 These measure the host as much as the tool, so they skip under xdist and run, enforced, in the
 serial CI step ``pytest tests/bench -n0``. Each prints its numbers. The figures come from the
 series' own ``send.outcome`` record (lateness is measured in the pacer thread when each send
 returns) and from the child's CPU time, net of a single send's (interpreter start-up).
+
+The 1 ms guard is measured against the host, not against a fixed figure: a serial run on a shared
+VM is no quiet host, and there a bare thread sleeping to the same deadlines (``wake_reference``,
+measured before and after the series) already wakes 20-100 us late on average. What the guard
+gates is the pacer's own share on top of that floor (its wait, the send, the interpreter lock),
+and its skips beyond the host's own; on a quiet host (a floor under 25 us) that keeps the mean
+lateness under 100 us. That share is 30-50 us on a busy 4-vCPU development VM, and a send through
+the loop instead of from the thread adds about 400 us. A host whose bare thread cannot hold the
+period itself cannot measure the pacer at all, and the guard skips there, with its numbers.
 """
 
 from __future__ import annotations
@@ -21,13 +30,19 @@ import time
 from pathlib import Path
 from typing import Any
 
-from hosttiming import needs_a_quiet_host
+import pytest
+
+from hosttiming import needs_a_quiet_host, wake_reference
 from ironbird import pacer, sendmodes
 from recutil import CLI_MAIN
 from replayutil import child_env, write_config_58k
 
-SKIPPED_SHARE_MAX = 0.02  # of the slots at 1 ms
-LATE_MEAN_MAX_NS = 100_000  # mean lateness at 1 ms
+MS = 1_000_000
+SKIPPED_SHARE_MAX = 0.02  # of the slots at 1 ms, beyond the share the host's bare thread loses
+LATE_OVER_HOST_MAX_NS = 75_000  # mean lateness at 1 ms, beyond the host's bare thread's mean
+REFERENCE_SLOTS = 1000  # of the host's bare thread at 1 ms, before and after the series
+HOST_LATE_MEAN_MAX_NS = 250_000  # beyond this the host's bare thread cannot measure 1 ms
+HOST_SKIPPED_SHARE_MAX = 0.05  # ... nor beyond this share of its slots passed over
 CPU_SHARE_MAX_10MS = 0.10  # of one core, at a 10 ms period
 LATE_MAX_50MS_NS = 25_000_000  # the longest send, at a 50 ms period (half a period)
 SKIPPED_SHARE_MAX_BUSY = 0.10  # of the slots at 10 ms, with a helper thread busy in Python
@@ -88,22 +103,40 @@ def _outcome(tmp_path: Path) -> dict[str, Any]:
 def test_a_one_millisecond_period_is_kept(tmp_path: Path) -> None:
     config, port, _ = write_config_58k(tmp_path)
     env = child_env(tmp_path)
+    before = wake_reference(MS, REFERENCE_SLOTS)
     sink = _Sink(port)
     try:
         _send(tmp_path, config, env, "--every", "1ms", "--for", "3s")
     finally:
         sink.close()
+    host = before + wake_reference(MS, REFERENCE_SLOTS)
     outcome = _outcome(tmp_path)
     print(
         f"\n1 ms: sent {outcome['sent']} of {outcome['planned']}, skipped {outcome['skipped']} "
         f"(starved {outcome['starved']}), lateness mean {outcome['late_mean_ns'] / 1000:.1f} us "
-        f"max {outcome['late_max_ns'] / 1000:.1f} us, pacer {outcome['pacer']}"
+        f"max {outcome['late_max_ns'] / 1000:.1f} us, pacer {outcome['pacer']}; host's bare "
+        f"thread: lateness mean {host.late_mean_ns / 1000:.1f} us, skipped {host.skipped} "
+        f"of {host.slots}"
     )
     assert outcome["planned"] == 3000
-    assert outcome["skipped"] <= SKIPPED_SHARE_MAX * 3000, outcome
-    assert outcome["late_mean_ns"] < LATE_MEAN_MAX_NS, outcome
     assert sink.count == outcome["sent"]
     assert outcome["pacer"]["timer_slack_ns"] == 1000, outcome["pacer"]
+    if host.late_mean_ns > HOST_LATE_MEAN_MAX_NS or host.skipped_share > HOST_SKIPPED_SHARE_MAX:
+        pytest.skip(
+            f"this host cannot measure a 1 ms period: a bare thread sleeping to it wakes "
+            f"{host.late_mean_ns / 1000:.0f} us late on average and loses "
+            f"{host.skipped_share:.1%} of its slots"
+        )
+    skipped_share = outcome["skipped"] / outcome["planned"]
+    assert skipped_share - host.skipped_share <= SKIPPED_SHARE_MAX, (
+        f"the pacer lost {skipped_share:.1%} of its slots, the host's bare thread "
+        f"{host.skipped_share:.1%}"
+    )
+    assert outcome["late_mean_ns"] - host.late_mean_ns < LATE_OVER_HOST_MAX_NS, (
+        f"the pacer's mean lateness {outcome['late_mean_ns'] / 1000:.1f} us is "
+        f"{LATE_OVER_HOST_MAX_NS / 1000:.0f} us or more over the host's bare thread's "
+        f"{host.late_mean_ns / 1000:.1f} us"
+    )
 
 
 @needs_a_quiet_host

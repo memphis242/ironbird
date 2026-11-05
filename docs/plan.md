@@ -4714,6 +4714,12 @@ its options:
      wire with a median jitter of 23 us, p99 170 us, at 26% of a core, against 185 us, 360 us and 100%
      for the spinning version; README "Send modes"); a period under `[send] spin_below_us` (0, off)
      ends each wait with a 75 us spin (median 7 us at 1 ms, for about spin / period more CPU).
+     The 1 ms guard (`tests/bench/test_send_timing.py`) is measured against the host, not a fixed
+     figure: a bare thread sleeping to the same 1 ms grid (`tests/hosttiming.py` `wake_reference`,
+     before and after the series) gives the host's floor, which a serial run on a shared CI VM puts
+     at 20-100 us by itself (a fixed 100 us mean failed there at 101.8 us, max 143.8 us); the pacer's
+     mean may exceed it by under 75 us and its skips the floor's by 2% of the slots, and a host whose
+     bare thread is over 250 us late on average or loses over 5% of its slots skips the guard.
      The loop builds the packets ahead (bounded queue, no earlier than 20 ms before the slot, so the
      ledger's transmit gate and a header time field are current, and only for slots the thread can still
      serve: it publishes the slot it takes before the packet leaves the queue, a timed series starts from
